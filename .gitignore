@@ -1,0 +1,50 @@
+# Binaries / release artifacts (attach via GitHub Release, not git)
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+aero-edge/aero-edge
+aero-edge/aero-edge.exe
+**/aero-edge-linux-*
+**/aero-edge-darwin-*
+**/aero-edge-windows-*
+*.test
+*.out
+
+# Data / runtime
+aero_data/
+**/aero_data/
+/var/lib/aero/
+*.db
+*.db-journal
+certs/
+**/certs/
+*.pem
+*.key
+!deploy/**
+
+# Logs
+*.log
+*.err
+*.out.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+# keep go.sum
+
+# Local secrets
+.env
+.env.*
+!.env.example
+tokens.json
+sub_meta.json
+client-sub.json
