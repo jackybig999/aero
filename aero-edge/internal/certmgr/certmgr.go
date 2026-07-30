@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,15 +37,16 @@ const (
 
 // Manager 证书管理器
 type Manager struct {
-	mu          sync.RWMutex
-	source      Source
-	certFile    string
-	keyFile     string
-	domains     []string
-	cacheDir    string
-	email       string
-	cert        *tls.Certificate
-	autocertMgr *autocert.Manager // Let's Encrypt 专用
+	mu             sync.RWMutex
+	source         Source
+	certFile       string
+	keyFile        string
+	domains        []string
+	cacheDir       string
+	email          string
+	cert           *tls.Certificate
+	lastPublicCert *tls.Certificate // last successful LE/public cert (prefer over self-signed)
+	autocertMgr    *autocert.Manager // Let's Encrypt 专用
 }
 
 // Config 证书管理器配置
@@ -110,10 +113,79 @@ func NewManager(cfg Config) (*Manager, error) {
 }
 
 // GetCertificate 返回 TLS 证书（tls.Config.GetCertificate 回调）
+//
+// Let's Encrypt / autocert 在「无 SNI」或「SNI=IP」时会返回
+// missing server name / missing certificate，导致本机探测、IP 访问、
+// 部分客户端握手直接失败。此处做兼容：
+//  1. 空 SNI → 用配置的主域名再向 autocert 取证（服务已缓存的 LE 证书）
+//  2. autocert 仍失败 → 回退自签名应急证书（运维/Admin 可用；正式客户端应走域名 SNI）
 func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	// Let's Encrypt 模式：委托给 autocert（自动处理获取和续期）
 	if m.autocertMgr != nil {
-		return m.autocertMgr.GetCertificate(hello)
+		h := hello
+		sni := ""
+		if h != nil {
+			sni = h.ServerName
+		}
+		// Empty / IP SNI: only for admin loopback — self-signed is OK.
+		// Public domain SNI: NEVER prefer self-signed over a previously good LE cert.
+		emptySNI := sni == "" || net.ParseIP(sni) != nil
+		if emptySNI && len(m.domains) > 0 {
+			cp := *h
+			cp.ServerName = m.domains[0]
+			h = &cp
+			sni = m.domains[0]
+			emptySNI = false
+		}
+
+		m.mu.RLock()
+		lastGood := m.lastPublicCert
+		m.mu.RUnlock()
+
+		// Fast path: serve last good public cert while refresh continues in background.
+		if lastGood != nil && !emptySNI {
+			go m.refreshPublicCert(h)
+			return lastGood, nil
+		}
+
+		type result struct {
+			cert *tls.Certificate
+			err  error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			c, e := m.autocertMgr.GetCertificate(h)
+			ch <- result{c, e}
+		}()
+		// First connection may need ACME; allow more time than 2.5s.
+		timeout := 8 * time.Second
+		if lastGood != nil {
+			timeout = 2 * time.Second
+		}
+		select {
+		case r := <-ch:
+			if r.err == nil && r.cert != nil {
+				m.mu.Lock()
+				m.lastPublicCert = r.cert
+				m.mu.Unlock()
+				return r.cert, nil
+			}
+			log.Printf("[CERT] autocert GetCertificate err (sni=%q): %v", sni, r.err)
+		case <-time.After(timeout):
+			log.Printf("[CERT] autocert GetCertificate timeout %s (sni=%q)", timeout, sni)
+		}
+		if lastGood != nil {
+			return lastGood, nil
+		}
+		// Only self-sign when we truly have nothing — browsers will show untrusted.
+		// Prefer failing open with self-signed so Admin/tunnel can still run with -insecure.
+		fb, fbErr := m.ensureFallbackCert()
+		if fbErr == nil {
+			if !emptySNI {
+				log.Printf("[CERT] WARNING: serving self-signed for public SNI %q — LE not ready (open :80 for HTTP-01)", sni)
+			}
+			return fb, nil
+		}
+		return nil, fbErr
 	}
 
 	m.mu.RLock()
@@ -123,6 +195,58 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 	if cert == nil {
 		return nil, fmt.Errorf("no certificate available")
 	}
+	return cert, nil
+}
+
+func (m *Manager) refreshPublicCert(h *tls.ClientHelloInfo) {
+	if m.autocertMgr == nil || h == nil {
+		return
+	}
+	c, err := m.autocertMgr.GetCertificate(h)
+	if err != nil || c == nil {
+		return
+	}
+	m.mu.Lock()
+	m.lastPublicCert = c
+	m.mu.Unlock()
+}
+
+// WarmPublicCert tries to obtain LE cert at startup (best-effort, non-blocking caller).
+func (m *Manager) WarmPublicCert(domain string) {
+	if m.autocertMgr == nil || domain == "" {
+		return
+	}
+	h := &tls.ClientHelloInfo{ServerName: domain}
+	c, err := m.autocertMgr.GetCertificate(h)
+	if err != nil {
+		log.Printf("[CERT] warm %s: %v (will retry on handshake; ensure :80 open for ACME)", domain, err)
+		return
+	}
+	if c != nil {
+		m.mu.Lock()
+		m.lastPublicCert = c
+		m.mu.Unlock()
+		log.Printf("[CERT] warm OK for %s", domain)
+	}
+}
+
+// ensureFallbackCert returns a long-lived self-signed cert for emergency TLS
+// (loopback Admin probes, IP access with InsecureSkipVerify).
+func (m *Manager) ensureFallbackCert() (*tls.Certificate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cert != nil {
+		return m.cert, nil
+	}
+	names := make([]string, 0, len(m.domains)+3)
+	names = append(names, m.domains...)
+	names = append(names, "localhost", "127.0.0.1")
+	cert, err := generateSelfSigned(names)
+	if err != nil {
+		return nil, err
+	}
+	m.cert = cert
+	log.Printf("[CERT] fallback self-signed ready for empty/IP SNI (domains=%v)", names)
 	return cert, nil
 }
 
@@ -139,7 +263,7 @@ func (m *Manager) ACMEHandler() http.Handler {
 func (m *Manager) TLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{"h2"},
+		NextProtos:         []string{"h2", "http/1.1"},
 		GetCertificate:     m.GetCertificate,
 		InsecureSkipVerify: false,
 	}
@@ -179,18 +303,42 @@ func generateSelfSigned(domains []string) (*tls.Certificate, error) {
 		return nil, fmt.Errorf("generate ECDSA key: %w", err)
 	}
 
+	var dns []string
+	var ips []net.IP
+	for _, d := range domains {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		if ip := net.ParseIP(d); ip != nil {
+			ips = append(ips, ip)
+		} else {
+			dns = append(dns, d)
+		}
+	}
+	if len(dns) == 0 && len(ips) == 0 {
+		dns = []string{"localhost"}
+	}
+	cn := "localhost"
+	if len(dns) > 0 {
+		cn = dns[0]
+	} else if len(ips) > 0 {
+		cn = ips[0].String()
+	}
+
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
 			Organization: []string{"AERO Protocol"},
-			CommonName:   domains[0],
+			CommonName:   cn,
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(90 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames:              domains,
+		DNSNames:              dns,
+		IPAddresses:           ips,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, priv.Public(), priv)

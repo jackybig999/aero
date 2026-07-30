@@ -13,6 +13,7 @@ import (
 	"time"
 
 	aeroproto "github.com/aero-protocol/proto"
+	"github.com/aero-protocol/aero-edge/internal/dialguard"
 	"github.com/aero-protocol/aero-edge/internal/protocol"
 	"github.com/aero-protocol/aero-edge/internal/ratelimit"
 )
@@ -70,6 +71,15 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if target == "" {
 		http.Error(w, "missing target", http.StatusBadRequest)
+		return
+	}
+	// SSRF / proxy-loop guard: never dial loopback/private from edge CONNECT
+	if blocked, why := dialguard.IsBlockedTarget(target); blocked {
+		h.metrics.DialFailure()
+		if !h.quiet {
+			log.Printf("[CONNECT] blocked target %s (%s) from %s", target, why, r.RemoteAddr)
+		}
+		http.Error(w, "forbidden target", http.StatusForbidden)
 		return
 	}
 	streamType := detectStreamType(target)

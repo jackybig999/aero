@@ -39,9 +39,10 @@ func NewManager(handler http.Handler, validator *auth.Validator, cfg *config.Ser
 	}
 
 	// 构建 TLS 配置
+	// h2 preferred; http/1.1 kept so Admin/sub probes and simple clients work.
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{"h2"}, // 公网仅 h2，无私有 ALPN 指纹
+		NextProtos: []string{"h2", "http/1.1"},
 	}
 
 	if cfg.TLSCert != nil {

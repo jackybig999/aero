@@ -2,7 +2,7 @@
 package version
 
 // Version 当前发布版本。小改小升，破坏性变更升 major。
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // Protocol 主路径协议标识。
 const Protocol = "aero/2.0"

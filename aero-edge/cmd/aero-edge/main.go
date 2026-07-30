@@ -96,6 +96,20 @@ func main() {
 
 	ports := resolvePorts(*listen, *portsFlag)
 	tlsPorts, plainPorts, quicPorts := config.ClassifyPorts(ports)
+	// Autocert HTTP-01 needs :80. If only :443 was given, add 80 automatically.
+	if *autoCert != "" {
+		has80 := false
+		for _, p := range plainPorts {
+			if p == 80 {
+				has80 = true
+				break
+			}
+		}
+		if !has80 {
+			plainPorts = append(plainPorts, 80)
+			log.Printf("[CERT] autocert enabled — also listening :80 for HTTP-01 ACME")
+		}
+	}
 	if len(quicPorts) > 0 {
 		log.Printf("[LISTEN] QUIC ports ignored")
 		quicPorts = nil
@@ -134,12 +148,18 @@ func main() {
 
 	var certSource certmgr.Source
 	switch {
+	case *certFile != "" && *keyFile != "":
+		// Prefer static PEMs (acme.sh / LE / ZeroSSL) — production path
+		certSource = certmgr.Manual
 	case *autoCert != "":
 		certSource = certmgr.LetsEncrypt
-	case *certFile != "" && *keyFile != "":
-		certSource = certmgr.Manual
 	default:
+		// No silent self-signed for production domains; require explicit certs
+		if *domain != "" || *sniFlag != "" {
+			log.Fatalf("[CERT] refuse self-signed: provide -cert/-key (recommended) or -autocert for ACME")
+		}
 		certSource = certmgr.SelfSigned
+		log.Printf("[CERT] WARNING: self-signed only for empty domain (dev)")
 	}
 	certCfg := certmgr.Config{
 		Source: certSource, CertFile: *certFile, KeyFile: *keyFile,
@@ -151,6 +171,12 @@ func main() {
 	certManager, err := certmgr.NewManager(certCfg)
 	if err != nil {
 		log.Fatalf("cert: %v", err)
+	}
+	// Best-effort LE warm-up so first client does not get self-signed fallback.
+	if *autoCert != "" {
+		go certManager.WarmPublicCert(*autoCert)
+	} else if publicName != "" && publicName != "cdn-aero.com" {
+		go certManager.WarmPublicCert(publicName)
 	}
 
 	serverCfg := &config.ServerConfig{

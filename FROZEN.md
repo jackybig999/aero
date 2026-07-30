@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|--------|
 | **Component** | AERO Edge Server |
-| **Version** | 1.0.0 |
+| **Version** | 1.1.0 |
 | **API level** | 1 |
 | **Protocol** | aero/2.0 (H2 CONNECT main path) |
 | **Freeze date** | 2026-07-14 |
@@ -18,3 +18,9 @@
 - **2.0.0** — breaking CONNECT / frame / signature changes  
 
 Canonical contract: `docs/edge-server-v1.md`  
+Ecosystem control: `../../ECOSYSTEM.md` · `../../CONTRACTS.md`
+
+## P0 freeze rule
+
+- **Allowed:** 1.0.x bugfix / security / docs only  
+- **Forbidden:** feature work that breaks api_level=1 or CONNECT contract  
