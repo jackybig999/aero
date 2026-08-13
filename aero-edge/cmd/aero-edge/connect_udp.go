@@ -9,11 +9,71 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	aeroproto "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-edge/internal/protocol"
 )
+
+// runUDPRelay forwards only UdpFrame + heartbeat (no TCP dial).
+func (h *edgeHandler) runUDPRelay(p connectRelayParams) {
+	if p.onDone != nil {
+		defer p.onDone()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	udpConns := make(map[string]*net.UDPConn)
+	var udpMu sync.Mutex
+	defer func() {
+		udpMu.Lock()
+		for _, c := range udpConns {
+			_ = c.Close()
+		}
+		udpMu.Unlock()
+	}()
+
+	var lastHB atomic.Int64
+	lastHB.Store(time.Now().UnixNano())
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastHB.Load())) > 90*time.Second {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		msgType, msg, err := protocol.TypedReadMessage(p.Body)
+		if err != nil {
+			return
+		}
+		switch msgType {
+		case protocol.MsgTypeUdpFrame:
+			handleUDPFrame(ctx, p, msg.(*aeroproto.UdpFrame), udpConns, &udpMu)
+		case protocol.MsgTypeHeartbeat:
+			hb := msg.(*aeroproto.Heartbeat)
+			lastHB.Store(time.Now().UnixNano())
+			ack := &aeroproto.HeartbeatAck{Timestamp: hb.Timestamp, Sequence: hb.Sequence}
+			if err := protocol.TypedWriteMessage(p.SF, protocol.MsgTypeHeartbeatAck, ack); err != nil {
+				return
+			}
+			p.SF.Flush()
+		default:
+		}
+	}
+}
 
 func handleUDPFrame(
 	ctx context.Context,

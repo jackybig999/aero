@@ -5,6 +5,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -87,21 +88,8 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[CONNECT] %s -> %s", r.RemoteAddr, target)
 	}
 
-	var targetConn net.Conn
-	var err error
-	if h.dialGuard != nil {
-		targetConn, err = h.dialGuard.DialTimeout("tcp", target, 10*time.Second)
-	} else {
-		targetConn, err = net.DialTimeout("tcp", target, 10*time.Second)
-	}
-	if err != nil {
-		h.metrics.DialFailure()
-		log.Printf("[CONNECT] dial %s: %v", target, err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	applyStreamQoS(targetConn, streamType)
-
+	// HTTP 200 first so the H2 CONNECT stream is established; then handshake
+	// tells us TCP vs UDP. Dialing TCP before handshake made QUIC/UDP impossible.
 	w.WriteHeader(http.StatusOK)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
@@ -110,12 +98,10 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	var req aeroproto.ConnectRequest
 	if err := protocol.ReadMessage(r.Body, &req); err != nil {
 		_ = protocol.WriteMessage(w, &aeroproto.ConnectResponse{Accepted: false, Message: "read failed"})
-		targetConn.Close()
 		return
 	}
 	if req.Token != "" && req.Token != tok {
 		_ = protocol.WriteMessage(w, &aeroproto.ConnectResponse{Accepted: false, Message: "token mismatch"})
-		targetConn.Close()
 		return
 	}
 	if req.Token == "" {
@@ -124,7 +110,6 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !h.validator.ValidateFull(req.Token, req.Timestamp, req.Nonce) {
 		h.failAuth(ip)
 		_ = protocol.WriteMessage(w, &aeroproto.ConnectResponse{Accepted: false, Message: "invalid token or replay"})
-		targetConn.Close()
 		return
 	}
 
@@ -134,6 +119,9 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		streamID = s0.GetStreamId()
 		if s0.GetStreamType() != aeroproto.StreamType_GENERAL {
 			streamType = s0.GetStreamType()
+		}
+		if s0.GetTargetHost() != "" && s0.GetTargetPort() != 0 {
+			target = net.JoinHostPort(s0.GetTargetHost(), fmt.Sprintf("%d", s0.GetTargetPort()))
 		}
 	}
 
@@ -145,7 +133,6 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		RecommendedPort:     443,
 	}
 	if err := protocol.WriteMessage(w, resp); err != nil {
-		targetConn.Close()
 		return
 	}
 	if f, ok := w.(http.Flusher); ok {
@@ -153,11 +140,36 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sf := newSafeFlusher(w)
-	h.runConnectRelay(connectRelayParams{
-		Body: r.Body, SF: sf, Target: targetConn, TargetAddr: target,
+	params := connectRelayParams{
+		Body: r.Body, SF: sf, TargetAddr: target,
 		Remote: r.RemoteAddr, StreamID: streamID, StreamType: streamType,
 		Req: &req, Resp: resp, Token: tok, onDone: release,
-	})
+	}
+
+	if streamType == aeroproto.StreamType_UDP {
+		if !h.quiet {
+			log.Printf("[CONNECT] UDP relay %s", target)
+		}
+		h.runUDPRelay(params)
+		released = true
+		return
+	}
+
+	var targetConn net.Conn
+	var err error
+	if h.dialGuard != nil {
+		targetConn, err = h.dialGuard.DialTimeout("tcp", target, 10*time.Second)
+	} else {
+		targetConn, err = net.DialTimeout("tcp", target, 10*time.Second)
+	}
+	if err != nil {
+		h.metrics.DialFailure()
+		log.Printf("[CONNECT] dial %s: %v", target, err)
+		return
+	}
+	applyStreamQoS(targetConn, streamType)
+	params.Target = targetConn
+	h.runConnectRelay(params)
 	released = true
 }
 
