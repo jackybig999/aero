@@ -21,29 +21,30 @@ func Get(name string) *Settings {
 	switch name {
 	case "tiny":
 		return &Settings{
-			Name: "tiny", MaxConn: 256, MaxConnUser: 16, RateIP: 10,
+			// Browser tabs open many concurrent CONNECTs; 16 was too low → client 503 flood.
+			Name: "tiny", MaxConn: 1024, MaxConnUser: 256, RateIP: 80,
 			BandwidthUser: 2 << 20,
 			IdleTimeout:   10 * time.Minute,
 			MaxLife:       12 * time.Hour,
-			MaxDial:       64,
+			MaxDial:       128,
 			Quiet:         true,
 		}
 	case "small":
 		return &Settings{
-			Name: "small", MaxConn: 1024, MaxConnUser: 32, RateIP: 20,
+			Name: "small", MaxConn: 4096, MaxConnUser: 512, RateIP: 120,
 			BandwidthUser: 5 << 20,
 			IdleTimeout:   15 * time.Minute,
 			MaxLife:       24 * time.Hour,
-			MaxDial:       128,
+			MaxDial:       256,
 			Quiet:         true,
 		}
 	case "medium":
 		return &Settings{
-			Name: "medium", MaxConn: 4096, MaxConnUser: 64, RateIP: 30,
+			Name: "medium", MaxConn: 8192, MaxConnUser: 1024, RateIP: 200,
 			BandwidthUser: 0,
 			IdleTimeout:   20 * time.Minute,
 			MaxLife:       0,
-			MaxDial:       256,
+			MaxDial:       512,
 			Quiet:         false,
 		}
 	default:

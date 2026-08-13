@@ -46,31 +46,35 @@ func ReadMessage(r io.Reader, msg proto.Message) error {
 	return nil
 }
 
-// WriteMessage 写入 4 字节大端长度 + Protobuf 消息
+// WriteMessage 写入 4 字节大端长度 + Protobuf（单次 Write）
 func WriteMessage(w io.Writer, msg proto.Message) error {
 	data, err := proto.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-
-	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
-
-	if _, err := w.Write(lenBuf[:]); err != nil {
-		return fmt.Errorf("write length: %w", err)
-	}
-	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("write payload: %w", err)
+	buf := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(data)))
+	copy(buf[4:], data)
+	if _, err := w.Write(buf); err != nil {
+		return fmt.Errorf("write message: %w", err)
 	}
 	return nil
 }
 
-// TypedWriteMessage 写入 1 字节类型 + 4 字节长度 + Protobuf 消息
+// TypedWriteMessage 整帧一次 Write，避免并发写交错
 func TypedWriteMessage(w io.Writer, msgType byte, msg proto.Message) error {
-	if _, err := w.Write([]byte{msgType}); err != nil {
-		return fmt.Errorf("write type: %w", err)
+	data, err := proto.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
 	}
-	return WriteMessage(w, msg)
+	buf := make([]byte, 1+4+len(data))
+	buf[0] = msgType
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(data)))
+	copy(buf[5:], data)
+	if _, err := w.Write(buf); err != nil {
+		return fmt.Errorf("write typed message: %w", err)
+	}
+	return nil
 }
 
 // TypedReadMessage 读取 1 字节类型 + 4 字节长度 + Protobuf 消息
