@@ -81,7 +81,8 @@ func (v *Validator) ValidateWithTimestamp(token string, timestamp uint64) bool {
 	if diff < 0 {
 		diff = -diff
 	}
-	if diff > 30*time.Second {
+	// Browser CONNECT storms + slow handshake exceed 30s easily; 5m still blocks replay.
+	if diff > 5*time.Minute {
 		return false
 	}
 
