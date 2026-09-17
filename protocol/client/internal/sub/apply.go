@@ -19,10 +19,14 @@ type Applied struct {
 	PrimarySNI string
 	// PrimaryPins 首个节点 SPKI pins
 	PrimaryPins []string
+	// AllPins 包含所有有效节点的 SPKI pins
+	AllPins []string
 	// Tokens 地址 -> token（多节点）
 	Tokens map[string]string
 	// SNIs 地址 -> sni
 	SNIs map[string]string
+	// Servers 完整节点配置列表
+	Servers []ServerConfig
 }
 
 // Apply 将订阅转为拨号参数
@@ -39,6 +43,8 @@ func Apply(s *Subscription) (*Applied, error) {
 	}
 	var addrs []string
 	var validServers []ServerConfig
+	seenPins := make(map[string]bool)
+	var allPins []string
 	for _, srv := range s.Servers {
 		addr := strings.TrimSpace(srv.Address)
 		if addr == "" {
@@ -50,6 +56,13 @@ func Apply(s *Subscription) (*Applied, error) {
 		if srv.SNI != "" {
 			out.SNIs[addr] = srv.SNI
 		}
+		for _, p := range srv.PinSPKI {
+			p = strings.TrimSpace(p)
+			if p != "" && !seenPins[p] {
+				seenPins[p] = true
+				allPins = append(allPins, p)
+			}
+		}
 	}
 	if len(validServers) == 0 {
 		return nil, fmt.Errorf("no valid server addresses")
@@ -58,5 +71,7 @@ func Apply(s *Subscription) (*Applied, error) {
 	out.PrimaryToken = validServers[0].Token
 	out.PrimarySNI = validServers[0].SNI
 	out.PrimaryPins = append([]string(nil), validServers[0].PinSPKI...)
+	out.AllPins = allPins
+	out.Servers = validServers
 	return out, nil
 }

@@ -1,4 +1,4 @@
-﻿package public
+package public
 
 import (
 	"bufio"
@@ -64,18 +64,18 @@ func handleHTTPProxyBuffered(client net.Conn, br *bufio.Reader, unwrapDepth int)
 		if viaProxy {
 			log.Printf("[HTTP-PROXY] CONNECT %s", target)
 		}
-		// Reply locally first so fingerprint browsers / Chrome do not wait
-		// for the edge handshake (box 12080 does the same).
-		if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-			return
-		}
-		serveTarget(startPrefetch(bc), target, func(ok bool) {
+		serveTarget(bc, target, func(ok bool) {
 			if ok {
 				if viaProxy {
 					log.Printf("[HTTP-PROXY] CONNECT ok %s", target)
 				}
+				if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+					_ = client.Close()
+					return
+				}
 			} else {
-				log.Printf("[HTTP-PROXY] CONNECT fail %s (already 200)", target)
+				log.Printf("[HTTP-PROXY] CONNECT fail %s", target)
+				writeHTTPStatus(client, 502, "tunnel failed")
 				_ = client.Close()
 			}
 		})

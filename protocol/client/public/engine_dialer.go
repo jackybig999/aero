@@ -1,4 +1,4 @@
-﻿package public
+package public
 
 import (
 	"crypto/x509"
@@ -55,13 +55,31 @@ func dialEdgeTLS() (net.Conn, error) {
 	return dialEdgeTLSStd(false)
 }
 
+func currentEdgeSNI() string {
+	sni := ""
+	if publicName != nil {
+		sni = *publicName
+	}
+	if (sni == "" || sni == "cdn-aero.com") && edgeAddr != nil && *edgeAddr != "" {
+		host, _, err := net.SplitHostPort(*edgeAddr)
+		if err == nil && net.ParseIP(host) == nil && host != "" {
+			sni = host
+		}
+	}
+	if sni == "" {
+		sni = "cdn-aero.com"
+	}
+	return sni
+}
+
 func dialEdgeTLSStd(useFragment bool) (net.Conn, error) {
 	var tlsConfig *tls.Config
+	sni := currentEdgeSNI()
 	if *echConfigB64 != "" {
 		echData, err := base64.URLEncoding.DecodeString(*echConfigB64)
 		if err == nil {
 			cfg, err := transport.BuildClientConfigWithECH(transport.Config{
-				PublicName:    *publicName,
+				PublicName:    sni,
 				EnableRealECH: true,
 				ECHPublicKey:  echData,
 			})
@@ -71,7 +89,7 @@ func dialEdgeTLSStd(useFragment bool) (net.Conn, error) {
 		}
 	}
 	if tlsConfig == nil {
-		tlsConfig = transport.BuildClientConfig(*publicName)
+		tlsConfig = transport.BuildClientConfig(sni)
 	}
 	// Ensure h2 ALPN for CONNECT path
 	if len(tlsConfig.NextProtos) == 0 {
@@ -80,7 +98,7 @@ func dialEdgeTLSStd(useFragment bool) (net.Conn, error) {
 	if *echConfigB64 != "" && len(tlsConfig.EncryptedClientHelloConfigList) == 0 {
 		if echRaw, _ := base64.URLEncoding.DecodeString(*echConfigB64); len(echRaw) > 0 {
 			tlsConfig.EncryptedClientHelloConfigList = echRaw
-			tlsConfig.ServerName = *publicName
+			tlsConfig.ServerName = sni
 		}
 	}
 	tcpConn, err := dialEdgeTCP(10 * time.Second)
@@ -101,7 +119,7 @@ func dialEdgeTLSStd(useFragment bool) (net.Conn, error) {
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 	tlsConn.SetDeadline(time.Time{})
-	log.Printf("[TLS] std sni=%s alpn=%v", *publicName, tlsConn.ConnectionState().NegotiatedProtocol)
+	log.Printf("[TLS] std sni=%s alpn=%v", sni, tlsConn.ConnectionState().NegotiatedProtocol)
 	return tlsConn, nil
 }
 
@@ -114,7 +132,8 @@ func dialEdgeTLSUTls(useFragment bool) (net.Conn, error) {
 	if useFragment {
 		raw = transport.NewSplitter(tcpConn, 100, 10*time.Millisecond, 50*time.Millisecond)
 	}
-	utlsConfig := transport.BuildUTLSConfig(*publicName, *fingerprint)
+	sni := currentEdgeSNI()
+	utlsConfig := transport.BuildUTLSConfig(sni, *fingerprint)
 	uconn, err := transport.NewUConn(raw, utlsConfig, *fingerprint)
 	if err != nil {
 		tcpConn.Close()
@@ -129,7 +148,7 @@ func dialEdgeTLSUTls(useFragment bool) (net.Conn, error) {
 		return nil, fmt.Errorf("utls handshake: %w", err)
 	}
 	uconn.SetDeadline(time.Time{})
-	log.Printf("[TLS] fingerprint=%s cipher=0x%x", *fingerprint, uconn.ConnectionState().CipherSuite)
+	log.Printf("[uTLS] finger=%s sni=%s alpn=%s", *fingerprint, sni, uconn.ConnectionState().NegotiatedProtocol)
 	return uconn, nil
 }
 
@@ -404,13 +423,13 @@ func resolveViaPublicDNS(target string) (string, error) {
 	if net.ParseIP(host) != nil {
 		return target, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 	r := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 3 * time.Second}
-			return d.DialContext(ctx, "udp", "8.8.8.8:53")
+			d := net.Dialer{Timeout: 1 * time.Second}
+			return d.DialContext(ctx, "udp", "223.5.5.5:53")
 		},
 	}
 	ips, err := r.LookupIP(ctx, "ip4", host)
@@ -552,6 +571,8 @@ var certloader = struct {
 	InsecureAllowed       func() bool
 	ShouldSkipVerify      func() bool
 	SetPins               func([]string)
+	AddPins               func([]string)
+	ClearPins             func()
 	Pins                  func() []string
 	HasPins               func() bool
 	MatchSPKI             func(*x509.Certificate) bool
@@ -564,6 +585,8 @@ var certloader = struct {
 	InsecureAllowed:       transport.InsecureAllowed,
 	ShouldSkipVerify:      transport.ShouldSkipVerify,
 	SetPins:               transport.SetPins,
+	AddPins:               func(pins []string) { transport.AddPins(pins...) },
+	ClearPins:             transport.ClearPins,
 	Pins:                  transport.Pins,
 	HasPins:               transport.HasPins,
 	MatchSPKI:             transport.MatchSPKI,

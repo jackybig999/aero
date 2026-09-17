@@ -1,4 +1,4 @@
-﻿package public
+package public
 
 import (
 	"context"
@@ -208,8 +208,10 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 	go func() {
 		defer wg.Done()
 		runHeartbeatLoop(ctx, cancel, p.Tunnel, hbInterval, hbTimeout, &lastAck, &ackMu, &hbSent, &rttMu, func() {
-			h2pool.Default.Reset()
-			markSwitch()
+			if p.StreamType == aeroproto.StreamType_AI {
+				h2pool.Default.Reset()
+				markSwitch()
+			}
 		})
 	}()
 	go func() {

@@ -29,7 +29,7 @@ func BuildClientConfig(publicName string) *tls.Config {
 		// h2 required for CONNECT tunnel; http/1.1 as fallback ALPN
 		NextProtos: []string{"h2", "http/1.1"},
 	}
-	applyVerifyPolicy(cfg)
+	applyVerifyPolicy(cfg, publicName)
 	return cfg
 }
 
@@ -40,15 +40,15 @@ func BuildUTLSConfig(publicName, fingerprint string) *utls.Config {
 		MinVersion: utls.VersionTLS13,
 		NextProtos: []string{"h2"},
 	}
-	applyVerifyPolicyUTLS(cfg)
+	applyVerifyPolicyUTLS(cfg, publicName)
 	return cfg
 }
 
-func applyVerifyPolicy(cfg *tls.Config) {
+func applyVerifyPolicy(cfg *tls.Config, serverName string) {
 	if HasPins() {
-		// 钉扎：跳过系统链，用 SPKI 校验 leaf
+		// 双轨校验：SPKI 优先，公网标准 CA 兜底，绝不误杀多节点
 		cfg.InsecureSkipVerify = true
-		cfg.VerifyPeerCertificate = VerifyPeerCertificate
+		cfg.VerifyPeerCertificate = MakeVerifyPeerCertificate(serverName)
 		return
 	}
 	if pool := RootCAs(); pool != nil {
@@ -59,10 +59,10 @@ func applyVerifyPolicy(cfg *tls.Config) {
 	cfg.InsecureSkipVerify = ShouldSkipVerify()
 }
 
-func applyVerifyPolicyUTLS(cfg *utls.Config) {
+func applyVerifyPolicyUTLS(cfg *utls.Config, serverName string) {
 	if HasPins() {
 		cfg.InsecureSkipVerify = true
-		cfg.VerifyPeerCertificate = VerifyPeerCertificate
+		cfg.VerifyPeerCertificate = MakeVerifyPeerCertificate(serverName)
 		return
 	}
 	if pool := RootCAs(); pool != nil {

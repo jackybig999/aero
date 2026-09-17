@@ -1,4 +1,4 @@
-﻿package public
+package public
 
 import (
 	"fmt"
@@ -238,7 +238,7 @@ func (apiRuntime) SwitchNode(addr string) error {
 			return fmt.Errorf("node %s not in pool", addr)
 		}
 	}
-	setEdgeAddr(addr)
+	switchActiveNodeByAddr(addr)
 	log.Printf("[API] switch node -> %s", addr)
 	return nil
 }

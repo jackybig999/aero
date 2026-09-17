@@ -1,4 +1,4 @@
-﻿package public
+package public
 
 import (
 	"bytes"
@@ -563,13 +563,13 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 	st.StreamType = aeroproto.StreamType_GENERAL
 
 	replied := false
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 2; attempt++ {
 		if edgePool != nil && edgePool.Count() > 1 {
 			best := edgePool.Best()
 			current := getEdgeAddr()
-			if best.Address != current && best.Reachable {
-				log.Printf("[POOL] switch edge %s -> %s", current, best.Address)
-				setEdgeAddr(best.Address)
+			if best != nil && best.Address != current && best.Reachable {
+				log.Printf("[POOL] auto switch edge %s -> %s", current, best.Address)
+				switchActiveNode(best)
 			}
 		}
 
@@ -581,17 +581,17 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 			if edgePool != nil {
 				edgePool.MarkFail(getEdgeAddr())
 			}
-			if attempt >= 2 && !replied {
+			if attempt >= 1 && !replied {
 				ready(false)
 				replied = true
 				_ = client.Close()
 				return
 			}
-			time.Sleep(time.Duration(attempt+1) * 400 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
-		_ = tunnel.SetDeadline(time.Now().Add(15 * time.Second))
+		_ = tunnel.SetDeadline(time.Now().Add(10 * time.Second))
 		var resp *aeroproto.ConnectResponse
 		if usedProto == "tcp_h2" && len(preface) > 0 {
 			resp, err = aeroHandshakeRead(tunnel)
@@ -605,12 +605,12 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 			if edgePool != nil {
 				edgePool.MarkFail(getEdgeAddr())
 			}
-			if attempt >= 2 && !replied {
+			if attempt >= 1 && !replied {
 				ready(false)
 				_ = client.Close()
 				return
 			}
-			time.Sleep(time.Duration(attempt+1) * time.Second)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 		if !replied {

@@ -19,13 +19,28 @@ import (
 
 // Server 表示一个 Edge 节点
 type Server struct {
+	Name      string
 	// Address 配置地址 host:port，探测不得改写
 	Address   string
+	Token     string
+	SNI       string
+	PinSPKI   []string
+	Protocol  string
 	Reachable bool
 	RTT       time.Duration
 	LastFail  time.Time
 	FailCount int
 	Results   []ProbeResult
+}
+
+// ServerConfig 节点配置参数
+type ServerConfig struct {
+	Name     string
+	Address  string
+	Token    string
+	SNI      string
+	PinSPKI  []string
+	Protocol string
 }
 
 // Pool 管理多个 Edge 节点
@@ -55,6 +70,51 @@ func New(addresses string) (*Pool, error) {
 		return nil, fmt.Errorf("no valid edge addresses")
 	}
 	return &Pool{servers: servers}, nil
+}
+
+// NewFromServers 从多节点详细配置列表构建节点池
+func NewFromServers(cfgs []ServerConfig) (*Pool, error) {
+	if len(cfgs) == 0 {
+		return nil, fmt.Errorf("no edge servers provided")
+	}
+	servers := make([]*Server, 0, len(cfgs))
+	for _, cfg := range cfgs {
+		addr := strings.TrimSpace(cfg.Address)
+		if addr == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return nil, fmt.Errorf("invalid edge address %q: %w", addr, err)
+		}
+		servers = append(servers, &Server{
+			Name:     cfg.Name,
+			Address:  addr,
+			Token:    cfg.Token,
+			SNI:      cfg.SNI,
+			PinSPKI:  append([]string(nil), cfg.PinSPKI...),
+			Protocol: cfg.Protocol,
+		})
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no valid edge addresses")
+	}
+	return &Pool{servers: servers}, nil
+}
+
+// FindServer 根据地址获取节点详细信息副本
+func (p *Pool) FindServer(addr string) *Server {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, s := range p.servers {
+		if s != nil && s.Address == addr {
+			cp := *s
+			return &cp
+		}
+	}
+	return nil
 }
 
 func splitAddresses(s string) []string {
@@ -129,6 +189,11 @@ func (p *Pool) setProbeResult(addr string, reachable bool, rtt time.Duration, re
 			return
 		}
 	}
+}
+
+// SetProbeResult updates the reachable state and RTT for a server in the pool.
+func (p *Pool) SetProbeResult(addr string, reachable bool, rtt time.Duration) {
+	p.setProbeResult(addr, reachable, rtt, nil)
 }
 
 // Best 返回最优节点：可达优先 → RTT → 失败次数

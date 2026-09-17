@@ -1,4 +1,4 @@
-﻿package public
+package public
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"time"
 	"github.com/aero-protocol/aero-ech/internal/config"
 	"github.com/aero-protocol/aero-ech/internal/edgepool"
+	"github.com/aero-protocol/aero-ech/internal/h2pool"
 	"github.com/aero-protocol/aero-ech/internal/split"
 	"github.com/aero-protocol/aero-ech/internal/sub"
 	"github.com/aero-protocol/aero-ech/internal/tun"
@@ -59,12 +60,77 @@ func getEdgeAddr() string {
 	return *edgeAddr
 }
 
-func setEdgeAddr(addr string) {
+func switchActiveNode(srv *edgepool.Server) {
+	if srv == nil || srv.Address == "" {
+		return
+	}
 	edgeAddrMu.Lock()
-	defer edgeAddrMu.Unlock()
+	if edgeAddr != nil {
+		*edgeAddr = srv.Address
+	}
+	if srv.Token != "" && token != nil {
+		*token = srv.Token
+	}
+	sni := srv.SNI
+	if (sni == "" || sni == "cdn-aero.com") && srv.Address != "" {
+		host, _, err := net.SplitHostPort(srv.Address)
+		if err == nil && net.ParseIP(host) == nil && host != "" {
+			sni = host
+		}
+	}
+	if sni != "" && publicName != nil {
+		*publicName = sni
+	}
+	if len(srv.PinSPKI) > 0 {
+		certloader.AddPins(srv.PinSPKI)
+	}
+	curEdge := ""
+	curSNI := ""
+	if edgeAddr != nil {
+		curEdge = *edgeAddr
+	}
+	if publicName != nil {
+		curSNI = *publicName
+	}
+	edgeAddrMu.Unlock()
+
+	h2pool.Default.Reset()
+	log.Printf("[NODE] active node switched to %s (sni=%s)", curEdge, curSNI)
+}
+
+func switchActiveNodeByAddr(addr string) {
+	if addr == "" {
+		return
+	}
+	if edgePool != nil {
+		if srv := edgePool.FindServer(addr); srv != nil {
+			switchActiveNode(srv)
+			return
+		}
+	}
+	edgeAddrMu.Lock()
 	if edgeAddr != nil {
 		*edgeAddr = addr
 	}
+	sni := ""
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil && net.ParseIP(host) == nil && host != "" {
+		sni = host
+	}
+	if sni != "" && publicName != nil {
+		*publicName = sni
+	}
+	curSNI := ""
+	if publicName != nil {
+		curSNI = *publicName
+	}
+	edgeAddrMu.Unlock()
+	h2pool.Default.Reset()
+	log.Printf("[NODE] active node switched to %s (sni=%s fallback)", addr, curSNI)
+}
+
+func setEdgeAddr(addr string) {
+	switchActiveNodeByAddr(addr)
 }
 
 // process-wide engine state
@@ -492,8 +558,11 @@ func loadSubscription(src string) (*sub.Applied, error) {
 	if app.PrimarySNI != "" {
 		*publicName = app.PrimarySNI
 	}
-	if len(app.PrimaryPins) > 0 {
-		certloader.SetPins(app.PrimaryPins)
+	if len(app.AllPins) > 0 {
+		certloader.AddPins(app.AllPins)
+		log.Printf("[SUB] SPKI pin(s) loaded: %d", len(app.AllPins))
+	} else if len(app.PrimaryPins) > 0 {
+		certloader.AddPins(app.PrimaryPins)
 		log.Printf("[SUB] SPKI pin(s) loaded: %d", len(app.PrimaryPins))
 	}
 	log.Printf("[SUB] loaded %d server(s), primary=%s", len(doc.Servers), doc.Servers[0].Address)
@@ -514,25 +583,48 @@ func applySubscription(app *sub.Applied) error {
 	if app == nil {
 		return fmt.Errorf("nil applied")
 	}
-	*edgeAddr = app.EdgeAddresses
-	*token = app.PrimaryToken
-	if app.PrimarySNI != "" {
-		*publicName = app.PrimarySNI
+	if len(app.AllPins) > 0 {
+		certloader.AddPins(app.AllPins)
+	} else if len(app.PrimaryPins) > 0 {
+		certloader.AddPins(app.PrimaryPins)
 	}
-	if len(app.PrimaryPins) > 0 {
-		// 热更时同步 pin
-		certloader.SetPins(app.PrimaryPins)
+	var pool *edgepool.Pool
+	var err error
+	if len(app.Servers) > 0 {
+		epServers := make([]edgepool.ServerConfig, 0, len(app.Servers))
+		for _, s := range app.Servers {
+			epServers = append(epServers, edgepool.ServerConfig{
+				Name:     s.Name,
+				Address:  s.Address,
+				Token:    s.Token,
+				SNI:      s.SNI,
+				Protocol: s.Protocol,
+				PinSPKI:  s.PinSPKI,
+			})
+		}
+		pool, err = edgepool.NewFromServers(epServers)
+	} else {
+		pool, err = edgepool.New(app.EdgeAddresses)
 	}
-	pool, err := edgepool.New(app.EdgeAddresses)
 	if err != nil {
 		return err
 	}
 	pool.ProbeAll(0)
 	edgePool = pool
-	if best := pool.Best(); best != nil && best.Address != "" {
-		*edgeAddr = best.Address
+	best := pool.Best()
+	if best != nil && best.Address != "" {
+		switchActiveNode(best)
+	} else if len(app.Servers) > 0 {
+		switchActiveNode(&edgepool.Server{
+			Address: app.Servers[0].Address,
+			Token:   app.Servers[0].Token,
+			SNI:     app.Servers[0].SNI,
+			PinSPKI: app.Servers[0].PinSPKI,
+		})
+	} else {
+		switchActiveNodeByAddr(app.EdgeAddresses)
 	}
-	log.Printf("[SUB] applied edges=%s active=%s", app.EdgeAddresses, *edgeAddr)
+	log.Printf("[SUB] applied %d edges, active=%s", pool.Count(), getEdgeAddr())
 	return nil
 }
 

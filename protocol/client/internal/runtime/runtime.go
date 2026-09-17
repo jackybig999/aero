@@ -352,7 +352,7 @@ func (w *windowsRuntime) SetSystemProxy(proxyAddr string) error {
 		mixed = raw
 	}
 
-	bypass := "localhost;127.*;10.*;192.168.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2*.*;172.30.*;172.31.*;<local>;*.local"
+	bypass := "localhost;127.*;10.*;192.168.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2*.*;172.30.*;172.31.*;<local>;*.local;*.cn;*.baidu.com;*.qq.com;*.taobao.com;*.jd.com;*.alipay.com;*.bilibili.com;*.zhihu.com;*.163.com;*.weibo.com;*.csdn.net;*.douyin.com;*.feishu.cn;*.aliyun.com;*.tencent.com"
 	regPath := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	quietRun("reg", "delete", regPath, "/v", "AutoConfigURL", "/f")
 	// Same string Clash/v2rayN write: HTTP CONNECT + SOCKS on the mixed port.

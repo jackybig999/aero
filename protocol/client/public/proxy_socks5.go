@@ -37,15 +37,14 @@ func handleSocks5Buffered(client net.Conn, br *bufio.Reader) {
 		return
 	}
 	log.Printf("[SOCKS5] CONNECT %s", target)
-	if err := replySocks5Bind(client, 0x00, net.IPv4(127, 0, 0, 1), 0); err != nil {
-		return
-	}
 	bc := &bufConn{Conn: client, r: br}
-	serveTarget(startPrefetch(bc), target, func(ok bool) {
+	serveTarget(bc, target, func(ok bool) {
 		if ok {
 			log.Printf("[SOCKS5] CONNECT ok %s", target)
+			_ = replySocks5Bind(client, 0x00, net.IPv4(127, 0, 0, 1), 0)
 		} else {
 			log.Printf("[SOCKS5] CONNECT fail %s", target)
+			_ = replySocks5(client, 0x01)
 		}
 	})
 }
