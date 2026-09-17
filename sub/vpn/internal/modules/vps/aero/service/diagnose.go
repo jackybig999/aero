@@ -231,11 +231,11 @@ func buildReport(cred *iface.Cred, kv map[string]string, raw string) *DiagnoseRe
 		Version:   kv["VERSION"],
 	}
 	// ports
-	for _, p := range []int{443, 80, 8443} {
+	for _, p := range []int{443, 80, 8443, 2053, 2083, 2087, 2096} {
 		key := fmt.Sprintf("PORT_%d", p)
 		listen := kv[key] == "yes"
 		role := "unknown"
-		if p == 443 || p == 8443 {
+		if p == 443 || p == 8443 || p == 2053 || p == 2083 || p == 2087 || p == 2096 {
 			role = "edge-tls"
 		}
 		if p == 80 {
@@ -314,12 +314,16 @@ func buildReport(cred *iface.Cred, kv map[string]string, raw string) *DiagnoseRe
 		LocalError: kv["SUB_LOCAL_ERR"],
 		Preview:    trim(kv["SUB_PREVIEW"], 160),
 	}
+	port := 443
+	if p, err := strconv.Atoi(kv["PORT"]); err == nil && p > 0 {
+		port = p
+	}
 	// nodes (kinds)
-	edgeOnline := rep.Service.Active && portListen(rep.Ports, 443)
+	edgeOnline := rep.Service.Active && portListen(rep.Ports, port)
 	rep.Nodes = []NodeKind{
 		{
 			Kind: "aero-h2", Name: "AERO H2 CONNECT",
-			Target: "https://" + empty(rep.Domain, cred.IP) + ":443",
+			Target: fmt.Sprintf("https://%s:%d", empty(rep.Domain, cred.IP), port),
 			Online: edgeOnline,
 			Detail: serviceDetail(rep),
 		},
@@ -390,8 +394,15 @@ func buildHints(r *DiagnoseReport) []string {
 	if !r.Service.Active {
 		h = append(h, "aero-edge 未 active：点「重启 Edge」或重新安装")
 	}
-	if !portListen(r.Ports, 443) {
-		h = append(h, "443 未监听：检查防火墙 / 进程是否崩溃（看日志）")
+	edgePortListening := false
+	for _, p := range r.Ports {
+		if p.Role == "edge-tls" && p.Listen {
+			edgePortListening = true
+			break
+		}
+	}
+	if !edgePortListening {
+		h = append(h, "Edge 业务端口未监听：检查防火墙 / 进程是否崩溃（看日志）")
 	}
 	if !r.Cert.OK && r.Domain != "" {
 		h = append(h, "证书异常或未签发：确认域名 A 记录指向本机 IP 后点「安装/续签证书」")
@@ -466,7 +477,7 @@ if [ -n "$BIN" ]; then echo "INSTALLED=yes"; echo "BINARY_PATH=$BIN"; else echo 
 [ -f /opt/aero/VERSION ] && echo "VERSION=$(tr -d '\r\n' </opt/aero/VERSION)" || echo "VERSION="
 
 # ports
-for P in 443 80 8443; do
+for P in 443 80 8443 2053 2083 2087 2096; do
   if ss -lntp 2>/dev/null | grep -qE ":$P\\b"; then
     echo "PORT_${P}=yes"
     PROC=$(ss -lntp 2>/dev/null | grep -E ":$P\\b" | head -1 | sed 's/.*users:((//' | cut -c1-80)
@@ -521,7 +532,14 @@ else
   if [ "${FC:-0}" -gt 0 ]; then echo "CERT_OK=yes"; echo "CERT_DETAIL=cache files exist"; else echo "CERT_OK=no"; echo "CERT_DETAIL=no cert files yet"; fi
 fi
 
-# sub secret
+# sub secret & port
+PORT="${AERO_PORTS:-}"
+if [ -z "$PORT" ] && [ -f /var/lib/aero/sub_meta.json ]; then
+  PORT=$(python3 -c "import json;addr=json.load(open('/var/lib/aero/sub_meta.json'))['document']['servers'][0]['address'];print(addr.split(':')[-1])" 2>/dev/null)
+fi
+[ -z "$PORT" ] && PORT="443"
+echo "PORT=$PORT"
+
 if [ -f /var/lib/aero/sub_meta.json ]; then
   SEC=$(python3 -c "import json;print(json.load(open('/var/lib/aero/sub_meta.json')).get('secret',''))" 2>/dev/null)
   [ -z "$SEC" ] && SEC=$(grep -oE '"secret"[[:space:]]*:[[:space:]]*"[^"]+"' /var/lib/aero/sub_meta.json | head -1 | sed 's/.*"\([^"]*\)"/\1/')
@@ -533,13 +551,18 @@ fi
 HOST=${AERO_ADVERTISE:-${AERO_DOMAIN:-}}
 [ -z "$HOST" ] && HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
 if [ -n "$SEC" ] && [ -n "$HOST" ]; then
-  echo "SUB_URL=https://${HOST}/sub/${SEC}"
+  if [ "$PORT" = "443" ]; then
+    echo "SUB_URL=https://${HOST}/sub/${SEC}"
+  else
+    echo "SUB_URL=https://${HOST}:${PORT}/sub/${SEC}"
+  fi
 fi
 
-# local admin + sub via python3 with correct SNI (autocert requires server name)
+# local admin + sub via python3 with correct SNI & port
 export AERO_ADMIN_KEY_ENV="${AERO_ADMIN_KEY:-$ADMIN_KEY}"
 export AERO_SUB_SEC_ENV="$SEC"
 export AERO_SNI_ENV="${AERO_DOMAIN:-${AERO_ADVERTISE:-localhost}}"
+export AERO_PORT_ENV="$PORT"
 # strip scheme/path if any
 export AERO_SNI_ENV=$(echo "$AERO_SNI_ENV" | sed -e 's#https\?://##' -e 's#/.*##' -e 's/:.*//')
 python3 - <<'PY' 2>/tmp/aero_diag_py.err
@@ -548,18 +571,19 @@ import os, ssl, json, sys, socket, http.client
 key = os.environ.get("AERO_ADMIN_KEY_ENV","")
 sec = os.environ.get("AERO_SUB_SEC_ENV","")
 sni = (os.environ.get("AERO_SNI_ENV") or "localhost").strip() or "localhost"
+port = int(os.environ.get("AERO_PORT_ENV", "443"))
 
 def fetch(path, headers=None, timeout=10):
-    """TLS to 127.0.0.1:443 with SNI=domain (fixes autocert missing server name)."""
+    """TLS to 127.0.0.1:port with SNI=domain."""
     headers = headers or {}
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         # prefer TLS1.2+; edge may be TLS1.3-only which is fine
-        raw = socket.create_connection(("127.0.0.1", 443), timeout=timeout)
+        raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         ssock = ctx.wrap_socket(raw, server_hostname=sni)
-        conn = http.client.HTTPSConnection("127.0.0.1", 443, timeout=timeout, context=ctx)
+        conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=timeout, context=ctx)
         conn.sock = ssock
         conn.request("GET", path, headers=headers)
         resp = conn.getresponse()

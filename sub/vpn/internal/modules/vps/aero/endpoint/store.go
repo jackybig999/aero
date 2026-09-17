@@ -1,6 +1,7 @@
 package endpoint
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -11,6 +12,7 @@ type Info struct {
 	Name       string    `json:"name,omitempty"`
 	Host       string    `json:"host"` // public host for sub URL
 	IP         string    `json:"ip,omitempty"`
+	Port       int       `json:"port,omitempty"` // edge listening port (default 443)
 	SubSecret  string    `json:"sub_secret,omitempty"`
 	AdminKey   string    `json:"-"` // never JSON to frontend
 	HasAdmin   bool      `json:"has_admin"`
@@ -22,11 +24,16 @@ type Info struct {
 
 // Public strips secrets for UI.
 func (i Info) Public() map[string]any {
+	port := i.Port
+	if port <= 0 {
+		port = 443
+	}
 	return map[string]any{
 		"vps_id":     i.VPSID,
 		"name":       i.Name,
 		"host":       i.Host,
 		"ip":         i.IP,
+		"port":       port,
 		"sub_url":    i.SubURL,
 		"has_admin":  i.HasAdmin || i.AdminKey != "",
 		"version":    i.Version,
@@ -48,9 +55,16 @@ func (s *Store) Upsert(info Info) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	info.UpdatedAt = time.Now()
+	if info.Port <= 0 {
+		info.Port = 443
+	}
 	if info.SubURL == "" && info.Host != "" && info.SubSecret != "" {
 		scheme := "https"
-		info.SubURL = scheme + "://" + info.Host + "/sub/" + info.SubSecret
+		if info.Port == 443 {
+			info.SubURL = scheme + "://" + info.Host + "/sub/" + info.SubSecret
+		} else {
+			info.SubURL = fmt.Sprintf("%s://%s:%d/sub/%s", scheme, info.Host, info.Port, info.SubSecret)
+		}
 	}
 	cp := info
 	s.byID[info.VPSID] = &cp

@@ -258,6 +258,7 @@ func (p *Pool) Count() int {
 
 // NodeView 只读节点视图（供 API/UI）
 type NodeView struct {
+	Name      string
 	Address   string
 	Reachable bool
 	RTT       time.Duration
@@ -274,6 +275,7 @@ func (p *Pool) Snapshot() []NodeView {
 	out := make([]NodeView, len(p.servers))
 	for i, s := range p.servers {
 		out[i] = NodeView{
+			Name:      s.Name,
 			Address:   s.Address,
 			Reachable: s.Reachable,
 			RTT:       s.RTT,

@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -408,6 +409,9 @@ func (s *Service) edgeFor(vpsID uint64) (*edgeclient.Client, error) {
 	if host == "" {
 		host = ep.Host
 	}
+	if ep.Port > 0 && ep.Port != 443 && !strings.Contains(host, ":") {
+		host = fmt.Sprintf("%s:%d", host, ep.Port)
+	}
 	return edgeclient.New(host, ep.AdminKey), nil
 }
 
@@ -498,11 +502,16 @@ func (s *Service) adminViaSSH(vpsID uint64, method, path, jsonBody string) ([]by
 	if sni == "" {
 		sni = "localhost"
 	}
+	port := ep.Port
+	if port <= 0 {
+		port = 443
+	}
 	cmd := "export AERO_ADMIN_KEY_ENV=" + shellQuote(ep.AdminKey) +
 		"; export AERO_ADM_METHOD=" + shellQuote(method) +
 		"; export AERO_ADM_PATH=" + shellQuote(path) +
 		"; export AERO_ADM_BODY=" + shellQuote(jsonBody) +
 		"; export AERO_SNI_ENV=" + shellQuote(sni) +
+		"; export AERO_ADM_PORT=" + strconv.Itoa(port) +
 		`; python3 - <<'PY'
 import os, ssl, json, sys, socket, http.client
 method = os.environ.get("AERO_ADM_METHOD","GET")
@@ -510,13 +519,14 @@ path = os.environ.get("AERO_ADM_PATH","/admin/status")
 body = os.environ.get("AERO_ADM_BODY","")
 key = os.environ.get("AERO_ADMIN_KEY_ENV","")
 sni = (os.environ.get("AERO_SNI_ENV") or "localhost").strip() or "localhost"
+port = int(os.environ.get("AERO_ADM_PORT", "443"))
 try:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    raw = socket.create_connection(("127.0.0.1", 443), timeout=12)
+    raw = socket.create_connection(("127.0.0.1", port), timeout=12)
     ssock = ctx.wrap_socket(raw, server_hostname=sni)
-    conn = http.client.HTTPSConnection("127.0.0.1", 443, timeout=12, context=ctx)
+    conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=12, context=ctx)
     conn.sock = ssock
     headers = {"X-Aero-Admin-Key": key, "Host": sni}
     data = body.encode() if body else None
@@ -560,6 +570,12 @@ const harvestMetaScript = `set +e
 echo "ADMIN_KEY=${AERO_ADMIN_KEY:-$ADMIN_KEY}"
 echo "AERO_TOKEN=${AERO_TOKEN:-$TOKEN}"
 echo "ADVERTISE=${AERO_ADVERTISE:-${AERO_DOMAIN:-}}"
+PORT="${AERO_PORTS:-}"
+if [ -z "$PORT" ] && [ -f /var/lib/aero/sub_meta.json ]; then
+  PORT=$(python3 -c "import json;addr=json.load(open('/var/lib/aero/sub_meta.json'))['document']['servers'][0]['address'];print(addr.split(':')[-1])" 2>/dev/null)
+fi
+[ -z "$PORT" ] && PORT="443"
+echo "PORT=$PORT"
 if [ -f /var/lib/aero/sub_meta.json ]; then
   SEC=$(python3 -c "import json;print(json.load(open('/var/lib/aero/sub_meta.json')).get('secret',''))" 2>/dev/null)
   [ -z "$SEC" ] && SEC=$(grep -o '"secret"[[:space:]]*:[[:space:]]*"[^"]*"' /var/lib/aero/sub_meta.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
@@ -586,17 +602,26 @@ func parseHarvest(out string, cred *iface.Cred) endpoint.Info {
 	host = strings.TrimPrefix(host, "https://")
 	host = strings.TrimPrefix(host, "http://")
 	host = strings.Split(host, "/")[0]
+	port := 443
+	if p, err := strconv.Atoi(strings.TrimSpace(kv["PORT"])); err == nil && p > 0 {
+		port = p
+	}
 	sec := strings.TrimSpace(kv["SUB_SECRET"])
 	admin := strings.TrimSpace(kv["ADMIN_KEY"])
 	subURL := ""
 	if host != "" && sec != "" {
-		subURL = "https://" + host + "/sub/" + sec
+		if port == 443 {
+			subURL = "https://" + host + "/sub/" + sec
+		} else {
+			subURL = fmt.Sprintf("https://%s:%d/sub/%s", host, port, sec)
+		}
 	}
 	return endpoint.Info{
 		VPSID:     cred.VPSID,
 		Name:      cred.Name,
 		Host:      host,
 		IP:        cred.IP,
+		Port:      port,
 		SubSecret: sec,
 		AdminKey:  admin,
 		HasAdmin:  admin != "",
@@ -665,11 +690,38 @@ if [ -z "$ADMIN_KEY" ] && [ -f /etc/systemd/system/aero-edge.service ]; then
 fi
 [ -z "$TOKEN" ] && TOKEN="aero_$(openssl rand -hex 16 2>/dev/null || echo fallbacktoken)"
 [ -z "$ADMIN_KEY" ] && ADMIN_KEY="$(openssl rand -hex 16 2>/dev/null || echo adminkey)"
-EMAIL="admin@${DOMAIN:-localhost}"
+# --- Auto-detect Best HTTPS Port (Preferred 443, fallback standard CF/IANA ports) ---
+systemctl stop aero-edge 2>/dev/null || true
+CANDIDATE_PORTS=(443 8443 2053 2083 2087 2096)
+CHOSEN_PORT=""
+for p in "${CANDIDATE_PORTS[@]}"; do
+  in_use=0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('0.0.0.0', $p)); s.close()" 2>/dev/null || in_use=1
+  elif command -v ss >/dev/null 2>&1; then
+    ss -tlpn 2>/dev/null | grep -qE ":$p\b" && in_use=1
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser "$p/tcp" >/dev/null 2>&1 && in_use=1
+  fi
+  if [ "$in_use" -eq 0 ]; then
+    CHOSEN_PORT="$p"
+    break
+  fi
+done
+[ -z "$CHOSEN_PORT" ] && CHOSEN_PORT=443
+echo "CHOSEN_PORT=$CHOSEN_PORT"
+
+# Open firewall for CHOSEN_PORT & 80
+command -v ufw >/dev/null 2>&1 && ufw allow ${CHOSEN_PORT}/tcp 2>/dev/null || true
+command -v ufw >/dev/null 2>&1 && ufw allow 80/tcp 2>/dev/null || true
+command -v iptables >/dev/null 2>&1 && iptables -I INPUT -p tcp --dport ${CHOSEN_PORT} -j ACCEPT 2>/dev/null || true
+command -v iptables >/dev/null 2>&1 && iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+
 cat > /etc/aero/edge.conf << EOF
 AERO_TOKEN=$TOKEN
 AERO_ADMIN_KEY=$ADMIN_KEY
 AERO_DOMAIN=$DOMAIN
+AERO_PORTS=$CHOSEN_PORT
 AERO_ADVERTISE=${DOMAIN:-$IP}
 EOF
 chmod 600 /etc/aero/edge.conf
@@ -792,7 +844,7 @@ Restart=always
 RestartSec=5
 WorkingDirectory=/var/lib/aero
 EnvironmentFile=-/etc/aero/edge.conf
-ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :443 -ports 443 -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -domain ${DOMAIN} -sni ${DOMAIN} -advertise-host ${DOMAIN} -cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem -log-file /var/log/aero-edge.log -q
+ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :${CHOSEN_PORT} -ports ${CHOSEN_PORT} -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -domain ${DOMAIN} -sni ${DOMAIN} -advertise-host ${DOMAIN} -cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem -log-file /var/log/aero-edge.log -q
 ExecReload=/bin/kill -HUP \$MAINPID
 LimitNOFILE=65535
 [Install]
@@ -810,7 +862,7 @@ Restart=always
 RestartSec=5
 WorkingDirectory=/var/lib/aero
 EnvironmentFile=-/etc/aero/edge.conf
-ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :443 -ports 443 -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -domain ${DOMAIN} -sni ${DOMAIN} -advertise-host ${DOMAIN} -cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem -log-file /var/log/aero-edge.log -q
+ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :${CHOSEN_PORT} -ports ${CHOSEN_PORT} -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -domain ${DOMAIN} -sni ${DOMAIN} -advertise-host ${DOMAIN} -cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem -log-file /var/log/aero-edge.log -q
 ExecReload=/bin/kill -HUP \$MAINPID
 LimitNOFILE=65535
 [Install]
@@ -831,7 +883,7 @@ Restart=always
 RestartSec=5
 WorkingDirectory=/var/lib/aero
 EnvironmentFile=-/etc/aero/edge.conf
-ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :443 -ports 443 -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -advertise-host ${IP} ${CERT_ARGS} -log-file /var/log/aero-edge.log -q
+ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :${CHOSEN_PORT} -ports ${CHOSEN_PORT} -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -advertise-host ${IP} ${CERT_ARGS} -log-file /var/log/aero-edge.log -q
 ExecReload=/bin/kill -HUP \$MAINPID
 LimitNOFILE=65535
 [Install]
@@ -849,8 +901,8 @@ done
 echo "SERVICE_STATUS=$ST"
 [ "$ST" = "active" ] && echo "SERVICE_ACTIVE=yes" || echo "SERVICE_ACTIVE=no"
 systemctl status aero-edge --no-pager 2>/dev/null | head -15
-ss -lntp 2>/dev/null | grep -E ':443\\b' || echo "WARN 443"
-echo | timeout 4 openssl s_client -connect 127.0.0.1:443 -servername "${DOMAIN:-localhost}" 2>/dev/null | openssl x509 -noout -issuer -subject 2>/dev/null | sed 's/^/TLS /'
+ss -lntp 2>/dev/null | grep -E ":${CHOSEN_PORT}\\b" || echo "WARN ${CHOSEN_PORT}"
+echo | timeout 4 openssl s_client -connect 127.0.0.1:${CHOSEN_PORT} -servername "${DOMAIN:-localhost}" 2>/dev/null | openssl x509 -noout -issuer -subject 2>/dev/null | sed 's/^/TLS /'
 `, domain, ip)
 }
 

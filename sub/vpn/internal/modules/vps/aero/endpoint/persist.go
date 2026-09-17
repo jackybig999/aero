@@ -32,6 +32,7 @@ type infoDTO struct {
 	Name      string    `json:"name,omitempty"`
 	Host      string    `json:"host"`
 	IP        string    `json:"ip,omitempty"`
+	Port      int       `json:"port,omitempty"`
 	SubSecret string    `json:"sub_secret,omitempty"`
 	AdminKey  string    `json:"admin_key,omitempty"`
 	HasAdmin  bool      `json:"has_admin"`
@@ -42,16 +43,24 @@ type infoDTO struct {
 }
 
 func toDTO(i Info) infoDTO {
+	port := i.Port
+	if port <= 0 {
+		port = 443
+	}
 	return infoDTO{
-		VPSID: i.VPSID, Name: i.Name, Host: i.Host, IP: i.IP,
+		VPSID: i.VPSID, Name: i.Name, Host: i.Host, IP: i.IP, Port: port,
 		SubSecret: i.SubSecret, AdminKey: i.AdminKey, HasAdmin: i.HasAdmin || i.AdminKey != "",
 		SubURL: i.SubURL, Version: i.Version, Installed: i.Installed, UpdatedAt: i.UpdatedAt,
 	}
 }
 
 func fromDTO(d infoDTO) Info {
+	port := d.Port
+	if port <= 0 {
+		port = 443
+	}
 	return Info{
-		VPSID: d.VPSID, Name: d.Name, Host: d.Host, IP: d.IP,
+		VPSID: d.VPSID, Name: d.Name, Host: d.Host, IP: d.IP, Port: port,
 		SubSecret: d.SubSecret, AdminKey: d.AdminKey, HasAdmin: d.HasAdmin || d.AdminKey != "",
 		SubURL: d.SubURL, Version: d.Version, Installed: d.Installed, UpdatedAt: d.UpdatedAt,
 	}

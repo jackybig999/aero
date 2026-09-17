@@ -91,6 +91,20 @@ func RunServer() {
 
 	ports := resolvePorts(*listen, *portsFlag)
 	tlsPorts, plainPorts, quicPorts := config.ClassifyPorts(ports)
+
+	// Auto-probe fallback: If preferred port (e.g. 443) is occupied,
+	// automatically fallback to the next available standard HTTPS candidate port.
+	if len(tlsPorts) > 0 {
+		firstPort := tlsPorts[0]
+		if !IsPortAvailable(firstPort) {
+			chosen := AutoProbeHTTPSPort(firstPort)
+			if chosen != firstPort {
+				log.Printf("[PORT] Port %d occupied by another service (e.g. sing-box/s-ui/nginx). Auto-switched to :%d", firstPort, chosen)
+				tlsPorts[0] = chosen
+			}
+		}
+	}
+
 	// Autocert HTTP-01 needs :80. If only :443 was given, add 80 automatically.
 	if *autoCert != "" {
 		has80 := false
@@ -334,7 +348,40 @@ func applyProfile(ps *ProfileSettings, maxC, maxU, rate, bw, idleSec, lifeSec, m
 	return outMaxC, outMaxU, outRate, outBW, outIdle, outLife, outDial, outQ
 }
 
+// StandardHTTPSPorts standard HTTPS candidate ports in priority order (Cloudflare & IANA standard HTTPS ports)
+var StandardHTTPSPorts = []int{443, 8443, 2053, 2083, 2087, 2096}
+
+// IsPortAvailable checks if a TCP port can be bound on 0.0.0.0
+func IsPortAvailable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
+}
+
+// AutoProbeHTTPSPort probes the preferred port (e.g. 443) and falls back to StandardHTTPSPorts
+func AutoProbeHTTPSPort(preferred int) int {
+	if IsPortAvailable(preferred) {
+		return preferred
+	}
+	for _, cand := range StandardHTTPSPorts {
+		if cand == preferred {
+			continue
+		}
+		if IsPortAvailable(cand) {
+			log.Printf("[PORT] Preferred port %d is occupied. Auto-selected standard HTTPS candidate port: %d", preferred, cand)
+			return cand
+		}
+	}
+	return preferred
+}
+
 func resolvePorts(listen, portsLegacy string) []int {
+	if listen == "auto" || listen == ":auto" || portsLegacy == "auto" {
+		return []int{AutoProbeHTTPSPort(443)}
+	}
 	if listen != "" {
 		s := strings.TrimSpace(listen)
 		if i := strings.LastIndex(s, ":"); i >= 0 {
@@ -349,7 +396,7 @@ func resolvePorts(listen, portsLegacy string) []int {
 			return p
 		}
 	}
-	return []int{8443}
+	return []int{443}
 }
 
 func setupLogging(file, format string) error { return applogInit(file, format) }

@@ -75,8 +75,54 @@ if [[ -z "$EMAIL" ]]; then
     EMAIL="admin@${DOMAIN}"
 fi
 
+detect_best_https_port() {
+    local preferred="$1"
+    local candidates=("$preferred" 8443 2053 2083 2087 2096)
+    local tested=" "
+    for p in "${candidates[@]}"; do
+        if [[ "$tested" =~ " ${p} " ]]; then
+            continue
+        fi
+        tested+="${p} "
+
+        local in_use=0
+        if command -v python3 >/dev/null 2>&1; then
+            if ! python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('0.0.0.0', $p)); s.close()" 2>/dev/null; then
+                in_use=1
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -tlpn 2>/dev/null | grep -qE ":$p\b"; then
+                in_use=1
+            fi
+        elif command -v fuser >/dev/null 2>&1; then
+            if fuser "$p/tcp" >/dev/null 2>&1; then
+                in_use=1
+            fi
+        fi
+
+        if [[ "$in_use" -eq 0 ]]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    echo "$preferred"
+}
+
 ADVERTISE_HOST="${DOMAIN:-$ADVERTISE_IP}"
 PRIMARY_PORT=$(echo "$PORTS" | cut -d, -f1 | tr -d ' ')
+if [[ "$PRIMARY_PORT" == "443" || "$PRIMARY_PORT" == "auto" || -z "$PRIMARY_PORT" ]]; then
+    systemctl stop aero-edge 2>/dev/null || true
+    BEST_PORT=$(detect_best_https_port 443)
+    if [[ "$BEST_PORT" != "443" ]]; then
+        echo "[port] 443 端口被其他服务占用 (如 sing-box/s-ui/nginx)，自动优选标准 HTTPS 备用端口: ${BEST_PORT}"
+        PRIMARY_PORT="$BEST_PORT"
+        PORTS="$BEST_PORT"
+    else
+        PRIMARY_PORT="443"
+        PORTS="443"
+    fi
+fi
+
 CERT="$TLS_DIR/fullchain.pem"
 KEY="$TLS_DIR/privkey.pem"
 
@@ -84,7 +130,7 @@ echo "========================================="
 echo " AERO Edge v${VERSION}"
 echo " domain:    $DOMAIN"
 echo " advertise: $ADVERTISE_HOST"
-echo " ports:     $PORTS (default/preferred 443)"
+echo " ports:     $PORTS (active/selected)"
 echo " data:      $DATA_DIR"
 echo " tls:       $TLS_DIR"
 echo " cert:      LE first, ZeroSSL backup; no self-sign"
@@ -264,6 +310,17 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 SERVICE
 
+# --- firewall: open PRIMARY_PORT & 80 ---
+echo "[firewall] 放行业务端口 TCP ${PRIMARY_PORT} 与 ACME TCP 80"
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${PRIMARY_PORT}/tcp" 2>/dev/null || true
+    ufw allow 80/tcp 2>/dev/null || true
+fi
+if command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+fi
+
 systemctl daemon-reload
 systemctl enable aero-edge
 systemctl restart aero-edge
@@ -285,7 +342,11 @@ fi
 SUB_SECRET=$(python3 -c "import json;print(json.load(open('$DATA_DIR/sub_meta.json'))['secret'])" 2>/dev/null || true)
 cp -f "$DATA_DIR/client-sub.json" "$CONFIG_DIR/client-sub.json" 2>/dev/null || true
 
-SUB_URL="https://${ADVERTISE_HOST}:${PRIMARY_PORT}/sub/${SUB_SECRET}"
+if [[ "${PRIMARY_PORT}" == "443" ]]; then
+    SUB_URL="https://${ADVERTISE_HOST}/sub/${SUB_SECRET}"
+else
+    SUB_URL="https://${ADVERTISE_HOST}:${PRIMARY_PORT}/sub/${SUB_SECRET}"
+fi
 if [[ -z "$SUB_SECRET" ]]; then
     SUB_URL="(见 $DATA_DIR/sub_meta.json)"
 fi

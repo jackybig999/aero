@@ -175,8 +175,12 @@ func (apiRuntime) Nodes() []api.NodeInfo {
 	snap := edgePool.Snapshot()
 	out := make([]api.NodeInfo, 0, len(snap))
 	for _, n := range snap {
+		name := n.Name
+		if name == "" {
+			name = n.Address
+		}
 		out = append(out, api.NodeInfo{
-			Name:      n.Address,
+			Name:      name,
 			Address:   n.Address,
 			Reachable: n.Reachable,
 			RTTMs:     n.RTT.Milliseconds(),
