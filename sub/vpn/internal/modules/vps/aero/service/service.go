@@ -689,21 +689,39 @@ if [ -f "$CERT" ] && [ -f "$KEY" ]; then
   fi
 fi
 # copy from acme.sh / certbot if present
-if [ "$need_issue" = "1" ] && [ -n "$DOMAIN" ]; then
-  for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}" "/etc/letsencrypt/live/${DOMAIN}"; do
-    if [ -f "$d/fullchain.cer" ] || [ -f "$d/fullchain.pem" ]; then
-      FC="$d/fullchain.cer"; [ -f "$d/fullchain.pem" ] && FC="$d/fullchain.pem"
-      KY=$(ls "$d"/*.key 2>/dev/null | head -1)
-      [ -f "$d/privkey.pem" ] && KY="$d/privkey.pem"
-      if [ -f "$FC" ] && [ -n "$KY" ] && [ -f "$KY" ]; then
-        cp -f "$FC" "$CERT"; cp -f "$KY" "$KEY"
-        chmod 644 "$CERT"; chmod 600 "$KEY"
-        echo "CERT_STATUS=copied_from $d"
-        need_issue=0
-        break
+if [ "$need_issue" = "1" ]; then
+  if [ -n "$DOMAIN" ]; then
+    for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}" "/etc/letsencrypt/live/${DOMAIN}"; do
+      if [ -f "$d/fullchain.cer" ] || [ -f "$d/fullchain.pem" ]; then
+        FC="$d/fullchain.cer"; [ -f "$d/fullchain.pem" ] && FC="$d/fullchain.pem"
+        KY=$(ls "$d"/*.key 2>/dev/null | head -1)
+        [ -f "$d/privkey.pem" ] && KY="$d/privkey.pem"
+        if [ -f "$FC" ] && [ -n "$KY" ] && [ -f "$KY" ]; then
+          cp -f "$FC" "$CERT"; cp -f "$KY" "$KEY"
+          chmod 644 "$CERT"; chmod 600 "$KEY"
+          echo "CERT_STATUS=copied_from $d"
+          need_issue=0
+          break
+        fi
       fi
-    fi
-  done
+    done
+  fi
+  if [ "$need_issue" = "1" ]; then
+    for d in /root/.acme.sh/*_ecc /root/.acme.sh/* /etc/letsencrypt/live/*; do
+      if [ -d "$d" ] && ([ -f "$d/fullchain.cer" ] || [ -f "$d/fullchain.pem" ]); then
+        FC="$d/fullchain.cer"; [ -f "$d/fullchain.pem" ] && FC="$d/fullchain.pem"
+        KY=$(ls "$d"/*.key 2>/dev/null | head -1)
+        [ -f "$d/privkey.pem" ] && KY="$d/privkey.pem"
+        if [ -f "$FC" ] && [ -n "$KY" ] && [ -f "$KY" ]; then
+          cp -f "$FC" "$CERT"; cp -f "$KY" "$KEY"
+          chmod 644 "$CERT"; chmod 600 "$KEY"
+          echo "CERT_STATUS=auto_copied_existing $d"
+          need_issue=0
+          break
+        fi
+      fi
+    done
+  fi
 fi
 if [ "$need_issue" = "1" ] && [ -n "$DOMAIN" ]; then
   echo "CERT_STATUS=issuing"
@@ -799,6 +817,10 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 else
+CERT_ARGS=""
+if [ -f "$CERT" ] && [ -f "$KEY" ]; then
+  CERT_ARGS="-cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem"
+fi
 cat > /etc/systemd/system/aero-edge.service << EOF
 [Unit]
 Description=AERO Edge Server
@@ -809,7 +831,7 @@ Restart=always
 RestartSec=5
 WorkingDirectory=/var/lib/aero
 EnvironmentFile=-/etc/aero/edge.conf
-ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :443 -ports 443 -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -advertise-host ${IP} -sni ${IP} -cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem -log-file /var/log/aero-edge.log -q
+ExecStart=/usr/local/bin/aero-edge -token ${TOKEN} -listen :443 -ports 443 -profile small -data-dir /var/lib/aero -admin-key ${ADMIN_KEY} -advertise-host ${IP} ${CERT_ARGS} -log-file /var/log/aero-edge.log -q
 ExecReload=/bin/kill -HUP \$MAINPID
 LimitNOFILE=65535
 [Install]

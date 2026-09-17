@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -149,11 +150,12 @@ func RunServer() {
 		certSource = transport.LetsEncrypt
 	default:
 		// No silent self-signed for production domains; require explicit certs
-		if *domain != "" || *sniFlag != "" {
+		isRealDomain := (*domain != "" && net.ParseIP(*domain) == nil) || (*sniFlag != "" && net.ParseIP(*sniFlag) == nil)
+		if isRealDomain {
 			log.Fatalf("[CERT] refuse self-signed: provide -cert/-key (recommended) or -autocert for ACME")
 		}
 		certSource = transport.SelfSigned
-		log.Printf("[CERT] WARNING: self-signed only for empty domain (dev)")
+		log.Printf("[CERT] WARNING: self-signed fallback enabled for IP/dev")
 	}
 	certCfg := transport.CertConfig{
 		Source: certSource, CertFile: *certFile, KeyFile: *keyFile,

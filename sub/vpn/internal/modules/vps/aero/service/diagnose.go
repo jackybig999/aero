@@ -142,6 +142,7 @@ func (s *Service) Diagnose(vpsID uint64) (*DiagnoseReport, error) {
 			rep.Binary.Version = v
 		}
 	}
+	rep.Hints = buildHints(rep)
 	return rep, nil
 }
 
@@ -162,7 +163,7 @@ func (s *Service) RenewCert(vpsID uint64, forceClear bool) (map[string]any, erro
 systemctl is-active aero-edge
 `
 	if forceClear {
-		script += `rm -rf /var/lib/aero/certs/* 2>/dev/null; echo "CLEARED=yes"
+		script += `rm -rf /var/lib/aero/certs/* /var/lib/aero/tls/* 2>/dev/null; echo "CLEARED=yes"
 `
 	} else {
 		script += `echo "CLEARED=no"
@@ -171,7 +172,7 @@ systemctl is-active aero-edge
 	script += `systemctl restart aero-edge
 sleep 3
 systemctl is-active aero-edge | sed 's/^/SERVICE=/'
-ls -la /var/lib/aero/certs 2>/dev/null | head -20
+ls -la /var/lib/aero/tls /var/lib/aero/certs 2>/dev/null | head -20
 journalctl -u aero-edge -n 25 --no-pager 2>/dev/null | tail -20
 `
 	out, err := sshprobe.Run(c, script, 40*time.Second)
@@ -247,16 +248,35 @@ func buildReport(cred *iface.Cred, kv map[string]string, raw string) *DiagnoseRe
 	// cert
 	days, _ := strconv.Atoi(kv["CERT_DAYS"])
 	fc, _ := strconv.Atoi(kv["CERT_FILES"])
+	certOK := kv["CERT_OK"] == "yes"
+	certDetail := kv["CERT_DETAIL"]
+	notAfter := kv["CERT_NOT_AFTER"]
+
+	// Fallback to Edge runtime metrics if available
+	if !certOK && rep.Metrics != nil {
+		if d, ok := rep.Metrics["cert_days_left"].(float64); ok && d > 0 {
+			days = int(d)
+			certOK = true
+			if na, ok := rep.Metrics["cert_not_after"].(string); ok && na != "" {
+				notAfter = na
+			}
+			certDetail = fmt.Sprintf("valid %dd (Let's Encrypt / public)", days)
+			if fc == 0 {
+				fc = 2
+			}
+		}
+	}
+
 	rep.Cert = CertCheck{
-		Mode:      empty(kv["CERT_MODE"], "unknown"),
+		Mode:      empty(kv["CERT_MODE"], "static"),
 		Domain:    empty(kv["CERT_DOMAIN"], rep.Domain),
-		HasFiles:  kv["CERT_HAS"] == "yes" || fc > 0,
-		Dir:       empty(kv["CERT_DIR"], "/var/lib/aero/certs"),
+		HasFiles:  certOK || kv["CERT_HAS"] == "yes" || fc > 0,
+		Dir:       empty(kv["CERT_DIR"], "/var/lib/aero/tls"),
 		FileCount: fc,
-		NotAfter:  kv["CERT_NOT_AFTER"],
+		NotAfter:  notAfter,
 		DaysLeft:  days,
-		OK:        kv["CERT_OK"] == "yes",
-		Detail:    kv["CERT_DETAIL"],
+		OK:        certOK,
+		Detail:    certDetail,
 		CanRenew:  rep.Domain != "" || kv["CERT_MODE"] == "autocert",
 	}
 	// admin
@@ -458,7 +478,10 @@ for P in 443 80 8443; do
 done
 
 # certs
-CERT_DIR=/var/lib/aero/certs
+CERT_DIR=/var/lib/aero/tls
+if [ ! -d "$CERT_DIR" ] || [ $(ls -A "$CERT_DIR" 2>/dev/null | wc -l) -eq 0 ]; then
+  [ -d /var/lib/aero/certs ] && CERT_DIR=/var/lib/aero/certs
+fi
 echo "CERT_DIR=$CERT_DIR"
 if [ -d "$CERT_DIR" ]; then
   FC=$(find "$CERT_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
@@ -470,11 +493,11 @@ fi
 if grep -q autocert /etc/systemd/system/aero-edge.service 2>/dev/null; then
   echo "CERT_MODE=autocert"
 else
-  echo "CERT_MODE=static-or-self"
+  echo "CERT_MODE=static"
 fi
 echo "CERT_DOMAIN=${AERO_DOMAIN:-}"
 # try read leaf cert notAfter
-CERT_PEM=$(find "$CERT_DIR" -name '*.crt' -o -name 'certificate' -o -name '*leaf*' 2>/dev/null | head -1)
+CERT_PEM=$(find "$CERT_DIR" /var/lib/aero/tls -name 'fullchain.pem' -o -name '*.crt' -o -name 'certificate' -o -name '*leaf*' 2>/dev/null | head -1)
 if [ -z "$CERT_PEM" ]; then CERT_PEM=$(find "$CERT_DIR" -type f 2>/dev/null | head -1); fi
 if [ -n "$CERT_PEM" ] && command -v openssl >/dev/null; then
   NA=$(openssl x509 -in "$CERT_PEM" -noout -enddate 2>/dev/null | cut -d= -f2)

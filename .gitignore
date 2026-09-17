@@ -22,7 +22,7 @@ yarn-error.log*
 *.exe
 *.exe~
 *.dll
-!**/wintun.dll
+!protocol/client/win/wintun.dll
 *.so
 *.dylib
 
@@ -54,3 +54,4 @@ platform.exe
 # Go Test Artifacts
 *.test
 __debug_bin*
+sub/vpn/vpn/
