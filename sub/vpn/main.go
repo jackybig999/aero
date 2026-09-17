@@ -1,0 +1,379 @@
+// VPN 中台主程序 — 单端口
+//
+//	/login   普通用户订阅
+//	/admin/  管理后台
+//	/health  健康检查
+//	/api/v1/ 业务 API
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/vpn-platform/vpsserver/vpn/internal/middleware"
+	"github.com/vpn-platform/vpsserver/vpn/internal/web"
+
+	billingH "github.com/vpn-platform/vpsserver/vpn/internal/modules/billing/handler"
+	billingS "github.com/vpn-platform/vpsserver/vpn/internal/modules/billing/service"
+	billingStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/billing/store"
+
+	nodeH "github.com/vpn-platform/vpsserver/vpn/internal/modules/node/handler"
+	nodeS "github.com/vpn-platform/vpsserver/vpn/internal/modules/node/service"
+	nodeStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/node/store"
+
+	payInH "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/in/handler"
+	payInS "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/in/service"
+
+	ledgerH "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/ledger/handler"
+	ledgerS "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/ledger/service"
+	ledgerStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/ledger/store"
+
+	payOutH "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/out/handler"
+	payOutS "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/out/service"
+
+	settleH "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/settlement/handler"
+	settleS "github.com/vpn-platform/vpsserver/vpn/internal/modules/pay/settlement/service"
+
+	"github.com/vpn-platform/vpsserver/vpn/internal/modules/user/domain"
+	userH "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/handler"
+	userS "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/service"
+	userStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/store"
+
+	subH "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/handler"
+	subS "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/service"
+	subStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/store"
+
+	aeroEndpoint "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/endpoint"
+	aeroH "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/handler"
+	aeroS "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/service"
+	aeroStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/store"
+	vpsH "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/handler"
+	"github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/secret"
+	vpsS "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/service"
+	vpsStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/store"
+)
+
+var modules = []string{
+	"login", "admin", "billing", "subscriptions", "nodes", "vps", "aero",
+	"pay", "ledger", "settlement", "config", "sync",
+}
+
+type YamlConfig struct {
+	Server struct {
+		Port int    `yaml:"port"`
+		Host string `yaml:"host"`
+	} `yaml:"server"`
+	Data struct {
+		Dir string `yaml:"dir"`
+	} `yaml:"data"`
+	Security struct {
+		HMACSecret string `yaml:"hmac_secret"`
+		SSHCredKey string `yaml:"ssh_cred_key"`
+	} `yaml:"security"`
+	Aero struct {
+		GithubRepo   string `yaml:"github_repo"`
+		FollowLatest bool   `yaml:"follow_latest"`
+		LocalBin     string `yaml:"local_bin"`
+	} `yaml:"aero"`
+	Web struct {
+		Root string `yaml:"root"`
+	} `yaml:"web"`
+}
+
+func loadConfigFile() *YamlConfig {
+	candidates := []string{
+		"config/config.yaml",
+		"../config/config.yaml",
+		"../../config/config.yaml",
+		filepath.Join(filepath.Dir(os.Args[0]), "config", "config.yaml"),
+		filepath.Join(filepath.Dir(os.Args[0]), "..", "config", "config.yaml"),
+	}
+	for _, p := range candidates {
+		data, err := os.ReadFile(p)
+		if err == nil {
+			var cfg YamlConfig
+			if err := yaml.Unmarshal(data, &cfg); err == nil {
+				log.Printf("[CONFIG] Loaded configuration from %s (port=%d)", p, cfg.Server.Port)
+				return &cfg
+			}
+		}
+	}
+	return nil
+}
+
+func main() {
+	cfg := loadConfigFile()
+
+	port := "18080"
+	if cfg != nil && cfg.Server.Port > 0 {
+		port = strconv.Itoa(cfg.Server.Port)
+	}
+	if p := os.Getenv("PORT"); p != "" {
+		port = p
+	}
+
+	hmacSecret := "dev-secret-change-me"
+	if cfg != nil && cfg.Security.HMACSecret != "" {
+		hmacSecret = cfg.Security.HMACSecret
+	}
+	if s := os.Getenv("HMAC_SECRET"); s != "" {
+		hmacSecret = s
+	}
+
+	if cfg != nil && cfg.Security.SSHCredKey != "" && os.Getenv("SSH_CRED_KEY") == "" {
+		_ = os.Setenv("SSH_CRED_KEY", cfg.Security.SSHCredKey)
+	}
+	if cfg != nil && cfg.Aero.LocalBin != "" && os.Getenv("AERO_LOCAL_BIN") == "" {
+		_ = os.Setenv("AERO_LOCAL_BIN", cfg.Aero.LocalBin)
+	}
+	if cfg != nil && cfg.Web.Root != "" && os.Getenv("WEB_ROOT") == "" {
+		_ = os.Setenv("WEB_ROOT", cfg.Web.Root)
+	}
+
+	userDB := userStore.NewMemoryStore()
+	userSvc := userS.New(userDB, hmacSecret)
+	seedAdmin(userSvc, userDB)
+
+	billingSvc := billingS.New(billingStore.NewMemoryStore())
+	nodeSvc := nodeS.New(nodeStore.NewMemoryStore())
+	subSvc := subS.New(subStore.NewMemoryStore())
+	ledgerSvc := ledgerS.New(ledgerStore.NewMemoryStore())
+
+	ledgerURL := env("LEDGER_URL", "http://127.0.0.1:"+port)
+	payInSvc := payInS.New(ledgerURL)
+	payOutSvc := payOutS.New()
+	settleSvc := settleS.New()
+
+	box, err := secret.NewBox()
+	if err != nil {
+		log.Fatalf("ssh crypto: %v", err)
+	}
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" && cfg != nil && cfg.Data.Dir != "" {
+		dataDir = cfg.Data.Dir
+	}
+	if dataDir == "" {
+		candidates := []string{"vpn/data", "data", "../vpn/data", filepath.Join(filepath.Dir(os.Args[0]), "data")}
+		for _, c := range candidates {
+			if st, err := os.Stat(c); err == nil && st.IsDir() {
+				dataDir = c
+				break
+			}
+		}
+		if dataDir == "" {
+			dataDir = "vpn/data"
+		}
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		log.Fatalf("data dir: %v", err)
+	}
+	vpsPath := filepath.Join(dataDir, "vps.json")
+	vpsDB, err := vpsStore.NewFileStore(vpsPath, box)
+	if err != nil {
+		log.Fatalf("vps store: %v", err)
+	}
+	if n, _ := vpsDB.List(); len(n) > 0 {
+		log.Printf("vps store: loaded %d host(s) from %s", len(n), vpsPath)
+	} else {
+		log.Printf("vps store: %s (empty)", vpsPath)
+	}
+	vpsSvc := vpsS.New(vpsDB, box)
+
+	epPath := filepath.Join(dataDir, "aero_endpoints.json")
+	epStore, err := aeroEndpoint.NewPersist(epPath)
+	if err != nil {
+		log.Fatalf("aero endpoints: %v", err)
+	}
+	if n := len(epStore.List()); n > 0 {
+		log.Printf("aero endpoints: loaded %d from %s", n, epPath)
+	}
+	aeroSvc := aeroS.NewWithEndpoints(aeroStore.NewMemoryStore(), vpsS.NewProvider(vpsSvc), epStore)
+
+	api := http.NewServeMux()
+	api.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		svcs := make([]map[string]string, 0, len(modules))
+		for _, m := range modules {
+			svcs = append(svcs, map[string]string{"name": m, "status": "ok"})
+		}
+		vpsN, _ := vpsDB.List()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok", "mode": "single-port", "port": port,
+			"product": "vpsserver",
+			"data_dir": dataDir,
+			"vps_count": len(vpsN),
+			"paths": map[string]string{
+				"user_login": "/login", "admin": "/admin/", "aero_ui": "/aero-ui/",
+				"health": "/health", "api": "/api/v1/",
+			},
+			"services": svcs,
+		})
+	})
+
+	userH.New(userSvc).RegisterRoutes(api)
+	billingH.New(billingSvc).RegisterRoutes(api)
+	nodeH.New(nodeSvc).RegisterRoutes(api)
+	subH.New(subSvc).RegisterRoutes(api)
+	vpsH.New(vpsSvc).RegisterRoutes(api)
+	aeroH.New(aeroSvc).RegisterRoutes(api)
+	payInH.New(payInSvc).RegisterRoutes(api)
+	payOutH.New(payOutSvc).RegisterRoutes(api)
+	ledgerH.New(ledgerSvc).RegisterRoutes(api)
+	settleH.New(settleSvc).RegisterRoutes(api)
+	registerConfig(api)
+	registerSync(api)
+	registerSecurity(api)
+	registerTestPay(api)
+	registerStubs(api)
+
+	dist := web.FindDist()
+	pages := web.Handler(dist)
+	split := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/health" || strings.HasPrefix(p, "/api/") {
+			api.ServeHTTP(w, r)
+			return
+		}
+		pages.ServeHTTP(w, r)
+	})
+
+	gate := &middleware.Gate{Verify: userSvc.VerifyToken, Next: split}
+	handler := middleware.CORSPermissive(middleware.Recover(gate))
+
+	fmt.Printf("\n  vpsserver → http://127.0.0.1:%s\n", port)
+	fmt.Printf("    /login    用户订阅\n")
+	fmt.Printf("    /admin/   管理后台\n")
+	fmt.Printf("    /aero-ui/ AERO 模块控制台\n")
+	fmt.Printf("    /health   健康检查\n")
+	fmt.Printf("    data:    %s  (VPS/端点持久化，重启不丢)\n", dataDir)
+	fmt.Printf("    user:    %s\n", empty(dist.UserDist, "(missing)"))
+	fmt.Printf("    admin:   %s\n", empty(dist.AdminDist, "(missing)"))
+	fmt.Printf("    aero-ui: %s\n\n", empty(dist.AeroUIDist, "(missing)"))
+	log.Fatal(http.ListenAndServe(":"+port, handler))
+}
+
+func empty(s, d string) string {
+	if strings.TrimSpace(s) == "" {
+		return d
+	}
+	return s
+}
+func env(k, def string) string {
+	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+		return v
+	}
+	return def
+}
+func seedAdmin(svc *userS.Service, db *userStore.MemoryStore) {
+	u, err := svc.Register(domain.CreateUserParams{
+		Username: "admin", Password: "admin123", Email: "admin@vpn.local",
+	})
+	if err != nil {
+		return
+	}
+	db.SetStaff(u.ID, true)
+}
+
+type configStore struct {
+	mu  sync.RWMutex
+	cfg map[string]string
+}
+
+func registerConfig(mux *http.ServeMux) {
+	st := &configStore{cfg: map[string]string{
+		"AERO_RELEASE_URL": env("AERO_RELEASE_URL", "https://github.com/jackybig999/aero/releases/download/v1.0.0/aero-edge-linux-amd64"),
+		"AERO_VERSION":     env("AERO_VERSION", "1.0.0"),
+	}}
+	mux.HandleFunc("GET /api/v1/config/", func(w http.ResponseWriter, r *http.Request) {
+		st.mu.RLock()
+		defer st.mu.RUnlock()
+		cp := make(map[string]string, len(st.cfg))
+		for k, v := range st.cfg {
+			cp[k] = v
+		}
+		writeJSON(w, 200, map[string]any{"code": 0, "data": cp})
+	})
+	mux.HandleFunc("PUT /api/v1/config/{key}", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Value string `json:"value"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		st.mu.Lock()
+		st.cfg[r.PathValue("key")] = req.Value
+		st.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"code": 0})
+	})
+}
+
+type agentState struct {
+	mu     sync.RWMutex
+	agents map[string]map[string]any
+}
+
+func registerSync(mux *http.ServeMux) {
+	st := &agentState{agents: map[string]map[string]any{}}
+	mux.HandleFunc("POST /api/v1/sync/agents/{agent_id}/heartbeat/", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Version string `json:"version"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		id := r.PathValue("agent_id")
+		st.mu.Lock()
+		st.agents[id] = map[string]any{"agent_id": id, "version": req.Version, "status": "online", "last_heartbeat": time.Now()}
+		st.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"code": 0})
+	})
+	mux.HandleFunc("GET /api/v1/sync/agents/", func(w http.ResponseWriter, r *http.Request) {
+		st.mu.RLock()
+		defer st.mu.RUnlock()
+		list := make([]map[string]any, 0, len(st.agents))
+		for _, a := range st.agents {
+			list = append(list, a)
+		}
+		writeJSON(w, 200, map[string]any{"code": 0, "data": list})
+	})
+}
+
+func registerSecurity(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/v1/security/verify/", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Token string `json:"token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSON(w, 200, map[string]any{"valid": len(req.Token) > 64})
+	})
+}
+
+func registerTestPay(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/v1/test/pay/", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"code": 0, "message": "sandbox", "data": map[string]any{"test_mode": true}})
+	})
+	mux.HandleFunc("POST /api/v1/test/pay/complete", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"code": 0, "message": "sandbox complete"})
+	})
+}
+
+func registerStubs(mux *http.ServeMux) {
+	ok := func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"code": 0, "message": "ok"})
+	}
+	mux.HandleFunc("GET /api/v1/failover/", ok)
+	mux.HandleFunc("GET /api/v1/scheduler/", ok)
+	mux.HandleFunc("GET /api/v1/analytics/", ok)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}

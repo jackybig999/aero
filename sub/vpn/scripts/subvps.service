@@ -1,0 +1,17 @@
+[Unit]
+Description=AIsys Subscription Platform Service (subvps)
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+WorkingDirectory=/opt/vpn
+Environment="PORT=18080"
+Environment="DATA_DIR=/opt/vpn/data"
+Environment="HMAC_SECRET=dev-secret-change-me"
+ExecStart=/usr/local/bin/subvps
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

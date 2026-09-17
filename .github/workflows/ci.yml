@@ -1,0 +1,74 @@
+name: AIsys CI Build & Test
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  build-linux:
+    name: Linux Build & Test (Server & Subplatform)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Test & Build Protocol Server
+        run: |
+          cd protocol/server
+          go vet ./...
+          go test -v ./...
+          cd vps
+          go build -v -o aero-edge-linux-amd64 .
+          cd ../cli
+          go build -v -o aero-edge-cli .
+
+      - name: Test & Build Subplatform
+        run: |
+          cd sub/vpn
+          go vet ./...
+          go test -v ./...
+          go build -v -o subvps .
+
+  build-windows:
+    name: Windows Build & Test (Client & Connect)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Test & Build Protocol Client
+        run: |
+          cd protocol/client
+          go vet ./...
+          go test -v ./...
+          cd cli
+          go build -v -o aerocli.exe .
+          cd ../win
+          go build -v -o aerowin.exe .
+          cd guard
+          go build -v -o aero-guard.exe .
+
+      - name: Test & Build Connect Tools
+        run: |
+          cd connect/cli
+          go vet ./...
+          go build -v -o connect-cli.exe .
+          cd ../desktop
+          go vet ./...
+          go test -v ./...
+          cd win
+          go build -v -o desktop.exe .

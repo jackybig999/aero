@@ -1,0 +1,256 @@
+// Copyright 2025 AERO Protocol Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+package sub
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// FetchOptions 拉取选项
+type FetchOptions struct {
+	// InsecureSkipVerify 仅开发/自签场景；生产应由调用方注入 CA
+	InsecureSkipVerify bool
+	Timeout            time.Duration
+	DisableCache       bool
+}
+
+// Fetch 从 URL 或本地 file:// / 路径加载订阅
+func Fetch(src string, opt FetchOptions) (*Subscription, error) {
+	if opt.Timeout <= 0 {
+		opt.Timeout = 15 * time.Second
+	}
+	src = strings.TrimSpace(src)
+	if src == "" {
+		return nil, fmt.Errorf("empty subscription source")
+	}
+
+	// 本地文件
+	if strings.HasPrefix(src, "file://") {
+		return loadFile(strings.TrimPrefix(src, "file://"))
+	}
+	if !strings.Contains(src, "://") {
+		if _, err := os.Stat(src); err == nil {
+			return loadFile(src)
+		}
+	}
+
+	u, err := url.Parse(src)
+	if err != nil {
+		return nil, fmt.Errorf("fetch subscription: %w", err)
+	}
+	client := &http.Client{
+		Timeout: opt.Timeout,
+		Transport: &http.Transport{
+			// Force direct: never follow HTTP_PROXY env (would loop into local mixed).
+			Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
+			DialContext: dialWithHostCache,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: opt.InsecureSkipVerify, //nolint:gosec // explicit opt-in for self-signed edge
+				ServerName:         u.Hostname(),
+			},
+		},
+	}
+	resp, err := client.Get(src)
+	if err != nil {
+		if !opt.DisableCache {
+			if cached := LoadLastBody(); len(cached) > 0 {
+				if sub, perr := ParseBytes(cached); perr == nil {
+					return sub, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("fetch subscription: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if !opt.DisableCache {
+			if cached := LoadLastBody(); len(cached) > 0 {
+				if sub, perr := ParseBytes(cached); perr == nil {
+					return sub, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("subscription HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		if !opt.DisableCache {
+			if cached := LoadLastBody(); len(cached) > 0 {
+				if sub, perr := ParseBytes(cached); perr == nil {
+					return sub, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	sub, err := ParseBytes(body)
+	if err != nil {
+		if !opt.DisableCache {
+			if cached := LoadLastBody(); len(cached) > 0 {
+				if csub, perr := ParseBytes(cached); perr == nil {
+					return csub, nil
+				}
+			}
+		}
+		return nil, err
+	}
+	if host := u.Hostname(); host != "" {
+		if ips, lerr := net.DefaultResolver.LookupHost(context.Background(), host); lerr == nil {
+			saveHostIPs(host, ips)
+		}
+	}
+	SaveLastBody(body)
+	return sub, nil
+}
+
+var hostCacheMu sync.Mutex
+
+func cacheFile(name string) []string {
+	var out []string
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		out = append(out, filepath.Join(dir, name), filepath.Join(dir, "..", name))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		out = append(out, filepath.Join(wd, name))
+	}
+	return out
+}
+
+func saveHostIPs(host string, ips []string) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" || len(ips) == 0 {
+		return
+	}
+	hostCacheMu.Lock()
+	defer hostCacheMu.Unlock()
+	m := map[string][]string{}
+	for _, p := range cacheFile(".host-ip-cache.json") {
+		if b, err := os.ReadFile(p); err == nil {
+			_ = json.Unmarshal(b, &m)
+			break
+		}
+	}
+	m[host] = ips
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	for _, p := range cacheFile(".host-ip-cache.json") {
+		_ = os.WriteFile(p, raw, 0o600)
+	}
+}
+
+func loadHostIPs(host string) []string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	hostCacheMu.Lock()
+	defer hostCacheMu.Unlock()
+	for _, p := range cacheFile(".host-ip-cache.json") {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		m := map[string][]string{}
+		if json.Unmarshal(b, &m) != nil {
+			continue
+		}
+		if ips := m[host]; len(ips) > 0 {
+			return ips
+		}
+	}
+	return nil
+}
+
+func SaveLastBody(body []byte) {
+	if len(body) == 0 {
+		return
+	}
+	for _, p := range cacheFile(".last-sub-body") {
+		_ = os.WriteFile(p, body, 0o600)
+	}
+}
+
+func LoadLastBody() []byte {
+	for _, p := range cacheFile(".last-sub-body") {
+		b, err := os.ReadFile(p)
+		if err == nil && len(b) > 0 {
+			return b
+		}
+	}
+	return nil
+}
+
+func dialWithHostCache(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	var ips []string
+	if parsed := net.ParseIP(host); parsed != nil {
+		ips = []string{host}
+	} else if resolved, lerr := net.DefaultResolver.LookupHost(ctx, host); lerr == nil && len(resolved) > 0 {
+		ips = resolved
+		saveHostIPs(host, resolved)
+	} else {
+		ips = loadHostIPs(host)
+		if len(ips) == 0 {
+			if lerr != nil {
+				return nil, lerr
+			}
+			return nil, fmt.Errorf("lookup %s: no such host", host)
+		}
+	}
+	d := net.Dialer{Timeout: 8 * time.Second}
+	var last error
+	for _, ip := range ips {
+		c, derr := d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if derr == nil {
+			return c, nil
+		}
+		last = derr
+	}
+	return nil, last
+}
+
+func loadFile(path string) (*Subscription, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseBytes(data)
+}
+
+// ParseBytes 解析 JSON 或 base64(JSON)
+func ParseBytes(body []byte) (*Subscription, error) {
+	body = trimSpaceBytes(body)
+	// 尝试 base64
+	if sub, err := ParseBase64(string(body)); err == nil && len(sub.Servers) > 0 {
+		return sub, nil
+	}
+	var sub Subscription
+	if err := json.Unmarshal(body, &sub); err != nil {
+		return nil, fmt.Errorf("parse subscription: %w", err)
+	}
+	if len(sub.Servers) == 0 {
+		return nil, fmt.Errorf("no servers in subscription")
+	}
+	return &sub, nil
+}
+
+func trimSpaceBytes(b []byte) []byte {
+	return []byte(strings.TrimSpace(string(b)))
+}

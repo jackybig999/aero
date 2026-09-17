@@ -1,0 +1,607 @@
+﻿package public
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"github.com/aero-protocol/aero-ech/internal/config"
+	"github.com/aero-protocol/aero-ech/internal/edgepool"
+	"github.com/aero-protocol/aero-ech/internal/split"
+	"github.com/aero-protocol/aero-ech/internal/sub"
+	"github.com/aero-protocol/aero-ech/internal/tun"
+)
+
+// -----------------------------------------------------------------------------
+// Source: main.go
+// -----------------------------------------------------------------------------
+// Copyright 2025 AERO Protocol Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+
+
+// CLI flags
+var (
+	listenAddr   = flag.String("listen", "127.0.0.1:55555", "mixed proxy: HTTP+HTTPS CONNECT+SOCKS5 (one port)")
+	edgeAddr     = flag.String("edge", "", "AERO edge server address(es)")
+	token        = flag.String("token", "", "auth token")
+	publicName   = flag.String("sni", "cdn-aero.com", "pseudo SNI for ECH")
+	subURL        = flag.String("sub", "", "subscription URL or file")
+	subInterval   = flag.Duration("sub-interval", 30*time.Minute, "subscription refresh interval (0=disable)")
+	fingerprint   = flag.String("fingerprint", "std", "TLS fingerprint: std|chrome|firefox|safari|random (std=compatible)")
+	enableSplit   = flag.Bool("split", true, "enable smart traffic splitting")
+	echConfigB64  = flag.String("ech", "", "base64-encoded ECH config list")
+	caCertPath    = flag.String("ca-cert", "", "CA certificate file for Edge server verification")
+	tlsInsecure   = flag.Bool("insecure", false, "skip TLS certificate verify (dev/self-signed only)")
+	configPath    = flag.String("config", "", "path to AERO config YAML/JSON file")
+	simOnly       = flag.Bool("sim", false, "simulate data plane (TCP/UDP/gVisor) and exit; no proxy, no wintun")
+	initMode      = flag.String("mode", "", "startup mode: tun|sysproxy|socks (empty = tun, or sysproxy if other global)")
+)
+
+var edgeAddrMu sync.RWMutex
+
+func getEdgeAddr() string {
+	edgeAddrMu.RLock()
+	defer edgeAddrMu.RUnlock()
+	if edgeAddr == nil {
+		return ""
+	}
+	return *edgeAddr
+}
+
+func setEdgeAddr(addr string) {
+	edgeAddrMu.Lock()
+	defer edgeAddrMu.Unlock()
+	if edgeAddr != nil {
+		*edgeAddr = addr
+	}
+}
+
+// process-wide engine state
+var (
+	splitEngine  *split.Engine
+	detectedISP  split.ISPType
+	testedPorts  []uint32
+	udpAvailable bool
+	switchEngine *edgepool.SwitchEngine
+	edgePool     *edgepool.Pool
+	contextIDCounter atomic.Uint64
+	aiContextSent sync.Map
+)
+
+func stripProcessProxyEnv() {
+	// Never let our own process use HTTP_PROXY=127.0.0.1:55555 (set for AI tools).
+	// That makes subscription fetch loop into a dead mixed port and look like a crash.
+	for _, k := range []string{
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "ftp_proxy",
+	} {
+		_ = os.Unsetenv(k)
+	}
+}
+
+func loadLastSubFile() string {
+	var cands []string
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		cands = append(cands,
+			filepath.Join(dir, ".last-sub-url"),
+			filepath.Join(dir, "..", ".last-sub-url"),
+		)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		cands = append(cands, filepath.Join(wd, ".last-sub-url"))
+	}
+	for _, p := range cands {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := strings.TrimSpace(string(b))
+		if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+			log.Printf("[SUB] resume last url from %s", p)
+			return s
+		}
+	}
+	return ""
+}
+
+func saveLastSub(url string) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return
+	}
+	var paths []string
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), ".last-sub-url"))
+	}
+	for _, p := range paths {
+		_ = os.WriteFile(p, []byte(url+"\n"), 0o600)
+	}
+}
+
+var logFile *os.File
+
+func setupFileLog() {
+	dir := ""
+	if exe, err := os.Executable(); err == nil {
+		dir = filepath.Dir(exe)
+	}
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+	name := "aero-ech.log"
+	if exe, err := os.Executable(); err == nil {
+		base := strings.TrimSuffix(filepath.Base(exe), filepath.Ext(exe))
+		if base != "" {
+			name = base + ".log"
+		}
+	}
+	path := filepath.Join(dir, name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("[LOG] open %s: %v", path, err)
+		return
+	}
+	logFile = f
+	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	log.Printf("[LOG] ===== session start pid=%d file=%s =====", os.Getpid(), path)
+}
+
+func healLeftoverAeroDNS() {
+	show := exec.Command("netsh", "interface", "show", "interface")
+	hideConsole(show)
+	out, err := show.Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "Connected") && !strings.Contains(line, "已连接") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		name := strings.Join(fields[3:], " ")
+		low := strings.ToLower(name)
+		if strings.Contains(low, "sing") || strings.Contains(low, "loopback") || strings.Contains(low, "meta") || strings.Contains(low, "clash") {
+			continue
+		}
+		dnsCmd := exec.Command("netsh", "interface", "ip", "show", "dns", "name="+name)
+		hideConsole(dnsCmd)
+		cfg, err := dnsCmd.Output()
+		if err != nil || !strings.Contains(string(cfg), "10.88.0.2") {
+			continue
+		}
+		dhcp := exec.Command("netsh", "interface", "ip", "set", "dns", "name="+name, "dhcp")
+		hideConsole(dhcp)
+		_ = dhcp.Run()
+		log.Printf("[NET] restored DHCP DNS on %s (cleared leftover 10.88.0.2)", name)
+	}
+}
+
+func acceptMixed(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("accept error: %v", err)
+			return
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(30 * time.Second)
+		}
+		go handleMixedClient(conn)
+	}
+}
+
+// applyConfig 灏嗛厤缃枃浠剁殑鍊艰鐩栧埌鏈樉寮忚缃殑 flag 涓?// 鍘熷垯锛氬懡浠よ flag 鏄惧紡璁剧疆鐨勫€间紭鍏堜簬閰嶇疆鏂囦欢
+func applyConfig(cfg *config.AeroConfig) {
+	c := &cfg.Client
+
+	// flag 涓洪粯璁ゅ€兼椂锛岀敤閰嶇疆鏂囦欢瑕嗙洊
+	if (*listenAddr == "127.0.0.1:1080" || *listenAddr == "127.0.0.1:55555") && c.Listen.SOCKS5 != "" {
+		*listenAddr = c.Listen.SOCKS5
+	}
+	if *publicName == "cdn-aero.com" && c.Edge.Transport.ECH.Enabled {
+		// SNI 淇濇寔 flag 榛樿鎴栦粠绗竴涓?edge 鑺傜偣璇诲彇
+	}
+	if *fingerprint == "chrome" && c.Edge.Transport.Fingerprint != "" {
+		*fingerprint = c.Edge.Transport.Fingerprint
+	}
+
+	// Edge 鑺傜偣锛氶厤缃枃浠朵腑鐨勭涓€涓妭鐐逛綔涓?-edge
+	if *edgeAddr == "" && len(c.Edge.Pool) > 0 {
+		*edgeAddr = c.Edge.Pool[0].Address
+	}
+	if *token == "" && len(c.Edge.Pool) > 0 && c.Edge.Pool[0].Token != "" {
+		*token = c.Edge.Pool[0].Token
+	}
+
+	// 澶氳妭鐐癸細鏋勫缓閫楀彿鍒嗛殧鐨勫湴鍧€鍒楄〃
+	if len(c.Edge.Pool) > 1 && !strings.Contains(*edgeAddr, ",") {
+		addrs := make([]string, len(c.Edge.Pool))
+		for i, n := range c.Edge.Pool {
+			addrs[i] = n.Address
+		}
+		*edgeAddr = strings.Join(addrs, ",")
+	}
+
+	// Split
+	if c.Split.Enabled {
+		*enableSplit = true
+	}
+
+	// ECH
+	if c.Edge.Transport.ECH.Enabled && c.Edge.Transport.ECH.ConfigB64 != "" {
+		*echConfigB64 = c.Edge.Transport.ECH.ConfigB64
+	}
+
+	// CA cert
+	if *caCertPath == "" && len(c.Edge.Pool) > 0 && c.Edge.Pool[0].CACert != "" {
+		*caCertPath = c.Edge.Pool[0].CACert
+	}
+}
+
+func Version() string {
+	return "aero-ech v2.0.0"
+}
+
+// startTUN 鍚姩 TUN 妯″紡寮曟搸
+func startTUN(cfg *config.AeroConfig) {
+	c := &cfg.Client
+	log.Printf("[TUN] Starting TUN mode: device=%s mtu=%d ipv4=%s",
+		c.TUN.Device, c.TUN.MTU, c.TUN.IPv4)
+
+	dev, err := tun.NewDevice(c.TUN.Device, c.TUN.MTU)
+	if err != nil {
+		log.Printf("[TUN] Failed to create device: %v", err)
+		return
+	}
+	defer dev.Close()
+
+	// 閰嶇疆绯荤粺璺敱
+	if err := tun.SetupRoutes(dev.Name(), c.TUN.IPv4, c.TUN.IPv6, c.TUN.Routes); err != nil {
+		log.Printf("[TUN] Failed to setup routes: %v", err)
+		return
+	}
+	defer tun.TeardownRoutes(dev.Name())
+
+	// 閰嶇疆 DNS
+	tun.SetupDNS(c.TUN.DNS.Servers)
+	defer tun.TeardownDNS()
+
+	// 鍒涘缓寮曟搸
+	engineCfg := tun.Config{
+		MTU:          c.TUN.MTU,
+		IPv4:         c.TUN.IPv4,
+		IPv6:         c.TUN.IPv6,
+		Routes:       c.TUN.Routes,
+		DNSServers:   c.TUN.DNS.Servers,
+		FakeIPRange:  c.TUN.DNS.FakeIP.Range,
+		FakeIPEnable: c.TUN.DNS.FakeIP.Enabled,
+	}
+
+	splitDecider := &tunSplitAdapter{engine: splitEngine}
+	dialer := &tunDialAdapter{edgeAddr: edgeAddr, token: token, publicName: publicName, fingerprint: fingerprint}
+
+	engine := tun.New(dev, engineCfg, splitDecider, dialer)
+	if err := engine.Start(); err != nil {
+		log.Printf("[TUN] Engine error: %v", err)
+	}
+}
+
+// tunSplitAdapter 閫傞厤 split.Engine 鈫?tun.SplitDecider
+type tunSplitAdapter struct {
+	engine *split.Engine
+}
+
+func (a *tunSplitAdapter) Decide(domain string) string {
+	if a.engine == nil {
+		return "proxy"
+	}
+	return a.engine.MatchDomain(domain).String()
+}
+
+// tunDialAdapter kept for config-path startTUN; prefers AERO path.
+type tunDialAdapter struct {
+	edgeAddr    *string
+	token       *string
+	publicName  *string
+	fingerprint *string
+}
+
+func (a *tunDialAdapter) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	return (&tunAERODialer{}).DialTCP(ctx, addr)
+}
+
+func (a *tunDialAdapter) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
+	return (&tunAERODialer{}).DialUDP(ctx, addr)
+}
+
+func init() {
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+}
+
+// -----------------------------------------------------------------------------
+// Source: engine_bg.go
+// -----------------------------------------------------------------------------
+var (
+	subLoopMu     sync.Mutex
+	subLoopCancel context.CancelFunc
+	bgOnce        sync.Once
+)
+
+func startBackgroundServices() {
+	bgOnce.Do(func() {
+		switchEngine = edgepool.NewSwitchEngine(edgepool.DefaultSwitchConfig())
+		go switchEngine.StartMonitor(context.Background())
+		log.Printf("[SWITCHER] Engine started")
+
+		netMonitor := monitor.New(func(ev Event) {
+			log.Printf("[MONITOR] Network change: %s", ev.String())
+			scheduleTUNRefresh(ev.String())
+			if edgePool != nil {
+				go func() {
+					edgePool.ProbeAll(0)
+					best := edgePool.Best()
+					current := getEdgeAddr()
+					if best != nil && best.Reachable && best.Address != "" && best.Address != current {
+						log.Printf("[MONITOR] Best Edge server changed: %s -> %s", current, best.Address)
+						setEdgeAddr(best.Address)
+					}
+				}()
+			}
+		})
+		netMonitor.Start()
+		netMonitor.StartPlatformMonitor()
+		log.Printf("[MONITOR] Network monitor started")
+
+		go runISPAndPathProbe()
+	})
+}
+
+func startSubRefreshLoop(src string, initial *sub.Applied) {
+	src = strings.TrimSpace(src)
+	subLoopMu.Lock()
+	defer subLoopMu.Unlock()
+	if subLoopCancel != nil {
+		subLoopCancel()
+		subLoopCancel = nil
+	}
+	if src == "" || subInterval == nil || *subInterval <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	subLoopCancel = cancel
+	loop := sub.NewLoop(sub.LoopConfig{
+		Source:   src,
+		Interval: *subInterval,
+		Fetch: sub.FetchOptions{
+			InsecureSkipVerify: certloader.ShouldSkipVerify(),
+		},
+		OnChange: func(app *sub.Applied) error {
+			return applySubscription(app)
+		},
+	})
+	if initial != nil {
+		loop.SetLastKey(initial.SnapshotKey())
+	}
+	go loop.Run(ctx)
+	log.Printf("[SUB] refresh every %s from %s", *subInterval, src)
+}
+
+func runISPAndPathProbe() {
+	if edgePool == nil {
+		return
+	}
+	detector := split.NewISPDetector()
+	gotISP, ispResults := detector.Detect()
+	detectedISP = gotISP
+	log.Printf("[ISP] %s", split.ISPReport(gotISP, ispResults))
+
+	edgePool.ProbeAll(0)
+	log.Printf("[POOL] Edge nodes: %v", edgePool.AllAddresses())
+	bestServer := edgePool.Best()
+	if bestServer == nil || !bestServer.Reachable {
+		log.Printf("[PROBE] edge not reachable yet; mixed/API stay up")
+		return
+	}
+	if edgeAddr != nil {
+		setEdgeAddr(bestServer.Address)
+	}
+	for _, s := range edgePool.AllAddresses() {
+		host, portStr, _ := net.SplitHostPort(s)
+		var port int
+		fmt.Sscanf(portStr, "%d", &port)
+		pr := edgepool.NewProbeWithPreferredPort(host, port)
+		res := pr.Run()
+		for _, r := range res {
+			if r.Reachable {
+				testedPorts = append(testedPorts, uint32(r.Path.Port))
+			}
+		}
+	}
+	selectedEdge := getEdgeAddr()
+	if selectedEdge == "" {
+		return
+	}
+	host, portStr, _ := net.SplitHostPort(selectedEdge)
+	var preferredPort int
+	fmt.Sscanf(portStr, "%d", &preferredPort)
+	udpAvailable = probeUDP(host, preferredPort)
+	log.Printf("[UDP] available=%v", udpAvailable)
+	log.Printf("[PROBE] Selected best server: %s", selectedEdge)
+}
+
+// -----------------------------------------------------------------------------
+// Source: subscription.go
+// -----------------------------------------------------------------------------
+// Copyright 2025 AERO Protocol Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+
+
+// loadSubscription 拉取订阅并写入全局 edge/token/sni（不重建 pool）
+func loadSubscription(src string) (*sub.Applied, error) {
+	doc, err := sub.Fetch(src, sub.FetchOptions{
+		InsecureSkipVerify: certloader.ShouldSkipVerify(),
+	})
+	if err != nil {
+		if raw := sub.LoadLastBody(); len(raw) > 0 {
+			cached, perr := sub.ParseBytes(raw)
+			if perr == nil {
+				log.Printf("[SUB] fetch failed (%v); using last cached subscription", err)
+				doc, err = cached, nil
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	// 强制验签（B 阶段）：签名必须存在且与首节点 token 匹配
+	if len(doc.Servers) == 0 {
+		return nil, fmt.Errorf("no servers")
+	}
+	if doc.Signature == "" {
+		return nil, fmt.Errorf("subscription missing signature")
+	}
+	if !sub.Verify(doc, []byte(doc.Servers[0].Token)) {
+		return nil, fmt.Errorf("subscription signature invalid")
+	}
+	app, err := sub.Apply(doc)
+	if err != nil {
+		return nil, err
+	}
+	*edgeAddr = app.EdgeAddresses
+	*token = app.PrimaryToken
+	if app.PrimarySNI != "" {
+		*publicName = app.PrimarySNI
+	}
+	if len(app.PrimaryPins) > 0 {
+		certloader.SetPins(app.PrimaryPins)
+		log.Printf("[SUB] SPKI pin(s) loaded: %d", len(app.PrimaryPins))
+	}
+	log.Printf("[SUB] loaded %d server(s), primary=%s", len(doc.Servers), doc.Servers[0].Address)
+	return app, nil
+}
+
+// -----------------------------------------------------------------------------
+// Source: sub_reload.go
+// -----------------------------------------------------------------------------
+// Copyright 2025 AERO Protocol Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+
+
+// applySubscription 将 Applied 写入全局并重建 edgePool
+func applySubscription(app *sub.Applied) error {
+	if app == nil {
+		return fmt.Errorf("nil applied")
+	}
+	*edgeAddr = app.EdgeAddresses
+	*token = app.PrimaryToken
+	if app.PrimarySNI != "" {
+		*publicName = app.PrimarySNI
+	}
+	if len(app.PrimaryPins) > 0 {
+		// 热更时同步 pin
+		certloader.SetPins(app.PrimaryPins)
+	}
+	pool, err := edgepool.New(app.EdgeAddresses)
+	if err != nil {
+		return err
+	}
+	pool.ProbeAll(0)
+	edgePool = pool
+	if best := pool.Best(); best != nil && best.Address != "" {
+		*edgeAddr = best.Address
+	}
+	log.Printf("[SUB] applied edges=%s active=%s", app.EdgeAddresses, *edgeAddr)
+	return nil
+}
+
+// loadAndApplySubscription 拉取 + 建池（启动 / API import）
+func loadAndApplySubscription(src string) (*sub.Applied, error) {
+	app, err := loadSubscription(src)
+	if err != nil {
+		return nil, err
+	}
+	if err := applySubscription(app); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// -----------------------------------------------------------------------------
+// Source: ai_traffic.go
+// -----------------------------------------------------------------------------
+// Copyright 2025 AERO Protocol Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+
+
+// isAITraffic 检查目标域名是否为 AI 服务
+//
+// AI 服务列表的权威来源：data/ai_services.json
+// 更新时请同步修改 JSON 文件和此函数。
+func isAITraffic(host string) bool {
+	aiDomains := []string{
+		"openai.com", "api.openai.com", "chatgpt.com",
+		"anthropic.com", "claude.ai", "api.anthropic.com",
+		"gemini.google.com", "aistudio.google.com", "generativelanguage.googleapis.com",
+		"api.groq.com", "api.perplexity.ai", "api.cohere.ai",
+		"api.together.xyz", "api.mistral.ai", "api.replicate.com",
+		"api.deepseek.com", "platform.moonshot.cn", "api.siliconflow.cn",
+		"api.qwen.ai", "api.baichuan-ai.com", "api.minimax.chat",
+		"api.sparkdesk.cn", "huggingface.co", "api-inference.huggingface.co",
+		"openrouter.ai", "api.fireworks.ai",
+	}
+	hostLower := strings.ToLower(host)
+	for _, d := range aiDomains {
+		if strings.HasSuffix(hostLower, d) || hostLower == d {
+			return true
+		}
+	}
+	return false
+}
+
+// inferModelName 根据目标 host 推断 AI 模型服务名称
+func inferModelName(host string) string {
+	switch {
+	case strings.Contains(host, "openai.com") || strings.Contains(host, "chatgpt.com"):
+		return "openai-gpt"
+	case strings.Contains(host, "anthropic.com") || strings.Contains(host, "claude.ai"):
+		return "anthropic-claude"
+	case strings.Contains(host, "gemini.google.com") || strings.Contains(host, "generativelanguage"):
+		return "google-gemini"
+	case strings.Contains(host, "groq.com"):
+		return "groq-llama"
+	case strings.Contains(host, "deepseek.com"):
+		return "deepseek-chat"
+	default:
+		return "unknown"
+	}
+}
+
+// generateAIContextID 为 AI 流生成 5 分钟对齐窗口的上下文标识
+func generateAIContextID(host string) string {
+	window := time.Now().Unix() / 300
+	return fmt.Sprintf("ai_%s_%d", host, window)
+}

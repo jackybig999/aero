@@ -1,0 +1,11 @@
+node_modules/
+dist/
+logs/
+*.log
+.DS_Store
+desktop/config/tools.json
+desktop/config/cwd.json
+cli/config/scanned.json
+desktop/config/window-state.json
+*.exe
+.asar

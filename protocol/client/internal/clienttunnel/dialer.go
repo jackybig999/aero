@@ -1,0 +1,391 @@
+﻿// Copyright 2025 AERO Protocol Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+
+package clienttunnel
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	aeroproto "github.com/aero-protocol/proto"
+	"github.com/aero-protocol/aero-ech/internal/gameqos"
+	"github.com/aero-protocol/aero-ech/internal/h2pool"
+	"github.com/aero-protocol/aero-ech/internal/protocol"
+	"github.com/aero-protocol/aero-ech/internal/split"
+	"github.com/aero-protocol/aero-ech/internal/transport"
+)
+
+// AERODialer 跨平台统一 AERO 出站拨号器（实现 tun.Dialer 接口）
+type AERODialer struct {
+	cfg       Config
+	cfgMu     sync.RWMutex
+	split     *split.Engine
+	h2Pool    *h2pool.Pool
+	streamID  atomic.Uint64
+	bytesSent atomic.Uint64
+	bytesRecv atomic.Uint64
+	aiContext sync.Map // contextID -> struct{}{}
+}
+
+// NewAERODialer 创建拨号器实例
+func NewAERODialer(cfg Config, splitEng *split.Engine) *AERODialer {
+	if splitEng == nil {
+		splitEng = split.NewEngine()
+	}
+	return &AERODialer{
+		cfg:    cfg,
+		split:  splitEng,
+		h2Pool: h2pool.New(6, 3*time.Minute),
+	}
+}
+
+// UpdateConfig 动态更新配置（如切节点、更新 Token）
+func (d *AERODialer) UpdateConfig(cfg Config) {
+	d.cfgMu.Lock()
+	d.cfg = cfg
+	d.cfgMu.Unlock()
+	d.h2Pool.Reset()
+}
+
+func (d *AERODialer) getConfig() Config {
+	d.cfgMu.RLock()
+	defer d.cfgMu.RUnlock()
+	return d.cfg
+}
+
+// DialTCP 出站 TCP 连接（根据分流规则选择直连或 AERO 隧道）
+func (d *AERODialer) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+
+	// 1. 检查私有网段与本地环回 -> 直连
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			var dialer net.Dialer
+			dialer.Timeout = 10 * time.Second
+			return dialer.DialContext(ctx, "tcp", addr)
+		}
+		// 阻断 fake-ip 泄漏
+		if v4 := ip.To4(); v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
+			return nil, fmt.Errorf("refuse fake-ip %s", addr)
+		}
+	}
+
+	cfg := d.getConfig()
+
+	// 2. 检查智能分流
+	if cfg.SplitEnabled && d.split != nil {
+		strat := d.split.MatchDomain(host)
+		if strat == split.DIRECT {
+			var dialer net.Dialer
+			dialer.Timeout = 10 * time.Second
+			return dialer.DialContext(ctx, "tcp", addr)
+		}
+	}
+
+	// 3. 走 AERO 隧道
+	return d.openAEROStream(ctx, addr, aeroproto.StreamType_GENERAL, false)
+}
+
+// DialUDP 出站 UDP 连接
+func (d *AERODialer) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
+	return d.openAEROStream(ctx, addr, aeroproto.StreamType_UDP, true)
+}
+
+// openAEROStream 建立 AERO 协议流
+func (d *AERODialer) openAEROStream(ctx context.Context, target string, defaultType aeroproto.StreamType, udp bool) (net.Conn, error) {
+	cfg := d.getConfig()
+	st := d.classifyTarget(target, defaultType, udp)
+
+	// 1. 建立底层传输通道 (H2 CONNECT 或 QUIC)
+	tunnel, err := d.dialTransport(ctx, target, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("dial transport: %w", err)
+	}
+
+	streamID := uint32(d.streamID.Add(1))
+
+	// 2. AERO 协议握手
+	_ = tunnel.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := d.handshake(tunnel, st, streamID, cfg.Token); err != nil {
+		_ = tunnel.Close()
+		return nil, fmt.Errorf("aero handshake: %w", err)
+	}
+	_ = tunnel.SetDeadline(time.Time{})
+
+	// 3. AI 协议流头处理
+	if st.StreamType == aeroproto.StreamType_AI {
+		d.maybeSendAIHeader(tunnel, st, streamID)
+	}
+
+	// 4. 包装为 AERO 流连接
+	return NewStreamConn(tunnel, streamID, target, udp, &d.bytesSent, &d.bytesRecv), nil
+}
+
+func (d *AERODialer) dialTransport(ctx context.Context, target string, cfg Config) (net.Conn, error) {
+	if cfg.PreferQUIC {
+		quicConn, err := d.dialQUIC(ctx, cfg)
+		if err == nil {
+			return quicConn, nil
+		}
+		log.Printf("[TRANSPORT] QUIC dial failed (%v), fallback to H2", err)
+	}
+
+	return d.dialH2(target, cfg)
+}
+
+func (d *AERODialer) dialH2(target string, cfg Config) (net.Conn, error) {
+	dialTLS := func() (net.Conn, error) {
+		return d.dialEdgeTLS(cfg)
+	}
+	return d.h2Pool.Open(cfg.ServerAddress, target, cfg.Token, dialTLS)
+}
+
+func (d *AERODialer) dialEdgeTLS(cfg Config) (net.Conn, error) {
+	fp := strings.ToLower(strings.TrimSpace(cfg.Fingerprint))
+	if fp == "" || fp == "std" || fp == "standard" {
+		return d.dialEdgeTLSStd(cfg)
+	}
+	conn, err := d.dialEdgeTLSUTls(cfg)
+	if err == nil {
+		return conn, nil
+	}
+	return d.dialEdgeTLSStd(cfg)
+}
+
+func (d *AERODialer) dialEdgeTLSStd(cfg Config) (net.Conn, error) {
+	var tlsConfig *tls.Config
+	if cfg.ECHConfigB64 != "" {
+		echData, err := base64.URLEncoding.DecodeString(cfg.ECHConfigB64)
+		if err == nil {
+			c, err := transport.BuildClientConfigWithECH(transport.Config{
+				PublicName:    cfg.SNIName,
+				EnableRealECH: true,
+				ECHPublicKey:  echData,
+			})
+			if err == nil {
+				tlsConfig = c
+			}
+		}
+	}
+	if tlsConfig == nil {
+		tlsConfig = transport.BuildClientConfig(cfg.SNIName)
+	}
+	if len(tlsConfig.NextProtos) == 0 {
+		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
+	}
+
+	tcpConn, err := net.DialTimeout("tcp", cfg.ServerAddress, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("tcp dial %s: %w", cfg.ServerAddress, err)
+	}
+
+	tlsConn := tls.Client(tcpConn, tlsConfig)
+	if err := tlsConn.SetDeadline(time.Now().Add(12 * time.Second)); err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	if err := tlsConn.Handshake(); err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+	_ = tlsConn.SetDeadline(time.Time{})
+	return tlsConn, nil
+}
+
+func (d *AERODialer) dialEdgeTLSUTls(cfg Config) (net.Conn, error) {
+	tcpConn, err := net.DialTimeout("tcp", cfg.ServerAddress, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	utlsConfig := transport.BuildUTLSConfig(cfg.SNIName, cfg.Fingerprint)
+	uconn, err := transport.NewUConn(tcpConn, utlsConfig, cfg.Fingerprint)
+	if err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	if err := uconn.SetDeadline(time.Now().Add(12 * time.Second)); err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+	if err := uconn.HandshakeContext(); err != nil {
+		uconn.Close()
+		return nil, err
+	}
+	_ = uconn.SetDeadline(time.Time{})
+	return uconn, nil
+}
+
+func (d *AERODialer) dialQUIC(ctx context.Context, cfg Config) (net.Conn, error) {
+	qcfg := transport.DefaultQUICConfig(cfg.ServerAddress, cfg.SNIName)
+	qcfg.TLSConfig = transport.BuildClientConfig(cfg.SNIName)
+	qcfg.TLSConfig.NextProtos = []string{"h3"}
+
+	client, err := transport.DialQUIC(ctx, qcfg)
+	if err != nil {
+		return nil, err
+	}
+
+	stream, err := client.OpenStreamAsync(ctx)
+	if err != nil {
+		client.Close()
+		return nil, err
+	}
+
+	return &quicWrapper{stream: stream, client: client}, nil
+}
+
+type quicWrapper struct {
+	stream io.ReadWriteCloser
+	client *transport.QUICClient
+	closed atomic.Bool
+}
+
+func (q *quicWrapper) Read(p []byte) (int, error)  { return q.stream.Read(p) }
+func (q *quicWrapper) Write(p []byte) (int, error) { return q.stream.Write(p) }
+func (q *quicWrapper) Close() error {
+	if q.closed.Swap(true) {
+		return nil
+	}
+	_ = q.stream.Close()
+	return q.client.Close()
+}
+func (q *quicWrapper) LocalAddr() net.Addr                { return q.client.LocalAddr() }
+func (q *quicWrapper) RemoteAddr() net.Addr               { return q.client.RemoteAddr() }
+func (q *quicWrapper) SetDeadline(t time.Time) error      { return nil }
+func (q *quicWrapper) SetReadDeadline(t time.Time) error  { return nil }
+func (q *quicWrapper) SetWriteDeadline(t time.Time) error { return nil }
+
+func (d *AERODialer) handshake(tunnel net.Conn, st streamTarget, streamID uint32, token string) error {
+	req := &aeroproto.ConnectRequest{
+		Version:      "aero/2.0",
+		Token:        token,
+		Nonce:        generateNonce(),
+		Timestamp:    uint64(time.Now().UnixMilli()),
+		UdpAvailable: true,
+		Streams: []*aeroproto.StreamSpec{{
+			StreamId:   streamID,
+			StreamType: st.StreamType,
+			TargetHost: st.Host,
+			TargetPort: st.Port,
+		}},
+	}
+	if err := protocol.WriteMessage(tunnel, req); err != nil {
+		return fmt.Errorf("write ConnectRequest: %w", err)
+	}
+
+	var resp aeroproto.ConnectResponse
+	if err := protocol.ReadMessage(tunnel, &resp); err != nil {
+		return fmt.Errorf("read ConnectResponse: %w", err)
+	}
+	if !resp.Accepted {
+		return fmt.Errorf("connect rejected by edge: %s", resp.Message)
+	}
+	return nil
+}
+
+func (d *AERODialer) maybeSendAIHeader(tunnel net.Conn, st streamTarget, streamID uint32) {
+	ctxID := fmt.Sprintf("ai_%s_%d", st.Host, time.Now().Unix()/300)
+	_, already := d.aiContext.Load(ctxID)
+	if !already {
+		d.aiContext.Store(ctxID, struct{}{})
+	}
+	header := &aeroproto.AiStreamHeader{
+		StreamId:  streamID,
+		ModelName: inferModelName(st.Host),
+		ContextId: ctxID,
+		Resume:    already,
+	}
+	_ = protocol.TypedWriteMessage(tunnel, protocol.MsgTypeAiStreamHeader, header)
+}
+
+type streamTarget struct {
+	Raw        string
+	Host       string
+	Port       uint32
+	StreamType aeroproto.StreamType
+}
+
+func (d *AERODialer) classifyTarget(raw string, defaultType aeroproto.StreamType, udp bool) streamTarget {
+	st := streamTarget{Raw: raw, StreamType: defaultType}
+	host, portStr, err := net.SplitHostPort(raw)
+	if err != nil {
+		st.Host = raw
+		return st
+	}
+	st.Host = host
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+	st.Port = uint32(port)
+
+	if udp && gameqos.IsGameTraffic(raw, port) {
+		st.StreamType = aeroproto.StreamType_UDP
+		return st
+	}
+	if isAITraffic(host) {
+		st.StreamType = aeroproto.StreamType_AI
+	}
+	return st
+}
+
+func generateNonce() []byte {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		ts := time.Now().UnixNano()
+		for i := 0; i < 8 && i < len(b); i++ {
+			b[i] = byte(ts >> (i * 8))
+		}
+	}
+	return b
+}
+
+func isAITraffic(host string) bool {
+	aiDomains := []string{
+		"openai.com", "api.openai.com", "chatgpt.com",
+		"anthropic.com", "claude.ai", "api.anthropic.com",
+		"gemini.google.com", "aistudio.google.com", "generativelanguage.googleapis.com",
+		"api.groq.com", "api.perplexity.ai", "api.cohere.ai",
+		"api.together.xyz", "api.mistral.ai", "api.replicate.com",
+		"api.deepseek.com", "platform.moonshot.cn", "api.siliconflow.cn",
+		"api.qwen.ai", "api.baichuan-ai.com", "api.minimax.chat",
+		"api.sparkdesk.cn", "huggingface.co", "api-inference.huggingface.co",
+		"openrouter.ai", "api.fireworks.ai",
+	}
+	hostLower := strings.ToLower(host)
+	for _, d := range aiDomains {
+		if strings.HasSuffix(hostLower, d) || hostLower == d {
+			return true
+		}
+	}
+	return false
+}
+
+func inferModelName(host string) string {
+	switch {
+	case strings.Contains(host, "openai.com") || strings.Contains(host, "chatgpt.com"):
+		return "openai-gpt"
+	case strings.Contains(host, "anthropic.com") || strings.Contains(host, "claude.ai"):
+		return "anthropic-claude"
+	case strings.Contains(host, "gemini.google.com") || strings.Contains(host, "generativelanguage"):
+		return "google-gemini"
+	case strings.Contains(host, "groq.com"):
+		return "groq-llama"
+	case strings.Contains(host, "deepseek.com"):
+		return "deepseek-chat"
+	default:
+		return "unknown"
+	}
+}

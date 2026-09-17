@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "vps_id": 1,
+      "name": "vps-a",
+      "host": "myconsun.cc.cd",
+      "ip": "128.241.228.161",
+      "sub_secret": "49adc46eff543149de857a49f89445b0",
+      "admin_key": "d326fae7c2fdfb4bf0a465fca45b493c",
+      "has_admin": true,
+      "sub_url": "https://myconsun.cc.cd/sub/49adc46eff543149de857a49f89445b0",
+      "installed": true,
+      "updated_at": "2026-09-03T17:21:07.8823858+08:00"
+    }
+  ]
+}

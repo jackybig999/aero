@@ -1,0 +1,9 @@
+# Local test binaries (platform.exe is local test only, not embedded)
+*.exe
+platform.exe
+.runtime-port
+.env
+
+# Test logs
+logs/
+*.log

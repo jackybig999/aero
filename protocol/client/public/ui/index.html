@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0c111c" />
+    <title>AERO</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <div class="brand">
+          <span class="logo">A</span>
+          <div>
+            <h1>AERO</h1>
+            <p class="hint" data-i18n="tagline">本地口已开</p>
+          </div>
+        </div>
+        <div class="lang-wrap">
+          <button type="button" id="btnLang" class="lang-btn">简</button>
+          <div id="langMenu" class="lang-menu" hidden>
+            <button type="button" data-lang="zh-CN">简体中文</button>
+            <button type="button" data-lang="zh-TW">繁體中文</button>
+            <button type="button" data-lang="en">English</button>
+          </div>
+        </div>
+      </header>
+
+      <div class="power-wrap">
+        <button type="button" id="btnPower" class="power" aria-label="connect">
+          <svg viewBox="0 0 24 24" width="52" height="52" aria-hidden="true">
+            <path
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.2"
+              stroke-linecap="round"
+              d="M12 3.5v8.2M8.1 6.2a7 7 0 1 0 7.8 0"
+            />
+          </svg>
+        </button>
+        <div id="stState" class="pill off" data-i18n="ready">就绪</div>
+      </div>
+
+      <section class="status-bar">
+        <div class="st-row">
+          <span class="st-label" data-i18n="network">网络</span>
+          <span id="stProbe" class="st-val">—</span>
+        </div>
+        <div class="st-row">
+          <span class="st-label" data-i18n="node">节点</span>
+          <span id="stNode" class="st-val">—</span>
+        </div>
+        <div class="st-row">
+          <span class="st-label" data-i18n="latency">延迟</span>
+          <span id="stRtt" class="st-val">—</span>
+        </div>
+        <div class="st-row">
+          <span class="st-label" data-i18n="mode">代理模式</span>
+          <span id="stMode" class="st-val">—</span>
+        </div>
+        <div class="st-row">
+          <span class="st-label" data-i18n="local">本地</span>
+          <span id="stListen" class="st-val">127.0.0.1:55555</span>
+        </div>
+      </section>
+
+      <button type="button" id="btnDesktop" class="desktop">
+        <span data-i18n="desktop">Desktop 指纹</span>
+        <b>SOCKS5 127.0.0.1:55555</b>
+        <span class="copy" data-i18n="copy">复制</span>
+      </button>
+
+      <section class="card">
+        <div class="card-hd" data-i18n="mode">代理模式</div>
+        <div class="mode-row">
+          <label class="mode" data-mode="sysproxy">
+            <input type="radio" name="mode" value="sysproxy" checked />
+            <b data-i18n="modeSys">系统代理</b>
+          </label>
+          <label class="mode" data-mode="tun">
+            <input type="radio" name="mode" value="tun" />
+            <b>TUN</b>
+          </label>
+        </div>
+        <p id="modeTip" class="muted" data-i18n="tipSys">浏览器自动走 55555</p>
+      </section>
+
+      <section class="card">
+        <div class="card-hd" data-i18n="sub">订阅</div>
+        <textarea id="subUrl" rows="2" spellcheck="false" data-i18n-placeholder="subPh"></textarea>
+        <div class="row">
+          <button type="button" id="btnPaste" class="ghost" data-i18n="paste">粘贴</button>
+          <button type="button" id="btnScan" class="ghost" data-i18n="scan">扫码</button>
+        </div>
+      </section>
+
+      <p id="msg" class="msg"></p>
+    </div>
+
+    <div id="scanSheet" class="sheet" hidden>
+      <div class="sheet-card">
+        <h2 data-i18n="scanTitle">导入订阅</h2>
+        <p class="muted" data-i18n="scanSub">扫码或从相册选图</p>
+        <video id="cam" playsinline muted></video>
+        <canvas id="qrCanvas" hidden></canvas>
+        <button type="button" id="btnCam" class="sheet-btn">
+          <span data-i18n="openCam">打开相机</span>
+          <small data-i18n="camHint">需相机权限 · Win / macOS / iOS</small>
+        </button>
+        <button type="button" id="btnAlbum" class="sheet-btn">
+          <span data-i18n="album">从相册选图</span>
+          <small data-i18n="albumHint">选择二维码截图</small>
+        </button>
+        <button type="button" id="btnScanCancel" class="sheet-cancel" data-i18n="cancel">取消</button>
+      </div>
+    </div>
+    <input id="fileAlbum" type="file" accept="image/*" hidden />
+    <script src="jsqr.js"></script>
+    <script src="i18n.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
