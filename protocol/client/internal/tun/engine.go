@@ -90,7 +90,7 @@ func New(dev Device, cfg Config, split SplitDecider, dialer Dialer) *Engine {
 	e := &Engine{
 		device:   dev,
 		sessions: NewSessionTable(5 * time.Minute),
-		fakeIP:   NewFakeIPTable(cfg.FakeIPRange),
+		fakeIP:   DefaultFakeIPTable,
 		dns:      NewDNSHandler(cfg.DNSServers),
 		split:    split,
 		dialer:   dialer,

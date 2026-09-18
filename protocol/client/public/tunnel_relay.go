@@ -53,6 +53,45 @@ func (c *serialConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
+func (c *serialConn) Unwrap() net.Conn {
+	return c.Conn
+}
+
+// optimizeTCP 针对 TCP 连接调优：全量禁用 Nagle 消除延迟，AI 流注入 15s 密集保活探针
+func optimizeTCP(c net.Conn, isAI bool) {
+	if c == nil {
+		return
+	}
+	for {
+		type unwrapper interface {
+			Unwrap() net.Conn
+		}
+		if u, ok := c.(unwrapper); ok {
+			c = u.Unwrap()
+		} else {
+			break
+		}
+	}
+	type noDelayer interface {
+		SetNoDelay(bool) error
+	}
+	type keepAliver interface {
+		SetKeepAlive(bool) error
+		SetKeepAlivePeriod(time.Duration) error
+	}
+	if nd, ok := c.(noDelayer); ok {
+		_ = nd.SetNoDelay(true)
+	}
+	if ka, ok := c.(keepAliver); ok {
+		_ = ka.SetKeepAlive(true)
+		if isAI {
+			_ = ka.SetKeepAlivePeriod(15 * time.Second)
+		} else {
+			_ = ka.SetKeepAlivePeriod(30 * time.Second)
+		}
+	}
+}
+
 // runTunnelRelay 阻塞直到会话结束；返回是否应重连切换
 func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,6 +99,10 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 	if _, ok := p.Tunnel.(*serialConn); !ok {
 		p.Tunnel = &serialConn{Conn: p.Tunnel}
 	}
+
+	isAI := p.StreamType == aeroproto.StreamType_AI
+	optimizeTCP(p.Client, isAI)
+	optimizeTCP(p.Tunnel, isAI)
 
 	var switchMu sync.Mutex
 	markSwitch := func() {
@@ -84,11 +127,17 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 	var rttMu sync.Mutex
 
 	hbInterval := p.HBInterval
-	if hbInterval < 5*time.Second {
+	if isAI {
+		// AI 深度思考长会话（如 DeepSeek R1/o1）：15s 密集探针
+		hbInterval = 15 * time.Second
+	} else if hbInterval < 5*time.Second {
 		hbInterval = 30 * time.Second
 	}
-	// 协议：3 个心跳周期无 ACK 判定超时
+	// 协议：常规 3 个心跳周期无 ACK 判定超时；AI 深度思考给足容限（6 个周期 90s）
 	hbTimeout := 3 * hbInterval
+	if isAI {
+		hbTimeout = 6 * hbInterval
+	}
 
 	model := inferModelName(p.TargetHost)
 	if p.StreamType == aeroproto.StreamType_AI {

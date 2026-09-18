@@ -1,4 +1,4 @@
-﻿package public
+package public
 
 import (
 	"bufio"
@@ -201,6 +201,8 @@ func startTUNIfPossible() error {
 	// Force IPv4 through TUN: block global IPv6 so Google Happy-Eyeballs
 	// cannot skip the adapter (needs admin, same as wintun).
 	quietFirewall("add", "AERO-NoIPv6", "dir=out", "action=block", "protocol=any", "remoteip=2000::/3")
+	// WebRTC STUN 物理防泄露装甲：阻止出站 STUN 探针绕过隧道直接从物理网卡泄露真实 IP
+	quietFirewall("add", "AERO-WebRTC-Shield", "dir=out", "action=block", "protocol=UDP", "remoteport=3478,19302,5349")
 
 	name := "aero0"
 	mtu := 1420
@@ -350,6 +352,7 @@ func stopTUN() {
 		_ = dev.Close()
 	}
 	quietFirewall("delete", "AERO-NoIPv6")
+	quietFirewall("delete", "AERO-WebRTC-Shield")
 	dis := exec.Command("netsh", "interface", "set", "interface", "name=aero0", "admin=DISABLED")
 	hideConsole(dis)
 	_ = dis.Run()
@@ -359,9 +362,10 @@ func stopTUN() {
 type tunAERODialer struct{}
 
 func (d *tunAERODialer) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
+		port = ""
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
@@ -369,14 +373,40 @@ func (d *tunAERODialer) DialTCP(ctx context.Context, addr string) (net.Conn, err
 			dialer.Timeout = 10 * time.Second
 			return dialer.DialContext(ctx, "tcp", addr)
 		}
+		// Fake-IP (198.18.0.0/15) 内存 0ms 反查还原为真实域名
 		if v4 := ip.To4(); v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
-			return nil, fmt.Errorf("refuse fake-ip %s", addr)
+			if domain, ok := tun.DefaultFakeIPTable.Lookup(ip); ok {
+				if port != "" {
+					addr = net.JoinHostPort(domain, port)
+				} else {
+					addr = domain
+				}
+			} else {
+				return nil, fmt.Errorf("unknown fake-ip %s", addr)
+			}
 		}
 	}
 	return openAEROStream(addr)
 }
 
 func (d *tunAERODialer) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+		port = ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		// Fake-IP (198.18.0.0/15) 内存 0ms 反查还原
+		if v4 := ip.To4(); v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
+			if domain, ok := tun.DefaultFakeIPTable.Lookup(ip); ok {
+				if port != "" {
+					addr = net.JoinHostPort(domain, port)
+				} else {
+					addr = domain
+				}
+			}
+		}
+	}
 	return openAEROUDP(addr)
 }
 

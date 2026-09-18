@@ -132,10 +132,19 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 		if h != nil {
 			sni = h.ServerName
 		}
-		// Empty / IP SNI: only for admin loopback — self-signed is OK.
-		// Public domain SNI: NEVER prefer self-signed over a previously good LE cert.
+		// Empty / IP SNI / Disguised Whitelist SNI:
+		// 当客户端使用伪装白名单 SNI (如 apple.com/microsoft.com) 或未指定 SNI 时，
+		// 自动映射为主域名 m.domains[0]，以返回合法的服务端证书并通过 SPKI 钉扎校验。
 		emptySNI := sni == "" || net.ParseIP(sni) != nil
-		if emptySNI && len(m.domains) > 0 {
+		isOurDomain := false
+		for _, d := range m.domains {
+			if strings.EqualFold(sni, d) {
+				isOurDomain = true
+				break
+			}
+		}
+
+		if (!isOurDomain || emptySNI) && len(m.domains) > 0 {
 			cp := *h
 			cp.ServerName = m.domains[0]
 			h = &cp

@@ -33,6 +33,10 @@ func detectStreamType(target string) aeroproto.StreamType {
 	aiDomains := []string{
 		"openai.com", "anthropic.com", "claude.ai",
 		"gemini.google.com", "chatgpt.com", "copilot.microsoft.com",
+		"deepseek.com", "groq.com", "cursor.com", "cursor.sh",
+		"mistral.ai", "together.ai", "together.xyz", "cohere.com",
+		"perplexity.ai", "poe.com", "openrouter.ai", "huggingface.co",
+		"replicate.com", "midjourney.com",
 	}
 	for _, d := range aiDomains {
 		if strings.Contains(host, d) {
@@ -56,13 +60,17 @@ func applyStreamQoS(conn net.Conn, streamType aeroproto.StreamType) {
 	if !ok {
 		return
 	}
+	// 全连接禁用 Nagle 算法，消除 40ms 延迟抖动
+	_ = tcp.SetNoDelay(true)
 	_ = tcp.SetKeepAlive(true)
 	switch streamType {
-	case aeroproto.StreamType_AI, aeroproto.StreamType_UDP, aeroproto.StreamType_CONTROL:
-		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+	case aeroproto.StreamType_AI:
+		// AI 深度思考长会话（如 R1/o1）：15 秒密集保活探针，防 NAT 表超时释放
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
+	case aeroproto.StreamType_UDP, aeroproto.StreamType_CONTROL:
+		_ = tcp.SetKeepAlivePeriod(20 * time.Second)
 	default:
-		_ = tcp.SetKeepAlivePeriod(60 * time.Second)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
 	// 适度缓冲：多隧道时避免默认过小导致 syscall 频繁
 	_ = tcp.SetReadBuffer(128 * 1024)

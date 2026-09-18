@@ -244,6 +244,10 @@ func (c *bufConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+func (c *bufConn) Unwrap() net.Conn {
+	return c.Conn
+}
+
 // httpProxyConn: request stream from pipe reader, responses to real client.
 type httpProxyConn struct {
 	r   io.Reader

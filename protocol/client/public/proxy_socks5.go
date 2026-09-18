@@ -9,7 +9,18 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/aero-protocol/aero-ech/internal/tun"
 )
+
+// isSTUNPacket 检测是否为 WebRTC STUN 探针数据包（RFC 5389 / RFC 8489）
+// 格式：0-1 字节为消息类型，4-7 字节为 Magic Cookie 0x2112A442
+func isSTUNPacket(payload []byte) bool {
+	if len(payload) < 20 {
+		return false
+	}
+	return payload[4] == 0x21 && payload[5] == 0x12 && payload[6] == 0xa4 && payload[7] == 0x42
+}
 
 // -----------------------------------------------------------------------------
 // Source: socks5.go
@@ -362,6 +373,18 @@ func serveSocksUDP(control net.Conn, _ string) {
 		if err != nil {
 			continue
 		}
+		// Fake-IP (198.18.0.0/15) 内存 0ms 反查还原
+		if h, p, e := net.SplitHostPort(dest); e == nil {
+			if ip := net.ParseIP(h); ip != nil {
+				if v4 := ip.To4(); v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
+					if domain, ok := tun.DefaultFakeIPTable.Lookup(ip); ok {
+						dest = net.JoinHostPort(domain, p)
+					}
+				}
+			}
+		}
+
+		isSTUN := isSTUNPacket(payload)
 		mu.Lock()
 		clientUA = from
 		entry, ok := tunnels[dest]
@@ -369,7 +392,11 @@ func serveSocksUDP(control net.Conn, _ string) {
 			tun, err := openAEROUDP(dest)
 			if err != nil {
 				mu.Unlock()
-				log.Printf("[SOCKS-UDP] dial %s: %v", dest, err)
+				if isSTUN {
+					log.Printf("[WEBRTC-ARMOR] STUN packet to %s blackholed (tunnel unavailable, leak prevented)", dest)
+				} else {
+					log.Printf("[SOCKS-UDP] dial %s: %v", dest, err)
+				}
 				continue
 			}
 			entry = &udpTunnelEntry{conn: tun, lastActive: time.Now()}

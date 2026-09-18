@@ -55,18 +55,30 @@ func dialEdgeTLS() (net.Conn, error) {
 	return dialEdgeTLSStd(false)
 }
 
+// WhiteSNIPool 常用顶级免流/防封白名单 SNI 候选池
+var WhiteSNIPool = []string{
+	"gateway.icloud.com",
+	"swdist.apple.com",
+	"edge.microsoft.com",
+	"live.azure.com",
+}
+
 func currentEdgeSNI() string {
 	sni := ""
 	if publicName != nil {
-		sni = *publicName
+		sni = strings.TrimSpace(*publicName)
 	}
-	if (sni == "" || sni == "cdn-aero.com") && edgeAddr != nil && *edgeAddr != "" {
+	// 当显式开启白名单或自动伪装模式且已加载 SPKI 钉扎时，自动借用顶级白名单伪装
+	if (sni == "white" || sni == "auto") && len(transport.Pins()) > 0 {
+		return WhiteSNIPool[0]
+	}
+	if (sni == "" || sni == "cdn-aero.com" || sni == "auto" || sni == "white") && edgeAddr != nil && *edgeAddr != "" {
 		host, _, err := net.SplitHostPort(*edgeAddr)
 		if err == nil && net.ParseIP(host) == nil && host != "" {
 			sni = host
 		}
 	}
-	if sni == "" {
+	if sni == "" || sni == "auto" || sni == "white" {
 		sni = "cdn-aero.com"
 	}
 	return sni

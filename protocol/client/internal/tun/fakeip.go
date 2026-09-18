@@ -15,6 +15,9 @@ import (
 	"sync/atomic"
 )
 
+// DefaultFakeIPTable 全局共享的 Fake-IP 映射表（用于 0ms DNS 解析与真实域名反查）
+var DefaultFakeIPTable = NewFakeIPTable("198.18.0.0/15")
+
 // FakeIPTable Fake-IP ↔ 域名映射表（线程安全）
 type FakeIPTable struct {
 	mu        sync.RWMutex

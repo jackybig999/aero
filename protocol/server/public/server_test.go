@@ -5,9 +5,13 @@
 package public
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"testing"
+
+	"github.com/aero-protocol/aero-edge/public/internal/transport"
+	aeroproto "github.com/aero-protocol/proto"
 )
 
 func TestAutoProbeHTTPSPort_Free(t *testing.T) {
@@ -50,5 +54,54 @@ func TestAutoProbeHTTPSPort_FallbackWhenBusy(t *testing.T) {
 	}
 	if !foundInStandard {
 		t.Fatalf("chosen port %d is not in StandardHTTPSPorts %v", chosen, StandardHTTPSPorts)
+	}
+}
+
+func TestServerStreamQoSAIDetection(t *testing.T) {
+	cases := []struct {
+		target   string
+		expected aeroproto.StreamType
+	}{
+		{"api.deepseek.com:443", aeroproto.StreamType_AI},
+		{"api.openai.com:443", aeroproto.StreamType_AI},
+		{"cursor.com:443", aeroproto.StreamType_AI},
+		{"api.groq.com:443", aeroproto.StreamType_AI},
+		{"example.com:443", aeroproto.StreamType_BROWSER},
+		{"example.com:8080", aeroproto.StreamType_GENERAL},
+	}
+
+	for _, tc := range cases {
+		st := detectStreamType(tc.target)
+		if st != tc.expected {
+			t.Errorf("detectStreamType(%s) = %v, expected %v", tc.target, st, tc.expected)
+		}
+	}
+}
+
+func TestServerDisguisedSNICertMapping(t *testing.T) {
+	mgr, err := transport.NewCertManager(transport.CertConfig{
+		Source:  transport.SelfSigned,
+		Domains: []string{"edge.example.com"},
+	})
+	if err != nil {
+		t.Fatalf("failed to create cert manager: %v", err)
+	}
+
+	// 1. Direct match with primary domain
+	cert1, err := mgr.GetCertificate(&tls.ClientHelloInfo{ServerName: "edge.example.com"})
+	if err != nil || cert1 == nil {
+		t.Fatalf("GetCertificate for primary domain failed: %v", err)
+	}
+
+	// 2. Disguised white SNI (e.g. gateway.icloud.com)
+	cert2, err := mgr.GetCertificate(&tls.ClientHelloInfo{ServerName: "gateway.icloud.com"})
+	if err != nil || cert2 == nil {
+		t.Fatalf("GetCertificate for disguised white SNI failed: %v", err)
+	}
+
+	// 3. Empty SNI
+	cert3, err := mgr.GetCertificate(&tls.ClientHelloInfo{ServerName: ""})
+	if err != nil || cert3 == nil {
+		t.Fatalf("GetCertificate for empty SNI failed: %v", err)
 	}
 }

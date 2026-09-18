@@ -13,6 +13,7 @@ import (
 	"time"
 	"github.com/aero-protocol/aero-ech/internal/protocol"
 	"github.com/aero-protocol/aero-ech/internal/split"
+	"github.com/aero-protocol/aero-ech/internal/tun"
 	"golang.org/x/net/http2"
 	aeroproto "github.com/aero-protocol/proto"
 )
@@ -535,6 +536,18 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 	if ready == nil {
 		ready = func(bool) {}
 	}
+	// Fake-IP (198.18.0.0/15) 内存 0ms 快速反查：还原真实域名
+	host, port, err := net.SplitHostPort(target)
+	if err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			if v4 := ip.To4(); v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
+				if realDomain, ok := tun.DefaultFakeIPTable.Lookup(ip); ok {
+					target = net.JoinHostPort(realDomain, port)
+				}
+			}
+		}
+	}
+
 	if isSelfListenTarget(target) {
 		log.Printf("[PROXY] reject self-loop target %s (prevent socket exhaustion)", target)
 		ready(false)
@@ -557,10 +570,8 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 	}
 
 	// Mixed/HTTP/SOCKS proxy path = pure TCP byte relay (same as Clash/box).
-	// NEVER inject AI StreamHeader or bridge side-channel here — that corrupts
-	// HTTPS ClientHello to claude.ai / chatgpt.com / google and looks "不通".
+	// 保留 AI 和 UDP 流类型特征供 QoS / 零延迟调度
 	st := classifyTarget(target)
-	st.StreamType = aeroproto.StreamType_GENERAL
 
 	replied := false
 	for attempt := 0; attempt < 2; attempt++ {
@@ -626,7 +637,7 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 			Client:     client,
 			Tunnel:     tunnel,
 			StreamID:   streamID,
-			StreamType: aeroproto.StreamType_GENERAL,
+			StreamType: st.StreamType,
 			SessionID:  resp.SessionId,
 			TargetHost: st.Host,
 			TargetPort: uint16(st.Port),

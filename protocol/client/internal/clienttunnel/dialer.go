@@ -1,4 +1,4 @@
-﻿// Copyright 2025 AERO Protocol Contributors
+// Copyright 2025 AERO Protocol Contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
@@ -354,19 +354,21 @@ func generateNonce() []byte {
 
 func isAITraffic(host string) bool {
 	aiDomains := []string{
-		"openai.com", "api.openai.com", "chatgpt.com",
+		"openai.com", "api.openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
 		"anthropic.com", "claude.ai", "api.anthropic.com",
 		"gemini.google.com", "aistudio.google.com", "generativelanguage.googleapis.com",
-		"api.groq.com", "api.perplexity.ai", "api.cohere.ai",
-		"api.together.xyz", "api.mistral.ai", "api.replicate.com",
-		"api.deepseek.com", "platform.moonshot.cn", "api.siliconflow.cn",
+		"copilot.microsoft.com",
+		"api.groq.com", "groq.com", "api.perplexity.ai", "perplexity.ai", "api.cohere.ai", "cohere.com",
+		"api.together.xyz", "together.xyz", "together.ai", "api.mistral.ai", "mistral.ai", "api.replicate.com", "replicate.com",
+		"api.deepseek.com", "deepseek.com", "platform.moonshot.cn", "api.siliconflow.cn", "siliconflow.cn",
 		"api.qwen.ai", "api.baichuan-ai.com", "api.minimax.chat",
 		"api.sparkdesk.cn", "huggingface.co", "api-inference.huggingface.co",
-		"openrouter.ai", "api.fireworks.ai",
+		"openrouter.ai", "api.fireworks.ai", "fireworks.ai",
+		"cursor.com", "cursor.sh", "poe.com", "midjourney.com",
 	}
 	hostLower := strings.ToLower(host)
 	for _, d := range aiDomains {
-		if strings.HasSuffix(hostLower, d) || hostLower == d {
+		if strings.HasSuffix(hostLower, d) || hostLower == d || strings.Contains(hostLower, d) {
 			return true
 		}
 	}
@@ -385,7 +387,11 @@ func inferModelName(host string) string {
 		return "groq-llama"
 	case strings.Contains(host, "deepseek.com"):
 		return "deepseek-chat"
+	case strings.Contains(host, "cursor"):
+		return "cursor-ai"
+	case strings.Contains(host, "perplexity"):
+		return "perplexity"
 	default:
-		return "unknown"
+		return "ai-service"
 	}
 }

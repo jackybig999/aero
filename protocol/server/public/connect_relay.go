@@ -67,6 +67,12 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 	if idleTO <= 0 {
 		idleTO = 15 * time.Minute
 	}
+	if p.StreamType == aeroproto.StreamType_AI {
+		// AI 深度思考长会话（如 DeepSeek R1/o1）：放宽超时容限至 30 分钟，防思考中断
+		if idleTO < 30*time.Minute {
+			idleTO = 30 * time.Minute
+		}
+	}
 	maxLife := h.maxLife
 
 	lowLatency := p.StreamType == aeroproto.StreamType_AI ||
