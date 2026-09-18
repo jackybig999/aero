@@ -77,7 +77,7 @@ fi
 
 detect_best_https_port() {
     local preferred="$1"
-    local candidates=("$preferred" 8443 2053 2083 2087 2096)
+    local candidates=("$preferred" 443 8443 2053 2083 2087 2096)
     local tested=" "
     for p in "${candidates[@]}"; do
         if [[ "$tested" =~ " ${p} " ]]; then
@@ -87,11 +87,11 @@ detect_best_https_port() {
 
         local in_use=0
         if command -v python3 >/dev/null 2>&1; then
-            if ! python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('0.0.0.0', $p)); s.close()" 2>/dev/null; then
+            if ! python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', $p)); s.close()" 2>/dev/null; then
                 in_use=1
             fi
         elif command -v ss >/dev/null 2>&1; then
-            if ss -tlpn 2>/dev/null | grep -qE ":$p\b"; then
+            if ss -tlpn 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge"; then
                 in_use=1
             fi
         elif command -v fuser >/dev/null 2>&1; then

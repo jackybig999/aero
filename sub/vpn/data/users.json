@@ -1,5 +1,5 @@
 {
-  "next_id": 2,
+  "next_id": 3,
   "users": {
     "1": {
       "id": 1,
@@ -26,6 +26,18 @@
       "expire_at": "2027-09-18T14:18:44.6368903+08:00",
       "created_at": "2026-09-18T14:18:44.6368903+08:00",
       "updated_at": "2026-09-18T15:12:30.7490232+08:00"
+    },
+    "3": {
+      "id": 3,
+      "username": "123",
+      "password_hash": "sha256:6e23a48e32e7e5d8:6256cd42a7b4a2b63adc46b26b391ee5fce0317cb339c29b67bf5a1bc0987fca",
+      "status": true,
+      "is_staff": false,
+      "sub_slug": "123lywo9x",
+      "sub_token": "usr_eea6d338fccbb1eae5757cc6412789f1",
+      "expire_at": "2027-09-18T15:38:37.8759255+08:00",
+      "created_at": "2026-09-18T15:38:37.8759255+08:00",
+      "updated_at": "2026-09-18T15:38:37.8759255+08:00"
     }
   },
   "traffic": {
@@ -40,6 +52,12 @@
       "used_bytes": 0,
       "limit_bytes": 107374182400,
       "updated_at": "2026-09-18T14:18:44.6368903+08:00"
+    },
+    "3": {
+      "user_id": 3,
+      "used_bytes": 0,
+      "limit_bytes": 107374182400,
+      "updated_at": "2026-09-18T15:38:37.8759255+08:00"
     }
   },
   "plans": [

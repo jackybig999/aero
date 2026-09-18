@@ -12,35 +12,35 @@
       "domain": "myconsun.de5.net",
       "status": "online",
       "metrics": {
-        "cpu_percent": 0,
+        "cpu_percent": 0.8,
         "mem_total_mb": 0,
         "mem_used_mb": 0,
         "mem_percent": 0,
         "disk_total_gb": 98.3091926574707,
-        "disk_used_gb": 15.909587860107422,
-        "disk_percent": 16.183214844963352,
-        "load_1": 0.12,
-        "load_5": 0.11,
-        "load_15": 0.04,
+        "disk_used_gb": 15.916816711425781,
+        "disk_percent": 16.190568024379186,
+        "load_1": 0.1,
+        "load_5": 0.03,
+        "load_15": 0.01,
         "net_rx_mbps": 0,
         "net_tx_mbps": 0,
-        "uptime_sec": 1268398,
+        "uptime_sec": 1273632,
         "os": "Linux",
         "arch": "x86_64",
-        "collected_at": "2026-09-18T14:08:28.0198683+08:00",
+        "collected_at": "2026-09-18T15:35:41.7500106+08:00",
         "source": "ssh",
         "probe_ok": true,
-        "latency_ms": 3154
+        "latency_ms": 6613
       },
-      "last_probe_at": "2026-09-18T14:08:29.2727042+08:00",
+      "last_probe_at": "2026-09-18T15:35:44.6423681+08:00",
       "created_at": "2026-09-18T14:08:18.8405146+08:00",
-      "updated_at": "2026-09-18T14:08:29.2727042+08:00"
+      "updated_at": "2026-09-18T15:35:44.6423681+08:00"
     }
   },
   "passwords": {
     "3": "WVUADjC5Twh2uoAGMGK/D8HzEYK8IHEJCeH6Klt+STYeInAyVYY="
   },
   "ips": {
-    "3": "ITmzQzYlHqVfRmZYU56xMU/j6H9LaTkP//LtZ03uCpBVSksvMRJ++1jaIg=="
+    "3": "S40Ye/gUysqierPoFCiwK13raDBnppsS5c14PnFUnR2MBKeqynPdX2QO3w=="
   }
 }

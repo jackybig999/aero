@@ -723,14 +723,23 @@ fi
 [ -z "$ADMIN_KEY" ] && ADMIN_KEY="$(openssl rand -hex 16 2>/dev/null || echo adminkey)"
 # --- Auto-detect Best HTTPS Port (Preferred 443, fallback standard CF/IANA ports) ---
 systemctl stop aero-edge 2>/dev/null || true
+sleep 1
+PREV_PORT=""
+[ -f /etc/aero/edge.conf ] && PREV_PORT=$(grep -E '^AERO_PORTS=' /etc/aero/edge.conf 2>/dev/null | head -n1 | cut -d= -f2 | tr -cd '0-9')
 CANDIDATE_PORTS=(443 8443 2053 2083 2087 2096)
+if [ -n "$PREV_PORT" ] && [ "$PREV_PORT" != "0" ]; then
+  CANDIDATE_PORTS=("$PREV_PORT" 443 8443 2053 2083 2087 2096)
+fi
 CHOSEN_PORT=""
+TESTED_PORTS=""
 for p in "${CANDIDATE_PORTS[@]}"; do
+  [[ " $TESTED_PORTS " =~ " $p " ]] && continue
+  TESTED_PORTS="$TESTED_PORTS $p"
   in_use=0
   if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.bind(('0.0.0.0', $p)); s.close()" 2>/dev/null || in_use=1
+    python3 -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', $p)); s.close()" 2>/dev/null || in_use=1
   elif command -v ss >/dev/null 2>&1; then
-    ss -tlpn 2>/dev/null | grep -qE ":$p\b" && in_use=1
+    ss -tlpn 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge" && in_use=1
   elif command -v fuser >/dev/null 2>&1; then
     fuser "$p/tcp" >/dev/null 2>&1 && in_use=1
   fi
