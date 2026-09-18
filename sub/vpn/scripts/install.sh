@@ -29,6 +29,15 @@ if [ ! -f "$CONFIG_DIR/config.yaml" ] && [ -f "../config/config.yaml" ]; then
     cp -f ../config/config.yaml "$CONFIG_DIR/config.yaml"
 fi
 
+# Copy web UI dist assets for single-port static serving
+if [ -d "./web" ]; then
+    mkdir -p /opt/vpn/web
+    cp -rf ./web/* /opt/vpn/web/
+elif [ -d "../web" ]; then
+    mkdir -p /opt/vpn/web
+    cp -rf ../web/* /opt/vpn/web/
+fi
+
 # Setup systemd service
 cat > /etc/systemd/system/subvps.service << EOF
 [Unit]
