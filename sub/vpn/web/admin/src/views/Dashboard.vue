@@ -149,7 +149,7 @@
               <el-table-column label="操作" :width="userKind === 'sub' ? 260 : 180" fixed="right">
                 <template #default="{ row }">
                   <el-button v-if="!row.is_staff && row.sub_slug" size="small" type="primary" plain @click="copySubLink(row)">
-                    复制订阅
+                    复制凭证
                   </el-button>
                   <el-button size="small" @click="editUser(row)">编辑</el-button>
                   <el-button size="small" type="danger" @click="delUser(row.id)">删除</el-button>
@@ -1047,11 +1047,11 @@ function copySubLink(row) {
   if (!row.sub_slug) {
     return ElMessage.warning('该用户暂无专属 Slug')
   }
-  const url = `${location.origin}/sub/${row.sub_slug}`
-  navigator.clipboard.writeText(url).then(() => {
-    ElMessage.success(`用户 ${row.username} 专属订阅链接已复制！`)
+  const text = `用户名: ${row.username} | 专属Slug: ${row.sub_slug} | 到期: ${row.expire_at ? fmt(row.expire_at) : '长期有效'}`
+  navigator.clipboard.writeText(text).then(() => {
+    ElMessage.success(`用户 [${row.username}] 订阅凭据已复制！`)
   }).catch(() => {
-    ElMessage.info(url)
+    ElMessage.info(text)
   })
 }
 

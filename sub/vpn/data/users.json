@@ -1,0 +1,74 @@
+{
+  "next_id": 2,
+  "users": {
+    "1": {
+      "id": 1,
+      "username": "admin",
+      "password_hash": "sha256:0d793e258de76220:982358550036dd73c85f331f3d0fed8f11af87544e10fc55440797cb5ff4c783",
+      "email": "admin@vpn.local",
+      "status": true,
+      "is_staff": true,
+      "sub_slug": "adminmodpyr",
+      "sub_token": "usr_fbaf3400436f1527c70c91182d8f9de0",
+      "expire_at": "2027-09-18T14:06:08.4791575+08:00",
+      "created_at": "2026-09-18T14:06:08.4791575+08:00",
+      "updated_at": "2026-09-18T15:12:30.74792+08:00"
+    },
+    "2": {
+      "id": 2,
+      "username": "jacky",
+      "password_hash": "sha256:912ba0de21b9afeb:50d7b5ec6a6ecad13b6bde7f6983f8becaf96233e5587bccaa6c3fc72e269848",
+      "email": "2442273302@qq.com",
+      "status": true,
+      "is_staff": false,
+      "sub_slug": "jackyw6joiw",
+      "sub_token": "usr_013ee0631b04710d0eeea3267f46f8ff",
+      "expire_at": "2027-09-18T14:18:44.6368903+08:00",
+      "created_at": "2026-09-18T14:18:44.6368903+08:00",
+      "updated_at": "2026-09-18T15:12:30.7490232+08:00"
+    }
+  },
+  "traffic": {
+    "1": {
+      "user_id": 1,
+      "used_bytes": 0,
+      "limit_bytes": 107374182400,
+      "updated_at": "2026-09-18T14:06:08.4791575+08:00"
+    },
+    "2": {
+      "user_id": 2,
+      "used_bytes": 0,
+      "limit_bytes": 107374182400,
+      "updated_at": "2026-09-18T14:18:44.6368903+08:00"
+    }
+  },
+  "plans": [
+    {
+      "id": 1,
+      "name": "月度套餐",
+      "duration_months": 1,
+      "traffic_bytes": 107374182400,
+      "price_cents": 999,
+      "status": true,
+      "created_at": "2026-09-18T14:06:08.4791575+08:00"
+    },
+    {
+      "id": 2,
+      "name": "季度套餐",
+      "duration_months": 3,
+      "traffic_bytes": 322122547200,
+      "price_cents": 2499,
+      "status": true,
+      "created_at": "2026-09-18T14:06:08.4791575+08:00"
+    },
+    {
+      "id": 3,
+      "name": "年度套餐",
+      "duration_months": 12,
+      "traffic_bytes": 1073741824000,
+      "price_cents": 7999,
+      "status": true,
+      "created_at": "2026-09-18T14:06:08.4791575+08:00"
+    }
+  ]
+}

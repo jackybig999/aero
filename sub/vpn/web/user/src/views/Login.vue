@@ -14,7 +14,6 @@
       </el-form>
       <p class="tip">
         没有账号？<router-link to="/register">立即注册</router-link>
-        · 管理员请走 <a href="/admin/">/admin</a>
       </p>
     </el-card>
   </div>
@@ -40,19 +39,17 @@ async function login() {
   if (!u.value || !p.value) return ElMessage.warning('请输入用户名和密码')
   ing.value = true
   try {
-    const r = await userApi.login(u.value, p.value)
-    if (r.data?.data?.is_staff) {
-      // 管理员账号请走后台
-      localStorage.setItem('vpn_admin_token', r.data.data.token)
-      localStorage.setItem('vpn_admin_user', JSON.stringify(r.data.data))
-      window.location.href = '/admin/'
-      return
+    const r = await userApi.login(u.value, p.value, 'user')
+    if (r.data?.data) {
+      localStorage.setItem('vpn_user_token', r.data.data.token)
+      localStorage.setItem('vpn_user_user', JSON.stringify(r.data.data))
+      router.push('/')
     }
-    localStorage.setItem('vpn_user_token', r.data.data.token)
-    localStorage.setItem('vpn_user_user', JSON.stringify(r.data.data))
-    router.push('/')
-  } catch { ElMessage.error('登录失败') }
-  finally { ing.value = false }
+  } catch (err) {
+    ElMessage.error(err.response?.data?.message || '登录失败')
+  } finally {
+    ing.value = false
+  }
 }
 </script>
 <style scoped>

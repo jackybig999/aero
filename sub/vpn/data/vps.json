@@ -1,45 +1,10 @@
 {
-  "next": 2,
+  "next": 3,
   "hosts": {
-    "1": {
-      "id": 1,
+    "3": {
+      "id": 3,
       "name": "vps-a",
-      "role": "node",
-      "ip": "",
-      "ssh_port": 22,
-      "ssh_username": "root",
-      "has_password": true,
-      "domain": "myconsun.cc.cd",
-      "status": "online",
-      "metrics": {
-        "cpu_percent": 0,
-        "mem_total_mb": 967.93359375,
-        "mem_used_mb": 364.1796875,
-        "mem_percent": 37.624449636992466,
-        "disk_total_gb": 48.912567138671875,
-        "disk_used_gb": 6.002540588378906,
-        "disk_percent": 12.271980269122087,
-        "load_1": 0,
-        "load_5": 0,
-        "load_15": 0,
-        "net_rx_mbps": 0.138368,
-        "net_tx_mbps": 0.195664,
-        "uptime_sec": 2924914,
-        "os": "Linux",
-        "arch": "x86_64",
-        "collected_at": "2026-08-31T08:57:49.9228335+08:00",
-        "source": "ssh",
-        "probe_ok": true,
-        "latency_ms": 6143
-      },
-      "last_probe_at": "2026-08-31T08:57:51.5925633+08:00",
-      "created_at": "2026-07-21T11:14:22.7925387+08:00",
-      "updated_at": "2026-08-31T08:57:51.5925633+08:00"
-    },
-    "2": {
-      "id": 2,
-      "name": "vps-b",
-      "role": "VPS-B",
+      "role": "VPS-A",
       "ip": "",
       "ssh_port": 22,
       "ssh_username": "root",
@@ -47,37 +12,35 @@
       "domain": "myconsun.de5.net",
       "status": "online",
       "metrics": {
-        "cpu_percent": 4.1,
+        "cpu_percent": 0,
         "mem_total_mb": 0,
         "mem_used_mb": 0,
         "mem_percent": 0,
         "disk_total_gb": 98.3091926574707,
-        "disk_used_gb": 22.26578140258789,
-        "disk_percent": 22.648727754449595,
-        "load_1": 0.08,
-        "load_5": 0.04,
-        "load_15": 0.01,
+        "disk_used_gb": 15.909587860107422,
+        "disk_percent": 16.183214844963352,
+        "load_1": 0.12,
+        "load_5": 0.11,
+        "load_15": 0.04,
         "net_rx_mbps": 0,
-        "net_tx_mbps": 0.060512,
-        "uptime_sec": 3515350,
+        "net_tx_mbps": 0,
+        "uptime_sec": 1268398,
         "os": "Linux",
         "arch": "x86_64",
-        "collected_at": "2026-08-31T08:57:47.0875385+08:00",
+        "collected_at": "2026-09-18T14:08:28.0198683+08:00",
         "source": "ssh",
         "probe_ok": true,
-        "latency_ms": 6089
+        "latency_ms": 3154
       },
-      "last_probe_at": "2026-08-31T08:57:49.1546922+08:00",
-      "created_at": "2026-07-25T10:54:44.5906786+08:00",
-      "updated_at": "2026-08-31T08:57:49.1546922+08:00"
+      "last_probe_at": "2026-09-18T14:08:29.2727042+08:00",
+      "created_at": "2026-09-18T14:08:18.8405146+08:00",
+      "updated_at": "2026-09-18T14:08:29.2727042+08:00"
     }
   },
   "passwords": {
-    "1": "hs83Z/LQ6uaBI1+Ip7OGrhHwYgU7TCxV8qnqY/HJtNMclnjw+l4=",
-    "2": "J7k5xixI3B4ILXlGascb4XpZSB24g3VsWiIlrqsf04teVe6/K0I="
+    "3": "WVUADjC5Twh2uoAGMGK/D8HzEYK8IHEJCeH6Klt+STYeInAyVYY="
   },
   "ips": {
-    "1": "OhtpgA0xw64tODZE3Jc5wtuUoFXntCjIzhU6KOW6O2kIAN+N/Iwo9gS4Cw==",
-    "2": "9vbRJuldFQSTFzj00FOXWuVLCMi+Ghj6e7n0BuvpRBv8tEStBlsPep3y9g=="
+    "3": "ITmzQzYlHqVfRmZYU56xMU/j6H9LaTkP//LtZ03uCpBVSksvMRJ++1jaIg=="
   }
 }

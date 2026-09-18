@@ -7,7 +7,7 @@ import "time"
 type User struct {
 	ID           uint64    `json:"id"`
 	Username     string    `json:"username"`
-	PasswordHash string    `json:"-"`
+	PasswordHash string    `json:"password_hash,omitempty"`
 	Email        string    `json:"email,omitempty"`
 	Status       bool      `json:"status"`
 	IsStaff      bool      `json:"is_staff"`
@@ -16,6 +16,16 @@ type User struct {
 	ExpireAt     time.Time `json:"expire_at,omitempty"` // 订阅到期时间
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// Sanitize 返回抹除敏感密码哈希后的用户安全副本，供外部 HTTP 接口返回
+func (u *User) Sanitize() *User {
+	if u == nil {
+		return nil
+	}
+	cp := *u
+	cp.PasswordHash = ""
+	return &cp
 }
 
 // Plan represents a subscription plan.

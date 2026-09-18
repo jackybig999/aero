@@ -22,7 +22,7 @@ api.interceptors.response.use(
 )
 
 export const userApi = {
-  login: (u, p) => api.post('/auth/login/', { username: u, password: p }),
+  login: (u, p, portal = 'user') => api.post('/auth/login/', { username: u, password: p, portal }),
   register: (u, p, e) => api.post('/users/', { username: u, password: p, email: e }),
   get: (i) => api.get(`/users/${i}/`),
   list: (q) => api.get('/users/', { params: q }),
@@ -39,6 +39,7 @@ export const subApi = {
   create: (d) => api.post('/subscriptions/', d),
   remove: (i) => api.delete(`/subscriptions/${i}/`),
   config: (u) => api.get('/subscriptions/config/', { params: { uuid: u } }),
+  userSub: () => api.get('/user/subscription'),
 }
 export const payInApi = {
   order: (d) => api.post('/payments/in/orders/', d),

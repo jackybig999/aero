@@ -112,6 +112,9 @@ func isUserOpenAPI(method, path string) bool {
 	if method == http.MethodDelete && strings.HasPrefix(path, "/api/v1/subscriptions/") {
 		return true
 	}
+	if method == http.MethodGet && path == "/api/v1/user/subscription" {
+		return true
+	}
 	if strings.HasPrefix(path, "/api/v1/test/") {
 		return true
 	}

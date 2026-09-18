@@ -47,29 +47,30 @@
 
       <main class="content">
         <div v-show="tab === 'subs'">
-          <!-- AERO 用户专属多节点聚合订阅卡片 (支持多 VPS 自动故障漂移) -->
+          <!-- AERO 账号无感私有同步 (无公开裸露订阅，防外网嗅探与节点窃取) -->
           <el-card shadow="never" class="panel" style="margin-bottom: 16px; border: 1px solid var(--el-color-primary-light-5); background: var(--el-fill-color-light);">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
               <div>
                 <div style="font-size: 16px; font-weight: 700; margin-bottom: 6px; color: var(--el-color-primary);">
-                  🚀 AERO 多节点高可用专属订阅
+                  🚀 AERO 账号无感私有同步（安全模式）
                 </div>
                 <div style="font-size: 13px; color: var(--el-text-color-regular); margin-bottom: 8px;">
-                  聚合全部已授权海外 VPS 节点（香港、日本等），单链接支持智能故障漂移与断网自愈。
+                  已启用端到端 Token 签名鉴权通道，杜绝明文订阅链接泄漏与节点探测。支持多 VPS 自动故障漂移与断网自愈。
                 </div>
                 <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                  <el-tag type="success" size="small">专属 Slug: {{ userSlug || '生成中' }}</el-tag>
+                  <el-tag type="primary" size="small">用户账号: {{ userData.username }}</el-tag>
+                  <el-tag type="success" size="small">专属 Slug: {{ userSlug || '已绑定' }}</el-tag>
                   <el-tag type="info" size="small">状态: {{ userData.status !== false ? '正常可用' : '已停用' }}</el-tag>
                   <el-tag type="warning" size="small">到期时间: {{ userData.expire_at ? fmt(userData.expire_at) : '长期有效' }}</el-tag>
                 </div>
               </div>
               <div style="display: flex; align-items: center; gap: 10px;">
-                <el-input :model-value="subUrl" readonly style="width: 380px;" size="default">
-                  <template #append>
-                    <el-button type="primary" @click="copySubUrl">复制订阅链接</el-button>
-                  </template>
-                </el-input>
+                <el-button type="primary" plain :loading="fetchingPrivCfg" @click="fetchPrivateConfig">查看私有配置 (JSON)</el-button>
+                <el-button type="primary" @click="copyCredentials">复制连接凭证</el-button>
               </div>
+            </div>
+            <div style="margin-top: 12px; padding: 8px 12px; background: var(--el-bg-color); border-radius: 6px; font-size: 12px; color: var(--el-text-color-secondary);">
+              💡 <b>客户端连接指引：</b> 在 AERO 客户端启动时直接填入您的中台账号与密码（或命令行 <code>-server {{ currentOrigin }} -user {{ userData.username }} -pass 密码</code>），客户端将通过端到端私密通道无感拉取节点并自动建立高可用隧道。
             </div>
           </el-card>
 
@@ -183,18 +184,29 @@ if (!user.username) router.replace('/login')
 
 const userData = ref(user)
 const userSlug = computed(() => userData.value.sub_slug || '')
-const subUrl = computed(() => {
-  const slug = userSlug.value || (userData.value.username ? userData.value.username + '888abc' : '')
-  return slug ? `${location.origin}/sub/${slug}` : ''
-})
+const currentOrigin = computed(() => location.origin)
+const fetchingPrivCfg = ref(false)
 
-async function copySubUrl() {
-  if (!subUrl.value) return
+async function fetchPrivateConfig() {
+  fetchingPrivCfg.value = true
   try {
-    await navigator.clipboard.writeText(subUrl.value)
-    ElMessage.success('专属多节点订阅链接已复制到剪贴板！')
+    const res = await subApi.userSub()
+    cfgStr.value = JSON.stringify(res.data, null, 2)
+    cfgShow.value = true
+  } catch (err) {
+    ElMessage.error(err.response?.data?.message || '获取私有配置失败')
+  } finally {
+    fetchingPrivCfg.value = false
+  }
+}
+
+async function copyCredentials() {
+  const text = `中台地址: ${location.origin}\n账号: ${userData.value.username}\n专属Slug: ${userSlug.value || '已绑定'}`
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success('连接凭证已复制到剪贴板！可在客户端直接填入')
   } catch {
-    ElMessage.info(subUrl.value)
+    ElMessage.info(text)
   }
 }
 

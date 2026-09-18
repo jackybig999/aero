@@ -1,8 +1,9 @@
-﻿package public
+package public
 
 import (
 	"embed"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -109,13 +110,26 @@ func RunApp() {
 		log.Printf("AERO app: MIXED %s ready (fill SOCKS5, no Connect needed)", *listenAddr)
 	}
 
-	if *subURL == "" {
-		if last := loadLastSubFile(); last != "" {
+	if *subURL == "" && (*subServer == "" || *subUser == "") {
+		if acc := loadLastAccount(); acc != nil {
+			*subServer = acc.Server
+			*subUser = acc.Username
+			*subPass = acc.Password
+		} else if last := loadLastSubFile(); last != "" {
 			*subURL = last
 		}
 	}
 	var initialSub *sub.Applied
-	if *subURL != "" {
+	if *subServer != "" && *subUser != "" && *subPass != "" {
+		app, err := loadAndApplyPrivateSubscription(*subServer, *subUser, *subPass)
+		if err != nil {
+			log.Printf("[SUB] preload private: %v", err)
+			apiSrv.UpdateState(func(st *api.AppState) { st.LastError = err.Error() })
+		} else {
+			initialSub = app
+			apiSrv.UpdateState(func(st *api.AppState) { st.SubURL = fmt.Sprintf("%s (user: %s)", *subServer, *subUser) })
+		}
+	} else if *subURL != "" {
 		app, err := loadAndApplySubscription(*subURL)
 		if err != nil {
 			log.Printf("[SUB] preload: %v", err)
@@ -127,7 +141,9 @@ func RunApp() {
 		}
 	}
 	startBackgroundServices()
-	if *subURL != "" {
+	if *subServer != "" && *subUser != "" && *subPass != "" {
+		startPrivateSubRefreshLoop(*subServer, *subUser, *subPass, initialSub)
+	} else if *subURL != "" {
 		startSubRefreshLoop(*subURL, initialSub)
 	}
 

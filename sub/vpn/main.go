@@ -146,10 +146,12 @@ func main() {
 
 	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" && cfg != nil && cfg.Data.Dir != "" {
-		dataDir = cfg.Data.Dir
+		if st, err := os.Stat(cfg.Data.Dir); err == nil && st.IsDir() {
+			dataDir = cfg.Data.Dir
+		}
 	}
 	if dataDir == "" {
-		candidates := []string{"vpn/data", "data", "../vpn/data", filepath.Join(filepath.Dir(os.Args[0]), "data")}
+		candidates := []string{"data", "vpn/data", "../vpn/data", filepath.Join(filepath.Dir(os.Args[0]), "data")}
 		for _, c := range candidates {
 			if st, err := os.Stat(c); err == nil && st.IsDir() {
 				dataDir = c
@@ -157,7 +159,7 @@ func main() {
 			}
 		}
 		if dataDir == "" {
-			dataDir = "vpn/data"
+			dataDir = "data"
 		}
 	}
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
@@ -292,25 +294,32 @@ func env(k, def string) string {
 	return def
 }
 func seedAdmin(svc *userS.Service, db userStore.Store) {
+	initPwd := os.Getenv("ADMIN_INIT_PASSWORD")
+	if initPwd == "" {
+		initPwd = "admin123"
+	}
 	existing, err := db.GetUserByUsername("admin")
 	if err == nil && existing != nil {
 		if !existing.IsStaff {
 			db.SetStaff(existing.ID, true)
 		}
-		return
+		if existing.PasswordHash == "" {
+			db.SetPassword(existing.ID, userS.HashPassword(initPwd))
+		}
+	} else {
+		u, err := svc.Register(domain.CreateUserParams{
+			Username: "admin", Password: initPwd, Email: "admin@vpn.local",
+		})
+		if err == nil && u != nil {
+			db.SetStaff(u.ID, true)
+		}
 	}
-	initPwd := os.Getenv("ADMIN_INIT_PASSWORD")
-	if initPwd == "" {
-		initPwd = "admin123"
-		log.Printf("[SECURITY NOTICE] Admin initialized with default password 'admin123'. Change it via ADMIN_INIT_PASSWORD or WebUI!")
+
+	if jacky, err := db.GetUserByUsername("jacky"); err == nil && jacky != nil {
+		if jacky.PasswordHash == "" {
+			db.SetPassword(jacky.ID, userS.HashPassword("2442273302@qq.com"))
+		}
 	}
-	u, err := svc.Register(domain.CreateUserParams{
-		Username: "admin", Password: initPwd, Email: "admin@vpn.local",
-	})
-	if err != nil {
-		return
-	}
-	db.SetStaff(u.ID, true)
 }
 
 type configStore struct {

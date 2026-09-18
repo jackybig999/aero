@@ -21,6 +21,7 @@ type Store interface {
 	GetTraffic(userID uint64) (*domain.TrafficStats, error)
 	ListPlans(activeOnly bool) ([]domain.Plan, error)
 	SetStaff(id uint64, staff bool)
+	SetPassword(id uint64, passwordHash string)
 }
 
 type MemoryStore struct {
@@ -48,6 +49,14 @@ func NewMemoryStore() *MemoryStore {
 func (m *MemoryStore) SetStaff(id uint64, staff bool) {
 	m.mu.Lock(); defer m.mu.Unlock()
 	if u, ok := m.users[id]; ok { u.IsStaff = staff }
+}
+
+func (m *MemoryStore) SetPassword(id uint64, passwordHash string) {
+	m.mu.Lock(); defer m.mu.Unlock()
+	if u, ok := m.users[id]; ok {
+		u.PasswordHash = passwordHash
+		u.UpdatedAt = time.Now()
+	}
 }
 
 func (m *MemoryStore) CreateUser(u *domain.User) (uint64, error) {

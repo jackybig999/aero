@@ -1,12 +1,17 @@
 package public
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,16 +42,19 @@ var (
 	edgeAddr     = flag.String("edge", "", "AERO edge server address(es)")
 	token        = flag.String("token", "", "auth token")
 	publicName   = flag.String("sni", "cdn-aero.com", "pseudo SNI for ECH")
-	subURL        = flag.String("sub", "", "subscription URL or file")
-	subInterval   = flag.Duration("sub-interval", 30*time.Minute, "subscription refresh interval (0=disable)")
-	fingerprint   = flag.String("fingerprint", "std", "TLS fingerprint: std|chrome|firefox|safari|random (std=compatible)")
-	enableSplit   = flag.Bool("split", true, "enable smart traffic splitting")
-	echConfigB64  = flag.String("ech", "", "base64-encoded ECH config list")
-	caCertPath    = flag.String("ca-cert", "", "CA certificate file for Edge server verification")
-	tlsInsecure   = flag.Bool("insecure", false, "skip TLS certificate verify (dev/self-signed only)")
-	configPath    = flag.String("config", "", "path to AERO config YAML/JSON file")
-	simOnly       = flag.Bool("sim", false, "simulate data plane (TCP/UDP/gVisor) and exit; no proxy, no wintun")
-	initMode      = flag.String("mode", "", "startup mode: tun|sysproxy|socks (empty = tun, or sysproxy if other global)")
+	subURL       = flag.String("sub", "", "subscription URL or file")
+	subServer    = flag.String("server", "", "subscription platform server URL (e.g. http://127.0.0.1:18080)")
+	subUser      = flag.String("user", "", "subscription account username")
+	subPass      = flag.String("pass", "", "subscription account password")
+	subInterval  = flag.Duration("sub-interval", 30*time.Minute, "subscription refresh interval (0=disable)")
+	fingerprint  = flag.String("fingerprint", "std", "TLS fingerprint: std|chrome|firefox|safari|random (std=compatible)")
+	enableSplit  = flag.Bool("split", true, "enable smart traffic splitting")
+	echConfigB64 = flag.String("ech", "", "base64-encoded ECH config list")
+	caCertPath   = flag.String("ca-cert", "", "CA certificate file for Edge server verification")
+	tlsInsecure  = flag.Bool("insecure", false, "skip TLS certificate verify (dev/self-signed only)")
+	configPath   = flag.String("config", "", "path to AERO config YAML/JSON file")
+	simOnly      = flag.Bool("sim", false, "simulate data plane (TCP/UDP/gVisor) and exit; no proxy, no wintun")
+	initMode     = flag.String("mode", "", "startup mode: tun|sysproxy|socks (empty = tun, or sysproxy if other global)")
 )
 
 var edgeAddrMu sync.RWMutex
@@ -194,6 +202,55 @@ func saveLastSub(url string) {
 	for _, p := range paths {
 		_ = os.WriteFile(p, []byte(url+"\n"), 0o600)
 	}
+}
+
+type lastAccount struct {
+	Server   string `json:"server"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func saveLastAccount(server, user, pass string) {
+	acc := lastAccount{Server: server, Username: user, Password: pass}
+	b, err := json.Marshal(acc)
+	if err != nil {
+		return
+	}
+	var paths []string
+	if exe, err := os.Executable(); err == nil {
+		paths = append(paths, filepath.Join(filepath.Dir(exe), ".last-sub-acc"))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		paths = append(paths, filepath.Join(wd, ".last-sub-acc"))
+	}
+	for _, p := range paths {
+		_ = os.WriteFile(p, b, 0o600)
+	}
+}
+
+func loadLastAccount() *lastAccount {
+	var cands []string
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		cands = append(cands,
+			filepath.Join(dir, ".last-sub-acc"),
+			filepath.Join(dir, "..", ".last-sub-acc"),
+		)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		cands = append(cands, filepath.Join(wd, ".last-sub-acc"))
+	}
+	for _, p := range cands {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var acc lastAccount
+		if err := json.Unmarshal(b, &acc); err == nil && acc.Server != "" && acc.Username != "" && acc.Password != "" {
+			return &acc
+		}
+	}
+	return nil
 }
 
 var logFile *os.File
@@ -650,6 +707,183 @@ func loadAndApplySubscription(src string) (*sub.Applied, error) {
 		return nil, err
 	}
 	return app, nil
+}
+
+// loadPrivateSubscription 使用中台账号密码无感获取鉴权订阅并解析生效
+func loadPrivateSubscription(server, username, password string) (*sub.Applied, error) {
+	server = strings.TrimRight(strings.TrimSpace(server), "/")
+	if server == "" {
+		return nil, fmt.Errorf("empty subscription server")
+	}
+
+	// 1. 登录中台获取 JWT Bearer Token
+	loginURL := server + "/api/v1/auth/login/"
+	loginPayload, err := json.Marshal(map[string]string{
+		"username": username,
+		"password": password,
+		"portal":   "client",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: certloader.ShouldSkipVerify()},
+		DialContext:     (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+	}
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+	resp, err := client.Post(loginURL, "application/json", bytes.NewReader(loginPayload))
+	if err != nil {
+		if raw := sub.LoadLastBody(); len(raw) > 0 {
+			if cached, perr := sub.ParseBytes(raw); perr == nil {
+				log.Printf("[SUB] private auth failed (%v); using last cached subscription", err)
+				return sub.Apply(cached)
+			}
+		}
+		return nil, fmt.Errorf("login subscription platform failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("login failed (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var loginRes struct {
+		Code int `json:"code"`
+		Data struct {
+			Token    string `json:"token"`
+			Username string `json:"username"`
+			SubSlug  string `json:"sub_slug"`
+		} `json:"data"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&loginRes); err != nil {
+		return nil, fmt.Errorf("parse login response failed: %w", err)
+	}
+	if loginRes.Data.Token == "" {
+		return nil, fmt.Errorf("login failed: token missing (%s)", loginRes.Message)
+	}
+
+	// 2. 带 Bearer Token 访问私有鉴权订阅接口拉取节点
+	ispHint := ""
+	if detectedISP != 0 {
+		ispHint = detectedISP.String()
+	}
+	subEndpoint := fmt.Sprintf("%s/api/v1/user/subscription", server)
+	if ispHint != "" {
+		subEndpoint += "?isp=" + url.QueryEscape(ispHint)
+	}
+
+	req, err := http.NewRequest("GET", subEndpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+loginRes.Data.Token)
+	req.Header.Set("User-Agent", "AERO-Client/2.0")
+
+	subResp, err := client.Do(req)
+	if err != nil {
+		if raw := sub.LoadLastBody(); len(raw) > 0 {
+			if cached, perr := sub.ParseBytes(raw); perr == nil {
+				log.Printf("[SUB] fetch private sub failed (%v); using last cached subscription", err)
+				return sub.Apply(cached)
+			}
+		}
+		return nil, fmt.Errorf("fetch private subscription failed: %w", err)
+	}
+	defer subResp.Body.Close()
+
+	if subResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(subResp.Body)
+		return nil, fmt.Errorf("fetch private subscription failed (HTTP %d): %s", subResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	bodyBytes, err := io.ReadAll(subResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read subscription body failed: %w", err)
+	}
+
+	doc, err := sub.ParseBytes(bodyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse private subscription json failed: %w", err)
+	}
+	if len(doc.Servers) == 0 {
+		return nil, fmt.Errorf("no servers in subscription")
+	}
+
+	sub.SaveLastBody(bodyBytes)
+	saveLastAccount(server, username, password)
+
+	app, err := sub.Apply(doc)
+	if err != nil {
+		return nil, err
+	}
+	*edgeAddr = app.EdgeAddresses
+	*token = app.PrimaryToken
+	if app.PrimarySNI != "" {
+		*publicName = app.PrimarySNI
+	}
+	if len(app.AllPins) > 0 {
+		certloader.AddPins(app.AllPins)
+		log.Printf("[SUB] SPKI pin(s) loaded: %d", len(app.AllPins))
+	} else if len(app.PrimaryPins) > 0 {
+		certloader.AddPins(app.PrimaryPins)
+		log.Printf("[SUB] SPKI pin(s) loaded: %d", len(app.PrimaryPins))
+	}
+	log.Printf("[SUB] (Private Auth) successfully loaded %d server(s) for user %s, primary=%s", len(doc.Servers), username, doc.Servers[0].Address)
+	return app, nil
+}
+
+// loadAndApplyPrivateSubscription 登录拉取鉴权订阅 + 建池生效
+func loadAndApplyPrivateSubscription(server, user, pass string) (*sub.Applied, error) {
+	app, err := loadPrivateSubscription(server, user, pass)
+	if err != nil {
+		return nil, err
+	}
+	if err := applySubscription(app); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// startPrivateSubRefreshLoop 启动基于账号密码的后台定时无感同步
+func startPrivateSubRefreshLoop(server, user, pass string, initial *sub.Applied) {
+	server = strings.TrimSpace(server)
+	user = strings.TrimSpace(user)
+	pass = strings.TrimSpace(pass)
+	subLoopMu.Lock()
+	defer subLoopMu.Unlock()
+	if subLoopCancel != nil {
+		subLoopCancel()
+		subLoopCancel = nil
+	}
+	if server == "" || user == "" || pass == "" || subInterval == nil || *subInterval <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	subLoopCancel = cancel
+	go func() {
+		ticker := time.NewTicker(*subInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				app, err := loadPrivateSubscription(server, user, pass)
+				if err != nil {
+					log.Printf("[SUB] private sub background refresh failed: %v", err)
+				} else if app != nil {
+					if err := applySubscription(app); err != nil {
+						log.Printf("[SUB] apply refreshed private sub failed: %v", err)
+					}
+				}
+			}
+		}
+	}()
+	log.Printf("[SUB] private auth refresh every %s for user %s from %s", *subInterval, user, server)
 }
 
 // -----------------------------------------------------------------------------

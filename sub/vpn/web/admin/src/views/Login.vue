@@ -55,16 +55,16 @@ async function login() {
   if (!u.value || !p.value) return ElMessage.warning('请输入账号密码')
   ing.value = true
   try {
-    const r = await userApi.login(u.value, p.value)
+    const r = await userApi.login(u.value, p.value, 'admin')
     if (!r.data?.data?.is_staff) {
-      ElMessage.error('非管理员账号')
+      ElMessage.error('非管理员账号禁止登录后台')
       return
     }
     localStorage.setItem('vpn_admin_token', r.data.data.token)
     localStorage.setItem('vpn_admin_user', JSON.stringify(r.data.data))
     router.push('/')
-  } catch {
-    ElMessage.error('登录失败')
+  } catch (err) {
+    ElMessage.error(err.response?.data?.message || '登录失败')
   } finally {
     ing.value = false
   }

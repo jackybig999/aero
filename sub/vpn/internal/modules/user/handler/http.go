@@ -56,11 +56,20 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		Portal   string `json:"portal"` // "user" | "admin" | "client"
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	_ = json.NewDecoder(r.Body).Decode(&req)
 	token, user, err := h.svc.Login(req.Username, req.Password)
 	if err != nil {
 		writeJSON(w, 401, errResp(1003, "invalid credentials"))
+		return
+	}
+	if req.Portal == "user" && user.IsStaff {
+		writeJSON(w, 403, errResp(1003, "管理员账号禁止在普通用户端登录"))
+		return
+	}
+	if req.Portal == "admin" && !user.IsStaff {
+		writeJSON(w, 403, errResp(1003, "非管理员账号禁止访问管理后台"))
 		return
 	}
 	writeJSON(w, 200, map[string]any{
@@ -83,15 +92,19 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, errResp(1001, "not found"))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"code": 0, "data": u})
+	writeJSON(w, 200, map[string]any{"code": 0, "data": u.Sanitize()})
 }
 
 func (h *Handler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
 	users, total, _ := h.svc.ListUsers(page, pageSize)
+	safeUsers := make([]*domain.User, 0, len(users))
+	for i := range users {
+		safeUsers = append(safeUsers, users[i].Sanitize())
+	}
 	writeJSON(w, 200, map[string]any{
-		"code": 0, "data": map[string]any{"results": users, "count": total},
+		"code": 0, "data": map[string]any{"results": safeUsers, "count": total},
 	})
 }
 

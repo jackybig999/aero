@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vpn-platform/vpsserver/vpn/internal/middleware"
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/service"
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/snimatrix"
+	userD "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/domain"
 	userStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/store"
 	aeroEndpoint "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/endpoint"
 )
@@ -40,7 +42,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/subscriptions/stats/by-node/", h.StatsByNode)
 	mux.HandleFunc("POST /api/v1/subscriptions/detach-node/", h.DetachNode)
 	mux.HandleFunc("DELETE /api/v1/subscriptions/{id}/", h.Delete)
-	// 公开订阅下发路由 (双轨支持: /sub/{username}{6位随机码} 以及 老版 /sub/{secret})
+	// 私有鉴权订阅接口（客户端账号无感同步 / 用户中心内部调用）
+	mux.HandleFunc("GET /api/v1/user/subscription", h.ServePrivateSub)
+	// 节点底层应急直连路由 (/sub/{secret})
 	mux.HandleFunc("GET /sub/{param}", h.ServeSub)
 }
 
@@ -173,7 +177,118 @@ func okResp() map[string]any {
 	return map[string]any{"code": 0, "message": "success"}
 }
 
-// ServeSub 处理公开订阅获取：优先匹配用户专属 Slug，次优先匹配节点老版 32-hex Secret
+// ServePrivateSub 处理经过 Bearer Token 鉴权的用户专属订阅拉取（供客户端账号登录同步或用户中心内部展示使用）
+func (h *Handler) ServePrivateSub(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	uid, ok := ctx.Value(middleware.CtxUserID).(uint64)
+	if !ok || uid == 0 {
+		writeJSON(w, http.StatusUnauthorized, errResp(1003, "unauthorized: login required"))
+		return
+	}
+	if h.userStore == nil {
+		writeJSON(w, http.StatusInternalServerError, errResp(1006, "user store unavailable"))
+		return
+	}
+	user, err := h.userStore.GetUser(uid)
+	if err != nil || user == nil {
+		writeJSON(w, http.StatusNotFound, errResp(1001, "user not found"))
+		return
+	}
+	if !user.Status {
+		writeJSON(w, http.StatusForbidden, errResp(1003, "account disabled"))
+		return
+	}
+	if !user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt) {
+		writeJSON(w, http.StatusForbidden, errResp(1003, "subscription expired, please renew"))
+		return
+	}
+
+	isp := r.URL.Query().Get("isp")
+	h.writeUserSubscription(w, user, isp)
+}
+
+func (h *Handler) writeUserSubscription(w http.ResponseWriter, user *userD.User, isp string) {
+	var servers []map[string]any
+	if h.epStore != nil {
+		for _, ep := range h.epStore.List() {
+			host := ep.Host
+			if host == "" {
+				host = ep.IP
+			}
+			port := ep.Port
+			if port <= 0 {
+				port = 443
+			}
+			name := ep.Name
+			if name == "" {
+				name = fmt.Sprintf("VPS-%d", ep.VPSID)
+			}
+			token := user.SubToken
+			if token == "" {
+				token = "usr_" + user.Username
+			}
+			sni := host
+			if h.sniMgr != nil {
+				regionKey := ep.Region
+				if regionKey == "" {
+					regionKey = name + " " + host
+				}
+				matched := h.sniMgr.Match(isp, regionKey)
+				if matched != "" {
+					sni = matched
+				}
+			}
+			servers = append(servers, map[string]any{
+				"name":     name,
+				"address":  fmt.Sprintf("%s:%d", host, port),
+				"token":    token,
+				"sni":      sni,
+				"protocol": "tcp_h2",
+			})
+		}
+	}
+
+	if len(servers) == 0 {
+		defaultSNI := "edge.microsoft.com"
+		if h.sniMgr != nil {
+			defaultSNI = h.sniMgr.Match(isp, "DEFAULT")
+		}
+		servers = append(servers, map[string]any{
+			"name":     "Default-Edge",
+			"address":  "127.0.0.1:443",
+			"token":    user.SubToken,
+			"sni":      defaultSNI,
+			"protocol": "tcp_h2",
+		})
+	}
+
+	expireUnix := int64(0)
+	if !user.ExpireAt.IsZero() {
+		expireUnix = user.ExpireAt.Unix()
+	} else {
+		expireUnix = time.Now().AddDate(1, 0, 0).Unix()
+	}
+
+	doc := map[string]any{
+		"version":   "aero/2.0",
+		"userId":    user.Username,
+		"slug":      user.SubSlug,
+		"expireAt":  expireUnix,
+		"createdAt": user.CreatedAt.Unix(),
+		"servers":   servers,
+		"optimization": map[string]any{
+			"defaultQoS": "ultra-low-latency",
+			"ispMatched": isp,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(doc)
+}
+
+// ServeSub 处理节点底层应急直连：仅允许匹配节点老版 32-hex Secret
 func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 	param := r.PathValue("param")
 	if param == "" {
@@ -186,98 +301,10 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 轨道 1: 检查是否匹配用户专属 Slug (格式: {username}{6位随机码})
+	// 为防止明文裸 URL 泄密与外网扫描，公开接口禁止未经鉴权裸拉取
 	if h.userStore != nil {
 		if user, err := h.userStore.GetUserBySlug(param); err == nil && user != nil {
-			if !user.Status {
-				http.Error(w, "User disabled", http.StatusForbidden)
-				return
-			}
-			if !user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt) {
-				http.Error(w, "Subscription expired", http.StatusForbidden)
-				return
-			}
-
-			isp := r.URL.Query().Get("isp")
-
-			// 聚合所有在线 VPS 节点，并根据客户端网络及节点区域计算最优伪装 SNI
-			var servers []map[string]any
-			if h.epStore != nil {
-				for _, ep := range h.epStore.List() {
-					host := ep.Host
-					if host == "" {
-						host = ep.IP
-					}
-					port := ep.Port
-					if port <= 0 {
-						port = 443
-					}
-					name := ep.Name
-					if name == "" {
-						name = fmt.Sprintf("VPS-%d", ep.VPSID)
-					}
-					token := user.SubToken
-					if token == "" {
-						token = "usr_" + user.Username
-					}
-					sni := host
-					if h.sniMgr != nil {
-						regionKey := ep.Region
-						if regionKey == "" {
-							regionKey = name + " " + host
-						}
-						matched := h.sniMgr.Match(isp, regionKey)
-						if matched != "" {
-							sni = matched
-						}
-					}
-					servers = append(servers, map[string]any{
-						"name":     name,
-						"address":  fmt.Sprintf("%s:%d", host, port),
-						"token":    token,
-						"sni":      sni,
-						"protocol": "tcp_h2",
-					})
-				}
-			}
-
-			if len(servers) == 0 {
-				defaultSNI := "edge.microsoft.com"
-				if h.sniMgr != nil {
-					defaultSNI = h.sniMgr.Match(isp, "DEFAULT")
-				}
-				servers = append(servers, map[string]any{
-					"name":     "Default-Edge",
-					"address":  "127.0.0.1:443",
-					"token":    user.SubToken,
-					"sni":      defaultSNI,
-					"protocol": "tcp_h2",
-				})
-			}
-
-			expireUnix := int64(0)
-			if !user.ExpireAt.IsZero() {
-				expireUnix = user.ExpireAt.Unix()
-			} else {
-				expireUnix = time.Now().AddDate(1, 0, 0).Unix()
-			}
-
-			doc := map[string]any{
-				"version":   "aero/2.0",
-				"userId":    user.Username,
-				"slug":      user.SubSlug,
-				"expireAt":  expireUnix,
-				"createdAt": user.CreatedAt.Unix(),
-				"servers":   servers,
-				"optimization": map[string]any{
-					"defaultQoS": "ultra-low-latency",
-					"ispMatched": isp,
-				},
-			}
-
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-store")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(doc)
+			http.Error(w, "Forbidden: public slug subscription disabled for security. Use client account login or authenticated user center.", http.StatusForbidden)
 			return
 		}
 	}

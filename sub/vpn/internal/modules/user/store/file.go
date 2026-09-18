@@ -111,6 +111,16 @@ func (f *FileStore) SetStaff(id uint64, staff bool) {
 	}
 }
 
+func (f *FileStore) SetPassword(id uint64, passwordHash string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if u, ok := f.users[id]; ok {
+		u.PasswordHash = passwordHash
+		u.UpdatedAt = time.Now()
+		_ = f.persistLocked()
+	}
+}
+
 func (f *FileStore) CreateUser(u *domain.User) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -24,7 +24,7 @@ api.interceptors.response.use(
 )
 
 export const userApi = {
-  login: (u, p) => api.post('/auth/login/', { username: u, password: p }),
+  login: (u, p, portal = 'admin') => api.post('/auth/login/', { username: u, password: p, portal }),
   list: (q) => api.get('/users/', { params: q }),
   create: (d) => api.post('/users/', d),
   update: (i, d) => api.patch(`/users/${i}/`, d),

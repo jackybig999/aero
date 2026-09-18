@@ -1,7 +1,8 @@
-﻿package public
+package public
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -29,9 +30,13 @@ func RunCLI() {
 	healLeftoverAeroDNS()
 	stripProcessProxyEnv()
 	flag.Parse()
-	// Double-click / no flags: reuse last subscription written by the GUI.
-	if *subURL == "" && (*edgeAddr == "" || *token == "") && *configPath == "" {
-		if last := loadLastSubFile(); last != "" {
+	// Double-click / no flags: reuse last subscription or account credentials.
+	if *subURL == "" && (*edgeAddr == "" || *token == "") && *configPath == "" && (*subServer == "" || *subUser == "") {
+		if acc := loadLastAccount(); acc != nil {
+			*subServer = acc.Server
+			*subUser = acc.Username
+			*subPass = acc.Password
+		} else if last := loadLastSubFile(); last != "" {
 			*subURL = last
 		}
 	}
@@ -86,7 +91,13 @@ func RunCLI() {
 	}
 
 	var initialSub *sub.Applied
-	if *subURL != "" {
+	if *subServer != "" && *subUser != "" && *subPass != "" {
+		app, err := loadPrivateSubscription(*subServer, *subUser, *subPass)
+		if err != nil {
+			log.Fatalf("load private subscription failed: %v", err)
+		}
+		initialSub = app
+	} else if *subURL != "" {
 		app, err := loadSubscription(*subURL)
 		if err != nil {
 			log.Fatalf("load subscription failed: %v", err)
@@ -95,9 +106,9 @@ func RunCLI() {
 		saveLastSub(*subURL)
 	}
 
-	// 仅 -sub 即可；或 -edge + -token
+	// 仅 -server/-user/-pass 或 -sub 即可；或 -edge + -token
 	if *edgeAddr == "" || *token == "" {
-		log.Fatal("需要订阅：aero-ech -sub <url>  或先用 GUI 连接一次（会记住订阅）")
+		log.Fatal("需要订阅：aero-ech -server <url> -user <username> -pass <password>  或 -sub <url>")
 	}
 
 	pool, err := edgepool.New(*edgeAddr)
@@ -134,7 +145,9 @@ func RunCLI() {
 		st.HTTPListen = *listenAddr
 		st.Mode = "sysproxy"
 		st.Protocol = "aero/2.0"
-		if *subURL != "" {
+		if *subServer != "" && *subUser != "" {
+			st.SubURL = fmt.Sprintf("%s (user: %s)", *subServer, *subUser)
+		} else if *subURL != "" {
 			st.SubURL = *subURL
 		}
 	})
@@ -179,7 +192,9 @@ func RunCLI() {
 	}
 
 	startBackgroundServices()
-	if *subURL != "" {
+	if *subServer != "" && *subUser != "" && *subPass != "" {
+		startPrivateSubRefreshLoop(*subServer, *subUser, *subPass, initialSub)
+	} else if *subURL != "" {
 		startSubRefreshLoop(*subURL, initialSub)
 	}
 
