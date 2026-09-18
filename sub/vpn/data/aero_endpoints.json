@@ -3,6 +3,7 @@
     {
       "vps_id": 1,
       "name": "vps-a",
+      "region": "US",
       "host": "myconsun.cc.cd",
       "ip": "128.241.228.161",
       "sub_secret": "49adc46eff543149de857a49f89445b0",

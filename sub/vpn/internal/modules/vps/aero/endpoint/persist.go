@@ -30,6 +30,7 @@ type fileDTO struct {
 type infoDTO struct {
 	VPSID     uint64    `json:"vps_id"`
 	Name      string    `json:"name,omitempty"`
+	Region    string    `json:"region,omitempty"`
 	Host      string    `json:"host"`
 	IP        string    `json:"ip,omitempty"`
 	Port      int       `json:"port,omitempty"`
@@ -48,7 +49,7 @@ func toDTO(i Info) infoDTO {
 		port = 443
 	}
 	return infoDTO{
-		VPSID: i.VPSID, Name: i.Name, Host: i.Host, IP: i.IP, Port: port,
+		VPSID: i.VPSID, Name: i.Name, Region: i.Region, Host: i.Host, IP: i.IP, Port: port,
 		SubSecret: i.SubSecret, AdminKey: i.AdminKey, HasAdmin: i.HasAdmin || i.AdminKey != "",
 		SubURL: i.SubURL, Version: i.Version, Installed: i.Installed, UpdatedAt: i.UpdatedAt,
 	}
@@ -60,7 +61,7 @@ func fromDTO(d infoDTO) Info {
 		port = 443
 	}
 	return Info{
-		VPSID: d.VPSID, Name: d.Name, Host: d.Host, IP: d.IP, Port: port,
+		VPSID: d.VPSID, Name: d.Name, Region: d.Region, Host: d.Host, IP: d.IP, Port: port,
 		SubSecret: d.SubSecret, AdminKey: d.AdminKey, HasAdmin: d.HasAdmin || d.AdminKey != "",
 		SubURL: d.SubURL, Version: d.Version, Installed: d.Installed, UpdatedAt: d.UpdatedAt,
 	}

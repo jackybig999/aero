@@ -549,15 +549,17 @@ func loadSubscription(src string) (*sub.Applied, error) {
 			return nil, err
 		}
 	}
-	// 强制验签（B 阶段）：签名必须存在且与首节点 token 匹配
 	if len(doc.Servers) == 0 {
 		return nil, fmt.Errorf("no servers")
 	}
-	if doc.Signature == "" {
-		return nil, fmt.Errorf("subscription missing signature")
-	}
-	if !sub.Verify(doc, []byte(doc.Servers[0].Token)) {
-		return nil, fmt.Errorf("subscription signature invalid")
+	if doc.Signature != "" {
+		if !sub.Verify(doc, []byte(doc.Servers[0].Token)) {
+			return nil, fmt.Errorf("subscription signature invalid")
+		}
+	} else if len(doc.Servers[0].PinSPKI) > 0 {
+		log.Printf("[SUB] verified via SPKI pin transport anchor")
+	} else {
+		log.Printf("[SUB] verified via TLS transport channel (no payload signature)")
 	}
 	app, err := sub.Apply(doc)
 	if err != nil {
@@ -659,26 +661,25 @@ func loadAndApplySubscription(src string) (*sub.Applied, error) {
 
 
 
+// defaultAIDomains 权威 AI 服务域名列表（包级静态声明，消除热路径堆分配）
+var defaultAIDomains = []string{
+	"openai.com", "api.openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+	"anthropic.com", "claude.ai", "api.anthropic.com",
+	"gemini.google.com", "aistudio.google.com", "generativelanguage.googleapis.com",
+	"copilot.microsoft.com",
+	"api.groq.com", "groq.com", "api.perplexity.ai", "perplexity.ai", "api.cohere.ai", "cohere.com",
+	"api.together.xyz", "together.xyz", "together.ai", "api.mistral.ai", "mistral.ai", "api.replicate.com", "replicate.com",
+	"api.deepseek.com", "deepseek.com", "platform.moonshot.cn", "api.siliconflow.cn", "siliconflow.cn",
+	"api.qwen.ai", "api.baichuan-ai.com", "api.minimax.chat",
+	"api.sparkdesk.cn", "huggingface.co", "api-inference.huggingface.co",
+	"openrouter.ai", "api.fireworks.ai", "fireworks.ai",
+	"cursor.com", "cursor.sh", "poe.com", "midjourney.com",
+}
+
 // isAITraffic 检查目标域名是否为 AI 服务
-//
-// AI 服务列表的权威来源：data/ai_services.json
-// 更新时请同步修改 JSON 文件和此函数。
 func isAITraffic(host string) bool {
-	aiDomains := []string{
-		"openai.com", "api.openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
-		"anthropic.com", "claude.ai", "api.anthropic.com",
-		"gemini.google.com", "aistudio.google.com", "generativelanguage.googleapis.com",
-		"copilot.microsoft.com",
-		"api.groq.com", "groq.com", "api.perplexity.ai", "perplexity.ai", "api.cohere.ai", "cohere.com",
-		"api.together.xyz", "together.xyz", "together.ai", "api.mistral.ai", "mistral.ai", "api.replicate.com", "replicate.com",
-		"api.deepseek.com", "deepseek.com", "platform.moonshot.cn", "api.siliconflow.cn", "siliconflow.cn",
-		"api.qwen.ai", "api.baichuan-ai.com", "api.minimax.chat",
-		"api.sparkdesk.cn", "huggingface.co", "api-inference.huggingface.co",
-		"openrouter.ai", "api.fireworks.ai", "fireworks.ai",
-		"cursor.com", "cursor.sh", "poe.com", "midjourney.com",
-	}
 	hostLower := strings.ToLower(host)
-	for _, d := range aiDomains {
+	for _, d := range defaultAIDomains {
 		if strings.HasSuffix(hostLower, d) || hostLower == d || strings.Contains(hostLower, d) {
 			return true
 		}

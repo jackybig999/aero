@@ -130,6 +130,9 @@ func main() {
 	if s := os.Getenv("HMAC_SECRET"); s != "" {
 		hmacSecret = s
 	}
+	if hmacSecret == "dev-secret-change-me" {
+		log.Printf("[SECURITY NOTICE] Using default HMAC secret. Set HMAC_SECRET in config or env for production!")
+	}
 
 	if cfg != nil && cfg.Security.SSHCredKey != "" && os.Getenv("SSH_CRED_KEY") == "" {
 		_ = os.Setenv("SSH_CRED_KEY", cfg.Security.SSHCredKey)
@@ -296,8 +299,13 @@ func seedAdmin(svc *userS.Service, db userStore.Store) {
 		}
 		return
 	}
+	initPwd := os.Getenv("ADMIN_INIT_PASSWORD")
+	if initPwd == "" {
+		initPwd = "admin123"
+		log.Printf("[SECURITY NOTICE] Admin initialized with default password 'admin123'. Change it via ADMIN_INIT_PASSWORD or WebUI!")
+	}
 	u, err := svc.Register(domain.CreateUserParams{
-		Username: "admin", Password: "admin123", Email: "admin@vpn.local",
+		Username: "admin", Password: initPwd, Email: "admin@vpn.local",
 	})
 	if err != nil {
 		return

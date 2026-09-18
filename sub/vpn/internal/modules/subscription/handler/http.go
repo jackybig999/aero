@@ -221,7 +221,11 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 					}
 					sni := host
 					if h.sniMgr != nil {
-						matched := h.sniMgr.Match(isp, name+" "+host)
+						regionKey := ep.Region
+						if regionKey == "" {
+							regionKey = name + " " + host
+						}
+						matched := h.sniMgr.Match(isp, regionKey)
 						if matched != "" {
 							sni = matched
 						}

@@ -202,7 +202,7 @@ type h2Tunnel struct {
 	readBuf   bytes.Buffer
 	readErr   error
 	writeMu   sync.Mutex
-	closed    bool
+	closed    atomic.Bool
 	obfWriter *protocol.ObfuscateWriter
 }
 
@@ -213,7 +213,7 @@ func (t *h2Tunnel) Read(p []byte) (int, error) {
 	if t.readErr != nil {
 		return 0, t.readErr
 	}
-	if t.closed {
+	if t.closed.Load() {
 		return 0, fmt.Errorf("tunnel closed")
 	}
 
@@ -257,11 +257,10 @@ func (t *h2Tunnel) Write(p []byte) (int, error) {
 			n = len(p)
 		}
 
-		t.writeMu.Lock()
-		if t.closed {
-			t.writeMu.Unlock()
+		if t.closed.Load() {
 			return written, fmt.Errorf("tunnel closed")
 		}
+		t.writeMu.Lock()
 		err := t.framer.WriteData(t.streamID, false, p[:n])
 		t.writeMu.Unlock()
 
@@ -281,12 +280,11 @@ func (t *h2Tunnel) Write(p []byte) (int, error) {
 }
 
 func (t *h2Tunnel) Close() error {
-	t.writeMu.Lock()
-	defer t.writeMu.Unlock()
-	if t.closed {
+	if t.closed.Swap(true) {
 		return nil
 	}
-	t.closed = true
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	err1 := t.framer.WriteRSTStream(t.streamID, http2.ErrCodeCancel)
 	err2 := t.conn.Close()
 	if err2 != nil {

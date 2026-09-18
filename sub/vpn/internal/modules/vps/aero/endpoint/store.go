@@ -10,7 +10,8 @@ import (
 type Info struct {
 	VPSID      uint64    `json:"vps_id"`
 	Name       string    `json:"name,omitempty"`
-	Host       string    `json:"host"` // public host for sub URL
+	Region     string    `json:"region,omitempty"` // explicit node region: JP, HK, US, DE, SG
+	Host       string    `json:"host"`             // public host for sub URL
 	IP         string    `json:"ip,omitempty"`
 	Port       int       `json:"port,omitempty"` // edge listening port (default 443)
 	SubSecret  string    `json:"sub_secret,omitempty"`
@@ -31,6 +32,7 @@ func (i Info) Public() map[string]any {
 	return map[string]any{
 		"vps_id":     i.VPSID,
 		"name":       i.Name,
+		"region":     i.Region,
 		"host":       i.Host,
 		"ip":         i.IP,
 		"port":       port,
