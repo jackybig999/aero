@@ -47,12 +47,38 @@
 
       <main class="content">
         <div v-show="tab === 'subs'">
+          <!-- AERO 用户专属多节点聚合订阅卡片 (支持多 VPS 自动故障漂移) -->
+          <el-card shadow="never" class="panel" style="margin-bottom: 16px; border: 1px solid var(--el-color-primary-light-5); background: var(--el-fill-color-light);">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;">
+              <div>
+                <div style="font-size: 16px; font-weight: 700; margin-bottom: 6px; color: var(--el-color-primary);">
+                  🚀 AERO 多节点高可用专属订阅
+                </div>
+                <div style="font-size: 13px; color: var(--el-text-color-regular); margin-bottom: 8px;">
+                  聚合全部已授权海外 VPS 节点（香港、日本等），单链接支持智能故障漂移与断网自愈。
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <el-tag type="success" size="small">专属 Slug: {{ userSlug || '生成中' }}</el-tag>
+                  <el-tag type="info" size="small">状态: {{ userData.status !== false ? '正常可用' : '已停用' }}</el-tag>
+                  <el-tag type="warning" size="small">到期时间: {{ userData.expire_at ? fmt(userData.expire_at) : '长期有效' }}</el-tag>
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <el-input :model-value="subUrl" readonly style="width: 380px;" size="default">
+                  <template #append>
+                    <el-button type="primary" @click="copySubUrl">复制订阅链接</el-button>
+                  </template>
+                </el-input>
+              </div>
+            </div>
+          </el-card>
+
           <el-alert
             v-if="!subs.length"
             type="info"
             :closable="false"
             show-icon
-            title="暂无订阅。可购买套餐，或联系管理员为您开通节点访问。"
+            title="您也可以在下方查看或单节点单独开通。"
             style="margin-bottom: 12px"
           />
           <el-card shadow="never" class="panel">
@@ -148,12 +174,29 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Ticket, Goods, Monitor, Document, Fold, Expand } from '@element-plus/icons-vue'
-import { subApi, planApi, nodeApi, payInApi, ledgerApi } from '../api'
+import { userApi, subApi, planApi, nodeApi, payInApi, ledgerApi } from '../api'
 import { getStoredMode, applyTheme, watchSystemTheme } from '../theme'
 
 const router = useRouter()
 const user = JSON.parse(localStorage.getItem('vpn_user_user') || '{}')
 if (!user.username) router.replace('/login')
+
+const userData = ref(user)
+const userSlug = computed(() => userData.value.sub_slug || '')
+const subUrl = computed(() => {
+  const slug = userSlug.value || (userData.value.username ? userData.value.username + '888abc' : '')
+  return slug ? `${location.origin}/sub/${slug}` : ''
+})
+
+async function copySubUrl() {
+  if (!subUrl.value) return
+  try {
+    await navigator.clipboard.writeText(subUrl.value)
+    ElMessage.success('专属多节点订阅链接已复制到剪贴板！')
+  } catch {
+    ElMessage.info(subUrl.value)
+  }
+}
 
 const SIDEBAR_KEY = 'vpn_user_sidebar_collapsed'
 const collapsed = ref(localStorage.getItem(SIDEBAR_KEY) === '1')
@@ -200,7 +243,15 @@ function switchTab(t) {
 async function loadTab() {
   if (tab.value === 'subs') {
     try {
-      const uid = user.user_id
+      const uid = user.user_id || user.id
+      if (uid) {
+        userApi.get(uid).then((res) => {
+          if (res.data?.data) {
+            userData.value = { ...userData.value, ...res.data.data }
+            localStorage.setItem('vpn_user_user', JSON.stringify(userData.value))
+          }
+        }).catch(() => {})
+      }
       const r = await subApi.list(uid ? { user_id: uid } : {})
       subs.value = r.data?.data?.results || []
     } catch {

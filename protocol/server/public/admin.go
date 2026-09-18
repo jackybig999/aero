@@ -12,6 +12,7 @@ import (
 
 	"github.com/aero-protocol/aero-edge/public/internal/auth"
 	"github.com/aero-protocol/aero-edge/public/internal/cover"
+	"github.com/aero-protocol/aero-edge/public/internal/subscribe"
 )
 
 func (h *edgeHandler) adminOK(r *http.Request) bool {
@@ -61,6 +62,12 @@ func (h *edgeHandler) tryAdmin(w http.ResponseWriter, r *http.Request) bool {
 		h.adminAddToken(w, r)
 	case r.URL.Path == "/admin/tokens" && r.Method == http.MethodDelete:
 		h.adminDelToken(w, r)
+	case r.URL.Path == "/admin/subs" && r.Method == http.MethodGet:
+		h.adminListSubs(w)
+	case r.URL.Path == "/admin/subs" && r.Method == http.MethodPost:
+		h.adminUpsertSubs(w, r)
+	case r.URL.Path == "/admin/subs" && r.Method == http.MethodDelete:
+		h.adminDeleteSub(w, r)
 	case r.URL.Path == "/admin/reload" && r.Method == http.MethodPost:
 		h.adminReload(w)
 	default:
@@ -177,6 +184,108 @@ func (h *edgeHandler) adminDelToken(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]any{"ok": true, "removed": tok})
 }
+
+func (h *edgeHandler) adminListSubs(w http.ResponseWriter) {
+	if h.subHandler == nil || h.subHandler.Store == nil {
+		writeJSON(w, map[string]any{"subs": []any{}, "count": 0})
+		return
+	}
+	subs := h.subHandler.Store.ListUserSubs()
+	writeJSON(w, map[string]any{
+		"subs":       subs,
+		"count":      len(subs),
+		"legacy_sub": "/sub/" + h.subHandler.Store.Secret(),
+	})
+}
+
+type upsertSubsReq struct {
+	Username string              `json:"username"`
+	Slug     string              `json:"slug"`
+	Token    string              `json:"token"`
+	ExpireAt int64               `json:"expire_at"`
+	Servers  []subscribe.Server  `json:"servers"`
+	Subs     []subscribe.UserSub `json:"subs"`
+}
+
+func (h *edgeHandler) adminUpsertSubs(w http.ResponseWriter, r *http.Request) {
+	if h.subHandler == nil || h.subHandler.Store == nil {
+		http.Error(w, "subscription store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var req upsertSubsReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	toProcess := req.Subs
+	if req.Slug != "" {
+		toProcess = append(toProcess, subscribe.UserSub{
+			Username: req.Username,
+			Slug:     req.Slug,
+			Token:    req.Token,
+			ExpireAt: req.ExpireAt,
+			Servers:  req.Servers,
+		})
+	}
+	if len(toProcess) == 0 {
+		http.Error(w, "no subscriptions provided", http.StatusBadRequest)
+		return
+	}
+
+	synced := 0
+	for _, item := range toProcess {
+		if item.Slug == "" {
+			continue
+		}
+		if err := h.subHandler.Store.UpsertUserSub(item); err != nil {
+			http.Error(w, "upsert failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// 自动挂载该用户的 Token 进 TokenStore / Validator，免重载热生效
+		if item.Token != "" {
+			ttl := 365 * 24 * time.Hour
+			if item.ExpireAt > time.Now().Unix() {
+				ttl = time.Duration(item.ExpireAt-time.Now().Unix()) * time.Second
+			}
+			label := "user:" + item.Username
+			if item.Username == "" {
+				label = "user:" + item.Slug
+			}
+			if h.tokenStore != nil {
+				_, _ = h.tokenStore.AddReturn(item.Token, label, ttl)
+			} else if h.validator != nil {
+				h.validator.AddToken(item.Token, label, ttl)
+			}
+		}
+		synced++
+	}
+	writeJSON(w, map[string]any{"ok": true, "synced_count": synced})
+}
+
+func (h *edgeHandler) adminDeleteSub(w http.ResponseWriter, r *http.Request) {
+	if h.subHandler == nil || h.subHandler.Store == nil {
+		http.Error(w, "subscription store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	slug := r.URL.Query().Get("slug")
+	if slug == "" {
+		http.Error(w, "slug required", http.StatusBadRequest)
+		return
+	}
+	if sub, ok := h.subHandler.Store.GetUserSub(slug); ok && sub.Token != "" {
+		if h.tokenStore != nil {
+			_ = h.tokenStore.Remove(sub.Token)
+		} else if h.validator != nil {
+			h.validator.RemoveToken(sub.Token)
+		}
+	}
+	if err := h.subHandler.Store.DeleteUserSub(slug); err != nil {
+		http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "deleted_slug": slug})
+}
+
 
 func (h *edgeHandler) adminReload(w http.ResponseWriter) {
 	if h.tokenStore == nil {

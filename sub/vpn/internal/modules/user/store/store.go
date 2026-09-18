@@ -14,6 +14,7 @@ type Store interface {
 	CreateUser(u *domain.User) (uint64, error)
 	GetUser(id uint64) (*domain.User, error)
 	GetUserByUsername(username string) (*domain.User, error)
+	GetUserBySlug(slug string) (*domain.User, error)
 	ListUsers(page, pageSize int) ([]domain.User, int, error)
 	UpdateUser(id uint64, email *string, status *bool, isStaff *bool) error
 	DeleteUser(id uint64) error
@@ -78,6 +79,17 @@ func (m *MemoryStore) GetUserByUsername(username string) (*domain.User, error) {
 	defer m.mu.RUnlock()
 	for _, u := range m.users {
 		if u.Username == username { return u, nil }
+	}
+	return nil, ErrNotFound
+}
+
+func (m *MemoryStore) GetUserBySlug(slug string) (*domain.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, u := range m.users {
+		if u.SubSlug != "" && u.SubSlug == slug {
+			return u, nil
+		}
 	}
 	return nil, ErrNotFound
 }

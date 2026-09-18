@@ -120,6 +120,44 @@ func (c *Client) DelToken(token string) error {
 	return nil
 }
 
+func (c *Client) SyncSubs(body any) (map[string]any, error) {
+	raw, code, err := c.do(http.MethodPost, "/admin/subs", body)
+	if err != nil {
+		return nil, err
+	}
+	if code >= 300 {
+		return nil, fmt.Errorf("edge HTTP %d: %s", code, trim(string(raw), 120))
+	}
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	return m, nil
+}
+
+func (c *Client) ListSubs() (map[string]any, error) {
+	raw, code, err := c.do(http.MethodGet, "/admin/subs", nil)
+	if err != nil {
+		return nil, err
+	}
+	if code >= 300 {
+		return nil, fmt.Errorf("edge HTTP %d: %s", code, trim(string(raw), 120))
+	}
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	return m, nil
+}
+
+func (c *Client) DelSub(slug string) error {
+	path := "/admin/subs?slug=" + url.QueryEscape(slug)
+	raw, code, err := c.do(http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	if code >= 300 {
+		return fmt.Errorf("edge HTTP %d: %s", code, trim(string(raw), 120))
+	}
+	return nil
+}
+
 func trim(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= n {

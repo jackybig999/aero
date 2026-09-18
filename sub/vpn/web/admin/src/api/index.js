@@ -59,6 +59,8 @@ export const aeroApi = {
   deleteTask: (i) => api.delete(`/aero/tasks/${i}/`),
   clearFailed: () => api.post('/aero/tasks/clear-failed/'),
   vpsOptions: () => api.get('/aero/vps-options/'),
+  broadcastSubs: (subs) => api.post('/aero/subs/broadcast/', subs),
+  syncVpsSubs: (vps_id, subs) => api.post(`/aero/vps/${vps_id}/subs/sync/`, subs),
 }
 
 export const subApi = {

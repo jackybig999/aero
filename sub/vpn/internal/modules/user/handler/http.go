@@ -67,6 +67,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		"code": 0, "data": map[string]any{
 			"token": token, "username": user.Username,
 			"is_staff": user.IsStaff, "user_id": user.ID,
+			"sub_slug": user.SubSlug, "expire_at": user.ExpireAt,
 		},
 	})
 }

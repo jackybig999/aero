@@ -461,6 +461,37 @@ func (s *Service) DelToken(vpsID uint64, token string) error {
 	return err
 }
 
+func (s *Service) SyncSubs(vpsID uint64, subs any) (map[string]any, error) {
+	if cli, err := s.edgeFor(vpsID); err == nil {
+		if m, err2 := cli.SyncSubs(subs); err2 == nil {
+			return m, nil
+		}
+	}
+	body, _ := json.Marshal(subs)
+	raw, err := s.adminViaSSH(vpsID, "POST", "/admin/subs", string(body))
+	if err != nil {
+		return nil, fmt.Errorf("public Admin unreachable; SSH fallback failed: %w", err)
+	}
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	return m, nil
+}
+
+func (s *Service) BroadcastUserSubs(subs any) map[uint64]error {
+	results := make(map[uint64]error)
+	if s.endpoint == nil {
+		return results
+	}
+	for _, ep := range s.endpoint.List() {
+		if !ep.Installed {
+			continue
+		}
+		_, err := s.SyncSubs(ep.VPSID, subs)
+		results[ep.VPSID] = err
+	}
+	return results
+}
+
 func (s *Service) EdgeStatus(vpsID uint64) (map[string]any, error) {
 	// Full SSH diagnose is source of truth (public HTTPS Admin often broken from mid).
 	rep, err := s.Diagnose(vpsID)

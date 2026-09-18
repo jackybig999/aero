@@ -115,26 +115,42 @@
             <el-button type="primary" @click="openUserDlg()">
               {{ userKind === 'staff' ? '新增管理员' : '新增订阅用户' }}
             </el-button>
+            <el-button v-if="userKind === 'sub'" :loading="syncingSubs" @click="broadcastAllSubs">
+              一键同步用户凭证至所有 Edge VPS
+            </el-button>
           </div>
           <el-card shadow="never" class="panel-card">
             <el-table :data="filteredUsers" stripe :empty-text="userKind === 'staff' ? '暂无管理员' : '暂无订阅用户'">
               <el-table-column prop="id" label="ID" width="70" />
-              <el-table-column prop="username" label="用户名" />
-              <el-table-column prop="email" label="邮箱" />
-              <el-table-column label="类型" width="110">
+              <el-table-column prop="username" label="用户名" width="120" />
+              <el-table-column v-if="userKind === 'sub'" label="专属 Slug" min-width="160">
+                <template #default="{ row }">
+                  <el-tag size="small" type="success">{{ row.sub_slug || '未生成' }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="userKind === 'sub'" label="到期时间" min-width="160">
+                <template #default="{ row }">
+                  {{ row.expire_at ? fmt(row.expire_at) : '长期有效' }}
+                </template>
+              </el-table-column>
+              <el-table-column prop="email" label="邮箱" min-width="140" />
+              <el-table-column label="类型" width="100">
                 <template #default="{ row }">
                   <el-tag :type="row.is_staff ? 'warning' : 'primary'" size="small">
                     {{ row.is_staff ? '管理员' : '订阅用户' }}
                   </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="状态" width="90">
+              <el-table-column label="状态" width="80">
                 <template #default="{ row }">
                   <el-tag :type="row.status ? 'success' : 'danger'" size="small">{{ row.status ? '正常' : '停用' }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="200">
+              <el-table-column label="操作" :width="userKind === 'sub' ? 260 : 180" fixed="right">
                 <template #default="{ row }">
+                  <el-button v-if="!row.is_staff && row.sub_slug" size="small" type="primary" plain @click="copySubLink(row)">
+                    复制订阅
+                  </el-button>
                   <el-button size="small" @click="editUser(row)">编辑</el-button>
                   <el-button size="small" type="danger" @click="delUser(row.id)">删除</el-button>
                 </template>
@@ -1024,6 +1040,44 @@ function openTaskDetail(row) {
 watch(deployDrawer, (open) => {
   if (!open) stopTaskPoll()
 })
+
+const syncingSubs = ref(false)
+
+function copySubLink(row) {
+  if (!row.sub_slug) {
+    return ElMessage.warning('该用户暂无专属 Slug')
+  }
+  const url = `${location.origin}/sub/${row.sub_slug}`
+  navigator.clipboard.writeText(url).then(() => {
+    ElMessage.success(`用户 ${row.username} 专属订阅链接已复制！`)
+  }).catch(() => {
+    ElMessage.info(url)
+  })
+}
+
+async function broadcastAllSubs() {
+  syncingSubs.value = true
+  try {
+    const list = subUsers.value.map((u) => ({
+      username: u.username,
+      slug: u.sub_slug,
+      token: u.sub_token,
+      expire_at: u.expire_at ? Math.floor(new Date(u.expire_at).getTime() / 1000) : 0,
+    })).filter((x) => x.slug)
+
+    if (!list.length) {
+      ElMessage.warning('暂无具备专属 Slug 的订阅用户')
+      return
+    }
+
+    await aeroApi.broadcastSubs({ subs: list })
+    ElMessage.success('已广播同步用户凭证至所有在线 Edge VPS！')
+  } catch (err) {
+    ElMessage.error('同步失败: ' + (err.response?.data?.message || err.message || '网络错误'))
+  } finally {
+    syncingSubs.value = false
+  }
+}
 
 function openUserDlg() {
   userEdit.value = false

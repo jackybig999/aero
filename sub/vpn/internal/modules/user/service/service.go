@@ -3,6 +3,7 @@ package service
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -32,12 +33,18 @@ func (s *Service) Register(params domain.CreateUserParams) (*domain.User, error)
 	if params.Username == "" || params.Password == "" {
 		return nil, fmt.Errorf("username and password required")
 	}
+	slug := GenerateUserSlug(params.Username)
+	token := GenerateUserToken()
+	expire := time.Now().AddDate(1, 0, 0) // 默认 1 年有效
 	u := &domain.User{
 		Username:     params.Username,
 		PasswordHash: HashPassword(params.Password),
 		Email:        params.Email,
 		Status:       true,
 		IsStaff:      params.IsStaff,
+		SubSlug:      slug,
+		SubToken:     token,
+		ExpireAt:     expire,
 	}
 	if _, err := s.store.CreateUser(u); err != nil {
 		return nil, err
@@ -126,6 +133,7 @@ func (s *Service) VerifyToken(token string) (uint64, bool, error) {
 }
 
 func (s *Service) GetUser(id uint64) (*domain.User, error)      { return s.store.GetUser(id) }
+func (s *Service) GetUserBySlug(slug string) (*domain.User, error) { return s.store.GetUserBySlug(slug) }
 func (s *Service) ListUsers(p, ps int) ([]domain.User, int, error) {
 	if p < 1 { p = 1 }
 	if ps < 1 || ps > 100 { ps = 20 }
@@ -137,3 +145,38 @@ func (s *Service) UpdateUser(id uint64, email *string, st *bool, isStaff *bool) 
 func (s *Service) DeleteUser(id uint64) error                          { return s.store.DeleteUser(id) }
 func (s *Service) GetTraffic(uid uint64) (*domain.TrafficStats, error) { return s.store.GetTraffic(uid) }
 func (s *Service) ListPlans(active bool) ([]domain.Plan, error)        { return s.store.ListPlans(active) }
+
+// GenerateUserSlug 生成用户专属订阅 Slug: {username}{6位随机码}
+func GenerateUserSlug(username string) string {
+	clean := strings.ToLower(strings.TrimSpace(username))
+	var sb strings.Builder
+	for _, r := range clean {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		}
+	}
+	base := sb.String()
+	if base == "" {
+		base = "user"
+	}
+	return fmt.Sprintf("%s%s", base, randomCode(6))
+}
+
+func randomCode(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		return "a8b8c8"
+	}
+	for i := range b {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+	return string(b)
+}
+
+func GenerateUserToken() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("usr_%s", hex.EncodeToString(b))
+}
+

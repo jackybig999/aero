@@ -48,74 +48,89 @@ func Fetch(src string, opt FetchOptions) (*Subscription, error) {
 		}
 	}
 
-	u, err := url.Parse(src)
+	// 1. 首先尝试主订阅 URL
+	sub, body, err := tryFetchSingleURL(src, opt)
+	if err == nil && sub != nil {
+		SaveLastBody(body)
+		return sub, nil
+	}
+
+	// 2. 主 URL 失败时，尝试从缓存的历史服务器列表进行多源故障漂移 (Failover Fetch)
+	u, parseErr := url.Parse(src)
+	if parseErr == nil && u.Path != "" && strings.HasPrefix(u.Path, "/sub/") {
+		if cached := LoadLastBody(); len(cached) > 0 {
+			if lastSub, perr := ParseBytes(cached); perr == nil && len(lastSub.Servers) > 0 {
+				scheme := u.Scheme
+				if scheme == "" {
+					scheme = "https"
+				}
+				for _, srv := range lastSub.Servers {
+					altAddr := srv.Address
+					if altAddr == "" || altAddr == u.Host {
+						continue
+					}
+					// 构造备选 VPS 订阅链接
+					altURL := fmt.Sprintf("%s://%s%s", scheme, altAddr, u.Path)
+					if altSub, altBody, altErr := tryFetchSingleURL(altURL, opt); altErr == nil && altSub != nil {
+						SaveLastBody(altBody)
+						return altSub, nil
+					}
+				}
+			}
+		}
+	}
+
+	// 3. 所有网络源均不可达时，回退至本地最后一次有效缓存
+	if !opt.DisableCache {
+		if cached := LoadLastBody(); len(cached) > 0 {
+			if sub, perr := ParseBytes(cached); perr == nil {
+				return sub, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("fetch subscription (all sources failed): %w", err)
+}
+
+func tryFetchSingleURL(targetURL string, opt FetchOptions) (*Subscription, []byte, error) {
+	u, err := url.Parse(targetURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch subscription: %w", err)
+		return nil, nil, err
 	}
 	client := &http.Client{
 		Timeout: opt.Timeout,
 		Transport: &http.Transport{
-			// Force direct: never follow HTTP_PROXY env (would loop into local mixed).
 			Proxy: func(*http.Request) (*url.URL, error) { return nil, nil },
 			DialContext: dialWithHostCache,
 			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: opt.InsecureSkipVerify, //nolint:gosec // explicit opt-in for self-signed edge
+				InsecureSkipVerify: opt.InsecureSkipVerify,
 				ServerName:         u.Hostname(),
 			},
 		},
 	}
-	resp, err := client.Get(src)
+	resp, err := client.Get(targetURL)
 	if err != nil {
-		if !opt.DisableCache {
-			if cached := LoadLastBody(); len(cached) > 0 {
-				if sub, perr := ParseBytes(cached); perr == nil {
-					return sub, nil
-				}
-			}
-		}
-		return nil, fmt.Errorf("fetch subscription: %w", err)
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if !opt.DisableCache {
-			if cached := LoadLastBody(); len(cached) > 0 {
-				if sub, perr := ParseBytes(cached); perr == nil {
-					return sub, nil
-				}
-			}
-		}
-		return nil, fmt.Errorf("subscription HTTP %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		if !opt.DisableCache {
-			if cached := LoadLastBody(); len(cached) > 0 {
-				if sub, perr := ParseBytes(cached); perr == nil {
-					return sub, nil
-				}
-			}
-		}
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, nil, err
 	}
 	sub, err := ParseBytes(body)
 	if err != nil {
-		if !opt.DisableCache {
-			if cached := LoadLastBody(); len(cached) > 0 {
-				if csub, perr := ParseBytes(cached); perr == nil {
-					return csub, nil
-				}
-			}
-		}
-		return nil, err
+		return nil, nil, err
 	}
 	if host := u.Hostname(); host != "" {
 		if ips, lerr := net.DefaultResolver.LookupHost(context.Background(), host); lerr == nil {
 			saveHostIPs(host, ips)
 		}
 	}
-	SaveLastBody(body)
-	return sub, nil
+	return sub, body, nil
 }
+
 
 var hostCacheMu sync.Mutex
 

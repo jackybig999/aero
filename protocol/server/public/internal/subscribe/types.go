@@ -6,6 +6,8 @@
 // JSON 字段与 aero-ech/internal/sub 对齐。
 package subscribe
 
+import "time"
+
 // Document 对外订阅文档
 type Document struct {
 	Version   string   `json:"version"`
@@ -27,8 +29,29 @@ type Server struct {
 	PinSPKI []string `json:"pin_spki,omitempty"`
 }
 
-// Meta 本地持久化
-type Meta struct {
-	Secret   string   `json:"secret"`
-	Document Document `json:"document"`
+// UserSub 用户专属订阅结构 (格式: /sub/{username}{6位随机码})
+type UserSub struct {
+	Username  string   `json:"username"`
+	Slug      string   `json:"slug"`      // 专属 slug，如 jacky888abc
+	Token     string   `json:"token"`     // 用户专属连接 Token
+	ExpireAt  int64    `json:"expireAt"`  // 过期时间戳 (unix 秒)
+	Servers   []Server `json:"servers"`   // 分配给该用户的多 VPS 节点列表
+	Signature string   `json:"signature"` // 校验签名
+	CreatedAt int64    `json:"createdAt"` // 创建时间戳
 }
+
+// IsExpired 判断用户订阅是否已到期
+func (u *UserSub) IsExpired() bool {
+	if u.ExpireAt <= 0 {
+		return false
+	}
+	return time.Now().Unix() > u.ExpireAt
+}
+
+// Meta 本地持久化 (保持 secret 和 document 字段 100% 兼容老单节点格式)
+type Meta struct {
+	Secret   string             `json:"secret"`
+	Document Document           `json:"document"`
+	UserSubs map[string]UserSub `json:"user_subs,omitempty"`
+}
+

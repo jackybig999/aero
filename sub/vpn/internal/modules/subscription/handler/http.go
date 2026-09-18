@@ -2,16 +2,28 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/service"
+	userStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/store"
+	aeroEndpoint "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/endpoint"
 )
 
-type Handler struct{ svc *service.Service }
+type Handler struct {
+	svc       *service.Service
+	userStore userStore.Store
+	epStore   *aeroEndpoint.Persist
+}
 
 func New(svc *service.Service) *Handler { return &Handler{svc: svc} }
+
+func NewWithStores(svc *service.Service, uStore userStore.Store, ep *aeroEndpoint.Persist) *Handler {
+	return &Handler{svc: svc, userStore: uStore, epStore: ep}
+}
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/subscriptions/", h.Create)
@@ -20,6 +32,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/subscriptions/stats/by-node/", h.StatsByNode)
 	mux.HandleFunc("POST /api/v1/subscriptions/detach-node/", h.DetachNode)
 	mux.HandleFunc("DELETE /api/v1/subscriptions/{id}/", h.Delete)
+	// 公开订阅下发路由 (双轨支持: /sub/{username}{6位随机码} 以及 老版 /sub/{secret})
+	mux.HandleFunc("GET /sub/{param}", h.ServeSub)
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
@@ -150,3 +164,132 @@ func dataResp(v any) map[string]any {
 func okResp() map[string]any {
 	return map[string]any{"code": 0, "message": "success"}
 }
+
+// ServeSub 处理公开订阅获取：优先匹配用户专属 Slug，次优先匹配节点老版 32-hex Secret
+func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
+	param := r.PathValue("param")
+	if param == "" {
+		param = strings.TrimPrefix(r.URL.Path, "/sub/")
+		param = strings.Trim(param, "/")
+	}
+	if param == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// 轨道 1: 检查是否匹配用户专属 Slug (格式: {username}{6位随机码})
+	if h.userStore != nil {
+		if user, err := h.userStore.GetUserBySlug(param); err == nil && user != nil {
+			if !user.Status {
+				http.Error(w, "User disabled", http.StatusForbidden)
+				return
+			}
+			if !user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt) {
+				http.Error(w, "Subscription expired", http.StatusForbidden)
+				return
+			}
+
+			// 聚合所有在线 VPS 节点
+			var servers []map[string]any
+			if h.epStore != nil {
+				for _, ep := range h.epStore.List() {
+					host := ep.Host
+					if host == "" {
+						host = ep.IP
+					}
+					port := ep.Port
+					if port <= 0 {
+						port = 443
+					}
+					name := ep.Name
+					if name == "" {
+						name = fmt.Sprintf("VPS-%d", ep.VPSID)
+					}
+					token := user.SubToken
+					if token == "" {
+						token = "usr_" + user.Username
+					}
+					servers = append(servers, map[string]any{
+						"name":     name,
+						"address":  fmt.Sprintf("%s:%d", host, port),
+						"token":    token,
+						"sni":      host,
+						"protocol": "tcp_h2",
+					})
+				}
+			}
+
+			if len(servers) == 0 {
+				servers = append(servers, map[string]any{
+					"name":     "Default-Edge",
+					"address":  "127.0.0.1:443",
+					"token":    user.SubToken,
+					"sni":      "localhost",
+					"protocol": "tcp_h2",
+				})
+			}
+
+			expireUnix := int64(0)
+			if !user.ExpireAt.IsZero() {
+				expireUnix = user.ExpireAt.Unix()
+			} else {
+				expireUnix = time.Now().AddDate(1, 0, 0).Unix()
+			}
+
+			doc := map[string]any{
+				"version":   "aero/2.0",
+				"userId":    user.Username,
+				"slug":      user.SubSlug,
+				"expireAt":  expireUnix,
+				"createdAt": user.CreatedAt.Unix(),
+				"servers":   servers,
+				"optimization": map[string]any{
+					"defaultQoS": "ultra-low-latency",
+				},
+			}
+
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(doc)
+			return
+		}
+	}
+
+	// 轨道 2: 保持 100% 兼容老单节点密钥
+	if h.epStore != nil {
+		for _, ep := range h.epStore.List() {
+			if ep.SubSecret != "" && ep.SubSecret == param {
+				host := ep.Host
+				if host == "" {
+					host = ep.IP
+				}
+				port := ep.Port
+				if port <= 0 {
+					port = 443
+				}
+				doc := map[string]any{
+					"version":   "aero/2.0",
+					"createdAt": ep.UpdatedAt.Unix(),
+					"servers": []map[string]any{
+						{
+							"name":     ep.Name,
+							"address":  fmt.Sprintf("%s:%d", host, port),
+							"token":    ep.SubSecret,
+							"sni":      host,
+							"protocol": "tcp_h2",
+						},
+					},
+				}
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(doc)
+				return
+			}
+		}
+	}
+
+	http.NotFound(w, r)
+}
+

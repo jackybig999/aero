@@ -223,7 +223,7 @@ func main() {
 	userH.New(userSvc).RegisterRoutes(api)
 	billingH.New(billingSvc).RegisterRoutes(api)
 	nodeH.New(nodeSvc).RegisterRoutes(api)
-	subH.New(subSvc).RegisterRoutes(api)
+	subH.NewWithStores(subSvc, userDB, epStore).RegisterRoutes(api)
 	vpsH.New(vpsSvc).RegisterRoutes(api)
 	aeroH.New(aeroSvc).RegisterRoutes(api)
 	payInH.New(payInSvc).RegisterRoutes(api)
@@ -240,7 +240,7 @@ func main() {
 	pages := web.Handler(dist)
 	split := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if p == "/health" || strings.HasPrefix(p, "/api/") {
+		if p == "/health" || strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/sub/") {
 			api.ServeHTTP(w, r)
 			return
 		}
@@ -252,6 +252,7 @@ func main() {
 
 	fmt.Printf("\n  vpsserver → http://127.0.0.1:%s\n", port)
 	fmt.Printf("    /login    用户订阅\n")
+	fmt.Printf("    /sub/     专属订阅分发 (/sub/{username}{6位随机码})\n")
 	fmt.Printf("    /admin/   管理后台\n")
 	fmt.Printf("    /aero-ui/ AERO 模块控制台\n")
 	fmt.Printf("    /health   健康检查\n")

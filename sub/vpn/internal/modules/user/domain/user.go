@@ -5,14 +5,17 @@ import "time"
 
 // User represents a registered user.
 type User struct {
-	ID          uint64    `json:"id"`
-	Username    string    `json:"username"`
-	PasswordHash string   `json:"-"`
-	Email       string    `json:"email,omitempty"`
-	Status      bool      `json:"status"`
-	IsStaff     bool      `json:"is_staff"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID           uint64    `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"-"`
+	Email        string    `json:"email,omitempty"`
+	Status       bool      `json:"status"`
+	IsStaff      bool      `json:"is_staff"`
+	SubSlug      string    `json:"sub_slug,omitempty"`  // 专属订阅 Slug: {username}{6位随机码}
+	SubToken     string    `json:"sub_token,omitempty"` // 专属连接凭证
+	ExpireAt     time.Time `json:"expire_at,omitempty"` // 订阅到期时间
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // Plan represents a subscription plan.

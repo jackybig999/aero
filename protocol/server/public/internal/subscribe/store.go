@@ -37,11 +37,15 @@ func NewStore(dir string) (*Store, error) {
 		if err := json.Unmarshal(data, &s.meta); err != nil {
 			return nil, fmt.Errorf("parse sub meta: %w", err)
 		}
+		if s.meta.UserSubs == nil {
+			s.meta.UserSubs = make(map[string]UserSub)
+		}
 		return s, nil
 	}
 	if !os.IsNotExist(err) {
 		return nil, err
 	}
+	s.meta.UserSubs = make(map[string]UserSub)
 	return s, nil
 }
 
@@ -138,6 +142,87 @@ func (s *Store) Document() Document {
 	defer s.mu.RUnlock()
 	return s.meta.Document
 }
+
+// UpsertUserSub 添加或更新用户专属订阅配置
+func (s *Store) UpsertUserSub(sub UserSub) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.meta.UserSubs == nil {
+		s.meta.UserSubs = make(map[string]UserSub)
+	}
+	if sub.Slug == "" {
+		return fmt.Errorf("empty slug")
+	}
+	if sub.CreatedAt == 0 {
+		sub.CreatedAt = time.Now().Unix()
+	}
+	// 若未指定具体节点，继承默认节点并将 token 替换为用户 token
+	if len(sub.Servers) == 0 && len(s.meta.Document.Servers) > 0 {
+		defaultSrv := s.meta.Document.Servers[0]
+		defaultSrv.Token = sub.Token
+		sub.Servers = []Server{defaultSrv}
+	}
+	// 计算用户订阅文档的 HMAC-SHA256 签名
+	doc := Document{
+		Version:   "aero/2.0",
+		UserID:    sub.Username,
+		ExpireAt:  sub.ExpireAt,
+		Servers:   sub.Servers,
+		CreatedAt: sub.CreatedAt,
+	}
+	if sub.Token != "" {
+		sub.Signature = Sign(doc, []byte(sub.Token))
+	}
+	s.meta.UserSubs[sub.Slug] = sub
+	return s.saveLocked()
+}
+
+// GetUserSub 根据 slug 获取用户订阅
+func (s *Store) GetUserSub(slug string) (UserSub, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.meta.UserSubs == nil {
+		return UserSub{}, false
+	}
+	sub, ok := s.meta.UserSubs[slug]
+	return sub, ok
+}
+
+// ListUserSubs 列出所有用户订阅
+func (s *Store) ListUserSubs() []UserSub {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]UserSub, 0, len(s.meta.UserSubs))
+	for _, sub := range s.meta.UserSubs {
+		out = append(out, sub)
+	}
+	return out
+}
+
+// DeleteUserSub 根据 slug 删除用户订阅
+func (s *Store) DeleteUserSub(slug string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.meta.UserSubs == nil {
+		return nil
+	}
+	delete(s.meta.UserSubs, slug)
+	return s.saveLocked()
+}
+
+// UserDocumentJSON 序列化用户专属多节点订阅文档为 JSON
+func (s *Store) UserDocumentJSON(sub UserSub) ([]byte, error) {
+	doc := Document{
+		Version:   "aero/2.0",
+		UserID:    sub.Username,
+		ExpireAt:  sub.ExpireAt,
+		Signature: sub.Signature,
+		Servers:   sub.Servers,
+		CreatedAt: sub.CreatedAt,
+	}
+	return json.Marshal(doc)
+}
+
 
 func randomSecret(n int) (string, error) {
 	b := make([]byte, n)

@@ -24,8 +24,9 @@ api.interceptors.response.use(
 export const userApi = {
   login: (u, p) => api.post('/auth/login/', { username: u, password: p }),
   register: (u, p, e) => api.post('/users/', { username: u, password: p, email: e }),
+  get: (i) => api.get(`/users/${i}/`),
   list: (q) => api.get('/users/', { params: q }),
-  update: (i, d) => api.patch(`/users/${i}/`, d),
+  update: (i, d) => api.patch(`/users/${i}/`),
   remove: (i) => api.delete(`/users/${i}/`),
 }
 export const nodeApi = {

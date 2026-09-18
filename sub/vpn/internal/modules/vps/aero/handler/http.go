@@ -31,6 +31,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/aero/vps/{id}/diagnose/", h.Diagnose)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/cert/renew/", h.RenewCert)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/restart/", h.RestartEdge)
+	mux.HandleFunc("POST /api/v1/aero/vps/{id}/subs/sync/", h.SyncSubs)
+	mux.HandleFunc("POST /api/v1/aero/subs/broadcast/", h.BroadcastSubs)
 }
 
 func (h *Handler) Install(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +214,40 @@ func (h *Handler) RestartEdge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, dataResp(m))
+}
+
+func (h *Handler) SyncSubs(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	var body any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid json body"))
+		return
+	}
+	m, err := h.svc.SyncSubs(id, body)
+	if err != nil {
+		writeJSON(w, 502, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, 200, dataResp(m))
+}
+
+func (h *Handler) BroadcastSubs(w http.ResponseWriter, r *http.Request) {
+	var body any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid json body"))
+		return
+	}
+	results := h.svc.BroadcastUserSubs(body)
+	resMap := make(map[string]any)
+	for vpsID, err := range results {
+		k := strconv.FormatUint(vpsID, 10)
+		if err != nil {
+			resMap[k] = map[string]any{"ok": false, "error": err.Error()}
+		} else {
+			resMap[k] = map[string]any{"ok": true}
+		}
+	}
+	writeJSON(w, 200, dataResp(resMap))
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
