@@ -140,24 +140,6 @@ func main() {
 		_ = os.Setenv("WEB_ROOT", cfg.Web.Root)
 	}
 
-	userDB := userStore.NewMemoryStore()
-	userSvc := userS.New(userDB, hmacSecret)
-	seedAdmin(userSvc, userDB)
-
-	billingSvc := billingS.New(billingStore.NewMemoryStore())
-	nodeSvc := nodeS.New(nodeStore.NewMemoryStore())
-	subSvc := subS.New(subStore.NewMemoryStore())
-	ledgerSvc := ledgerS.New(ledgerStore.NewMemoryStore())
-
-	ledgerURL := env("LEDGER_URL", "http://127.0.0.1:"+port)
-	payInSvc := payInS.New(ledgerURL)
-	payOutSvc := payOutS.New()
-	settleSvc := settleS.New()
-
-	box, err := secret.NewBox()
-	if err != nil {
-		log.Fatalf("ssh crypto: %v", err)
-	}
 	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" && cfg != nil && cfg.Data.Dir != "" {
 		dataDir = cfg.Data.Dir
@@ -176,6 +158,34 @@ func main() {
 	}
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("data dir: %v", err)
+	}
+
+	userPath := filepath.Join(dataDir, "users.json")
+	var userDB userStore.Store
+	fStore, err := userStore.NewFileStore(userPath)
+	if err != nil {
+		log.Printf("[WARN] user file store failed (%v), falling back to memory", err)
+		userDB = userStore.NewMemoryStore()
+	} else {
+		userDB = fStore
+		log.Printf("user store: %s", userPath)
+	}
+	userSvc := userS.New(userDB, hmacSecret)
+	seedAdmin(userSvc, userDB)
+
+	billingSvc := billingS.New(billingStore.NewMemoryStore())
+	nodeSvc := nodeS.New(nodeStore.NewMemoryStore())
+	subSvc := subS.New(subStore.NewMemoryStore())
+	ledgerSvc := ledgerS.New(ledgerStore.NewMemoryStore())
+
+	ledgerURL := env("LEDGER_URL", "http://127.0.0.1:"+port)
+	payInSvc := payInS.New(ledgerURL)
+	payOutSvc := payOutS.New()
+	settleSvc := settleS.New()
+
+	box, err := secret.NewBox()
+	if err != nil {
+		log.Fatalf("ssh crypto: %v", err)
 	}
 	vpsPath := filepath.Join(dataDir, "vps.json")
 	vpsDB, err := vpsStore.NewFileStore(vpsPath, box)
@@ -275,7 +285,14 @@ func env(k, def string) string {
 	}
 	return def
 }
-func seedAdmin(svc *userS.Service, db *userStore.MemoryStore) {
+func seedAdmin(svc *userS.Service, db userStore.Store) {
+	existing, err := db.GetUserByUsername("admin")
+	if err == nil && existing != nil {
+		if !existing.IsStaff {
+			db.SetStaff(existing.ID, true)
+		}
+		return
+	}
 	u, err := svc.Register(domain.CreateUserParams{
 		Username: "admin", Password: "admin123", Email: "admin@vpn.local",
 	})

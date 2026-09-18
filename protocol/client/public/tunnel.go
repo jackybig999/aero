@@ -574,7 +574,11 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 	st := classifyTarget(target)
 
 	replied := false
-	for attempt := 0; attempt < 2; attempt++ {
+	maxAttempts := 2
+	if edgePool != nil && edgePool.Count() > 2 {
+		maxAttempts = 3
+	}
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if edgePool != nil && edgePool.Count() > 1 {
 			best := edgePool.Best()
 			current := getEdgeAddr()
@@ -592,7 +596,7 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 			if edgePool != nil {
 				edgePool.MarkFail(getEdgeAddr())
 			}
-			if attempt >= 1 && !replied {
+			if attempt >= maxAttempts-1 && !replied {
 				ready(false)
 				replied = true
 				_ = client.Close()
@@ -616,7 +620,7 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 			if edgePool != nil {
 				edgePool.MarkFail(getEdgeAddr())
 			}
-			if attempt >= 1 && !replied {
+			if attempt >= maxAttempts-1 && !replied {
 				ready(false)
 				_ = client.Close()
 				return

@@ -20,6 +20,7 @@ type Store interface {
 	DeleteUser(id uint64) error
 	GetTraffic(userID uint64) (*domain.TrafficStats, error)
 	ListPlans(activeOnly bool) ([]domain.Plan, error)
+	SetStaff(id uint64, staff bool)
 }
 
 type MemoryStore struct {
