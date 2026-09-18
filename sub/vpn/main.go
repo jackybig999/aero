@@ -51,6 +51,7 @@ import (
 
 	subH "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/handler"
 	subS "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/service"
+	snimatrix "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/snimatrix"
 	subStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/store"
 
 	aeroEndpoint "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/endpoint"
@@ -233,7 +234,9 @@ func main() {
 	userH.New(userSvc).RegisterRoutes(api)
 	billingH.New(billingSvc).RegisterRoutes(api)
 	nodeH.New(nodeSvc).RegisterRoutes(api)
-	subH.NewWithStores(subSvc, userDB, epStore).RegisterRoutes(api)
+	sniPath := filepath.Join(dataDir, "sni_matrix.json")
+	sniMgr := snimatrix.New(sniPath)
+	subH.NewWithStores(subSvc, userDB, epStore, sniMgr).RegisterRoutes(api)
 	vpsH.New(vpsSvc).RegisterRoutes(api)
 	aeroH.New(aeroSvc).RegisterRoutes(api)
 	payInH.New(payInSvc).RegisterRoutes(api)

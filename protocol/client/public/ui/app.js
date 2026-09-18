@@ -134,6 +134,8 @@ async function refreshStatus() {
       else tag.textContent = t('tagline')
     }
     $('stNode').textContent = st.node || '—'
+    if ($('stISP')) $('stISP').textContent = st.isp_name || st.isp || '—'
+    if ($('stSNI')) $('stSNI').textContent = st.sni || '—'
     $('stListen').textContent = st.listen || DEFAULT_LISTEN
     let rtt = st.rtt_ms
     if (!rtt && st.nodes && st.nodes.length) {

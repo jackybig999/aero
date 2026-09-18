@@ -453,11 +453,16 @@ func startSubRefreshLoop(src string, initial *sub.Applied) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	subLoopCancel = cancel
+	ispHint := ""
+	if detectedISP != 0 {
+		ispHint = detectedISP.String()
+	}
 	loop := sub.NewLoop(sub.LoopConfig{
 		Source:   src,
 		Interval: *subInterval,
 		Fetch: sub.FetchOptions{
 			InsecureSkipVerify: certloader.ShouldSkipVerify(),
+			ISPHint:            ispHint,
 		},
 		OnChange: func(app *sub.Applied) error {
 			return applySubscription(app)
@@ -524,8 +529,13 @@ func runISPAndPathProbe() {
 
 // loadSubscription 拉取订阅并写入全局 edge/token/sni（不重建 pool）
 func loadSubscription(src string) (*sub.Applied, error) {
+	ispHint := ""
+	if detectedISP != 0 {
+		ispHint = detectedISP.String()
+	}
 	doc, err := sub.Fetch(src, sub.FetchOptions{
 		InsecureSkipVerify: certloader.ShouldSkipVerify(),
+		ISPHint:            ispHint,
 	})
 	if err != nil {
 		if raw := sub.LoadLastBody(); len(raw) > 0 {

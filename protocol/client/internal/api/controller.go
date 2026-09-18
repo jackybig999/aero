@@ -28,6 +28,10 @@ type Runtime interface {
 	SubSource() string
 	// Probe optional live path check (google via local proxy). May return nil.
 	Probe() map[string]interface{}
+	// ISPInfo 返回识别到的运营商标识与显示名 (isp, ispName)
+	ISPInfo() (string, string)
+	// ActiveSNI 返回当前使用的伪装 SNI
+	ActiveSNI() string
 }
 
 // SetRuntime 注入运行时（可 nil）
@@ -55,6 +59,8 @@ func (s *Server) syncFromRuntime() {
 	mode := rt.Mode()
 	listen := rt.ListenAddr()
 	sub := rt.SubSource()
+	isp, ispName := rt.ISPInfo()
+	sni := rt.ActiveSNI()
 	var rtt uint32
 	for _, n := range nodes {
 		if n.Active || (active != "" && n.Address == active) {
@@ -74,6 +80,13 @@ func (s *Server) syncFromRuntime() {
 	}
 	s.UpdateState(func(st *AppState) {
 		st.Connected = running
+		if isp != "" {
+			st.ISP = isp
+			st.ISPName = ispName
+		}
+		if sni != "" {
+			st.SNI = sni
+		}
 		if active != "" {
 			st.Node = active
 		}

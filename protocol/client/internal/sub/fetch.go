@@ -26,6 +26,7 @@ type FetchOptions struct {
 	InsecureSkipVerify bool
 	Timeout            time.Duration
 	DisableCache       bool
+	ISPHint            string
 }
 
 // Fetch 从 URL 或本地 file:// / 路径加载订阅
@@ -95,6 +96,12 @@ func tryFetchSingleURL(targetURL string, opt FetchOptions) (*Subscription, []byt
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, nil, err
+	}
+	if opt.ISPHint != "" && !strings.Contains(u.RawQuery, "isp=") {
+		q := u.Query()
+		q.Set("isp", opt.ISPHint)
+		u.RawQuery = q.Encode()
+		targetURL = u.String()
 	}
 	client := &http.Client{
 		Timeout: opt.Timeout,

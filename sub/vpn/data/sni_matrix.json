@@ -1,0 +1,44 @@
+{
+  "version": "1.0.0",
+  "providers": {
+    "china_telecom": {
+      "name": "中国电信",
+      "default_sni": "edge.microsoft.com",
+      "routes": {
+        "JP": ["edge.microsoft.com", "gateway.icloud.com", "swdist.apple.com"],
+        "HK": ["live.azure.com", "teams.microsoft.com", "edge.microsoft.com"],
+        "US": ["edge.microsoft.com", "live.azure.com"],
+        "DE": ["edge.microsoft.com", "gateway.icloud.com"],
+        "DEFAULT": ["edge.microsoft.com", "gateway.icloud.com"]
+      }
+    },
+    "china_unicom": {
+      "name": "中国联通",
+      "default_sni": "gateway.icloud.com",
+      "routes": {
+        "JP": ["gateway.icloud.com", "swdist.apple.com", "edge.microsoft.com"],
+        "HK": ["gateway.icloud.com", "edge.microsoft.com"],
+        "DE": ["gateway.icloud.com", "edge.microsoft.com"],
+        "US": ["gateway.icloud.com", "edge.microsoft.com"],
+        "DEFAULT": ["gateway.icloud.com", "edge.microsoft.com"]
+      }
+    },
+    "china_mobile": {
+      "name": "中国移动",
+      "default_sni": "live.azure.com",
+      "routes": {
+        "HK": ["live.azure.com", "edge.microsoft.com", "s3.ap-east-1.amazonaws.com"],
+        "SG": ["live.azure.com", "edge.microsoft.com"],
+        "JP": ["live.azure.com", "swdist.apple.com"],
+        "DEFAULT": ["live.azure.com", "edge.microsoft.com"]
+      }
+    },
+    "default": {
+      "name": "通用网络",
+      "default_sni": "edge.microsoft.com",
+      "routes": {
+        "DEFAULT": ["edge.microsoft.com", "gateway.icloud.com", "live.azure.com"]
+      }
+    }
+  }
+}

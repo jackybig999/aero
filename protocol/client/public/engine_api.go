@@ -9,6 +9,7 @@ import (
 	"github.com/aero-protocol/aero-ech/internal/api"
 	"github.com/aero-protocol/aero-ech/internal/h2pool"
 	appruntime "github.com/aero-protocol/aero-ech/internal/runtime"
+	"github.com/aero-protocol/aero-ech/internal/split"
 )
 
 // -----------------------------------------------------------------------------
@@ -287,6 +288,28 @@ func (apiRuntime) Probe() map[string]interface{} {
 		"listen":    listen,
 		"node":      (apiRuntime{}).ActiveNode(),
 	}
+}
+
+func (apiRuntime) ISPInfo() (string, string) {
+	if detectedISP == 0 {
+		return "unknown", "自动探测中"
+	}
+	switch detectedISP {
+	case split.ChinaTelecom:
+		return "china_telecom", "中国电信 (China Telecom)"
+	case split.ChinaUnicom:
+		return "china_unicom", "中国联通 (China Unicom)"
+	case split.ChinaMobile:
+		return "china_mobile", "中国移动 (China Mobile)"
+	case split.ChinaBroadcast:
+		return "china_broadcast", "中国广电 (China Broadcast)"
+	default:
+		return detectedISP.String(), detectedISP.String()
+	}
+}
+
+func (apiRuntime) ActiveSNI() string {
+	return currentEdgeSNI()
 }
 
 var setModeMu sync.Mutex

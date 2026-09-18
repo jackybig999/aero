@@ -181,5 +181,38 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden for disabled user, got %d", recJackyDisabled.Code)
 	}
 
-	t.Logf("[SUCCESS] Multi-VPS User Slug & Legacy Dual-Track test passed completely!")
+	// 8. 测试服务端根据客户端 ?isp= 动态注入最匹配的 SNI
+	reqTelecom := httptest.NewRequest(http.MethodGet, "/sub/"+userAlice.SubSlug+"?isp=china_telecom", nil)
+	recTelecom := httptest.NewRecorder()
+	mux.ServeHTTP(recTelecom, reqTelecom)
+	if recTelecom.Code != http.StatusOK {
+		t.Fatalf("expected 200 for telecom query, got %d", recTelecom.Code)
+	}
+	var telecomDoc struct {
+		Servers []map[string]any `json:"servers"`
+	}
+	_ = json.Unmarshal(recTelecom.Body.Bytes(), &telecomDoc)
+	// Tokyo 节点针对电信应匹配 edge.microsoft.com
+	for _, srv := range telecomDoc.Servers {
+		if srv["name"] == "Tokyo-Edge-01" && srv["sni"] != "edge.microsoft.com" {
+			t.Errorf("expected edge.microsoft.com for Tokyo under telecom, got %v", srv["sni"])
+		}
+	}
+
+	reqUnicom := httptest.NewRequest(http.MethodGet, "/sub/"+userAlice.SubSlug+"?isp=china_unicom", nil)
+	recUnicom := httptest.NewRecorder()
+	mux.ServeHTTP(recUnicom, reqUnicom)
+	var unicomDoc struct {
+		Servers []map[string]any `json:"servers"`
+	}
+	_ = json.Unmarshal(recUnicom.Body.Bytes(), &unicomDoc)
+	// Tokyo 节点针对联通应匹配 gateway.icloud.com
+	for _, srv := range unicomDoc.Servers {
+		if srv["name"] == "Tokyo-Edge-01" && srv["sni"] != "gateway.icloud.com" {
+			t.Errorf("expected gateway.icloud.com for Tokyo under unicom, got %v", srv["sni"])
+		}
+	}
+
+	t.Logf("[SUCCESS] Multi-VPS User Slug, Legacy Dual-Track & Server-Side ISP Dynamic SNI test passed completely!")
 }
+

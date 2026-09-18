@@ -49,6 +49,9 @@ type AppState struct {
 	Nodes       []NodeInfo      `json:"nodes"`
 	Version     string          `json:"version,omitempty"`
 	Hint        string          `json:"hint,omitempty"` // UI tip: which apps need manual proxy
+	ISP         string          `json:"isp,omitempty"`
+	ISPName     string          `json:"isp_name,omitempty"`
+	SNI         string          `json:"sni,omitempty"`
 	// Live probe (filled by /api/v1/probe or status?probe=1)
 	ProbeOK     *bool  `json:"probe_ok,omitempty"`
 	ProbeMS     int64  `json:"probe_ms,omitempty"`

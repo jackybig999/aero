@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/service"
+	"github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/snimatrix"
 	userStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/store"
 	aeroEndpoint "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/endpoint"
 )
@@ -17,12 +18,19 @@ type Handler struct {
 	svc       *service.Service
 	userStore userStore.Store
 	epStore   *aeroEndpoint.Persist
+	sniMgr    *snimatrix.Manager
 }
 
-func New(svc *service.Service) *Handler { return &Handler{svc: svc} }
+func New(svc *service.Service) *Handler { return &Handler{svc: svc, sniMgr: snimatrix.New("")} }
 
-func NewWithStores(svc *service.Service, uStore userStore.Store, ep *aeroEndpoint.Persist) *Handler {
-	return &Handler{svc: svc, userStore: uStore, epStore: ep}
+func NewWithStores(svc *service.Service, uStore userStore.Store, ep *aeroEndpoint.Persist, mgr ...*snimatrix.Manager) *Handler {
+	var m *snimatrix.Manager
+	if len(mgr) > 0 && mgr[0] != nil {
+		m = mgr[0]
+	} else {
+		m = snimatrix.New("")
+	}
+	return &Handler{svc: svc, userStore: uStore, epStore: ep, sniMgr: m}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -189,7 +197,9 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// 聚合所有在线 VPS 节点
+			isp := r.URL.Query().Get("isp")
+
+			// 聚合所有在线 VPS 节点，并根据客户端网络及节点区域计算最优伪装 SNI
 			var servers []map[string]any
 			if h.epStore != nil {
 				for _, ep := range h.epStore.List() {
@@ -209,22 +219,33 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 					if token == "" {
 						token = "usr_" + user.Username
 					}
+					sni := host
+					if h.sniMgr != nil {
+						matched := h.sniMgr.Match(isp, name+" "+host)
+						if matched != "" {
+							sni = matched
+						}
+					}
 					servers = append(servers, map[string]any{
 						"name":     name,
 						"address":  fmt.Sprintf("%s:%d", host, port),
 						"token":    token,
-						"sni":      host,
+						"sni":      sni,
 						"protocol": "tcp_h2",
 					})
 				}
 			}
 
 			if len(servers) == 0 {
+				defaultSNI := "edge.microsoft.com"
+				if h.sniMgr != nil {
+					defaultSNI = h.sniMgr.Match(isp, "DEFAULT")
+				}
 				servers = append(servers, map[string]any{
 					"name":     "Default-Edge",
 					"address":  "127.0.0.1:443",
 					"token":    user.SubToken,
-					"sni":      "localhost",
+					"sni":      defaultSNI,
 					"protocol": "tcp_h2",
 				})
 			}
@@ -245,6 +266,7 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 				"servers":   servers,
 				"optimization": map[string]any{
 					"defaultQoS": "ultra-low-latency",
+					"ispMatched": isp,
 				},
 			}
 
