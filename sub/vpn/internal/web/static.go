@@ -130,6 +130,11 @@ func serveSPA(w http.ResponseWriter, r *http.Request, distDir, urlPrefix string)
 	}
 
 	if st, err := os.Stat(full); err == nil && !st.IsDir() {
+		if strings.HasSuffix(rel, ".html") {
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+		}
 		http.ServeFile(w, r, full)
 		return
 	}
@@ -139,6 +144,9 @@ func serveSPA(w http.ResponseWriter, r *http.Request, distDir, urlPrefix string)
 		return
 	}
 	// SPA fallback
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	http.ServeFile(w, r, filepath.Join(distDir, "index.html"))
 }
 

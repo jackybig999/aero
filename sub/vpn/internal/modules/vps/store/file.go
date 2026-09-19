@@ -230,6 +230,13 @@ func (f *FileStore) SetPassword(id uint64, passwordCipher string) error {
 	return f.persist()
 }
 
+func (f *FileStore) UpdateDomain(id uint64, domain string) error {
+	if err := f.mem.UpdateDomain(id, domain); err != nil {
+		return err
+	}
+	return f.persist()
+}
+
 func (f *FileStore) UpdateStatus(id uint64, status string) error {
 	if err := f.mem.UpdateStatus(id, status); err != nil {
 		return err

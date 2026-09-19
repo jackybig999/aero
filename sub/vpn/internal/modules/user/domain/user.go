@@ -8,12 +8,16 @@ type User struct {
 	ID           uint64    `json:"id"`
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"password_hash,omitempty"`
+	Phone        string    `json:"phone,omitempty"`
 	Email        string    `json:"email,omitempty"`
 	Status       bool      `json:"status"`
 	IsStaff      bool      `json:"is_staff"`
-	SubSlug      string    `json:"sub_slug,omitempty"`  // 专属订阅 Slug: {username}{6位随机码}
-	SubToken     string    `json:"sub_token,omitempty"` // 专属连接凭证
-	ExpireAt     time.Time `json:"expire_at,omitempty"` // 订阅到期时间
+	PlanName     string    `json:"plan_name,omitempty"`     // 订阅套餐: 月度套餐 / 季度套餐 / 年度套餐
+	PlanMonths   int32     `json:"plan_months,omitempty"`   // 套餐月数: 1 / 3 / 12
+	PriceCents   int64     `json:"price_cents,omitempty"`   // 套餐金额(分): 如 999 = $9.99
+	SubSlug      string    `json:"sub_slug,omitempty"`      // 专属订阅 Slug: {username}{6位随机码}
+	SubToken     string    `json:"sub_token,omitempty"`     // 专属连接凭证
+	ExpireAt     time.Time `json:"expire_at,omitempty"`     // 订阅到期时间
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -50,8 +54,12 @@ type TrafficStats struct {
 
 // CreateUserParams contains fields for user registration.
 type CreateUserParams struct {
-	Username string
-	Password string
-	Email    string
-	IsStaff  bool // true = 管理员；false = 订阅用户
+	Username   string
+	Password   string
+	Phone      string
+	Email      string
+	PlanName   string
+	PlanMonths int32
+	PriceCents int64
+	IsStaff    bool // true = 管理员；false = 订阅用户
 }

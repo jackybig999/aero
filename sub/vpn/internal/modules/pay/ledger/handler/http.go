@@ -17,10 +17,12 @@ type Handler struct {
 func New(svc *service.Service) *Handler { return &Handler{svc: svc} }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/v1/ledger/entries/", h.ListAll)
 	mux.HandleFunc("POST /api/v1/ledger/entries/", h.Record)
 	mux.HandleFunc("GET /api/v1/ledger/entries/{ledgerNo}", h.Get)
 	mux.HandleFunc("GET /api/v1/ledger/entries/unsettled/", h.ListUnsettled)
 	mux.HandleFunc("POST /api/v1/ledger/entries/settle/", h.Settle)
+	mux.HandleFunc("POST /api/v1/ledger/settle/batch/", h.SettleBatch)
 	mux.HandleFunc("GET /api/v1/ledger/summary/", h.Summary)
 }
 
@@ -78,6 +80,36 @@ func (h *Handler) Settle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, okResp())
+}
+
+func (h *Handler) ListAll(w http.ResponseWriter, r *http.Request) {
+	entries, err := h.svc.ListAll()
+	if err != nil {
+		writeJSON(w, 500, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, 200, dataResp(entries))
+}
+
+func (h *Handler) SettleBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Channel   string `json:"channel"`
+		TargetRef string `json:"target_ref"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	outEntry, count, err := h.svc.SettleBatch(req.Channel, req.TargetRef)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, err.Error()))
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"code":    0,
+		"message": "归集结算成功",
+		"data": map[string]any{
+			"settled_count": count,
+			"out_entry":     outEntry,
+		},
+	})
 }
 
 func (h *Handler) Summary(w http.ResponseWriter, r *http.Request) {

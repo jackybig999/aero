@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,9 +22,10 @@ import (
 
 // Service deploys AERO only. VPS data comes via iface.VPSProvider (in-process).
 type Service struct {
-	store    store.Store
-	vps      iface.VPSProvider
-	endpoint endpoint.Backend
+	store      store.Store
+	vps        iface.VPSProvider
+	endpoint   endpoint.Backend
+	nodeSyncer func(ep endpoint.Info)
 }
 
 func New(st store.Store, vps iface.VPSProvider) *Service {
@@ -36,6 +38,19 @@ func NewWithEndpoints(st store.Store, vps iface.VPSProvider, ep endpoint.Backend
 		ep = endpoint.NewStore()
 	}
 	return &Service{store: st, vps: vps, endpoint: ep}
+}
+
+func (s *Service) SetNodeSyncer(fn func(ep endpoint.Info)) {
+	s.nodeSyncer = fn
+}
+
+func (s *Service) saveEndpoint(ep endpoint.Info) {
+	if s.endpoint != nil {
+		s.endpoint.Upsert(ep)
+	}
+	if s.nodeSyncer != nil {
+		s.nodeSyncer(ep)
+	}
 }
 
 func (s *Service) Endpoints() endpoint.Backend { return s.endpoint }
@@ -57,6 +72,10 @@ func (s *Service) StartInstall(vpsID uint64) (*domain.DeployTask, error) {
 	cred, err := s.vps.Credentials(vpsID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch VPS credentials: %w", err)
+	}
+	hostDomain := strings.TrimSpace(cred.Domain)
+	if hostDomain == "" || net.ParseIP(hostDomain) != nil {
+		return nil, fmt.Errorf("该 VPS 未绑定合法域名 (当前: %q)，禁止部署 AERO！请先在 VPS 资产绑定域名以杜绝源站 IP 泄露", hostDomain)
 	}
 	spec, _ := artifact.ResolveDesired()
 	ver := "…"
@@ -94,12 +113,12 @@ func (s *Service) StartUninstall(vpsID uint64) (*domain.DeployTask, error) {
 
 func installSteps() []domain.DeployStep {
 	return []domain.DeployStep{
-		{Key: "resolve", Title: "解析最新制品", Status: "pending"},
+		{Key: "precheck", Title: "前置域名与环境核验", Status: "pending"},
 		{Key: "ssh", Title: "SSH 连通", Status: "pending"},
-		{Key: "detect", Title: "检测已有版本", Status: "pending"},
-		{Key: "binary", Title: "安装/升级二进制", Status: "pending"},
-		{Key: "systemd", Title: "配置 systemd", Status: "pending"},
-		{Key: "finish", Title: "验收", Status: "pending"},
+		{Key: "detect", Title: "版本与依赖检测", Status: "pending"},
+		{Key: "binary", Title: "下发 AERO 协议底座", Status: "pending"},
+		{Key: "systemd", Title: "LE 证书与服务启动", Status: "pending"},
+		{Key: "finish", Title: "服务验收上线", Status: "pending"},
 	}
 }
 
@@ -137,28 +156,56 @@ func (s *Service) runInstall(taskID uint64, cred *iface.Cred) {
 		_ = s.store.Finish(taskID, "failed", msg)
 	}
 
-	setStep(0, "running", "GitHub latest")
-	log(fmt.Sprintf("AERO 安装任务 #%d → VPS %s (%s)", taskID, cred.Name, cred.IP))
-	log("模块边界: 凭据经 VPSProvider 接口，本包只负责 Edge 包")
-	spec, err := artifact.ResolveDesired()
-	if err != nil {
-		fail(0, "解析制品失败: "+err.Error())
+	setStep(0, "running", "前置核验")
+	log(fmt.Sprintf("[1/6] AERO 安装部署任务 #%d → VPS %s (%s)", taskID, cred.Name, cred.IP))
+	domain := strings.TrimSpace(cred.Domain)
+	log(fmt.Sprintf("[1/6] 域名准入核验: %s", domain))
+	if domain == "" || net.ParseIP(domain) != nil {
+		fail(0, fmt.Sprintf("前置核验失败: VPS 未绑定有效公网域名 (%q)，严禁裸 IP 部署", domain))
 		return
 	}
-	log(fmt.Sprintf("期望 %s source=%s url=%s", spec.Tag, spec.Source, spec.URL))
+	ips, err := net.LookupIP(domain)
+	if err != nil {
+		log(fmt.Sprintf("[1/6] 提示: 域名 %s 本地 DNS 暂未返回 A 记录，若刚配置解析请稍候同步", domain))
+	} else {
+		log(fmt.Sprintf("[1/6] 域名解析正常: %s -> %v", domain, ips))
+	}
+
+	localBin := resolveLocalEdgeBin()
+	forceLocal := localBin != ""
+	var spec artifact.Spec
+	if forceLocal {
+		log("[1/6] 检测到本地制品，启用本地秒级部署: " + localBin)
+		spec = artifact.Spec{Tag: "v1.0.1-local", Source: "local-binary"}
+	} else {
+		log("[1/6] 正在解析 AERO 生产制品规范...")
+		s, err := artifact.ResolveDesired()
+		if err != nil {
+			log("[1/6] 外网 GitHub 解析受限，自动启用预置稳定制品: " + err.Error())
+			spec = artifact.Spec{
+				Tag:    "v1.0.0",
+				URL:    "https://github.com/jackybig999/aero/releases/download/v1.0.0/aero-edge-linux-amd64",
+				Source: "builtin-stable",
+			}
+		} else {
+			spec = s
+		}
+	}
+	log(fmt.Sprintf("[1/6] 制品确定: %s (来源: %s)", spec.Tag, spec.Source))
 	setStep(0, "success", spec.Tag)
 
-	setStep(1, "running", "SSH")
+	setStep(1, "running", "SSH 连通")
+	log(fmt.Sprintf("[2/6] 连接 VPS SSH %s:%d (用户: %s)...", cred.IP, cred.SSHPort, cred.SSHUsername))
 	clientSSH, err := sshprobe.Dial(sshprobe.Credentials{
 		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
 	}, 15*time.Second)
 	if err != nil {
-		fail(1, err.Error())
+		fail(1, "SSH 连通失败: "+err.Error())
 		return
 	}
 	defer clientSSH.Close()
 	setStep(1, "success", "已连接")
-	log("SSH 成功")
+	log("[2/6] SSH 成功建立，宿主机安全会话就绪")
 
 	setStep(2, "running", "VERSION 对比")
 	detOut, _ := sshprobe.Run(clientSSH, detectScript, 20*time.Second)
@@ -170,9 +217,6 @@ func (s *Service) runInstall(taskID uint64, cred *iface.Cred) {
 	det := parseDetect(detOut)
 	skipBin := det.ok && (artifact.EqualVersion(det.version, spec.Version) ||
 		(spec.SHA256 != "" && det.sha != "" && strings.EqualFold(det.sha, spec.SHA256)))
-	// Prefer local fix binary (TLS SNI/autocert bugfix) when present, even if version tag matches.
-	localBin := resolveLocalEdgeBin()
-	forceLocal := localBin != ""
 
 	if skipBin && !forceLocal {
 		log("已是最新 " + spec.Tag + "，跳过下载")
@@ -267,7 +311,7 @@ ls -lh /opt/aero/aero-edge
 	}
 	ep := parseHarvest(metaOut, cred)
 	if ep.SubSecret != "" || ep.AdminKey != "" {
-		s.endpoint.Upsert(ep)
+		s.saveEndpoint(ep)
 		log("SUB_URL=" + ep.SubURL)
 	} else {
 		log("WARN  未能解析 sub_secret，可稍后点「刷新端点」")
@@ -379,7 +423,7 @@ func (s *Service) RefreshEndpoint(vpsID uint64) error {
 		return fmt.Errorf("no edge metadata on host")
 	}
 	ep.Installed = true
-	s.endpoint.Upsert(ep)
+	s.saveEndpoint(ep)
 	return nil
 }
 
@@ -825,16 +869,12 @@ if [ "$need_issue" = "1" ] && [ -n "$DOMAIN" ]; then
   export HOME=/root
   ACME=/root/.acme.sh/acme.sh
   if [ -x "$ACME" ]; then
-    # Primary: Let's Encrypt
+    # 确保 ACME standalone 依赖 (socat 是 standalone 验证模式必需组件)
+    command -v socat >/dev/null 2>&1 || (apt-get update -y && apt-get install -y socat curl openssl 2>/dev/null || yum install -y socat curl openssl 2>/dev/null || true)
+    # 铁律：只允许使用 Let's Encrypt，严禁任何其他 CA 或自签
+    echo "[cert] 使用 acme.sh 签发纯正 Let's Encrypt ECC-256 证书..."
     $ACME --set-default-ca --server letsencrypt >/dev/null 2>&1
     $ACME --issue -d "$DOMAIN" --standalone --keylength ec-256 --force 2>&1 | tail -20
-    if [ ! -f "/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ] && [ ! -f "/root/.acme.sh/${DOMAIN}/fullchain.cer" ]; then
-      echo "CERT_STATUS=le_failed_try_zerossl"
-      # Backup CA: ZeroSSL (acme.sh built-in)
-      $ACME --set-default-ca --server zerossl >/dev/null 2>&1
-      $ACME --register-account -m "$EMAIL" >/dev/null 2>&1
-      $ACME --issue -d "$DOMAIN" --standalone --keylength ec-256 --force 2>&1 | tail -20
-    fi
     for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}"; do
       if [ -f "$d/fullchain.cer" ]; then
         cp -f "$d/fullchain.cer" "$CERT"

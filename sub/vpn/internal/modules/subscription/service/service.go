@@ -59,9 +59,6 @@ func (svc *Service) GetConfig(uuid string) (map[string]any, error) {
 		"user_id":     sub.UserID,
 		"node_id":     sub.NodeID,
 		"expire_date": sub.ExpireDate,
-		// legacy V2Ray-compatible keys (transition)
-		"v": "2", "ps": sub.NodeName, "add": sub.NodeIP, "id": sub.ClientUUID,
-		"port_legacy": sub.NodePort, "scy": sub.Security, "net": "tcp", "tls": "tls",
 	}, nil
 }
 

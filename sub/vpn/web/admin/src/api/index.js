@@ -28,6 +28,8 @@ export const userApi = {
   list: (q) => api.get('/users/', { params: q }),
   create: (d) => api.post('/users/', d),
   update: (i, d) => api.patch(`/users/${i}/`, d),
+  renew: (i, d) => api.post(`/users/${i}/renew/`, d),
+  resetSlug: (i) => api.post(`/users/${i}/reset-slug/`),
   remove: (i) => api.delete(`/users/${i}/`),
 }
 
@@ -47,7 +49,11 @@ export const vpsApi = {
   create: (d) => api.post('/vps/', d),
   remove: (i) => api.delete(`/vps/${i}/`),
   updatePassword: (i, ssh_password) => api.patch(`/vps/${i}/`, { ssh_password }),
+  updateDomain: (i, domain) => api.patch(`/vps/${i}/`, { domain }),
   probe: (i) => api.post(`/vps/${i}/probe/`, null, { timeout: 30000 }),
+  verifyDomain: (i) => api.post(`/vps/${i}/verify-domain/`, null, { timeout: 20000 }),
+  cfStatus: () => api.get('/vps/cf-dns/status/'),
+  syncCFDNS: (d) => api.post('/vps/cf-dns/sync/', d),
 }
 
 /** AERO 部署（同进程 /aero，需管理员） */
@@ -74,7 +80,9 @@ export const subApi = {
 
 export const ledgerApi = {
   summary: (d) => api.get('/ledger/summary/', { params: { date: d } }),
-  list: () => api.get('/ledger/entries/unsettled/', { params: { direction: 'IN' } }),
+  list: () => api.get('/ledger/entries/'),
+  unsettled: () => api.get('/ledger/entries/unsettled/', { params: { direction: 'IN' } }),
+  settleBatch: (d) => api.post('/ledger/settle/batch/', d || {}),
 }
 
 export const healthApi = {

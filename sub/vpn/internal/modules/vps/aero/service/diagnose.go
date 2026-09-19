@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -121,7 +122,7 @@ func (s *Service) Diagnose(vpsID uint64) (*DiagnoseReport, error) {
 	if kv["SUB_SECRET"] != "" || kv["ADMIN_KEY"] != "" {
 		ep := parseHarvest(out, cred)
 		ep.Installed = kv["SERVICE_ACTIVE"] == "yes" || ep.SubSecret != ""
-		s.endpoint.Upsert(ep)
+		s.saveEndpoint(ep)
 	}
 
 	rep := buildReport(cred, kv, out)
@@ -146,11 +147,15 @@ func (s *Service) Diagnose(vpsID uint64) (*DiagnoseReport, error) {
 	return rep, nil
 }
 
-// RenewCert clears ACME cache (optional) and restarts edge so autocert re-issues.
+// RenewCert calls acme.sh directly on VPS to renew Let's Encrypt certificate and reloads aero-edge.
 func (s *Service) RenewCert(vpsID uint64, forceClear bool) (map[string]any, error) {
 	cred, err := s.vps.Credentials(vpsID)
 	if err != nil {
 		return nil, err
+	}
+	domain := strings.TrimSpace(cred.Domain)
+	if domain == "" || net.ParseIP(domain) != nil {
+		return nil, fmt.Errorf("VPS 未绑定有效域名，无法执行 Let's Encrypt 续签")
 	}
 	c, err := sshprobe.Dial(sshprobe.Credentials{
 		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
@@ -159,27 +164,35 @@ func (s *Service) RenewCert(vpsID uint64, forceClear bool) (map[string]any, erro
 		return nil, err
 	}
 	defer c.Close()
-	script := `set +e
-systemctl is-active aero-edge
-`
-	if forceClear {
-		script += `rm -rf /var/lib/aero/certs/* /var/lib/aero/tls/* 2>/dev/null; echo "CLEARED=yes"
-`
-	} else {
-		script += `echo "CLEARED=no"
-`
-	}
-	script += `systemctl restart aero-edge
-sleep 3
+
+	script := fmt.Sprintf(`set +e
+DOMAIN=%q
+ACME=/root/.acme.sh/acme.sh
+if [ ! -x "$ACME" ]; then
+  echo "ERROR: acme.sh 未安装或不可执行"
+  exit 1
+fi
+echo "[renew] 开始向 Let's Encrypt 申请强制续签: $DOMAIN"
+$ACME --renew -d "$DOMAIN" --server letsencrypt --force 2>&1 | tail -25
+$ACME --install-cert -d "$DOMAIN" --ecc \
+  --fullchain-file /var/lib/aero/tls/fullchain.pem \
+  --key-file /var/lib/aero/tls/privkey.pem \
+  --reloadcmd "systemctl reload aero-edge 2>/dev/null || systemctl restart aero-edge" 2>/dev/null \
+  || $ACME --install-cert -d "$DOMAIN" \
+  --fullchain-file /var/lib/aero/tls/fullchain.pem \
+  --key-file /var/lib/aero/tls/privkey.pem \
+  --reloadcmd "systemctl restart aero-edge" 2>/dev/null
+echo "[renew] 证书已安装并通知服务重载，检查状态..."
+sleep 1
 systemctl is-active aero-edge | sed 's/^/SERVICE=/'
-ls -la /var/lib/aero/tls /var/lib/aero/certs 2>/dev/null | head -20
-journalctl -u aero-edge -n 25 --no-pager 2>/dev/null | tail -20
-`
-	out, err := sshprobe.Run(c, script, 40*time.Second)
+openssl x509 -in /var/lib/aero/tls/fullchain.pem -noout -enddate 2>/dev/null
+`, domain)
+
+	out, err := sshprobe.Run(c, script, 60*time.Second)
 	if err != nil {
 		return map[string]any{"ok": false, "log": out, "error": err.Error()}, err
 	}
-	// re-diagnose cert
+	// 重新调用 Diagnose 刷新中台大屏的证书天数与状态
 	rep, _ := s.Diagnose(vpsID)
 	return map[string]any{
 		"ok":      strings.Contains(out, "SERVICE=active"),

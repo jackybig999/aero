@@ -22,10 +22,15 @@ type Order struct {
 
 // Service handles payment-in order creation and ledger recording.
 type Service struct {
-	ledgerURL string
+	ledgerURL      string
+	onOrderSuccess func(userID uint64, amountCents int64)
 }
 
 func New(ledgerURL string) *Service { return &Service{ledgerURL: ledgerURL} }
+
+func (s *Service) SetOnOrderSuccess(fn func(userID uint64, amountCents int64)) {
+	s.onOrderSuccess = fn
+}
 
 // CreateOrder creates a payment order and records it in the Ledger.
 func (s *Service) CreateOrder(userID uint64, channel string, amountCents int64) (*Order, error) {
@@ -45,8 +50,12 @@ func (s *Service) CreateOrder(userID uint64, channel string, amountCents int64) 
 	// Fire and record — non-blocking if ledger is unavailable
 	http.Post(s.ledgerURL+"/api/v1/ledger/entries/", "application/json", bytes.NewReader(body))
 
+	if s.onOrderSuccess != nil && userID > 0 {
+		s.onOrderSuccess(userID, amountCents)
+	}
+
 	return &Order{
 		OrderNo: orderNo, UserID: userID, Channel: channel,
-		AmountCents: amountCents, LedgerNo: ledgerNo, Status: "pending",
+		AmountCents: amountCents, LedgerNo: ledgerNo, Status: "completed",
 	}, nil
 }

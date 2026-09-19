@@ -10,6 +10,17 @@ import (
 
 var ErrNotFound = errors.New("not found")
 
+type UpdateUserParams struct {
+	Phone      *string
+	Email      *string
+	Status     *bool
+	IsStaff    *bool
+	PlanName   *string
+	PlanMonths *int32
+	PriceCents *int64
+	ExpireAt   *time.Time
+}
+
 type Store interface {
 	CreateUser(u *domain.User) (uint64, error)
 	GetUser(id uint64) (*domain.User, error)
@@ -17,6 +28,9 @@ type Store interface {
 	GetUserBySlug(slug string) (*domain.User, error)
 	ListUsers(page, pageSize int) ([]domain.User, int, error)
 	UpdateUser(id uint64, email *string, status *bool, isStaff *bool) error
+	UpdateUserFull(id uint64, p UpdateUserParams) error
+	RenewUser(id uint64, planName string, months int32, priceCents int64) (*domain.User, error)
+	ResetSlug(id uint64, newSlug string) error
 	DeleteUser(id uint64) error
 	GetTraffic(userID uint64) (*domain.TrafficStats, error)
 	ListPlans(activeOnly bool) ([]domain.Plan, error)
@@ -124,6 +138,55 @@ func (m *MemoryStore) UpdateUser(id uint64, email *string, status *bool, isStaff
 	if email != nil { u.Email = *email }
 	if status != nil { u.Status = *status }
 	if isStaff != nil { u.IsStaff = *isStaff }
+	u.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) UpdateUserFull(id uint64, p UpdateUserParams) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[id]
+	if !ok { return ErrNotFound }
+	if p.Phone != nil { u.Phone = *p.Phone }
+	if p.Email != nil { u.Email = *p.Email }
+	if p.Status != nil { u.Status = *p.Status }
+	if p.IsStaff != nil { u.IsStaff = *p.IsStaff }
+	if p.PlanName != nil { u.PlanName = *p.PlanName }
+	if p.PlanMonths != nil { u.PlanMonths = *p.PlanMonths }
+	if p.PriceCents != nil { u.PriceCents = *p.PriceCents }
+	if p.ExpireAt != nil { u.ExpireAt = *p.ExpireAt }
+	u.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) RenewUser(id uint64, planName string, months int32, priceCents int64) (*domain.User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[id]
+	if !ok { return nil, ErrNotFound }
+	now := time.Now()
+	base := now
+	if !u.ExpireAt.IsZero() && u.ExpireAt.After(now) {
+		base = u.ExpireAt
+	}
+	if months <= 0 {
+		months = 1
+	}
+	u.ExpireAt = base.AddDate(0, int(months), 0)
+	if planName != "" { u.PlanName = planName }
+	u.PlanMonths = months
+	if priceCents > 0 { u.PriceCents = priceCents }
+	u.Status = true
+	u.UpdatedAt = now
+	return u, nil
+}
+
+func (m *MemoryStore) ResetSlug(id uint64, newSlug string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[id]
+	if !ok { return ErrNotFound }
+	u.SubSlug = newSlug
 	u.UpdatedAt = time.Now()
 	return nil
 }

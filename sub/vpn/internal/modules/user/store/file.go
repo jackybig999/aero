@@ -215,6 +215,85 @@ func (f *FileStore) UpdateUser(id uint64, email *string, status *bool, isStaff *
 	return f.persistLocked()
 }
 
+func (f *FileStore) UpdateUserFull(id uint64, p UpdateUserParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.users[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if p.Phone != nil {
+		u.Phone = *p.Phone
+	}
+	if p.Email != nil {
+		u.Email = *p.Email
+	}
+	if p.Status != nil {
+		u.Status = *p.Status
+	}
+	if p.IsStaff != nil {
+		u.IsStaff = *p.IsStaff
+	}
+	if p.PlanName != nil {
+		u.PlanName = *p.PlanName
+	}
+	if p.PlanMonths != nil {
+		u.PlanMonths = *p.PlanMonths
+	}
+	if p.PriceCents != nil {
+		u.PriceCents = *p.PriceCents
+	}
+	if p.ExpireAt != nil {
+		u.ExpireAt = *p.ExpireAt
+	}
+	u.UpdatedAt = time.Now()
+	return f.persistLocked()
+}
+
+func (f *FileStore) RenewUser(id uint64, planName string, months int32, priceCents int64) (*domain.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.users[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	now := time.Now()
+	base := now
+	if !u.ExpireAt.IsZero() && u.ExpireAt.After(now) {
+		base = u.ExpireAt
+	}
+	if months <= 0 {
+		months = 1
+	}
+	u.ExpireAt = base.AddDate(0, int(months), 0)
+	if planName != "" {
+		u.PlanName = planName
+	}
+	u.PlanMonths = months
+	if priceCents > 0 {
+		u.PriceCents = priceCents
+	}
+	u.Status = true
+	u.UpdatedAt = now
+	if err := f.persistLocked(); err != nil {
+		return nil, err
+	}
+	cp := *u
+	return &cp, nil
+}
+
+func (f *FileStore) ResetSlug(id uint64, newSlug string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.users[id]
+	if !ok {
+		return ErrNotFound
+	}
+	u.SubSlug = newSlug
+	u.UpdatedAt = time.Now()
+	return f.persistLocked()
+}
+
 func (f *FileStore) DeleteUser(id uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -17,6 +17,7 @@ var ErrNotFound = fmt.Errorf("entry not found")
 type Store interface {
 	Append(e *domain.Entry) (uint64, error)
 	GetByLedgerNo(no string) (*domain.Entry, error)
+	ListAll() ([]domain.Entry, error)
 	ListUnsettled(direction string) ([]domain.Entry, error)
 	MarkSettled(ledgerNo, settlementNo string) error
 	GetDailySummary(date time.Time) (*domain.Summary, error)
@@ -54,6 +55,16 @@ func (m *MemoryStore) GetByLedgerNo(no string) (*domain.Entry, error) {
 		return nil, ErrNotFound
 	}
 	return e, nil
+}
+
+func (m *MemoryStore) ListAll() ([]domain.Entry, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var result []domain.Entry
+	for _, e := range m.entries {
+		result = append(result, *e)
+	}
+	return result, nil
 }
 
 func (m *MemoryStore) ListUnsettled(direction string) ([]domain.Entry, error) {

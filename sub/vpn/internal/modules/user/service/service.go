@@ -35,13 +35,44 @@ func (s *Service) Register(params domain.CreateUserParams) (*domain.User, error)
 	}
 	slug := GenerateUserSlug(params.Username)
 	token := GenerateUserToken()
-	expire := time.Now().AddDate(1, 0, 0) // 默认 1 年有效
+	months := params.PlanMonths
+	if months <= 0 {
+		months = 1
+	}
+	planName := params.PlanName
+	if planName == "" {
+		if months == 3 {
+			planName = "季度套餐"
+		} else if months == 12 {
+			planName = "年度套餐"
+		} else {
+			planName = "月度套餐"
+		}
+	}
+	priceCents := params.PriceCents
+	if priceCents <= 0 {
+		if months == 3 {
+			priceCents = 2499
+		} else if months == 12 {
+			priceCents = 7999
+		} else {
+			priceCents = 999
+		}
+	}
+	expire := time.Now().AddDate(0, int(months), 0)
+	if params.IsStaff {
+		expire = time.Now().AddDate(10, 0, 0)
+	}
 	u := &domain.User{
 		Username:     params.Username,
 		PasswordHash: HashPassword(params.Password),
+		Phone:        params.Phone,
 		Email:        params.Email,
 		Status:       true,
 		IsStaff:      params.IsStaff,
+		PlanName:     planName,
+		PlanMonths:   months,
+		PriceCents:   priceCents,
 		SubSlug:      slug,
 		SubToken:     token,
 		ExpireAt:     expire,
@@ -141,6 +172,23 @@ func (s *Service) ListUsers(p, ps int) ([]domain.User, int, error) {
 }
 func (s *Service) UpdateUser(id uint64, email *string, st *bool, isStaff *bool) error {
 	return s.store.UpdateUser(id, email, st, isStaff)
+}
+func (s *Service) UpdateUserFull(id uint64, p store.UpdateUserParams) error {
+	return s.store.UpdateUserFull(id, p)
+}
+func (s *Service) RenewUser(id uint64, planName string, months int32, priceCents int64) (*domain.User, error) {
+	return s.store.RenewUser(id, planName, months, priceCents)
+}
+func (s *Service) ResetSlug(id uint64) (string, error) {
+	u, err := s.store.GetUser(id)
+	if err != nil {
+		return "", err
+	}
+	newSlug := GenerateUserSlug(u.Username)
+	if err := s.store.ResetSlug(id, newSlug); err != nil {
+		return "", err
+	}
+	return newSlug, nil
 }
 func (s *Service) DeleteUser(id uint64) error                          { return s.store.DeleteUser(id) }
 func (s *Service) GetTraffic(uid uint64) (*domain.TrafficStats, error) { return s.store.GetTraffic(uid) }

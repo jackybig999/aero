@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -211,9 +212,10 @@ func (h *Handler) writeUserSubscription(w http.ResponseWriter, user *userD.User,
 	var servers []map[string]any
 	if h.epStore != nil {
 		for _, ep := range h.epStore.List() {
-			host := ep.Host
-			if host == "" {
-				host = ep.IP
+			host := strings.TrimSpace(ep.Host)
+			// 铁律：必须有合法域名，严禁使用裸 IP，严禁泄露源站真实 IP
+			if host == "" || net.ParseIP(host) != nil {
+				continue
 			}
 			port := ep.Port
 			if port <= 0 {
@@ -301,10 +303,18 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 轨道 1: 检查是否匹配用户专属 Slug (格式: {username}{6位随机码})
-	// 为防止明文裸 URL 泄密与外网扫描，公开接口禁止未经鉴权裸拉取
 	if h.userStore != nil {
 		if user, err := h.userStore.GetUserBySlug(param); err == nil && user != nil {
-			http.Error(w, "Forbidden: public slug subscription disabled for security. Use client account login or authenticated user center.", http.StatusForbidden)
+			if !user.Status {
+				http.Error(w, `{"code": 1003, "message": "账号已停用 (Account Disabled)"}`, http.StatusForbidden)
+				return
+			}
+			if !user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt) {
+				http.Error(w, `{"code": 1003, "message": "订阅已到期，请前往用户中心续费 (Subscription Expired)"}`, http.StatusForbidden)
+				return
+			}
+			isp := r.URL.Query().Get("isp")
+			h.writeUserSubscription(w, user, isp)
 			return
 		}
 	}
@@ -313,9 +323,9 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 	if h.epStore != nil {
 		for _, ep := range h.epStore.List() {
 			if ep.SubSecret != "" && ep.SubSecret == param {
-				host := ep.Host
-				if host == "" {
-					host = ep.IP
+				host := strings.TrimSpace(ep.Host)
+				if host == "" || net.ParseIP(host) != nil {
+					continue
 				}
 				port := ep.Port
 				if port <= 0 {

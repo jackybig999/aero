@@ -15,6 +15,7 @@ type Store interface {
 	Get(id uint64) (*domain.VPSHost, string, error)
 	List() ([]domain.VPSHost, error)
 	SetPassword(id uint64, passwordCipher string) error
+	UpdateDomain(id uint64, domain string) error
 	UpdateStatus(id uint64, status string) error
 	UpdateMetrics(id uint64, m *domain.HostMetrics, status string) error
 	Delete(id uint64) error
@@ -94,6 +95,18 @@ func (m *MemoryStore) SetPassword(id uint64, passwordCipher string) error {
 	}
 	m.passwords[id] = passwordCipher
 	h.HasPassword = passwordCipher != ""
+	h.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) UpdateDomain(id uint64, domain string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.hosts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	h.Domain = domain
 	h.UpdatedAt = time.Now()
 	return nil
 }

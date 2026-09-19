@@ -42,6 +42,10 @@ func (s *Service) RecordPayment(userID uint64, amountCents int64, direction, cha
 
 func (s *Service) GetByLedgerNo(no string) (*domain.Entry, error) { return s.store.GetByLedgerNo(no) }
 
+func (s *Service) ListAll() ([]domain.Entry, error) {
+	return s.store.ListAll()
+}
+
 func (s *Service) ListUnsettled(direction string) ([]domain.Entry, error) {
 	if direction == "" { direction = "IN" }
 	return s.store.ListUnsettled(direction)
@@ -50,6 +54,38 @@ func (s *Service) ListUnsettled(direction string) ([]domain.Entry, error) {
 // MarkSettled is the ONLY allowed modification on ledger entries.
 func (s *Service) MarkSettled(ledgerNo, settlementNo string) error {
 	return s.store.MarkSettled(ledgerNo, settlementNo)
+}
+
+// SettleBatch 资金归集结算：汇总未结算 IN 流水，生成汇总 OUT 记录，并将原单标记为已结算
+func (s *Service) SettleBatch(channel, targetRef string) (*domain.Entry, int, error) {
+	unsettled, err := s.store.ListUnsettled("IN")
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(unsettled) == 0 {
+		return nil, 0, fmt.Errorf("无待结算入账记录")
+	}
+	var totalCents int64
+	for _, it := range unsettled {
+		totalCents += it.AmountCents
+	}
+	now := time.Now()
+	setNo := fmt.Sprintf("SET-%s-%04x", now.Format("20060102"), now.UnixNano()%0xffff)
+	for _, it := range unsettled {
+		_ = s.store.MarkSettled(it.LedgerNo, setNo)
+	}
+	if channel == "" {
+		channel = "PingPong"
+	}
+	if targetRef == "" {
+		targetRef = "归集账户: " + setNo
+	}
+	outEntry, err := s.RecordPayment(0, totalCents, "OUT", channel, targetRef)
+	if err != nil {
+		return nil, len(unsettled), err
+	}
+	_ = s.store.MarkSettled(outEntry.LedgerNo, setNo)
+	return outEntry, len(unsettled), nil
 }
 
 func (s *Service) GetDailySummary(date time.Time) (*domain.Summary, error) {

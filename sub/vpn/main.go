@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -182,10 +183,32 @@ func main() {
 	billingSvc := billingS.New(billingStore.NewMemoryStore())
 	nodeSvc := nodeS.New(nodeStore.NewMemoryStore())
 	subSvc := subS.New(subStore.NewMemoryStore())
-	ledgerSvc := ledgerS.New(ledgerStore.NewMemoryStore())
+
+	ledgerPath := filepath.Join(dataDir, "ledger.json")
+	var ledgerDB ledgerStore.Store
+	if lStore, err := ledgerStore.NewFileStore(ledgerPath); err == nil {
+		ledgerDB = lStore
+		log.Printf("ledger store: %s", ledgerPath)
+	} else {
+		log.Printf("[WARN] ledger file store failed (%v), falling back to memory", err)
+		ledgerDB = ledgerStore.NewMemoryStore()
+	}
+	ledgerSvc := ledgerS.New(ledgerDB)
 
 	ledgerURL := env("LEDGER_URL", "http://127.0.0.1:"+port)
 	payInSvc := payInS.New(ledgerURL)
+	payInSvc.SetOnOrderSuccess(func(userID uint64, amountCents int64) {
+		months := int32(1)
+		planName := "月度套餐"
+		if amountCents >= 7999 {
+			months = 12
+			planName = "年度套餐"
+		} else if amountCents >= 2499 {
+			months = 3
+			planName = "季度套餐"
+		}
+		_, _ = userSvc.RenewUser(userID, planName, months, amountCents)
+	})
 	payOutSvc := payOutS.New()
 	settleSvc := settleS.New()
 
@@ -214,6 +237,38 @@ func main() {
 		log.Printf("aero endpoints: loaded %d from %s", n, epPath)
 	}
 	aeroSvc := aeroS.NewWithEndpoints(aeroStore.NewMemoryStore(), vpsS.NewProvider(vpsSvc), epStore)
+
+	// 自动联动：AERO 部署/刷新成功自动推送到节点管理，免手动录入
+	syncNode := func(ep aeroEndpoint.Info) {
+		if !ep.Installed {
+			return
+		}
+		host := strings.TrimSpace(ep.Host)
+		// 铁律：没有有效域名的节点严禁推送到节点管理，杜绝裸 IP 泄露
+		if host == "" || net.ParseIP(host) != nil {
+			return
+		}
+		port := int32(ep.Port)
+		if port <= 0 {
+			port = 443
+		}
+		name := ep.Name
+		if name == "" {
+			name = fmt.Sprintf("VPS-%d", ep.VPSID)
+		}
+		nodes, _ := nodeSvc.ListAll()
+		for _, n := range nodes {
+			if n.VPSID == ep.VPSID {
+				_ = nodeSvc.Heartbeat(n.ID, ep.Version)
+				return
+			}
+		}
+		_, _ = nodeSvc.CreateNode(name, ep.Region, host, "aero-h2", port, 500, false, 100, ep.VPSID)
+	}
+	aeroSvc.SetNodeSyncer(syncNode)
+	for _, ep := range epStore.List() {
+		syncNode(ep)
+	}
 
 	api := http.NewServeMux()
 	api.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

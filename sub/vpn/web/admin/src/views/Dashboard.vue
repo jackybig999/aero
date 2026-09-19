@@ -121,24 +121,40 @@
           </div>
           <el-card shadow="never" class="panel-card">
             <el-table :data="filteredUsers" stripe :empty-text="userKind === 'staff' ? '暂无管理员' : '暂无订阅用户'">
-              <el-table-column prop="id" label="ID" width="70" />
-              <el-table-column prop="username" label="用户名" width="120" />
-              <el-table-column v-if="userKind === 'sub'" label="专属 Slug" min-width="160">
-                <template #default="{ row }">
-                  <el-tag size="small" type="success">{{ row.sub_slug || '未生成' }}</el-tag>
-                </template>
+              <el-table-column prop="id" label="ID" width="60" />
+              <el-table-column prop="username" label="用户名" min-width="110" />
+              <el-table-column label="手机号" min-width="120">
+                <template #default="{ row }">{{ row.phone || '—' }}</template>
               </el-table-column>
-              <el-table-column v-if="userKind === 'sub'" label="到期时间" min-width="160">
-                <template #default="{ row }">
-                  {{ row.expire_at ? fmt(row.expire_at) : '长期有效' }}
-                </template>
+              <el-table-column label="邮箱" min-width="130">
+                <template #default="{ row }">{{ row.email || '—' }}</template>
               </el-table-column>
-              <el-table-column prop="email" label="邮箱" min-width="140" />
-              <el-table-column label="类型" width="100">
+              <el-table-column label="套餐类型" min-width="110">
                 <template #default="{ row }">
-                  <el-tag :type="row.is_staff ? 'warning' : 'primary'" size="small">
-                    {{ row.is_staff ? '管理员' : '订阅用户' }}
+                  <el-tag size="small" :type="row.is_staff ? 'warning' : 'primary'">
+                    {{ row.is_staff ? '系统管理' : (row.plan_name || '月度套餐') }}
                   </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="金额" width="90">
+                <template #default="{ row }">
+                  {{ row.is_staff ? '—' : (row.price_cents ? ('$' + (row.price_cents / 100).toFixed(2)) : '$9.99') }}
+                </template>
+              </el-table-column>
+              <el-table-column label="有效期" min-width="150">
+                <template #default="{ row }">
+                  <span v-if="row.is_staff" class="muted">长期有效</span>
+                  <el-tag v-else-if="isExpired(row)" size="small" type="danger">已过期 ({{ fmt(row.expire_at) }})</el-tag>
+                  <el-tag v-else size="small" type="success">{{ row.expire_at ? fmt(row.expire_at) : '长期有效' }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="userKind === 'sub'" label="专属订阅地址" min-width="260">
+                <template #default="{ row }">
+                  <div v-if="row.sub_slug" style="display: flex; align-items: center; gap: 6px;">
+                    <el-input :model-value="subURL(row.sub_slug)" size="small" readonly style="font-size: 11px;" />
+                    <el-button size="small" type="primary" plain @click="copySubURL(row)">复制</el-button>
+                  </div>
+                  <span v-else class="muted">未生成</span>
                 </template>
               </el-table-column>
               <el-table-column label="状态" width="80">
@@ -146,10 +162,10 @@
                   <el-tag :type="row.status ? 'success' : 'danger'" size="small">{{ row.status ? '正常' : '停用' }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" :width="userKind === 'sub' ? 260 : 180" fixed="right">
+              <el-table-column label="操作" :width="userKind === 'sub' ? 240 : 160" fixed="right">
                 <template #default="{ row }">
-                  <el-button v-if="!row.is_staff && row.sub_slug" size="small" type="primary" plain @click="copySubLink(row)">
-                    复制凭证
+                  <el-button v-if="!row.is_staff" size="small" type="success" plain @click="openRenewDlg(row)">
+                    续费
                   </el-button>
                   <el-button size="small" @click="editUser(row)">编辑</el-button>
                   <el-button size="small" type="danger" @click="delUser(row.id)">删除</el-button>
@@ -167,78 +183,96 @@
             :closable="false"
             show-icon
             style="margin-bottom: 12px"
-            title="本页只管理 VPS 机器（登记/探测/密码）。安装 AERO 请到左侧「AERO」模块，两模块通过 HTTP 接口协作。"
+            title="本页管理 VPS 集群资产与域名绑定。已实现公网 DNS 实时复核与 Cloudflare 灰云 (proxied: false) 自动化防封解析。"
           />
-          <div class="toolbar">
-            <el-button type="primary" @click="openVpsDlg">添加 VPS</el-button>
-            <el-button @click="refreshVpsAll" :loading="vpsRefreshing">刷新探测</el-button>
-            <el-switch v-model="vpsAutoProbe" active-text="自动探测" inactive-text="" style="margin-left: 8px" />
-            <span class="muted">仅 CPU/内存等 · 删除只去掉中台登记，不卸 Edge</span>
+          <div class="toolbar" style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <el-button type="primary" @click="openVpsDlg">添加 VPS</el-button>
+              <el-button @click="refreshVpsAll" :loading="vpsRefreshing">刷新探测</el-button>
+              <el-button :loading="verifyingAllDNS" @click="verifyAllDomains">批量复核域名/CF</el-button>
+              <el-switch v-model="vpsAutoProbe" active-text="自动探测" inactive-text="" style="margin-left: 8px" />
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <el-tag :type="cfReady ? 'success' : 'info'" effect="plain" size="small">
+                {{ cfReady ? '🟢 Cloudflare 灰云自动化: 已就绪' : '⚪ Cloudflare: 未配置 Token (仅公网DNS)' }}
+              </el-tag>
+            </div>
           </div>
 
           <el-empty v-if="!vpsList.length" description="尚未登记 VPS" />
 
-          <div v-for="v in vpsList" :key="v.id" class="vps-card">
-            <div class="vps-card-hd">
-              <div class="vps-id">
-                <el-tag size="small" effect="dark" type="info">{{ v.role || 'node' }}</el-tag>
-                <span class="vps-name">{{ v.name }}</span>
-                <el-tag size="small" :type="vpsStatusType(v.status)">{{ vpsStatusLabel(v.status) }}</el-tag>
+          <!-- 紧凑响应式多 VPS 网格布局 -->
+          <div v-else class="vps-grid">
+            <div v-for="v in vpsList" :key="v.id" class="vps-card">
+              <div class="vps-card-hd">
+                <div class="vps-id">
+                  <el-tag size="small" effect="dark" type="info">{{ v.role || 'node' }}</el-tag>
+                  <span class="vps-name">{{ v.name }}</span>
+                  <el-tag size="small" :type="vpsStatusType(v.status)">{{ vpsStatusLabel(v.status) }}</el-tag>
+                  <el-tag size="small" :type="dnsStatusTagType(v)" effect="plain">
+                    {{ dnsStatusLabel(v) }}
+                  </el-tag>
+                </div>
+                <div class="vps-actions">
+                  <el-button size="small" :loading="probingId === v.id" @click="probeVps(v)">探测</el-button>
+                  <el-button size="small" type="primary" plain :loading="verifyingId === v.id" @click="verifyDomain(v)">
+                    复核域名/CF
+                  </el-button>
+                  <el-button size="small" @click="openEditDomainDlg(v)">改域名</el-button>
+                  <el-button size="small" @click="updateVpsPassword(v)">改密码</el-button>
+                  <el-button size="small" type="danger" plain @click="delVps(v.id)">删除</el-button>
+                </div>
               </div>
-              <div class="vps-actions">
-                <el-button size="small" :loading="probingId === v.id" @click="probeVps(v)">探测状态</el-button>
-                <el-button size="small" @click="updateVpsPassword(v)">改密码</el-button>
-                <el-button size="small" type="danger" plain @click="delVps(v.id)">删除登记</el-button>
-              </div>
-            </div>
-            <div class="vps-meta">
-              <span>{{ v.ssh_username }}@{{ v.ip }}:{{ v.ssh_port }}</span>
-              <span v-if="v.domain">· {{ v.domain }}</span>
-              <span v-if="v.metrics?.latency_ms != null">· 延迟 {{ v.metrics.latency_ms }}ms</span>
-              <span v-if="v.metrics?.os">· {{ v.metrics.os }}/{{ v.metrics.arch }}</span>
-              <span v-if="v.last_probe_at" class="muted">· 探测 {{ fmt(v.last_probe_at) }}</span>
-            </div>
 
-            <div v-if="v.metrics && v.metrics.probe_ok" class="metric-grid">
-              <div class="metric-item" :class="metricLevel(v.metrics.cpu_percent)">
-                <div class="metric-label">CPU</div>
-                <div class="metric-value">{{ fmtNum(v.metrics.cpu_percent) }}%</div>
-                <el-progress :percentage="clampPct(v.metrics.cpu_percent)" :show-text="false" :stroke-width="6" :status="progStatus(v.metrics.cpu_percent)" />
+              <div class="vps-meta">
+                <span>{{ v.ssh_username }}@{{ v.ip }}:{{ v.ssh_port }}</span>
+                <span v-if="v.domain" style="font-weight: 600; color: var(--app-text, #333);">· 域名: {{ v.domain }}</span>
+                <span v-if="v.metrics?.latency_ms != null">· 延迟 {{ v.metrics.latency_ms }}ms</span>
+                <span v-if="v.metrics?.os">· {{ v.metrics.os }}/{{ v.metrics.arch }}</span>
+                <span v-if="v.last_probe_at" class="muted">· 探测 {{ fmt(v.last_probe_at) }}</span>
               </div>
-              <div class="metric-item" :class="metricLevel(v.metrics.mem_percent)">
-                <div class="metric-label">内存</div>
-                <div class="metric-value">{{ fmtNum(v.metrics.mem_percent) }}%</div>
-                <div class="metric-sub">{{ fmtNum(v.metrics.mem_used_mb) }} / {{ fmtNum(v.metrics.mem_total_mb) }} MB</div>
-                <el-progress :percentage="clampPct(v.metrics.mem_percent)" :show-text="false" :stroke-width="6" :status="progStatus(v.metrics.mem_percent)" />
-              </div>
-              <div class="metric-item" :class="metricLevel(v.metrics.disk_percent)">
-                <div class="metric-label">磁盘</div>
-                <div class="metric-value">{{ fmtNum(v.metrics.disk_percent) }}%</div>
-                <div class="metric-sub">{{ fmtNum(v.metrics.disk_used_gb) }} / {{ fmtNum(v.metrics.disk_total_gb) }} GB</div>
-                <el-progress :percentage="clampPct(v.metrics.disk_percent)" :show-text="false" :stroke-width="6" :status="progStatus(v.metrics.disk_percent)" />
-              </div>
-              <div class="metric-item">
-                <div class="metric-label">负载 Load</div>
-                <div class="metric-value sm">{{ fmtNum(v.metrics.load_1, 2) }}</div>
-                <div class="metric-sub">5m {{ fmtNum(v.metrics.load_5, 2) }} · 15m {{ fmtNum(v.metrics.load_15, 2) }}</div>
-              </div>
-              <div class="metric-item">
-                <div class="metric-label">网络</div>
-                <div class="metric-value sm">↓{{ fmtNum(v.metrics.net_rx_mbps, 2) }}</div>
-                <div class="metric-sub">↑ {{ fmtNum(v.metrics.net_tx_mbps, 2) }} Mbps</div>
-              </div>
-              <div class="metric-item">
-                <div class="metric-label">运行时间</div>
-                <div class="metric-value sm">{{ fmtUptime(v.metrics.uptime_sec) }}</div>
-                <div class="metric-sub">来源 {{ v.metrics.source || 'ssh' }}</div>
-              </div>
-            </div>
-            <div v-else class="metric-empty">
-              <span class="muted">
-                {{ v.metrics?.probe_error ? ('探测失败：' + v.metrics.probe_error) : '尚未采集运行状态，点击「探测状态」或开启自动探测' }}
-              </span>
-            </div>
 
+              <!-- 紧凑型指标面板 (Mini Metrics Dashboard) -->
+              <div v-if="v.metrics && v.metrics.probe_ok" class="metric-compact-row">
+                <div class="mc-item">
+                  <span class="mc-label">CPU</span>
+                  <span class="mc-val">{{ fmtNum(v.metrics.cpu_percent) }}%</span>
+                  <el-progress :percentage="clampPct(v.metrics.cpu_percent)" :show-text="false" :stroke-width="4" :status="progStatus(v.metrics.cpu_percent)" style="width: 46px;" />
+                </div>
+                <div class="mc-divider"></div>
+                <div class="mc-item">
+                  <span class="mc-label">内存</span>
+                  <span class="mc-val">{{ fmtNum(v.metrics.mem_percent) }}%</span>
+                  <span class="mc-sub">({{ fmtNum(v.metrics.mem_used_mb) }}M)</span>
+                </div>
+                <div class="mc-divider"></div>
+                <div class="mc-item">
+                  <span class="mc-label">磁盘</span>
+                  <span class="mc-val">{{ fmtNum(v.metrics.disk_percent) }}%</span>
+                  <span class="mc-sub">({{ fmtNum(v.metrics.disk_used_gb) }}G)</span>
+                </div>
+                <div class="mc-divider"></div>
+                <div class="mc-item">
+                  <span class="mc-label">负载</span>
+                  <span class="mc-val">{{ fmtNum(v.metrics.load_1, 2) }}</span>
+                </div>
+                <div class="mc-divider"></div>
+                <div class="mc-item">
+                  <span class="mc-label">网络</span>
+                  <span class="mc-val">↓{{ fmtNum(v.metrics.net_rx_mbps, 1) }} / ↑{{ fmtNum(v.metrics.net_tx_mbps, 1) }}</span>
+                </div>
+                <div class="mc-divider"></div>
+                <div class="mc-item">
+                  <span class="mc-label">运行</span>
+                  <span class="mc-val">{{ fmtUptime(v.metrics.uptime_sec) }}</span>
+                </div>
+              </div>
+              <div v-else class="metric-empty" style="padding: 6px 0; font-size: 12px;">
+                <span class="muted">
+                  {{ v.metrics?.probe_error ? ('探测失败：' + v.metrics.probe_error) : '尚未采集运行状态，点击「探测」或开启自动探测' }}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -315,68 +349,48 @@
           </el-card>
         </div>
 
-        <!-- 订阅：给「订阅用户」开节点访问（一用户可多条，一节点可多人） -->
-        <div v-show="tab === 'subs'">
-          <el-alert
-            type="info"
-            :closable="false"
-            show-icon
-            style="margin-bottom: 12px"
-            title="订阅 = 用户专属凭据，绑定某个节点。同一节点可挂很多用户。"
-          />
-          <div class="toolbar">
-            <el-button type="primary" @click="openSubDlg">开通订阅</el-button>
-            <span class="muted">订阅用户 {{ subUsers.length }} 人 · 在线节点 {{ onlineNodes.length }} 个</span>
+        <!-- 账本：收支明细与资金归集出账 -->
+        <div v-show="tab === 'ledger'">
+          <div class="toolbar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+              <el-radio-group v-model="ledgerFilter" size="default">
+                <el-radio-button value="all">全部明细 ({{ llist.length }})</el-radio-button>
+                <el-radio-button value="in">入账 IN ({{ inEntries.length }})</el-radio-button>
+                <el-radio-button value="out">出账 OUT ({{ outEntries.length }})</el-radio-button>
+                <el-radio-button value="unsettled">待归集 ({{ unsettledEntries.length }})</el-radio-button>
+              </el-radio-group>
+              <span class="muted">累计入账: ${{ (totalInCents / 100).toFixed(2) }} · 累计出账: ${{ (totalOutCents / 100).toFixed(2) }}</span>
+            </div>
+            <el-button type="primary" :loading="settling" @click="doBatchSettle">
+              一键资金归集/结算
+            </el-button>
           </div>
           <el-card shadow="never" class="panel-card">
-            <el-table :data="slist" stripe empty-text="暂无订阅，请先为订阅用户开通">
-              <el-table-column prop="id" label="ID" width="60" />
-              <el-table-column label="用户" width="120">
-                <template #default="{ row }">{{ userName(row.user_id) }}</template>
-              </el-table-column>
-              <el-table-column label="节点" min-width="140">
+            <el-table :data="filteredLedger" stripe empty-text="暂无账本记录">
+              <el-table-column prop="ledger_no" label="账本流水号" min-width="190" />
+              <el-table-column label="方向" width="90">
                 <template #default="{ row }">
-                  {{ row.node_name || nodeName(row.node_id) }}
-                  <span class="muted"> #{{ row.node_id }}</span>
+                  <el-tag :type="row.direction === 'IN' ? 'success' : 'warning'" size="small">
+                    {{ row.direction === 'IN' ? '收入 IN' : '支出 OUT' }}
+                  </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column prop="client_uuid" label="客户端 UUID" min-width="200" show-overflow-tooltip />
-              <el-table-column label="到期" width="160">
-                <template #default="{ row }">{{ fmt(row.expire_date) }}</template>
-              </el-table-column>
-              <el-table-column label="状态" width="80">
+              <el-table-column label="金额" width="110">
                 <template #default="{ row }">
-                  <el-tag size="small" :type="subActive(row) ? 'success' : 'info'">{{ subActive(row) ? '有效' : '过期' }}</el-tag>
+                  <b :style="{ color: row.direction === 'IN' ? 'var(--el-color-success)' : 'var(--el-color-warning)' }">
+                    {{ row.direction === 'IN' ? '+' : '-' }}${{ (Number(row.amount_cents || 0) / 100).toFixed(2) }}
+                  </b>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="180" fixed="right">
+              <el-table-column prop="channel" label="支付/归集渠道" width="130" />
+              <el-table-column label="归集结算状态" width="140">
                 <template #default="{ row }">
-                  <el-button size="small" @click="copySubCfg(row)">复制配置</el-button>
-                  <el-button size="small" type="danger" @click="delSub(row.id)">删除</el-button>
+                  <el-tag v-if="row.settled" size="small" type="info">已归集</el-tag>
+                  <el-tag v-else size="small" type="warning">待结算</el-tag>
                 </template>
               </el-table-column>
-            </el-table>
-          </el-card>
-        </div>
-
-        <!-- 账本 -->
-        <div v-show="tab === 'ledger'">
-          <el-card shadow="never" class="panel-card">
-            <el-table :data="llist" stripe empty-text="暂无账本记录">
-              <el-table-column prop="ledger_no" label="账本号" min-width="180" />
-              <el-table-column label="方向" width="80">
-                <template #default="{ row }">
-                  <el-tag :type="row.direction === 'IN' ? 'success' : 'warning'" size="small">{{ row.direction }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="金额" width="100">
-                <template #default="{ row }">${{ (Number(row.amount_cents || 0) / 100).toFixed(2) }}</template>
-              </el-table-column>
-              <el-table-column prop="channel" label="渠道" width="90" />
-              <el-table-column label="结算" width="70">
-                <template #default="{ row }">{{ row.settled ? '是' : '否' }}</template>
-              </el-table-column>
-              <el-table-column label="时间" width="170">
+              <el-table-column prop="channel_ref" label="关联单号 / 备注" min-width="160" show-overflow-tooltip />
+              <el-table-column label="流水时间" width="170">
                 <template #default="{ row }">{{ fmt(row.created_at) }}</template>
               </el-table-column>
             </el-table>
@@ -386,21 +400,51 @@
     </div>
 
     <!-- dialogs -->
-    <el-dialog v-model="userDlg" :title="userEdit ? '编辑用户' : (uf.is_staff ? '新增管理员' : '新增订阅用户')" width="420px" destroy-on-close>
-      <el-form label-width="80px">
+    <el-dialog v-model="userDlg" :title="userEdit ? '编辑用户' : (uf.is_staff ? '新增管理员' : '新增订阅用户')" width="460px" destroy-on-close>
+      <el-form label-width="90px">
         <el-form-item label="用户名"><el-input v-model="uf.username" :disabled="userEdit" /></el-form-item>
         <el-form-item v-if="!userEdit" label="密码"><el-input v-model="uf.password" type="password" show-password /></el-form-item>
-        <el-form-item label="邮箱"><el-input v-model="uf.email" /></el-form-item>
+        <el-form-item label="手机号"><el-input v-model="uf.phone" placeholder="选填，如 13800138000" /></el-form-item>
+        <el-form-item label="邮箱"><el-input v-model="uf.email" placeholder="选填，如 user@domain.com" /></el-form-item>
         <el-form-item label="类型">
           <el-radio-group v-model="uf.is_staff" :disabled="userEdit && uf.username === 'admin'">
             <el-radio :value="true">管理员</el-radio>
             <el-radio :value="false">订阅用户</el-radio>
           </el-radio-group>
         </el-form-item>
+        <el-form-item v-if="!uf.is_staff" label="开通套餐">
+          <el-select v-model="uf.plan_months" style="width: 100%">
+            <el-option :value="1" label="月度套餐 (1个月) - $9.99" />
+            <el-option :value="3" label="季度套餐 (3个月) - $24.99" />
+            <el-option :value="12" label="年度套餐 (12个月) - $79.99" />
+          </el-select>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="userDlg = false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="saveUser">确定</el-button>
+        <el-button type="primary" :loading="saving" @click="saveUser">确定保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="renewDlg" title="用户快捷续费" width="420px" destroy-on-close>
+      <el-form label-width="90px">
+        <el-form-item label="用户名">
+          <b>{{ rf.username }}</b>
+        </el-form-item>
+        <el-form-item label="当前到期">
+          <span class="muted">{{ rf.current_expire ? fmt(rf.current_expire) : '长期有效' }}</span>
+        </el-form-item>
+        <el-form-item label="续费时长">
+          <el-radio-group v-model="rf.months">
+            <el-radio :value="1">1个月 ($9.99)</el-radio>
+            <el-radio :value="3">3个月 ($24.99)</el-radio>
+            <el-radio :value="12">1年 ($79.99)</el-radio>
+          </el-radio-group>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="renewDlg = false">取消</el-button>
+        <el-button type="primary" :loading="renewing" @click="submitRenew">确认续费并入账</el-button>
       </template>
     </el-dialog>
 
@@ -420,12 +464,35 @@
         <el-form-item label="SSH 密码" required>
           <el-input v-model="vf.ssh_password" type="password" show-password placeholder="root 密码 · 服务端 AES 加密存储 · 永不回显" />
         </el-form-item>
-        <el-form-item label="域名"><el-input v-model="vf.domain" placeholder="可选 a.example.com" /></el-form-item>
+        <el-form-item label="节点域名" required>
+          <div style="display: flex; gap: 8px; width: 100%">
+            <el-input v-model="vf.domain" placeholder="必填 a.example.com (严禁纯IP)" />
+            <el-button type="info" plain size="small" :loading="syncingCF" @click="checkOrSyncCF">CF 灰云同步</el-button>
+          </div>
+        </el-form-item>
         <el-form-item label="备注"><el-input v-model="vf.remark" placeholder="可选" /></el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="vpsDlg = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="saveVps">登记</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="editDomainDlg" :title="`修改 VPS [${edf.name}] 域名与 CF 绑定`" width="460px" destroy-on-close>
+      <el-form label-width="90px">
+        <el-form-item label="公网 IP">
+          <el-input :model-value="edf.ip" readonly disabled />
+        </el-form-item>
+        <el-form-item label="新域名" required>
+          <div style="display: flex; gap: 8px; width: 100%">
+            <el-input v-model="edf.domain" placeholder="a.example.com" />
+            <el-button type="info" plain size="small" :loading="syncingCF" @click="checkOrSyncEditCF">CF 灰云同步</el-button>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="editDomainDlg = false">取消</el-button>
+        <el-button type="primary" :loading="saving" @click="saveEditDomain">保存并复核</el-button>
       </template>
     </el-dialog>
 
@@ -483,46 +550,6 @@
         <el-button type="primary" :loading="saving" @click="saveNode">确定</el-button>
       </template>
     </el-dialog>
-
-    <el-dialog v-model="subDlg" title="开通订阅（绑定用户 ↔ 节点）" width="460px" destroy-on-close>
-      <el-form label-width="88px">
-        <el-form-item label="订阅用户" required>
-          <el-select v-model="sf.user_id" filterable placeholder="仅订阅用户" style="width: 100%">
-            <el-option
-              v-for="u in subUsers"
-              :key="u.id"
-              :label="`${u.username} (#${u.id})`"
-              :value="u.id"
-            />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="节点" required>
-          <el-select v-model="sf.node_id" filterable placeholder="选择节点" style="width: 100%">
-            <el-option
-              v-for="n in nlist"
-              :key="n.id"
-              :label="`${n.name} · ${n.ip}:${n.port} · 已挂 ${subCount(n.id)}/${n.max_users || 100}`"
-              :value="n.id"
-            />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="时长">
-          <el-radio-group v-model="sf.days">
-            <el-radio-button :value="30">30天</el-radio-button>
-            <el-radio-button :value="90">90天</el-radio-button>
-            <el-radio-button :value="365">1年</el-radio-button>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item label="到期">
-          <el-date-picker v-model="sf.expire_date" type="datetime" style="width: 100%" />
-        </el-form-item>
-      </el-form>
-      <p class="muted" style="margin: 0 0 0 88px">UUID 自动生成；同一用户可多次开通不同节点。</p>
-      <template #footer>
-        <el-button @click="subDlg = false">取消</el-button>
-        <el-button type="primary" :loading="saving" @click="saveSub">开通</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
@@ -531,7 +558,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Odometer, User, Monitor, Ticket, Wallet, Fold, Expand, Cloudy, Box,
+  Odometer, User, Monitor, Wallet, Fold, Expand, Cloudy, Box,
 } from '@element-plus/icons-vue'
 import { userApi, nodeApi, subApi, ledgerApi, healthApi, vpsApi, aeroApi } from '../api'
 import { getStoredMode, applyTheme, watchSystemTheme } from '../theme'
@@ -554,7 +581,6 @@ const tabs = [
   { id: 'vps', label: 'VPS', icon: Cloudy },
   { id: 'aero', label: 'AERO', icon: Box },
   { id: 'nodes', label: '节点', icon: Monitor },
-  { id: 'subs', label: '订阅', icon: Ticket },
   { id: 'ledger', label: '账本', icon: Wallet },
 ]
 const currentTitle = computed(() => tabs.find((t) => t.id === tab.value)?.label || '')
@@ -618,7 +644,6 @@ const taskListFiltered = computed(() => {
 const failedTaskCount = computed(() => taskList.value.filter((t) => t.status === 'failed').length)
 const nodeSubMap = ref({}) // node_id -> active sub count
 const onlineNodes = computed(() => nlist.value.filter((n) => n.status))
-const slist = ref([])
 const llist = ref([])
 const saving = ref(false)
 const deployingId = ref(0)
@@ -626,6 +651,17 @@ const aeroVpsId = ref(null)
 const probingId = ref(0)
 const vpsRefreshing = ref(false)
 const vpsAutoProbe = ref(false)
+const cfReady = ref(false)
+const verifyingId = ref(0)
+const verifyingAllDNS = ref(false)
+const editDomainDlg = ref(false)
+const edf = reactive({
+  id: null,
+  name: '',
+  ip: '',
+  domain: '',
+})
+const vpsDnsMap = ref({}) // key: vps.id -> DomainVerifyResult
 const deployDrawer = ref(false)
 const activeTask = ref(null)
 const logBox = ref(null)
@@ -676,7 +712,36 @@ function buildSvcGroups(list) {
 
 const userDlg = ref(false)
 const userEdit = ref(false)
-const uf = reactive({ id: null, username: '', password: '', email: '', is_staff: false })
+const uf = reactive({
+  id: null,
+  username: '',
+  password: '',
+  phone: '',
+  email: '',
+  is_staff: false,
+  plan_months: 1,
+})
+
+const renewDlg = ref(false)
+const renewing = ref(false)
+const rf = reactive({ user_id: null, username: '', current_expire: 0, months: 1 })
+
+const ledgerFilter = ref('all')
+const settling = ref(false)
+const syncingSubs = ref(false)
+
+const inEntries = computed(() => llist.value.filter((e) => e.direction === 'IN'))
+const outEntries = computed(() => llist.value.filter((e) => e.direction === 'OUT'))
+const unsettledEntries = computed(() => llist.value.filter((e) => !e.settled))
+const totalInCents = computed(() => inEntries.value.reduce((acc, cur) => acc + (Number(cur.amount_cents) || 0), 0))
+const totalOutCents = computed(() => outEntries.value.reduce((acc, cur) => acc + (Number(cur.amount_cents) || 0), 0))
+const filteredLedger = computed(() => {
+  if (ledgerFilter.value === 'in') return inEntries.value
+  if (ledgerFilter.value === 'out') return outEntries.value
+  if (ledgerFilter.value === 'unsettled') return unsettledEntries.value
+  return llist.value
+})
+
 const vpsDlg = ref(false)
 const vf = reactive({
   name: '', role: 'VPS-A', ip: '', ssh_port: 22, ssh_username: 'root',
@@ -684,8 +749,6 @@ const vf = reactive({
 })
 const nodeDlg = ref(false)
 const nf = reactive({ name: '', ip: '', port: 443, protocol: 'aero', max_users: 100, region: '' })
-const subDlg = ref(false)
-const sf = reactive({ user_id: null, node_id: null, days: 30, expire_date: null })
 
 function switchTab(t) {
   tab.value = t.id
@@ -758,10 +821,65 @@ function nodeName(nid) {
   const n = nlist.value.find((x) => x.id === nid)
   return n ? n.name : `节点${nid}`
 }
-function subActive(row) {
-  if (!row?.status) return false
-  if (!row.expire_date) return true
-  return new Date(row.expire_date) > new Date()
+function isExpired(u) {
+  if (!u.expire_at) return false
+  return new Date(u.expire_at).getTime() < Date.now()
+}
+function subURL(slug) {
+  if (!slug) return ''
+  const origin = window.location.origin
+  return `${origin}/sub/${slug}`
+}
+function copySubURL(u) {
+  const url = subURL(u.sub_slug)
+  if (!url) return ElMessage.warning('暂无订阅地址')
+  navigator.clipboard.writeText(url).then(() => {
+    ElMessage.success(`用户 [${u.username}] 订阅地址已复制！`)
+  }).catch(() => {
+    ElMessage.info(url)
+  })
+}
+function openRenewDlg(row) {
+  rf.user_id = row.id
+  rf.username = row.username
+  rf.current_expire = row.expire_at ? new Date(row.expire_at).getTime() : 0
+  rf.months = 1
+  renewDlg.value = true
+}
+async function submitRenew() {
+  if (!rf.user_id) return
+  renewing.value = true
+  try {
+    await userApi.renew(rf.user_id, { months: rf.months })
+    ElMessage.success(`用户 [${rf.username}] 续费成功！`)
+    renewDlg.value = false
+    await load()
+  } catch (err) {
+    ElMessage.error('续费失败: ' + (err.response?.data?.message || err.message || '网络错误'))
+  } finally {
+    renewing.value = false
+  }
+}
+async function doBatchSettle() {
+  if (!unsettledEntries.value.length) {
+    return ElMessage.info('暂无待归集的账本流水')
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确认对 ${unsettledEntries.value.length} 笔未归集流水进行统一归集结算？`,
+      '资金归集结算',
+      { type: 'warning' }
+    )
+    settling.value = true
+    const r = await ledgerApi.settleBatch('admin_batch')
+    ElMessage.success(`成功归集 ${r.data?.data?.settled_count || 0} 笔流水！`)
+    await load()
+  } catch (err) {
+    if (err === 'cancel' || err === 'close') return
+    ElMessage.error('归集结算失败: ' + (err.response?.data?.message || err.message || '网络错误'))
+  } finally {
+    settling.value = false
+  }
 }
 function stepActive(task) {
   const steps = task?.steps || []
@@ -864,12 +982,6 @@ async function load() {
     stats.value[2].v = '0/0'
   }
   try {
-    const s = await subApi.list()
-    slist.value = s.data?.data?.results || []
-  } catch {
-    slist.value = []
-  }
-  try {
     const st = await subApi.nodeStats()
     nodeSubMap.value = st.data?.data || {}
   } catch {
@@ -883,6 +995,10 @@ async function loadVps() {
     const r = await vpsApi.list()
     vpsList.value = r.data?.data?.results || []
     if (!aeroVpsId.value && vpsList.value[0]) aeroVpsId.value = vpsList.value[0].id
+    checkCFStatus()
+    if (vpsList.value.length > 0) {
+      verifyAllDomains(true)
+    }
   } catch {
     vpsList.value = []
   }
@@ -924,8 +1040,6 @@ async function syncNodesWithVps() {
     await loadVps()
     await loadNodesOnly()
     try {
-      const s = await subApi.list({ page_size: 200 })
-      slist.value = s.data?.data?.results || []
       const st = await subApi.nodeStats()
       nodeSubMap.value = st.data?.data || {}
     } catch { /* ignore */ }
@@ -1006,6 +1120,122 @@ async function refreshVpsAll(silent = false) {
   }
 }
 
+async function checkCFStatus() {
+  try {
+    const res = await vpsApi.cfStatus()
+    cfReady.value = !!res.data?.data?.enabled
+  } catch {
+    cfReady.value = false
+  }
+}
+
+function dnsStatusTagType(v) {
+  const d = vpsDnsMap.value[v.id]
+  if (d) {
+    if (d.is_cf_proxy) return 'danger'
+    if (d.matched) return 'success'
+    return 'danger'
+  }
+  return v.domain ? 'info' : 'danger'
+}
+
+function dnsStatusLabel(v) {
+  const d = vpsDnsMap.value[v.id]
+  if (d) {
+    if (d.is_cf_proxy) return '⚠️ 误开 CDN 代理'
+    if (d.matched) return 'DNS 直连正常'
+    return 'DNS 不匹配'
+  }
+  return v.domain ? 'DNS 待复核' : '未绑定域名'
+}
+
+async function verifyDomain(v) {
+  if (!v.domain) return ElMessage.warning('该 VPS 尚未绑定域名')
+  verifyingId.value = v.id
+  try {
+    const res = await vpsApi.verifyDomain(v.id)
+    const d = res.data?.data
+    if (d) vpsDnsMap.value[v.id] = d
+    ElMessage.success(res.data?.message || '域名解析复核通过')
+  } catch (err) {
+    const d = err.response?.data?.data
+    if (d) vpsDnsMap.value[v.id] = d
+    ElMessage.error(err.response?.data?.message || err.message || '复核失败')
+  } finally {
+    verifyingId.value = 0
+  }
+}
+
+async function verifyAllDomains(silent = false) {
+  verifyingAllDNS.value = true
+  let successCount = 0
+  try {
+    for (const v of vpsList.value) {
+      if (!v.domain) continue
+      try {
+        const res = await vpsApi.verifyDomain(v.id)
+        const d = res.data?.data
+        if (d) vpsDnsMap.value[v.id] = d
+        successCount++
+      } catch (err) {
+        const d = err.response?.data?.data
+        if (d) vpsDnsMap.value[v.id] = d
+      }
+    }
+    if (!silent) ElMessage.success(`已完成 ${successCount} 台 VPS 域名与 CF 灰云复核`)
+  } finally {
+    verifyingAllDNS.value = false
+  }
+}
+
+function openEditDomainDlg(v) {
+  Object.assign(edf, {
+    id: v.id,
+    name: v.name,
+    ip: v.ip,
+    domain: v.domain || '',
+  })
+  editDomainDlg.value = true
+}
+
+async function checkOrSyncEditCF() {
+  if (!edf.domain) return ElMessage.warning('请输入域名')
+  const dom = edf.domain.trim()
+  if (!dom.includes('.') || /^(\d{1,3}\.){3}\d{1,3}$/.test(dom)) {
+    return ElMessage.warning('请输入合法的公网域名格式')
+  }
+  syncingCF.value = true
+  try {
+    const res = await vpsApi.syncCFDNS({ domain: dom, ip: edf.ip })
+    ElMessage.success(res.data?.message || 'CF 灰云同步成功')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.message || 'CF 灰云同步失败')
+  } finally {
+    syncingCF.value = false
+  }
+}
+
+async function saveEditDomain() {
+  const dom = edf.domain.trim()
+  if (!dom) return ElMessage.warning('域名不能为空')
+  if (!dom.includes('.') || /^(\d{1,3}\.){3}\d{1,3}$/.test(dom)) {
+    return ElMessage.warning('请输入合法的公网域名格式（严禁纯 IP）')
+  }
+  saving.value = true
+  try {
+    await vpsApi.updateDomain(edf.id, dom)
+    ElMessage.success(`VPS [${edf.name}] 域名已更新并完成复核`)
+    editDomainDlg.value = false
+    await loadVps()
+    const updated = vpsList.value.find((x) => x.id === edf.id)
+    if (updated) await verifyDomain(updated)
+  } catch (err) {
+    ElMessage.error(err.response?.data?.message || err.message || '更新域名失败')
+  } finally {
+    saving.value = false
+  }
+}
+
 function openDeployDetail(v) {
   const t = latestTask(v.id)
   if (t) openTaskDetail(t)
@@ -1040,8 +1270,6 @@ function openTaskDetail(row) {
 watch(deployDrawer, (open) => {
   if (!open) stopTaskPoll()
 })
-
-const syncingSubs = ref(false)
 
 function copySubLink(row) {
   if (!row.sub_slug) {
@@ -1082,16 +1310,18 @@ async function broadcastAllSubs() {
 function openUserDlg() {
   userEdit.value = false
   Object.assign(uf, {
-    id: null, username: '', password: '', email: '',
+    id: null, username: '', password: '', phone: '', email: '',
     is_staff: userKind.value === 'staff',
+    plan_months: 1,
   })
   userDlg.value = true
 }
 function editUser(row) {
   userEdit.value = true
   Object.assign(uf, {
-    id: row.id, username: row.username, email: row.email || '', password: '',
+    id: row.id, username: row.username, email: row.email || '', phone: row.phone || '', password: '',
     is_staff: !!row.is_staff,
+    plan_months: row.plan_months || 1,
   })
   userDlg.value = true
 }
@@ -1100,10 +1330,20 @@ async function saveUser() {
   saving.value = true
   try {
     if (userEdit.value) {
-      await userApi.update(uf.id, { email: uf.email, is_staff: uf.is_staff })
+      await userApi.update(uf.id, {
+        email: uf.email,
+        phone: uf.phone,
+        is_staff: uf.is_staff,
+        plan_months: uf.plan_months,
+      })
     } else {
       await userApi.create({
-        username: uf.username, password: uf.password, email: uf.email, is_staff: uf.is_staff,
+        username: uf.username,
+        password: uf.password,
+        phone: uf.phone,
+        email: uf.email,
+        is_staff: uf.is_staff,
+        plan_months: uf.plan_months,
       })
     }
     ElMessage.success('成功')
@@ -1126,13 +1366,38 @@ function openVpsDlg() {
   })
   vpsDlg.value = true
 }
+const syncingCF = ref(false)
+async function checkOrSyncCF() {
+  if (!vf.ip || !vf.domain) {
+    return ElMessage.warning('请先填写公网 IP 和要绑定的域名')
+  }
+  const dom = vf.domain.trim()
+  if (!dom.includes('.') || /^(\d{1,3}\.){3}\d{1,3}$/.test(dom)) {
+    return ElMessage.warning('请输入有效的域名格式，严禁填写纯 IP')
+  }
+  syncingCF.value = true
+  try {
+    const res = await vpsApi.syncCFDNS({ domain: dom, ip: vf.ip.trim() })
+    ElMessage.success(res.data?.message || 'Cloudflare 灰云 A 记录同步成功')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.message || 'CF 灰云同步失败')
+  } finally {
+    syncingCF.value = false
+  }
+}
+
 async function saveVps() {
   if (!vf.name || !vf.ip) return ElMessage.warning('名称和 IP 必填')
+  if (!vf.domain || !vf.domain.trim()) return ElMessage.warning('节点域名为必填项：严禁未绑定域名的 VPS 接入，杜绝裸 IP 泄露！')
+  const dom = vf.domain.trim()
+  if (!dom.includes('.') || /^(\d{1,3}\.){3}\d{1,3}$/.test(dom)) {
+    return ElMessage.warning('请输入合法的公网域名格式（严禁直接输入纯 IP）！')
+  }
   if (!vf.ssh_password) return ElMessage.warning('请填写 SSH 密码（服务端 AES 加密存储，不会回显）')
   saving.value = true
   try {
-    await vpsApi.create({ ...vf })
-    ElMessage.success('VPS 已登记（密码加密 · 模块 vps-manager）')
+    await vpsApi.create({ ...vf, domain: dom })
+    ElMessage.success('VPS 节点已登记（域名一致性校验通过 · 密码 AES 加密）')
     vpsDlg.value = false
     vf.ssh_password = ''
     await loadVps()
@@ -1289,73 +1554,7 @@ async function delNode(id) {
     await load()
   } catch {}
 }
-function openSubDlg() {
-  const su = subUsers.value
-  if (!su.length) {
-    ElMessage.warning('请先在「用户」页创建订阅用户（非管理员）')
-    return
-  }
-  if (!nlist.value.length) {
-    ElMessage.warning('请先部署/登记节点')
-    return
-  }
-  sf.user_id = su[0].id
-  // pick node with most free capacity
-  const sorted = [...nlist.value].sort(
-    (a, b) => subCount(a.id) / (a.max_users || 100) - subCount(b.id) / (b.max_users || 100),
-  )
-  sf.node_id = sorted[0]?.id || nlist.value[0].id
-  sf.days = 30
-  sf.expire_date = new Date(Date.now() + 30 * 864e5)
-  subDlg.value = true
-}
-watch(
-  () => sf.days,
-  (d) => {
-    if (d) sf.expire_date = new Date(Date.now() + d * 864e5)
-  },
-)
-async function saveSub() {
-  if (!sf.user_id || !sf.node_id) return ElMessage.warning('请选择用户和节点')
-  saving.value = true
-  try {
-    const e = sf.expire_date || new Date(Date.now() + (sf.days || 30) * 864e5)
-    const node = nlist.value.find((n) => n.id === sf.node_id)
-    const r = await subApi.create({
-      user_id: sf.user_id,
-      node_id: sf.node_id,
-      node_name: node?.name || '',
-      node_ip: node?.ip || '',
-      node_port: node?.port || 443,
-      expire_date: new Date(e).toISOString(),
-    })
-    ElMessage.success(`订阅已开通 UUID=${r.data?.data?.client_uuid || ''}`)
-    subDlg.value = false
-    await load()
-  } catch (e) {
-    ElMessage.error(e.response?.data?.message || '开通失败')
-  } finally {
-    saving.value = false
-  }
-}
-async function delSub(id) {
-  try {
-    await ElMessageBox.confirm('确认删除该用户订阅？凭据将失效。', '警告', { type: 'warning' })
-    await subApi.remove(id)
-    ElMessage.success('已删除')
-    await load()
-  } catch {}
-}
-async function copySubCfg(row) {
-  try {
-    const r = await subApi.config(row.client_uuid)
-    const text = JSON.stringify(r.data?.data || r.data, null, 2)
-    await navigator.clipboard.writeText(text)
-    ElMessage.success('配置已复制到剪贴板')
-  } catch {
-    ElMessage.error('获取配置失败')
-  }
-}
+
 async function delTask(row) {
   try {
     await ElMessageBox.confirm(`删除失败任务 #${row.id} 及其日志？`, '清理', { type: 'warning' })
@@ -1556,15 +1755,62 @@ function fmt(t) {
   padding-right: 12px; font-weight: 600; font-size: 13px;
 }
 .toolbar { margin-bottom: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap }
-.vps-card {
-  background: var(--app-card); border: 1px solid var(--app-border); border-radius: 14px;
-  padding: 16px 18px; margin-bottom: 14px;
+.vps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(540px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
 }
-.vps-card-hd { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap }
-.vps-id { display: flex; align-items: center; gap: 8px; flex-wrap: wrap }
-.vps-name { font-weight: 700; font-size: 16px }
-.vps-actions { display: flex; gap: 8px; flex-wrap: wrap }
-.vps-meta { margin-top: 8px; font-size: 13px; color: var(--app-muted) }
+@media (max-width: 768px) {
+  .vps-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.vps-card {
+  background: var(--app-card); border: 1px solid var(--app-border); border-radius: 12px;
+  padding: 12px 16px; display: flex; flex-direction: column; justify-content: space-between;
+}
+.vps-card-hd { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap }
+.vps-id { display: flex; align-items: center; gap: 6px; flex-wrap: wrap }
+.vps-name { font-weight: 700; font-size: 15px }
+.vps-actions { display: flex; gap: 6px; flex-wrap: wrap }
+.vps-meta { margin-top: 6px; font-size: 12px; color: var(--app-muted); display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* 紧凑型指标面板 (Mini Metrics Dashboard) */
+.metric-compact-row {
+  margin-top: 10px;
+  background: var(--app-bg);
+  border-radius: 8px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+}
+.mc-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.mc-label {
+  color: var(--app-muted);
+}
+.mc-val {
+  font-weight: 600;
+  color: var(--app-text);
+}
+.mc-sub {
+  color: var(--app-muted);
+  font-size: 11px;
+}
+.mc-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--app-border);
+}
+
 .metric-grid {
   display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 14px;
 }
