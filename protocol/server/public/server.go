@@ -119,9 +119,19 @@ func RunServer() {
 			log.Printf("[CERT] autocert enabled — also listening :80 for HTTP-01 ACME")
 		}
 	}
-	if len(quicPorts) > 0 {
-		log.Printf("[LISTEN] QUIC ports ignored")
-		quicPorts = nil
+	if os.Getenv("AERO_ENABLE_QUIC") == "1" || os.Getenv("AERO_ENABLE_QUIC") == "true" {
+		for _, p := range tlsPorts {
+			already := false
+			for _, qp := range quicPorts {
+				if qp == p {
+					already = true
+					break
+				}
+			}
+			if !already {
+				quicPorts = append(quicPorts, p)
+			}
+		}
 	}
 
 	publicName := *domain
