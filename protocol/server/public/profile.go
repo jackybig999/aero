@@ -55,9 +55,3 @@ func GetProfile(name string) *ProfileSettings {
 		return nil
 	}
 }
-
-var profile = struct {
-	Get func(string) *ProfileSettings
-}{
-	Get: GetProfile,
-}
