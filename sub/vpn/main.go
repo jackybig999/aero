@@ -16,8 +16,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -303,11 +301,6 @@ func main() {
 	payOutH.New(payOutSvc).RegisterRoutes(api)
 	ledgerH.New(ledgerSvc).RegisterRoutes(api)
 	settleH.New(settleSvc).RegisterRoutes(api)
-	registerConfig(api)
-	registerSync(api)
-	registerSecurity(api)
-	registerTestPay(api)
-	registerStubs(api)
 
 	dist := web.FindDist()
 	pages := web.Handler(dist)
@@ -369,104 +362,4 @@ func seedAdmin(svc *userS.Service, db userStore.Store) {
 			db.SetStaff(u.ID, true)
 		}
 	}
-
-	if jacky, err := db.GetUserByUsername("jacky"); err == nil && jacky != nil {
-		if jacky.PasswordHash == "" {
-			db.SetPassword(jacky.ID, userS.HashPassword("2442273302@qq.com"))
-		}
-	}
-}
-
-type configStore struct {
-	mu  sync.RWMutex
-	cfg map[string]string
-}
-
-func registerConfig(mux *http.ServeMux) {
-	st := &configStore{cfg: map[string]string{
-		"AERO_RELEASE_URL": env("AERO_RELEASE_URL", "https://github.com/jackybig999/aero/releases/download/v1.0.0/aero-edge-linux-amd64"),
-		"AERO_VERSION":     env("AERO_VERSION", "1.0.0"),
-	}}
-	mux.HandleFunc("GET /api/v1/config/", func(w http.ResponseWriter, r *http.Request) {
-		st.mu.RLock()
-		defer st.mu.RUnlock()
-		cp := make(map[string]string, len(st.cfg))
-		for k, v := range st.cfg {
-			cp[k] = v
-		}
-		writeJSON(w, 200, map[string]any{"code": 0, "data": cp})
-	})
-	mux.HandleFunc("PUT /api/v1/config/{key}", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Value string `json:"value"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		st.mu.Lock()
-		st.cfg[r.PathValue("key")] = req.Value
-		st.mu.Unlock()
-		writeJSON(w, 200, map[string]any{"code": 0})
-	})
-}
-
-type agentState struct {
-	mu     sync.RWMutex
-	agents map[string]map[string]any
-}
-
-func registerSync(mux *http.ServeMux) {
-	st := &agentState{agents: map[string]map[string]any{}}
-	mux.HandleFunc("POST /api/v1/sync/agents/{agent_id}/heartbeat/", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Version string `json:"version"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		id := r.PathValue("agent_id")
-		st.mu.Lock()
-		st.agents[id] = map[string]any{"agent_id": id, "version": req.Version, "status": "online", "last_heartbeat": time.Now()}
-		st.mu.Unlock()
-		writeJSON(w, 200, map[string]any{"code": 0})
-	})
-	mux.HandleFunc("GET /api/v1/sync/agents/", func(w http.ResponseWriter, r *http.Request) {
-		st.mu.RLock()
-		defer st.mu.RUnlock()
-		list := make([]map[string]any, 0, len(st.agents))
-		for _, a := range st.agents {
-			list = append(list, a)
-		}
-		writeJSON(w, 200, map[string]any{"code": 0, "data": list})
-	})
-}
-
-func registerSecurity(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/v1/security/verify/", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Token string `json:"token"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		writeJSON(w, 200, map[string]any{"valid": len(req.Token) > 64})
-	})
-}
-
-func registerTestPay(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/v1/test/pay/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"code": 0, "message": "sandbox", "data": map[string]any{"test_mode": true}})
-	})
-	mux.HandleFunc("POST /api/v1/test/pay/complete", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"code": 0, "message": "sandbox complete"})
-	})
-}
-
-func registerStubs(mux *http.ServeMux) {
-	ok := func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"code": 0, "message": "ok"})
-	}
-	mux.HandleFunc("GET /api/v1/failover/", ok)
-	mux.HandleFunc("GET /api/v1/scheduler/", ok)
-	mux.HandleFunc("GET /api/v1/analytics/", ok)
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }
