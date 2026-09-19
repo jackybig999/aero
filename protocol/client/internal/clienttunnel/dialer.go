@@ -156,8 +156,11 @@ func (d *AERODialer) dialH2(target string, cfg Config) (net.Conn, error) {
 
 func (d *AERODialer) dialEdgeTLS(cfg Config) (net.Conn, error) {
 	fp := strings.ToLower(strings.TrimSpace(cfg.Fingerprint))
-	if fp == "" || fp == "std" || fp == "standard" {
+	if fp == "std" || fp == "standard" {
 		return d.dialEdgeTLSStd(cfg)
+	}
+	if cfg.Fingerprint == "" {
+		cfg.Fingerprint = transport.FingerprintChrome
 	}
 	conn, err := d.dialEdgeTLSUTls(cfg)
 	if err == nil {

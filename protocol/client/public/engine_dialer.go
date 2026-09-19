@@ -39,19 +39,20 @@ func dialTCPH2(target string, preface []byte) (net.Conn, error) {
 }
 
 // dialEdgeTLS 仅完成到 Edge 的 TCP+TLS（不含 H2）。
-// 默认走标准 TLS1.3+h2（与 edge 兼容）。utls 指纹 + ClientHello 分片易被 edge 以
-// "tls: internal error" 拒绝，导致「显示已连接但 SOCKS 全失败」。
+// 默认优先走 uTLS 真实浏览器指纹（Chrome 120+ 拟态，消除 Go 原生特征），极端异常自动回退 std。
 func dialEdgeTLS() (net.Conn, error) {
-	// 1) Prefer standard crypto/tls (reliable path to our edge)
-	if *fingerprint == "" || *fingerprint == "std" || *fingerprint == "standard" {
+	fp := ""
+	if fingerprint != nil {
+		fp = strings.ToLower(strings.TrimSpace(*fingerprint))
+	}
+	if fp == "std" || fp == "standard" {
 		return dialEdgeTLSStd(false)
 	}
-	// 2) Optional utls fingerprint — without fragment first; fallback to std
 	conn, err := dialEdgeTLSUTls(false)
 	if err == nil {
 		return conn, nil
 	}
-	log.Printf("[TLS] utls(%s) failed: %v — fallback std", *fingerprint, err)
+	log.Printf("[TLS] utls failed: %v — fallback std", err)
 	return dialEdgeTLSStd(false)
 }
 
@@ -145,8 +146,15 @@ func dialEdgeTLSUTls(useFragment bool) (net.Conn, error) {
 		raw = transport.NewSplitter(tcpConn, 100, 10*time.Millisecond, 50*time.Millisecond)
 	}
 	sni := currentEdgeSNI()
-	utlsConfig := transport.BuildUTLSConfig(sni, *fingerprint)
-	uconn, err := transport.NewUConn(raw, utlsConfig, *fingerprint)
+	fp := ""
+	if fingerprint != nil {
+		fp = *fingerprint
+	}
+	if fp == "" || fp == "auto" {
+		fp = transport.FingerprintChrome
+	}
+	utlsConfig := transport.BuildUTLSConfig(sni, fp)
+	uconn, err := transport.NewUConn(raw, utlsConfig, fp)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("create uconn: %w", err)
@@ -160,7 +168,7 @@ func dialEdgeTLSUTls(useFragment bool) (net.Conn, error) {
 		return nil, fmt.Errorf("utls handshake: %w", err)
 	}
 	uconn.SetDeadline(time.Time{})
-	log.Printf("[uTLS] finger=%s sni=%s alpn=%s", *fingerprint, sni, uconn.ConnectionState().NegotiatedProtocol)
+	log.Printf("[uTLS] finger=%s sni=%s alpn=%s", fp, sni, uconn.ConnectionState().NegotiatedProtocol)
 	return uconn, nil
 }
 
