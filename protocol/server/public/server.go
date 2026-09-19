@@ -234,6 +234,7 @@ func RunServer() {
 		ConnLimit: cl, RateLimit: rl, BWLimit: bl, DialGuard: dg, TokenStore: tokStore,
 		CertMgr: certManager, ACMEWebRoot: *acmeWebRoot,
 		AdminKey: *adminKey, IdleTimeout: idle, MaxLife: life, Quiet: q,
+		StrictCamouflage: true,
 	})
 
 	mgr, err := listener.NewManager(handler, validator, serverCfg, echMgr.TLSKeys())

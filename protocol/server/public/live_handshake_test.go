@@ -225,6 +225,48 @@ func TestLiveServerHandshake(t *testing.T) {
 		t.Logf("[SECURITY] Invalid token rejected correctly with 407 Proxy Authentication Required")
 	})
 
+	// 4.1 测试严格伪装模式下，未授权探测被 Cover 伪装接管（绝不泄露 407 代理指纹）
+	t.Run("StrictCamouflageProbingDefense", func(t *testing.T) {
+		handler.strictCamouflage = true
+		defer func() { handler.strictCamouflage = false }()
+
+		clientTLS := &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		}
+		clientConn, err := tls.Dial("tcp", serverAddr, clientTLS)
+		if err != nil {
+			t.Fatalf("client TLS dial failed: %v", err)
+		}
+		defer clientConn.Close()
+
+		h2Transport := &http2.Transport{
+			TLSClientConfig: clientTLS,
+		}
+		h2Conn, err := h2Transport.NewClientConn(clientConn)
+		if err != nil {
+			t.Fatalf("http2 NewClientConn failed: %v", err)
+		}
+		defer h2Conn.Close()
+
+		req, err := http.NewRequest(http.MethodConnect, "https://example.com:443", nil)
+		if err != nil {
+			t.Fatalf("create CONNECT request failed: %v", err)
+		}
+		req.Header.Set("Proxy-Authorization", "Bearer invalid-token-probe")
+
+		resp, err := h2Conn.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			t.Fatalf("StrictCamouflage failed: server exposed 407 ProxyAuthRequired to active probe!")
+		}
+		t.Logf("[CAMOUFLAGE] Active probe defused! Server responded with status %d instead of 407 (anti-probing success)", resp.StatusCode)
+	})
+
 	// 5. 测试私网/环回 SSRF 防护
 	t.Run("LoopbackSSRFBlocked", func(t *testing.T) {
 		clientTLS := &tls.Config{

@@ -35,12 +35,20 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Proxy-Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
 		h.failAuth(ip)
+		if h.strictCamouflage && h.cover != nil {
+			h.cover.ServeHTTP(w, r)
+			return
+		}
 		http.Error(w, "Unauthorized", http.StatusProxyAuthRequired)
 		return
 	}
 	tok := strings.TrimPrefix(authHeader, "Bearer ")
 	if !h.validator.Validate(tok) {
 		h.failAuth(ip)
+		if h.strictCamouflage && h.cover != nil {
+			h.cover.ServeHTTP(w, r)
+			return
+		}
 		http.Error(w, "Unauthorized", http.StatusProxyAuthRequired)
 		return
 	}

@@ -42,31 +42,33 @@ type edgeHandler struct {
 	adminKey     string
 	idleTimeout  time.Duration
 	maxLife      time.Duration
-	quiet        bool
-	draining     atomic.Bool
-	startedAt    time.Time
+	quiet            bool
+	strictCamouflage bool
+	draining         atomic.Bool
+	startedAt        time.Time
 }
 
 // HandlerOptions 组装依赖
 type HandlerOptions struct {
-	Validator    *auth.Validator
-	ECH          *transport.ECHManager
-	ACME         http.Handler
-	Metrics      *metrics.Registry
-	ContextStore contextstore.Backend
-	SubStore     *subscribe.Store
-	Cover        *cover.Site
-	ConnLimit    *traffic.ConnLimiter
-	RateLimit    *traffic.RateLimiter
-	BWLimit      *traffic.BandwidthLimiter
-	DialGuard    *traffic.DialGuard
-	TokenStore   *auth.TokenStore
-	CertMgr      *transport.CertManager
-	ACMEWebRoot  string
-	AdminKey     string
-	IdleTimeout  time.Duration
-	MaxLife      time.Duration
-	Quiet        bool
+	Validator        *auth.Validator
+	ECH              *transport.ECHManager
+	ACME             http.Handler
+	Metrics          *metrics.Registry
+	ContextStore     contextstore.Backend
+	SubStore         *subscribe.Store
+	Cover            *cover.Site
+	ConnLimit        *traffic.ConnLimiter
+	RateLimit        *traffic.RateLimiter
+	BWLimit          *traffic.BandwidthLimiter
+	DialGuard        *traffic.DialGuard
+	TokenStore       *auth.TokenStore
+	CertMgr          *transport.CertManager
+	ACMEWebRoot      string
+	AdminKey         string
+	IdleTimeout      time.Duration
+	MaxLife          time.Duration
+	Quiet            bool
+	StrictCamouflage bool
 }
 
 // NewEdgeHandler 创建 handler
@@ -101,11 +103,12 @@ func NewEdgeHandler(opt HandlerOptions) *edgeHandler {
 		tokenStore:   opt.TokenStore,
 		certMgr:      opt.CertMgr,
 		acmeWebRoot:  strings.TrimSpace(opt.ACMEWebRoot),
-		adminKey:     opt.AdminKey,
-		idleTimeout:  idle,
-		maxLife:      opt.MaxLife,
-		quiet:        opt.Quiet,
-		startedAt:    time.Now(),
+		adminKey:         opt.AdminKey,
+		idleTimeout:      idle,
+		maxLife:          opt.MaxLife,
+		quiet:            opt.Quiet,
+		strictCamouflage: opt.StrictCamouflage,
+		startedAt:        time.Now(),
 	}
 	if opt.SubStore != nil {
 		h.subHandler = &subscribe.Handler{Store: opt.SubStore}
