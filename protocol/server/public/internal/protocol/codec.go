@@ -5,11 +5,13 @@
 package protocol
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
 
 	aeroproto "github.com/aero-protocol/proto"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -46,15 +48,30 @@ func ReadMessage(r io.Reader, msg proto.Message) error {
 	return nil
 }
 
-// WriteMessage 写入 4 字节大端长度 + Protobuf（单次 Write）
+// WriteMessage 写入 4 字节大端长度 + 携带随机高熵 Padding 的 Protobuf 消息。
+// 借鉴 XTLS-Vision 核心防御机制：在握手响应中注入 64~256 字节动态高熵 Padding，
+// 彻底打破固定报文长度分布特征，使机器学习流量分析模型无法通过固定长度判定 AERO 握手。
 func WriteMessage(w io.Writer, msg proto.Message) error {
 	data, err := proto.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	buf := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint32(buf[:4], uint32(len(data)))
-	copy(buf[4:], data)
+
+	// 生成 64 ~ 256 字节动态高熵伪随机填充
+	var padLenByte [1]byte
+	_, _ = rand.Read(padLenByte[:])
+	padLen := 64 + int(padLenByte[0])%193 // [64, 256]
+
+	padBytes := make([]byte, padLen)
+	_, _ = rand.Read(padBytes)
+
+	// 使用标准 Protobuf Length-Delimited (Tag 15) 注入 Padding
+	padded := protowire.AppendTag(data, 15, protowire.BytesType)
+	padded = protowire.AppendBytes(padded, padBytes)
+
+	buf := make([]byte, 4+len(padded))
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(padded)))
+	copy(buf[4:], padded)
 	if _, err := w.Write(buf); err != nil {
 		return fmt.Errorf("write message: %w", err)
 	}
