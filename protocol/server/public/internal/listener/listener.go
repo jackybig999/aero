@@ -85,13 +85,12 @@ func (m *Manager) Start(cfg *config.ServerConfig) error {
 			ReadHeaderTimeout: 10 * time.Second, // 仅限制握手头，防慢连
 			MaxHeaderBytes:    16 << 10,
 		}
-		// 单 TCP 连接上合理并发流；客户端应用 h2 复用，服务端不无限放大
-		// 显式提升 H2 流控窗口，打破默认 64KB 窗口在跨国高延迟下被压死在 3.4Mbps 的物理瓶颈
+		// 铁律 L6：显式声明 16MB/128MB 跨洋超大接收窗口，彻底突破跨洋 26Mbps 物理瓶颈
 		if err := http2.ConfigureServer(server, &http2.Server{
 			MaxConcurrentStreams:         256,
 			IdleTimeout:                  0,
-			MaxUploadBufferPerConnection: 16 * 1024 * 1024, // 16MB 连接级流控窗口
-			MaxUploadBufferPerStream:     4 * 1024 * 1024,  // 4MB 单流窗口 (释放 200M~1Gbps 吞吐)
+			MaxUploadBufferPerConnection: 128 * 1024 * 1024, // 128MB 连接级流控窗口 (Rule L6)
+			MaxUploadBufferPerStream:     16 * 1024 * 1024,  // 16MB 单流窗口 (Rule L6)
 		}); err != nil {
 			return fmt.Errorf("configure http2 %s: %w", addr, err)
 		}

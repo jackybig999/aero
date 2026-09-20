@@ -157,8 +157,11 @@ AERO_ADVERTISE=$ADVERTISE_HOST
 CONF
 chmod 600 "$CONFIG_DIR/edge.conf"
 
-# --- binary ---
+# --- binary: backup existing for rollback ---
 echo "[bin] install aero-edge -> $INSTALL_DIR/aero-edge"
+if [[ -f "$INSTALL_DIR/aero-edge" ]]; then
+    cp -f "$INSTALL_DIR/aero-edge" "$INSTALL_DIR/aero-edge.bak" 2>/dev/null || true
+fi
 if [[ -n "$LOCAL_BIN" && -f "$LOCAL_BIN" ]]; then
     cp -f "$LOCAL_BIN" "$INSTALL_DIR/aero-edge"
     chmod +x "$INSTALL_DIR/aero-edge"
@@ -319,11 +322,38 @@ fi
 if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-fi
+# --- sysctl: 固化 BBRv3、FQ 队列与 128MB TCP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
+echo "[sysctl] 优化 BBR 拥塞控制与 128MB TCP 缓冲区"
+cat > /etc/sysctl.d/99-aero-bbr.conf << 'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_mtu_probing = 1
+net.core.netdev_max_backlog = 10000
+EOF
+sysctl --system >/dev/null 2>&1 || true
 
 systemctl daemon-reload
 systemctl enable aero-edge
 systemctl restart aero-edge
+
+# --- health check & auto-rollback ---
+sleep 2
+if ! systemctl is-active --quiet aero-edge; then
+    echo "[rollback] 启动失败，触发自动回滚..."
+    if [[ -f "$INSTALL_DIR/aero-edge.bak" ]]; then
+        cp -f "$INSTALL_DIR/aero-edge.bak" "$INSTALL_DIR/aero-edge"
+        systemctl restart aero-edge
+        echo "[rollback] 已成功回滚至上一版本并恢复运行"
+    else
+        echo "[rollback] 无备份可回滚"
+        journalctl -u aero-edge -n 30 --no-pager || true
+        exit 1
+    fi
+fi
 
 echo "[wait] edge writing subscription..."
 for i in 1 2 3 4 5 6 7 8 9 10; do

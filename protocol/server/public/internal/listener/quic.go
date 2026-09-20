@@ -81,11 +81,16 @@ func generateSessionID() string {
 
 // StartQUIC 启动 QUIC 服务端监听
 func StartQUIC(addr string, tlsConfig *tls.Config, handler QUICHandler) (*quic.Listener, error) {
+	// 铁律 L6：显式声明 16MB/128MB 跨洋超大接收窗口
 	quicCfg := &quic.Config{
-		MaxIncomingStreams:    1000,
-		MaxIncomingUniStreams: 1000,
-		MaxIdleTimeout:        60 * time.Second,
-		EnableDatagrams:       true,
+		MaxIncomingStreams:             1000,
+		MaxIncomingUniStreams:          1000,
+		MaxIdleTimeout:                 60 * time.Second,
+		EnableDatagrams:                true,
+		InitialStreamReceiveWindow:     16 * 1024 * 1024, // 16 MB 单流窗口 (Rule L6)
+		MaxStreamReceiveWindow:         32 * 1024 * 1024, // 32 MB
+		InitialConnectionReceiveWindow: 64 * 1024 * 1024, // 64 MB
+		MaxConnectionReceiveWindow:     128 * 1024 * 1024, // 128 MB 连接级窗口 (Rule L6)
 	}
 
 	// 公网 ALPN 仅 h3（无私有标识）
