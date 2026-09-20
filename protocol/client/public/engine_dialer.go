@@ -39,7 +39,8 @@ func dialTCPH2(target string, preface []byte) (net.Conn, error) {
 }
 
 // dialEdgeTLS 仅完成到 Edge 的 TCP+TLS（不含 H2）。
-// 默认优先走 uTLS 真实浏览器指纹（Chrome 120+ 拟态，消除 Go 原生特征），极端异常自动回退 std。
+// 默认强制走 uTLS 真实浏览器指纹（Chrome 120+ 拟态，消除 Go 原生特征）。
+// 严格安全准则：绝不静默回退 std TLS，防止在网络异常时向 GFW 暴露 Go 原生 JA3 指纹。
 func dialEdgeTLS() (net.Conn, error) {
 	fp := ""
 	if fingerprint != nil {
@@ -52,8 +53,13 @@ func dialEdgeTLS() (net.Conn, error) {
 	if err == nil {
 		return conn, nil
 	}
-	log.Printf("[TLS] utls failed: %v — fallback std", err)
-	return dialEdgeTLSStd(false)
+	// 遇到异常尝试分片握手重试，若仍然失败坚决报错返回，触发上层节点重试，绝不降级 std TLS 泄露指纹
+	log.Printf("[uTLS] direct handshake failed: %v, trying fragmented hello...", err)
+	connFrag, errFrag := dialEdgeTLSUTls(true)
+	if errFrag == nil {
+		return connFrag, nil
+	}
+	return nil, fmt.Errorf("utls handshake failed: %w (fragmented: %v)", err, errFrag)
 }
 
 // WhiteSNIPool 常用顶级免流/防封白名单 SNI 候选池

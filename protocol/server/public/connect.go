@@ -35,8 +35,8 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Proxy-Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
 		h.failAuth(ip)
-		if h.strictCamouflage && h.cover != nil {
-			h.cover.ServeHTTP(w, r)
+		if h.strictCamouflage {
+			h.serveCamouflage(w, r)
 			return
 		}
 		http.Error(w, "Unauthorized", http.StatusProxyAuthRequired)
@@ -45,8 +45,8 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	tok := strings.TrimPrefix(authHeader, "Bearer ")
 	if !h.validator.Validate(tok) {
 		h.failAuth(ip)
-		if h.strictCamouflage && h.cover != nil {
-			h.cover.ServeHTTP(w, r)
+		if h.strictCamouflage {
+			h.serveCamouflage(w, r)
 			return
 		}
 		http.Error(w, "Unauthorized", http.StatusProxyAuthRequired)
@@ -194,6 +194,19 @@ func (h *edgeHandler) failAuth(ip string) {
 		h.rateLimit.RecordFail(ip)
 	}
 }
+
+// serveCamouflage 优先交由 cover 伪装站点处理；若未配置 cover，则由内建标准 Nginx 欢迎页兜底，绝对不暴露 407 代理指纹
+func (h *edgeHandler) serveCamouflage(w http.ResponseWriter, r *http.Request) {
+	if h.cover != nil {
+		h.cover.ServeHTTP(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Server", "nginx/1.24.0")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><title>Welcome to nginx!</title><style>html{color-scheme:light dark;}body{width:35em;margin:0 auto;font-family:Tahoma,Verdana,Arial,sans-serif;}</style></head><body><h1>Welcome to nginx!</h1><p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p><p><em>Thank you for using nginx.</em></p></body></html>`))
+}
+
 
 type connectRelayParams struct {
 	Body       io.Reader

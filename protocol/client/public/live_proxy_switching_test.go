@@ -16,6 +16,9 @@ import (
 )
 
 func TestLiveProxySwitching(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live VPS test in short mode")
+	}
 	// Start mixed listener on random free port
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

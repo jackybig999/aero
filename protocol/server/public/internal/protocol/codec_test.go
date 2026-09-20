@@ -38,7 +38,7 @@ func TestDynamicPaddingUnmarshal(t *testing.T) {
 	}
 
 	if decoded.Version != req.Version || decoded.Token != req.Token {
-		t.Errorf("decoded content mismatch: got %v, want %v", decoded, req)
+		t.Errorf("decoded content mismatch: got %v, want %v", &decoded, &req)
 	}
 
 	t.Logf("[SUCCESS] Base payload=%d bytes, Padded payload=%d bytes. Unmarshal successful without error!",

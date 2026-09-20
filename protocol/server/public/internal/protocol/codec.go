@@ -57,13 +57,11 @@ func WriteMessage(w io.Writer, msg proto.Message) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	// 生成 64 ~ 256 字节动态高熵伪随机填充
-	var padLenByte [1]byte
-	_, _ = rand.Read(padLenByte[:])
-	padLen := 64 + int(padLenByte[0])%193 // [64, 256]
-
-	padBytes := make([]byte, padLen)
-	_, _ = rand.Read(padBytes)
+	// 单次系统调用读取高熵随机数，首字节决定填充长度 [64, 256]，后续字节作为 Padding 载荷 (零堆分配)
+	var entropyBuf [257]byte
+	_, _ = rand.Read(entropyBuf[:])
+	padLen := 64 + int(entropyBuf[0])%193 // [64, 256]
+	padBytes := entropyBuf[1 : 1+padLen]
 
 	// 使用标准 Protobuf Length-Delimited (Tag 15) 注入 Padding
 	padded := protowire.AppendTag(data, 15, protowire.BytesType)

@@ -251,6 +251,21 @@ func (f *FileStore) UpdateMetrics(id uint64, met *domain.HostMetrics, status str
 	return f.persist()
 }
 
+func (f *FileStore) UpdateMeta(id uint64, params domain.UpdateVPSParams) error {
+	if err := f.mem.UpdateMeta(id, params); err != nil {
+		return err
+	}
+	return f.persist()
+}
+
+func (f *FileStore) UpdateCapacity(id uint64, score int, tier int, state string) error {
+	if err := f.mem.UpdateCapacity(id, score, tier, state); err != nil {
+		return err
+	}
+	return f.persist()
+}
+
+
 func (f *FileStore) Delete(id uint64) error {
 	if err := f.mem.Delete(id); err != nil {
 		return err

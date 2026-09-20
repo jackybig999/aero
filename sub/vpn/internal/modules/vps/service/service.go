@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/cloudflare"
@@ -180,8 +181,107 @@ func (s *Service) Probe(id uint64) (*domain.HostMetrics, error) {
 	met.LatencyMS = time.Since(start).Milliseconds()
 	met.ProbeOK = true
 	_ = s.store.UpdateMetrics(id, met, "online")
+	score, tier, state := CalculateCapacity(met)
+	_ = s.store.UpdateCapacity(id, score, tier, state)
 	return met, nil
 }
+
+// UpdateMeta 更新 VPS 主机元数据 (名称/备注/角色/SSH端口/用户)
+func (s *Service) UpdateMeta(id uint64, p domain.UpdateVPSParams) error {
+	p.Name = strings.TrimSpace(p.Name)
+	p.Role = strings.TrimSpace(p.Role)
+	p.Remark = strings.TrimSpace(p.Remark)
+	p.SSHUsername = strings.TrimSpace(p.SSHUsername)
+	return s.store.UpdateMeta(id, p)
+}
+
+// ProbeAll 并发探测所有 VPS 资产 (限制最大 5 并发)，更新指标与健康容量打分
+func (s *Service) ProbeAll(ctx context.Context) ([]domain.VPSHost, error) {
+	hosts, err := s.store.List()
+	if err != nil {
+		return nil, err
+	}
+	if len(hosts) == 0 {
+		return hosts, nil
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 5)
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(id uint64) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+				_, _ = s.Probe(id)
+			case <-ctx.Done():
+				return
+			}
+		}(h.ID)
+	}
+	wg.Wait()
+	return s.store.List()
+}
+
+// CalculateCapacity 根据 VPS 主机指标综合评估健康与容量评分 (0~100) 与档位
+func CalculateCapacity(m *domain.HostMetrics) (score int, tier int, state string) {
+	if m == nil || !m.ProbeOK {
+		return 0, 1, "offline"
+	}
+	// 1. 档位划分 (依据物理内存)
+	tier = 2
+	if m.MemTotalMB > 0 {
+		if m.MemTotalMB <= 1200 {
+			tier = 1 // Nano/Edge (<=1GB)
+		} else if m.MemTotalMB > 4500 {
+			tier = 3 // Enterprise (>4GB)
+		}
+	}
+
+	// 2. 动态健康分基准 100 分
+	s := 100.0
+	if m.MemPercent > 90 {
+		s -= 45
+	} else if m.MemPercent > 80 {
+		s -= 30
+	} else if m.MemPercent > 70 {
+		s -= 15
+	}
+
+	if m.CPUPercent > 90 {
+		s -= 40
+	} else if m.CPUPercent > 75 {
+		s -= 25
+	} else if m.CPUPercent > 50 {
+		s -= 10
+	}
+
+	if m.LatencyMS > 400 {
+		s -= 20
+	} else if m.LatencyMS > 250 {
+		s -= 10
+	} else if m.LatencyMS > 150 {
+		s -= 5
+	}
+
+	if s < 0 {
+		s = 0
+	}
+	score = int(s)
+
+	switch {
+	case score >= 80:
+		state = "excellent"
+	case score >= 60:
+		state = "good"
+	case score >= 40:
+		state = "heavy"
+	default:
+		state = "overload"
+	}
+	return score, tier, state
+}
+
 
 // Cloudflare IPv4 官方代理 IP 范围 (用于识别是否误开启了 CDN 橙色云朵)
 var cfProxyCIDRs = []string{

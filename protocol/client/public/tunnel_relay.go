@@ -179,7 +179,7 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 			}
 			frame := &aeroproto.TcpFrame{
 				StreamId: p.StreamID,
-				Payload:  append([]byte(nil), buf[:n]...),
+				Payload:  buf[:n],
 				Sequence: seq,
 			}
 			if err := protocol.TypedWriteMessage(p.Tunnel, protocol.MsgTypeTcpFrame, frame); err != nil {

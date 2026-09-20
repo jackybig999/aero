@@ -15,6 +15,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -74,6 +76,8 @@ func RunServer() {
 		return
 	}
 
+	initMemoryLimit()
+
 	if *configPath != "" {
 		if cfg, err := config.LoadServerFile(*configPath); err == nil {
 			applyServerConfig(cfg, listen, portsFlag, token, domain, sniFlag, autoCert, autoCertEmail, autoCertDir, certFile, keyFile, logFormat, logFile)
@@ -88,6 +92,14 @@ func RunServer() {
 
 	ps := GetProfile(*profName)
 	maxC, maxU, rate, bw, idle, life, dialN, q := applyProfile(ps, *maxConn, *maxConnUser, *rateIP, *bwUser, *idleSec, *lifeSec, *maxDial, *quiet)
+
+	memBytes := detectAvailableMemory()
+	if memBytes > 0 && memBytes <= 1024*1024*1024 && *maxConn == 0 {
+		if maxC > 500 {
+			maxC = 500
+			log.Printf("[PROFILE] Low-spec VPS (<=1GB RAM): dynamically capped maxConn to %d to protect stability", maxC)
+		}
+	}
 
 	ports := resolvePorts(*listen, *portsFlag)
 	tlsPorts, plainPorts, quicPorts := config.ClassifyPorts(ports)
@@ -461,3 +473,48 @@ func joinPorts(ports []int) string {
 func RunEdge() {
 	RunServer()
 }
+
+// initMemoryLimit 自动探测宿主机/cgroup 真实物理内存，并设置 GOMEMLIMIT 软上限 (70%)，杜绝低配 VPS 宕机
+func initMemoryLimit() {
+	memBytes := detectAvailableMemory()
+	if memBytes > 0 {
+		limit := int64(float64(memBytes) * 0.70)
+		debug.SetMemoryLimit(limit)
+		log.Printf("[MEM] System memory %d MB detected, GOMEMLIMIT set to %d MB (70%% protection)", memBytes/(1024*1024), limit/(1024*1024))
+	}
+}
+
+func detectAvailableMemory() int64 {
+	// 1. cgroup v2
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if s != "max" && s != "" {
+			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+				return v
+			}
+		}
+	}
+	// 2. cgroup v1
+	if data, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil {
+		s := strings.TrimSpace(string(data))
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 && v < (1<<60) {
+			return v
+		}
+	}
+	// 3. Linux /proc/meminfo
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil && kb > 0 {
+						return kb * 1024
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+

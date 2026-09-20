@@ -17,6 +17,9 @@ import (
 )
 
 func TestLiveTunnelDualVPS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live VPS test in short mode")
+	}
 	nodes := []struct {
 		name  string
 		addr  string

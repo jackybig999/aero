@@ -166,7 +166,7 @@ func (d *AERODialer) dialEdgeTLS(cfg Config) (net.Conn, error) {
 	if err == nil {
 		return conn, nil
 	}
-	return d.dialEdgeTLSStd(cfg)
+	return nil, fmt.Errorf("utls handshake failed (no fallback to std): %w", err)
 }
 
 func (d *AERODialer) dialEdgeTLSStd(cfg Config) (net.Conn, error) {

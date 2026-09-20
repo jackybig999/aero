@@ -18,6 +18,8 @@ type Store interface {
 	UpdateDomain(id uint64, domain string) error
 	UpdateStatus(id uint64, status string) error
 	UpdateMetrics(id uint64, m *domain.HostMetrics, status string) error
+	UpdateMeta(id uint64, params domain.UpdateVPSParams) error
+	UpdateCapacity(id uint64, score int, tier int, state string) error
 	Delete(id uint64) error
 }
 
@@ -145,6 +147,46 @@ func (m *MemoryStore) UpdateMetrics(id uint64, met *domain.HostMetrics, status s
 	return nil
 }
 
+func (m *MemoryStore) UpdateMeta(id uint64, params domain.UpdateVPSParams) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.hosts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if params.Name != "" {
+		h.Name = params.Name
+	}
+	if params.Role != "" {
+		h.Role = params.Role
+	}
+	if params.SSHPort > 0 {
+		h.SSHPort = params.SSHPort
+	}
+	if params.SSHUsername != "" {
+		h.SSHUsername = params.SSHUsername
+	}
+	if params.Remark != "" {
+		h.Remark = params.Remark
+	}
+	h.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) UpdateCapacity(id uint64, score int, tier int, state string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.hosts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	h.HealthScore = score
+	h.Tier = tier
+	h.CapacityState = state
+	h.UpdatedAt = time.Now()
+	return nil
+}
+
 func (m *MemoryStore) Delete(id uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -152,3 +194,4 @@ func (m *MemoryStore) Delete(id uint64) error {
 	delete(m.passwords, id)
 	return nil
 }
+

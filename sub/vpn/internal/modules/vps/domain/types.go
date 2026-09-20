@@ -37,11 +37,23 @@ type VPSHost struct {
 	HasPassword bool         `json:"has_password"`
 	Domain      string       `json:"domain,omitempty"`
 	Remark      string       `json:"remark,omitempty"`
-	Status      string       `json:"status"` // registered | online | offline | error
-	Metrics     *HostMetrics `json:"metrics,omitempty"`
-	LastProbeAt *time.Time   `json:"last_probe_at,omitempty"`
-	CreatedAt   time.Time    `json:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at"`
+	Status        string       `json:"status"` // registered | online | offline | error
+	HealthScore   int          `json:"health_score"`            // 0~100 综合健康与承载评分
+	Tier          int          `json:"tier"`                    // 1: Nano/Edge (<=1G), 2: Standard (<=4G), 3: Enterprise (>4G)
+	CapacityState string       `json:"capacity_state"`          // excellent | good | heavy | overload | unknown
+	Metrics       *HostMetrics `json:"metrics,omitempty"`
+	LastProbeAt   *time.Time   `json:"last_probe_at,omitempty"`
+	CreatedAt     time.Time    `json:"created_at"`
+	UpdatedAt     time.Time    `json:"updated_at"`
+}
+
+// UpdateVPSParams defines mutable metadata for VPS management Web.
+type UpdateVPSParams struct {
+	Name        string `json:"name,omitempty"`
+	Role        string `json:"role,omitempty"`
+	SSHPort     int    `json:"ssh_port,omitempty"`
+	SSHUsername string `json:"ssh_username,omitempty"`
+	Remark      string `json:"remark,omitempty"`
 }
 
 // CreateVPSParams registration input.

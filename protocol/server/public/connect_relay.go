@@ -32,10 +32,10 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer p.Target.Close()
-	go func() {
-		<-ctx.Done()
+	stopClose := context.AfterFunc(ctx, func() {
 		p.Target.Close()
-	}()
+	})
+	defer stopClose()
 
 	started := time.Now()
 	var lastHB, lastAct atomic.Int64
@@ -104,9 +104,7 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 				h.bwLimit.Take(p.Token, n)
 			}
 			lastAct.Store(time.Now().UnixNano())
-			payload := make([]byte, n)
-			copy(payload, buf[:n])
-			frame := &aeroproto.TcpFrame{StreamId: p.StreamID, Payload: payload, Sequence: seq}
+			frame := &aeroproto.TcpFrame{StreamId: p.StreamID, Payload: buf[:n], Sequence: seq}
 			if err := protocol.TypedWriteMessage(p.SF, protocol.MsgTypeTcpFrame, frame); err != nil {
 				return
 			}
