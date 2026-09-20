@@ -20,6 +20,7 @@ type Store interface {
 	UpdateMetrics(id uint64, m *domain.HostMetrics, status string) error
 	UpdateMeta(id uint64, params domain.UpdateVPSParams) error
 	UpdateCapacity(id uint64, score int, tier int, state string) error
+	UpdatePurity(id uint64, purityScore int, aiBlocked bool, googleClean bool, cfClean bool, isWarp bool) error
 	Delete(id uint64) error
 }
 
@@ -184,6 +185,24 @@ func (m *MemoryStore) UpdateCapacity(id uint64, score int, tier int, state strin
 	h.Tier = tier
 	h.CapacityState = state
 	h.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryStore) UpdatePurity(id uint64, purityScore int, aiBlocked bool, googleClean bool, cfClean bool, isWarp bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.hosts[id]
+	if !ok {
+		return ErrNotFound
+	}
+	h.PurityScore = purityScore
+	h.AIBlocked = aiBlocked
+	h.GoogleClean = googleClean
+	h.CFClean = cfClean
+	h.IsWARPEgress = isWarp
+	now := time.Now()
+	h.LastPurityProbeAt = &now
+	h.UpdatedAt = now
 	return nil
 }
 

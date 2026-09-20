@@ -265,6 +265,13 @@ func (f *FileStore) UpdateCapacity(id uint64, score int, tier int, state string)
 	return f.persist()
 }
 
+func (f *FileStore) UpdatePurity(id uint64, purityScore int, aiBlocked bool, googleClean bool, cfClean bool, isWarp bool) error {
+	if err := f.mem.UpdatePurity(id, purityScore, aiBlocked, googleClean, cfClean, isWarp); err != nil {
+		return err
+	}
+	return f.persist()
+}
+
 
 func (f *FileStore) Delete(id uint64) error {
 	if err := f.mem.Delete(id); err != nil {

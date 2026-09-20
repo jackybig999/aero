@@ -15,6 +15,8 @@ import (
 	userD "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/domain"
 	userStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/store"
 	aeroEndpoint "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/endpoint"
+	vpsD "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/domain"
+	vpsStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/store"
 )
 
 type Handler struct {
@@ -22,6 +24,7 @@ type Handler struct {
 	userStore userStore.Store
 	epStore   *aeroEndpoint.Persist
 	sniMgr    *snimatrix.Manager
+	vpsStore  vpsStore.Store
 }
 
 func New(svc *service.Service) *Handler { return &Handler{svc: svc, sniMgr: snimatrix.New("")} }
@@ -34,6 +37,11 @@ func NewWithStores(svc *service.Service, uStore userStore.Store, ep *aeroEndpoin
 		m = snimatrix.New("")
 	}
 	return &Handler{svc: svc, userStore: uStore, epStore: ep, sniMgr: m}
+}
+
+// SetVPSStore 注入 VPS 资产存储，用于读取节点纯净度评分与 AI 封控状态
+func (h *Handler) SetVPSStore(vs vpsStore.Store) {
+	h.vpsStore = vs
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -205,11 +213,24 @@ func (h *Handler) ServePrivateSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	isp := r.URL.Query().Get("isp")
-	h.writeUserSubscription(w, user, isp)
+	purpose := r.URL.Query().Get("purpose")
+	allowDegrade := r.URL.Query().Get("allow_degrade") == "true"
+	h.writeUserSubscription(w, user, isp, purpose, allowDegrade)
 }
 
-func (h *Handler) writeUserSubscription(w http.ResponseWriter, user *userD.User, isp string) {
-	var servers []map[string]any
+func (h *Handler) writeUserSubscription(w http.ResponseWriter, user *userD.User, isp, purpose string, allowDegrade bool) {
+	vpsMap := make(map[uint64]*vpsD.VPSHost)
+	if h.vpsStore != nil {
+		if hosts, err := h.vpsStore.List(); err == nil {
+			for i := range hosts {
+				vpsMap[hosts[i].ID] = &hosts[i]
+			}
+		}
+	}
+
+	var allServers []map[string]any
+	var tier1Servers []map[string]any
+
 	if h.epStore != nil {
 		for _, ep := range h.epStore.List() {
 			host := strings.TrimSpace(ep.Host)
@@ -240,14 +261,63 @@ func (h *Handler) writeUserSubscription(w http.ResponseWriter, user *userD.User,
 					sni = matched
 				}
 			}
-			servers = append(servers, map[string]any{
+			srv := map[string]any{
 				"name":     name,
 				"address":  fmt.Sprintf("%s:%d", host, port),
 				"token":    token,
 				"sni":      sni,
 				"protocol": "tcp_h2",
-			})
+			}
+
+			// 匹配 VPS 纯净度元数据
+			isTier1 := false
+			vps := vpsMap[ep.VPSID]
+			if vps == nil && ep.IP != "" {
+				for _, hst := range vpsMap {
+					if hst.IP == ep.IP {
+						vps = hst
+						break
+					}
+				}
+			}
+			if vps != nil {
+				srv["purityScore"] = vps.PurityScore
+				srv["aiBlocked"] = vps.AIBlocked
+				if !vps.AIBlocked && vps.PurityScore >= 90 && !vps.IsWARPEgress {
+					isTier1 = true
+				}
+			}
+
+			allServers = append(allServers, srv)
+			if isTier1 {
+				tier1Servers = append(tier1Servers, srv)
+			}
 		}
+	}
+
+	var servers []map[string]any
+	var riskWarning string
+
+	if purpose == "ai" {
+		if len(tier1Servers) > 0 {
+			servers = tier1Servers
+		} else {
+			// Tier 1 纯净节点耗尽
+			if !allowDegrade {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.Header().Set("Retry-After", "120")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code":  http.StatusServiceUnavailable,
+					"error": "TIER1_AI_NODES_EXHAUSTED",
+				})
+				return
+			}
+			servers = allServers
+			riskWarning = "dirty_ip_degraded"
+		}
+	} else {
+		servers = allServers
 	}
 
 	if len(servers) == 0 {
@@ -271,17 +341,25 @@ func (h *Handler) writeUserSubscription(w http.ResponseWriter, user *userD.User,
 		expireUnix = time.Now().AddDate(1, 0, 0).Unix()
 	}
 
+	optimization := map[string]any{
+		"defaultQoS": "ultra-low-latency",
+		"ispMatched": isp,
+	}
+	if purpose != "" {
+		optimization["purpose"] = purpose
+	}
+
 	doc := map[string]any{
-		"version":   "aero/2.0",
-		"userId":    user.Username,
-		"slug":      user.SubSlug,
-		"expireAt":  expireUnix,
-		"createdAt": user.CreatedAt.Unix(),
-		"servers":   servers,
-		"optimization": map[string]any{
-			"defaultQoS": "ultra-low-latency",
-			"ispMatched": isp,
-		},
+		"version":      "aero/2.0",
+		"userId":       user.Username,
+		"slug":         user.SubSlug,
+		"expireAt":     expireUnix,
+		"createdAt":    user.CreatedAt.Unix(),
+		"servers":      servers,
+		"optimization": optimization,
+	}
+	if riskWarning != "" {
+		doc["riskWarning"] = riskWarning
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -314,7 +392,9 @@ func (h *Handler) ServeSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			isp := r.URL.Query().Get("isp")
-			h.writeUserSubscription(w, user, isp)
+			purpose := r.URL.Query().Get("purpose")
+			allowDegrade := r.URL.Query().Get("allow_degrade") == "true"
+			h.writeUserSubscription(w, user, isp, purpose, allowDegrade)
 			return
 		}
 	}

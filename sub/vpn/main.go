@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -225,6 +227,8 @@ func main() {
 		log.Printf("vps store: %s (empty)", vpsPath)
 	}
 	vpsSvc := vpsS.New(vpsDB, box)
+	// 启动 VPS 真实出口 IP 纯净度后台例行巡检（每 4 小时）
+	vpsSvc.StartPurityTicker(context.Background(), 4*time.Hour)
 
 	epPath := filepath.Join(dataDir, "aero_endpoints.json")
 	epStore, err := aeroEndpoint.NewPersist(epPath)
@@ -294,7 +298,9 @@ func main() {
 	nodeH.New(nodeSvc).RegisterRoutes(api)
 	sniPath := filepath.Join(dataDir, "sni_matrix.json")
 	sniMgr := snimatrix.New(sniPath)
-	subH.NewWithStores(subSvc, userDB, epStore, sniMgr).RegisterRoutes(api)
+	subHandler := subH.NewWithStores(subSvc, userDB, epStore, sniMgr)
+	subHandler.SetVPSStore(vpsDB)
+	subHandler.RegisterRoutes(api)
 	vpsH.New(vpsSvc).RegisterRoutes(api)
 	aeroH.New(aeroSvc).RegisterRoutes(api)
 	payInH.New(payInSvc).RegisterRoutes(api)

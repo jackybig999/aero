@@ -5,13 +5,10 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/cloudflare"
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/domain"
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/secret"
-	"github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/sshprobe"
 	"github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/store"
 )
 
@@ -137,55 +134,6 @@ func (s *Service) Credentials(id uint64) (*domain.Credentials, error) {
 	}, nil
 }
 
-func (s *Service) Probe(id uint64) (*domain.HostMetrics, error) {
-	h, blob, err := s.store.Get(id)
-	if err != nil {
-		return nil, err
-	}
-	pass, err := s.box.Decrypt(blob)
-	if err != nil {
-		m := &domain.HostMetrics{ProbeOK: false, ProbeError: "decrypt failed", Source: "none", CollectedAt: time.Now()}
-		_ = s.store.UpdateMetrics(id, m, "offline")
-		return m, err
-	}
-	if pass == "" {
-		m := &domain.HostMetrics{ProbeOK: false, ProbeError: "no password", Source: "none", CollectedAt: time.Now()}
-		_ = s.store.UpdateMetrics(id, m, "offline")
-		return m, fmt.Errorf("no password")
-	}
-	start := time.Now()
-	client, err := sshprobe.Dial(sshprobe.Credentials{
-		Host: h.IP, Port: h.SSHPort, User: h.SSHUsername, Password: pass,
-	}, 12*time.Second)
-	if err != nil {
-		m := &domain.HostMetrics{
-			ProbeOK: false, ProbeError: err.Error(), Source: "ssh",
-			CollectedAt: time.Now(), LatencyMS: time.Since(start).Milliseconds(),
-		}
-		_ = s.store.UpdateMetrics(id, m, "offline")
-		return m, err
-	}
-	defer client.Close()
-	met, err := sshprobe.CollectMetrics(client)
-	if err != nil {
-		m := &domain.HostMetrics{
-			ProbeOK: false, ProbeError: err.Error(), Source: "ssh",
-			CollectedAt: time.Now(), LatencyMS: time.Since(start).Milliseconds(),
-		}
-		_ = s.store.UpdateMetrics(id, m, "error")
-		return m, err
-	}
-	if rx, tx, nerr := sshprobe.CollectNetDelta(client); nerr == nil {
-		met.NetRxMbps, met.NetTxMbps = rx, tx
-	}
-	met.LatencyMS = time.Since(start).Milliseconds()
-	met.ProbeOK = true
-	_ = s.store.UpdateMetrics(id, met, "online")
-	score, tier, state := CalculateCapacity(met)
-	_ = s.store.UpdateCapacity(id, score, tier, state)
-	return met, nil
-}
-
 // UpdateMeta 更新 VPS 主机元数据 (名称/备注/角色/SSH端口/用户)
 func (s *Service) UpdateMeta(id uint64, p domain.UpdateVPSParams) error {
 	p.Name = strings.TrimSpace(p.Name)
@@ -193,34 +141,6 @@ func (s *Service) UpdateMeta(id uint64, p domain.UpdateVPSParams) error {
 	p.Remark = strings.TrimSpace(p.Remark)
 	p.SSHUsername = strings.TrimSpace(p.SSHUsername)
 	return s.store.UpdateMeta(id, p)
-}
-
-// ProbeAll 并发探测所有 VPS 资产 (限制最大 5 并发)，更新指标与健康容量打分
-func (s *Service) ProbeAll(ctx context.Context) ([]domain.VPSHost, error) {
-	hosts, err := s.store.List()
-	if err != nil {
-		return nil, err
-	}
-	if len(hosts) == 0 {
-		return hosts, nil
-	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 5)
-	for _, h := range hosts {
-		wg.Add(1)
-		go func(id uint64) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-				_, _ = s.Probe(id)
-			case <-ctx.Done():
-				return
-			}
-		}(h.ID)
-	}
-	wg.Wait()
-	return s.store.List()
 }
 
 // CalculateCapacity 根据 VPS 主机指标综合评估健康与容量评分 (0~100) 与档位
