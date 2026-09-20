@@ -6,22 +6,26 @@
 package api
 
 import (
+	"crypto/subtle"
+	"encoding/json"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
 
 // Server HTTP API 服务器
 type Server struct {
-	addr    string
-	state   *AppState
-	mu      sync.RWMutex
-	srv     *http.Server
-	runtime Runtime
-	ui      fs.FS
+	addr      string
+	state     *AppState
+	mu        sync.RWMutex
+	srv       *http.Server
+	runtime   Runtime
+	ui        fs.FS
+	ctrlToken string
 }
 
 // AppState 应用运行状态（由 main 协程更新，API 读取）
@@ -114,6 +118,13 @@ func (s *Server) UpdateState(fn func(*AppState)) {
 	fn(s.state)
 }
 
+// SetCtrlToken 设置本地控制面 Bearer Token 保护
+func (s *Server) SetCtrlToken(tok string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ctrlToken = tok
+}
+
 // Start 启动 API 服务器（非阻塞）
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.addr)
@@ -135,10 +146,11 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/config/reload", s.handleConfigReload)
 	mux.HandleFunc("/api/v1/version", s.handleVersion)
 	mux.HandleFunc("/api/v1/import", s.handleImport)
-	mux.HandleFunc("/api/v1/ai/stats", s.handleAIStats)
-	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+	healthFn := func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"status": "ok", "service": "aero-ech-api"})
-	})
+	}
+	mux.HandleFunc("/health", healthFn)
+	mux.HandleFunc("/api/v1/health", healthFn)
 	mux.HandleFunc("/api/v1/probe", s.handleProbe)
 	// PAC for system proxy — HTTP URL works better than file:// for Chrome/Edge
 	mux.HandleFunc("/proxy.pac", s.handlePAC)
@@ -147,7 +159,47 @@ func (s *Server) Start() error {
 		mux.Handle("/", uiFileServer(s.ui))
 	}
 
-	s.srv = &http.Server{Handler: corsWrap(mux)}
+	var handler http.Handler = mux
+	if s.ctrlToken != "" {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			// 白名单：健康检查、PAC、静态资源及只读状态
+			if path == "/health" || path == "/api/v1/health" ||
+				strings.HasSuffix(path, "/proxy.pac") ||
+				path == "/favicon.ico" ||
+				path == "/api/v1/status" ||
+				path == "/api/v1/probe" ||
+				path == "/" ||
+				strings.HasPrefix(path, "/assets/") ||
+				r.Method == http.MethodOptions {
+				mux.ServeHTTP(w, r)
+				return
+			}
+			auth := r.Header.Get("Authorization")
+			token := ""
+			if strings.HasPrefix(auth, "Bearer ") {
+				token = strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+			}
+			if token == "" {
+				token = r.Header.Get("X-Ctrl-Token")
+			}
+			if token == "" {
+				token = r.URL.Query().Get("ctrl_token")
+			}
+			if token == "" || subtle.ConstantTimeCompare([]byte(s.ctrlToken), []byte(token)) != 1 {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code":  http.StatusUnauthorized,
+					"error": "unauthorized: invalid or missing ctrl.token",
+				})
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+	}
+
+	s.srv = &http.Server{Handler: corsWrap(handler)}
 	go func() {
 		log.Printf("[API] Listening on %s", s.addr)
 		if err := s.srv.Serve(ln); err != http.ErrServerClosed {

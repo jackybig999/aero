@@ -272,7 +272,11 @@ func (p *Pool) pickOrDial(edgeAddr string, dialTLS DialTLS) (*managedConn, error
 		}
 		return nil, err
 	}
-	tr := &http2.Transport{AllowHTTP: false}
+	t1 := &http.Transport{}
+	tr, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		tr = &http2.Transport{AllowHTTP: false}
+	}
 	cc, err := tr.NewClientConn(raw)
 	if err != nil {
 		_ = raw.Close()

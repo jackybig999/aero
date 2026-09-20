@@ -56,6 +56,19 @@ func readLastSub() string {
 	return ""
 }
 
+func readCtrlToken() string {
+	home, err := os.UserHomeDir()
+	if err == nil {
+		if data, err := os.ReadFile(filepath.Join(home, ".aero", "ctrl.token")); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	if data, err := os.ReadFile("ctrl.token"); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+	return ""
+}
+
 func aeroRequest(method, path string, body interface{}) (map[string]interface{}, error) {
 	url := fmt.Sprintf("http://%s:%d%s", aeroAPIHost, aeroAPIPort, path)
 	var bodyReader io.Reader
@@ -70,6 +83,9 @@ func aeroRequest(method, path string, body interface{}) (map[string]interface{},
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if tok := readCtrlToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
