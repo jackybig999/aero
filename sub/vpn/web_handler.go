@@ -12,8 +12,9 @@ import (
 )
 
 type WebPaths struct {
-	UserDist  string
-	AdminDist string
+	UserDist   string
+	AdminDist  string
+	AeroUIDist string
 }
 
 func FindWebDist() WebPaths {
@@ -23,9 +24,10 @@ func FindWebDist() WebPaths {
 		"sub/vpn",
 		filepath.Dir(os.Args[0]),
 		filepath.Join(filepath.Dir(os.Args[0]), "..", "..", "sub", "vpn"),
+		filepath.Join(filepath.Dir(os.Args[0]), "..", ".."),
 	}
 	cwd, _ := os.Getwd()
-	candidates = append(candidates, cwd, filepath.Join(cwd, "sub", "vpn"))
+	candidates = append(candidates, cwd, filepath.Join(cwd, "sub", "vpn"), filepath.Join(cwd, "..", ".."))
 
 	var p WebPaths
 	for _, root := range candidates {
@@ -49,7 +51,22 @@ func FindWebDist() WebPaths {
 				p.AdminDist = try("admin", "dist")
 			}
 		}
-		if p.UserDist != "" && p.AdminDist != "" {
+		if p.AeroUIDist == "" {
+			aeroCandidates := [][]string{
+				{"protocol", "server", "webui", "dist"},
+				{"protocol", "server", "public", "webui", "dist"},
+				{"..", "..", "protocol", "server", "webui", "dist"},
+				{"..", "..", "protocol", "server", "public", "webui", "dist"},
+				{"webui", "dist"},
+				{"web", "aero-ui", "dist"},
+			}
+			for _, parts := range aeroCandidates {
+				if p.AeroUIDist = try(parts...); p.AeroUIDist != "" {
+					break
+				}
+			}
+		}
+		if p.UserDist != "" && p.AdminDist != "" && p.AeroUIDist != "" {
 			break
 		}
 	}
@@ -65,6 +82,23 @@ func NewWebHandler(p WebPaths, api http.Handler) http.Handler {
 			return
 		}
 
+		if r.URL.Path == "/aero-ui" {
+			http.Redirect(w, r, "/aero-ui/", http.StatusMovedPermanently)
+			return
+		}
+		if upath == "/aero-ui" || strings.HasPrefix(upath, "/aero-ui/") {
+			if p.AeroUIDist == "" {
+				http.Error(w, "AERO Console UI not built — check protocol/server/webui/dist", http.StatusServiceUnavailable)
+				return
+			}
+			serveSPA(w, r, p.AeroUIDist, "/aero-ui")
+			return
+		}
+
+		if r.URL.Path == "/admin" {
+			http.Redirect(w, r, "/admin/", http.StatusMovedPermanently)
+			return
+		}
 		if upath == "/admin" || strings.HasPrefix(upath, "/admin/") {
 			if p.AdminDist == "" {
 				http.Error(w, "admin UI not built — check web/admin/dist", http.StatusServiceUnavailable)

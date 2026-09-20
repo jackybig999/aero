@@ -23,6 +23,7 @@ type FileVPSStore struct {
 }
 
 type vpsPersistFormat struct {
+	Next      uint64              `json:"next"`
 	NextID    uint64              `json:"next_id"`
 	Hosts     map[uint64]*VPSHost `json:"hosts"`
 	Passwords map[uint64]string   `json:"passwords"`
@@ -53,7 +54,11 @@ func (s *FileVPSStore) load() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.next = doc.NextID
+	if doc.Next > 0 {
+		s.next = doc.Next
+	} else {
+		s.next = doc.NextID
+	}
 	if doc.Hosts != nil {
 		s.hosts = doc.Hosts
 	}
@@ -87,6 +92,7 @@ func (s *FileVPSStore) save() error {
 		}
 	}
 	doc := vpsPersistFormat{
+		Next:      s.next,
 		NextID:    s.next,
 		Hosts:     s.hosts,
 		Passwords: s.passwords,
