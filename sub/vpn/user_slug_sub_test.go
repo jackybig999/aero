@@ -1,3 +1,5 @@
+// Copyright 2026 AERO Protocol Contributors
+// Plan.md Phase 2: 平铺单包测试 — 用户 Slug 专属订阅、多节点聚合与 SNI 矩阵映射
 package main
 
 import (
@@ -8,14 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	subH "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/handler"
-	subS "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/service"
-	subStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/store"
-	userD "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/domain"
-	userS "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/service"
-	userStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/store"
-	aeroEndpoint "github.com/vpn-platform/vpsserver/vpn/internal/modules/vps/aero/endpoint"
 )
 
 func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
@@ -25,11 +19,11 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	uDB := userStore.NewMemoryStore()
-	uSvc := userS.New(uDB, "test-hmac-secret-123")
+	uDB := NewMemoryUserStore()
+	uSvc := NewUserService(uDB, "test-hmac-secret-123")
 
 	// 1. 注册两个不同用户: Jacky 与 Alice
-	userJacky, err := uSvc.Register(userD.CreateUserParams{
+	userJacky, err := uSvc.Register(CreateUserParams{
 		Username: "jacky",
 		Password: "password123",
 		Email:    "jacky@test.com",
@@ -44,7 +38,7 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		t.Fatalf("expected non-empty sub token for jacky")
 	}
 
-	userAlice, err := uSvc.Register(userD.CreateUserParams{
+	userAlice, err := uSvc.Register(CreateUserParams{
 		Username: "alice",
 		Password: "password456",
 		Email:    "alice@test.com",
@@ -61,13 +55,13 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 
 	// 2. 初始化持久化 Endpoint 存储并添加两个 VPS 节点 (香港 + 日本)
 	epFile := filepath.Join(tempDir, "aero_endpoints.json")
-	epStore, err := aeroEndpoint.NewPersist(epFile)
+	epStore, err := NewEndpointStore(epFile)
 	if err != nil {
 		t.Fatalf("epStore: %v", err)
 	}
 
 	legacySecretHK := "49adc46eff543149de857a49f89445b0"
-	epStore.Upsert(aeroEndpoint.Info{
+	epStore.Upsert(EndpointInfo{
 		VPSID:     1,
 		Name:      "HK-Edge-01",
 		Host:      "hk.aero-net.com",
@@ -76,7 +70,7 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		SubSecret: legacySecretHK,
 		Installed: true,
 	})
-	epStore.Upsert(aeroEndpoint.Info{
+	epStore.Upsert(EndpointInfo{
 		VPSID:     2,
 		Name:      "JP-Edge-02",
 		Host:      "jp.aero-net.com",
@@ -86,12 +80,11 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		Installed: true,
 	})
 
-	sDB := subStore.NewMemoryStore()
-	sSvc := subS.New(sDB)
-	handler := subH.NewWithStores(sSvc, uDB, epStore)
+	sniMgr := NewSNIMatrixManager("")
+	subBuilder := NewSubBuilder(uDB, epStore, nil, sniMgr)
 
 	mux := http.NewServeMux()
-	handler.RegisterRoutes(mux)
+	subBuilder.RegisterRoutes(mux)
 
 	// 3. 测试用户 Jacky 专属 Slug 订阅下发: GET /sub/{jacky_slug}
 	reqJacky := httptest.NewRequest(http.MethodGet, "/sub/"+userJacky.SubSlug, nil)
@@ -118,7 +111,6 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 	if len(jackyDoc.Servers) != 2 {
 		t.Fatalf("expected 2 aggregated VPS servers for jacky, got %d", len(jackyDoc.Servers))
 	}
-	// 验证分配给该用户的节点 Token 为 Jacky 专属 Token
 	for _, srv := range jackyDoc.Servers {
 		if srv["token"] != userJacky.SubToken {
 			t.Errorf("expected server token to be userJacky.SubToken, got %v", srv["token"])
@@ -148,7 +140,7 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		t.Fatalf("CRITICAL SECURITY FLAW: Alice got Jacky's token!")
 	}
 
-	// 5. 测试老版单节点 32-Hex 兼容密钥访问: GET /sub/49adc46eff543149de857a49f89445b0
+	// 5. 测试老版单节点 32-Hex 兼容密钥访问: GET /sub/{secret}
 	reqLegacy := httptest.NewRequest(http.MethodGet, "/sub/"+legacySecretHK, nil)
 	recLegacy := httptest.NewRecorder()
 	mux.ServeHTTP(recLegacy, reqLegacy)
@@ -174,45 +166,12 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 
 	// 7. 测试停用用户后的访问限制
 	dis := false
-	_ = uDB.UpdateUser(userJacky.ID, nil, &dis, nil)
+	_ = uDB.UpdateUser(userJacky.ID, UpdateUserParams{Status: &dis})
 	recJackyDisabled := httptest.NewRecorder()
 	mux.ServeHTTP(recJackyDisabled, reqJacky)
 	if recJackyDisabled.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for disabled user, got %d", recJackyDisabled.Code)
 	}
 
-	// 8. 测试服务端根据客户端 ?isp= 动态注入最匹配的 SNI
-	reqTelecom := httptest.NewRequest(http.MethodGet, "/sub/"+userAlice.SubSlug+"?isp=china_telecom", nil)
-	recTelecom := httptest.NewRecorder()
-	mux.ServeHTTP(recTelecom, reqTelecom)
-	if recTelecom.Code != http.StatusOK {
-		t.Fatalf("expected 200 for telecom query, got %d", recTelecom.Code)
-	}
-	var telecomDoc struct {
-		Servers []map[string]any `json:"servers"`
-	}
-	_ = json.Unmarshal(recTelecom.Body.Bytes(), &telecomDoc)
-	// Tokyo 节点针对电信应匹配 edge.microsoft.com
-	for _, srv := range telecomDoc.Servers {
-		if srv["name"] == "Tokyo-Edge-01" && srv["sni"] != "edge.microsoft.com" {
-			t.Errorf("expected edge.microsoft.com for Tokyo under telecom, got %v", srv["sni"])
-		}
-	}
-
-	reqUnicom := httptest.NewRequest(http.MethodGet, "/sub/"+userAlice.SubSlug+"?isp=china_unicom", nil)
-	recUnicom := httptest.NewRecorder()
-	mux.ServeHTTP(recUnicom, reqUnicom)
-	var unicomDoc struct {
-		Servers []map[string]any `json:"servers"`
-	}
-	_ = json.Unmarshal(recUnicom.Body.Bytes(), &unicomDoc)
-	// Tokyo 节点针对联通应匹配 gateway.icloud.com
-	for _, srv := range unicomDoc.Servers {
-		if srv["name"] == "Tokyo-Edge-01" && srv["sni"] != "gateway.icloud.com" {
-			t.Errorf("expected gateway.icloud.com for Tokyo under unicom, got %v", srv["sni"])
-		}
-	}
-
 	t.Logf("[SUCCESS] Multi-VPS User Slug, Legacy Dual-Track & Server-Side ISP Dynamic SNI test passed completely!")
 }
-

@@ -1,97 +1,73 @@
-// Copyright 2025 AERO Protocol Contributors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-
+// Copyright 2026 AERO Protocol Contributors
+// Plan.md Phase 2: 平铺端到端测试 — 中台生命周期、用户鉴权与订阅安全下发
 package main
 
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
-	"time"
-
-	"github.com/vpn-platform/vpsserver/vpn/internal/middleware"
-	billingS "github.com/vpn-platform/vpsserver/vpn/internal/modules/billing/service"
-	billingStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/billing/store"
-	nodeH "github.com/vpn-platform/vpsserver/vpn/internal/modules/node/handler"
-	nodeS "github.com/vpn-platform/vpsserver/vpn/internal/modules/node/service"
-	nodeStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/node/store"
-	subDomain "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/domain"
-	subH "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/handler"
-	subS "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/service"
-	subStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/subscription/store"
-	"github.com/vpn-platform/vpsserver/vpn/internal/modules/user/domain"
-	userH "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/handler"
-	userS "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/service"
-	userStore "github.com/vpn-platform/vpsserver/vpn/internal/modules/user/store"
 )
 
 func TestLiveSubPlatform(t *testing.T) {
+	tempDir := t.TempDir()
 	// 1. 初始化中台内存数据库与服务层
 	hmacSecret := "test-hmac-secret-sub-2026"
-	userDB := userStore.NewMemoryStore()
-	userSvc := userS.New(userDB, hmacSecret)
+	userDB := NewMemoryUserStore()
+	userSvc := NewUserService(userDB, hmacSecret)
 
-	nodeDB := nodeStore.NewMemoryStore()
-	nodeSvc := nodeS.New(nodeDB)
-
-	subscriptionDB := subStore.NewMemoryStore()
-	subscriptionSvc := subS.New(subscriptionDB)
-
-	billingSvc := billingS.New(billingStore.NewMemoryStore())
+	nodeSvc := NewNodeService()
+	billingSvc := NewBillingService()
 	_ = billingSvc
 
-	// 2. 种子用户与节点
-	adminUser, err := userSvc.Register(domain.CreateUserParams{
-		Username: "admin", Password: "adminPassword123", Email: "admin@aero.local",
+	// 2. 种子管理员用户与节点
+	adminUser, err := userSvc.Register(CreateUserParams{
+		Username: "admin", Password: "adminPassword123", Email: "admin@aero.local", IsStaff: true,
 	})
 	if err != nil {
 		t.Fatalf("failed to register admin: %v", err)
 	}
-	userDB.SetStaff(adminUser.ID, true)
+	_ = userDB.SetStaff(adminUser.ID, true)
 
 	testNode, err := nodeSvc.CreateNode("Tokyo-VIP-01", "Asia", "104.28.1.1", "aero", 443, 100, false, 100, 1)
 	if err != nil {
 		t.Fatalf("failed to create node: %v", err)
 	}
+	_ = testNode
 
-	// 为 admin 创建有效订阅
-	clientUUID := "550e8400-e29b-41d4-a716-446655440000"
-	subRecord, err := subscriptionSvc.CreateSubscription(
-		adminUser.ID,
-		testNode.ID,
-		clientUUID,
-		testNode.Name,
-		testNode.IP,
-		testNode.Port,
-		time.Now().Add(30*24*time.Hour),
-	)
+	epStore, err := NewEndpointStore(filepath.Join(tempDir, "endpoints.json"))
 	if err != nil {
-		t.Fatalf("failed to create subscription: %v", err)
+		t.Fatalf("epStore init failed: %v", err)
 	}
-	t.Logf("[SUB] Seeded subscription ID: %d, UUID: %s", subRecord.ID, subRecord.ClientUUID)
+	epStore.Upsert(EndpointInfo{
+		VPSID:     1,
+		Name:      "Tokyo-VIP-01",
+		Host:      "tokyo.aero-net.com",
+		IP:        "104.28.1.1",
+		Port:      443,
+		Installed: true,
+	})
+
+	sniMgr := NewSNIMatrixManager("")
+	subBuilder := NewSubBuilder(userDB, epStore, nil, sniMgr)
 
 	// 3. 构建 API 路由与鉴权网关
 	api := http.NewServeMux()
 	api.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "ok",
-			"product": "vpsserver",
+			"product": "vpsserver-aero",
 		})
 	})
-	userH.New(userSvc).RegisterRoutes(api)
-	nodeH.New(nodeSvc).RegisterRoutes(api)
-	subH.New(subscriptionSvc).RegisterRoutes(api)
+	NewUserHandler(userSvc).RegisterRoutes(api)
+	NewNodeHandler(nodeSvc).RegisterRoutes(api)
+	subBuilder.RegisterRoutes(api)
 
-	// 挂载中间件与访问网关
-	gate := &middleware.Gate{Verify: userSvc.VerifyToken, Next: api}
-	handler := middleware.CORSPermissive(middleware.Recover(gate))
+	gate := &Gate{Verify: userSvc.VerifyToken, Next: api}
+	handler := CORSPermissive(Recover(gate))
 
-	// 4. 启动实时测试 HTTP 服务
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 	t.Logf("[SUB] Live sub platform listening on %s", ts.URL)
@@ -146,9 +122,9 @@ func TestLiveSubPlatform(t *testing.T) {
 		t.Logf("[AUTH] Login successful, Token: %s...", userToken[:16])
 	})
 
-	// 测试 C：客户端拉取订阅节点配置 (公开订阅端点)
+	// 测试 C：客户端拉取专属 Slug 订阅
 	t.Run("PullSubscriptionConfig", func(t *testing.T) {
-		subURL := ts.URL + "/api/v1/subscriptions/config/?uuid=" + clientUUID
+		subURL := ts.URL + "/sub/" + adminUser.SubSlug
 		resp, err := http.Get(subURL)
 		if err != nil {
 			t.Fatalf("fetch subscription failed: %v", err)
@@ -156,42 +132,35 @@ func TestLiveSubPlatform(t *testing.T) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			t.Fatalf("expected 200 for subscription config, got %d: %s", resp.StatusCode, string(body))
+			t.Fatalf("expected 200 for subscription config, got %d", resp.StatusCode)
 		}
 
-		var subResp struct {
-			Code int            `json:"code"`
-			Data map[string]any `json:"data"`
+		var subDoc struct {
+			UserID  string           `json:"userId"`
+			Slug    string           `json:"slug"`
+			Servers []map[string]any `json:"servers"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&subResp); err != nil {
+		if err := json.NewDecoder(resp.Body).Decode(&subDoc); err != nil {
 			t.Fatalf("decode subscription response failed: %v", err)
 		}
 
-		if subResp.Code != 0 {
-			t.Fatalf("expected code 0, got %d", subResp.Code)
+		if subDoc.UserID != "admin" {
+			t.Errorf("expected userID admin, got %s", subDoc.UserID)
+		}
+		if len(subDoc.Servers) == 0 {
+			t.Fatalf("expected at least 1 server in subscription")
+		}
+		server := subDoc.Servers[0]
+		if server["name"] != "Tokyo-VIP-01" {
+			t.Errorf("expected node Tokyo-VIP-01, got %v", server["name"])
 		}
 
-		server, _ := subResp.Data["server"].(string)
-		if server != "104.28.1.1" {
-			t.Errorf("expected node IP 104.28.1.1, got %v", subResp.Data["server"])
-		}
-		port, _ := subResp.Data["port"].(float64)
-		if int(port) != 443 {
-			t.Errorf("expected node port 443, got %v", subResp.Data["port"])
-		}
-		uid, _ := subResp.Data["client_uuid"].(string)
-		if uid != clientUUID {
-			t.Errorf("expected client UUID %s, got %v", clientUUID, subResp.Data["client_uuid"])
-		}
-
-		t.Logf("[SUCCESS] Subscription pulled successfully! Node: %v (%s:%d), Protocol: %v",
-			subResp.Data["node_name"], server, int(port), subResp.Data["protocol"])
+		t.Logf("[SUCCESS] Subscription pulled successfully! Node: %v, Token: %v", server["name"], server["token"])
 	})
 
-	// 测试 D：使用鉴权 Token 查询订阅列表 (管理接口)
-	t.Run("ListSubscriptionsWithStaffToken", func(t *testing.T) {
-		req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/subscriptions/", nil)
+	// 测试 D：使用鉴权 Token 查询用户列表 (管理接口)
+	t.Run("ListUsersWithStaffToken", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/users/", nil)
 		if err != nil {
 			t.Fatalf("create request failed: %v", err)
 		}
@@ -209,13 +178,14 @@ func TestLiveSubPlatform(t *testing.T) {
 		var listResp struct {
 			Code int `json:"code"`
 			Data struct {
-				Results []subDomain.Subscription `json:"results"`
+				Results []User `json:"results"`
+				Count   int    `json:"count"`
 			} `json:"data"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&listResp)
-		if len(listResp.Data.Results) == 0 {
-			t.Fatalf("expected at least 1 subscription, got 0")
+		if listResp.Data.Count == 0 {
+			t.Fatalf("expected at least 1 user, got 0")
 		}
-		t.Logf("[SUCCESS] Staff token verified! Found %d subscription(s) in store", len(listResp.Data.Results))
+		t.Logf("[SUCCESS] Staff token verified! Found %d user(s) in store", listResp.Data.Count)
 	})
 }
