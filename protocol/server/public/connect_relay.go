@@ -12,9 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	aeroproto "github.com/aero-protocol/proto"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-edge/public/internal/contextstore"
-	"github.com/aero-protocol/aero-edge/public/internal/protocol"
 )
 
 var frameBufPool = sync.Pool{
@@ -67,7 +66,7 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 	if idleTO <= 0 {
 		idleTO = 15 * time.Minute
 	}
-	if p.StreamType == aeroproto.StreamType_AI {
+	if p.StreamType == protocol.StreamType_AI {
 		// AI 深度思考长会话（如 DeepSeek R1/o1）：放宽超时容限至 30 分钟，防思考中断
 		if idleTO < 30*time.Minute {
 			idleTO = 30 * time.Minute
@@ -75,9 +74,9 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 	}
 	maxLife := h.maxLife
 
-	lowLatency := p.StreamType == aeroproto.StreamType_AI ||
-		p.StreamType == aeroproto.StreamType_UDP ||
-		p.StreamType == aeroproto.StreamType_CONTROL
+	lowLatency := p.StreamType == protocol.StreamType_AI ||
+		p.StreamType == protocol.StreamType_UDP ||
+		p.StreamType == protocol.StreamType_CONTROL
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -104,7 +103,7 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 				h.bwLimit.Take(p.Token, n)
 			}
 			lastAct.Store(time.Now().UnixNano())
-			frame := &aeroproto.TcpFrame{StreamId: p.StreamID, Payload: buf[:n], Sequence: seq}
+			frame := &protocol.TcpFrame{StreamId: p.StreamID, Payload: buf[:n], Sequence: seq}
 			if err := protocol.TypedWriteMessage(p.SF, protocol.MsgTypeTcpFrame, frame); err != nil {
 				return
 			}
@@ -114,7 +113,7 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 				sinceFlush = 0
 			}
 			bytesFrom.Add(uint64(n))
-			if p.StreamType == aeroproto.StreamType_AI {
+			if p.StreamType == protocol.StreamType_AI {
 				lastSeq.Store(seq)
 			}
 			seq++
@@ -134,7 +133,7 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 			}
 			switch msgType {
 			case protocol.MsgTypeTcpFrame:
-				frame := msg.(*aeroproto.TcpFrame)
+				frame := msg.(*protocol.TcpFrame)
 				n := len(frame.Payload)
 				if h.bwLimit != nil {
 					h.bwLimit.Take(p.Token, n)
@@ -145,20 +144,20 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 				}
 				bytesTo.Add(uint64(n))
 			case protocol.MsgTypeHeartbeat:
-				hb := msg.(*aeroproto.Heartbeat)
+				hb := msg.(*protocol.Heartbeat)
 				now := time.Now().UnixNano()
 				lastHB.Store(now)
 				lastAct.Store(now)
-				ack := &aeroproto.HeartbeatAck{Timestamp: hb.Timestamp, Sequence: hb.Sequence}
+				ack := &protocol.HeartbeatAck{Timestamp: hb.Timestamp, Sequence: hb.Sequence}
 				if err := protocol.TypedWriteMessage(p.SF, protocol.MsgTypeHeartbeatAck, ack); err != nil {
 					return
 				}
 				p.SF.Flush()
 			case protocol.MsgTypeUdpFrame:
 				lastAct.Store(time.Now().UnixNano())
-				handleUDPFrame(ctx, p, msg.(*aeroproto.UdpFrame), udpConns, &udpMu)
+				handleUDPFrame(ctx, p, msg.(*protocol.UdpFrame), udpConns, &udpMu)
 			case protocol.MsgTypeAiStreamHeader:
-				header := msg.(*aeroproto.AiStreamHeader)
+				header := msg.(*protocol.AiStreamHeader)
 				aiContextID = header.ContextId
 				lastAct.Store(time.Now().UnixNano())
 				if header.Resume && header.ContextId != "" && h.contextStore != nil {
@@ -209,7 +208,7 @@ func (h *edgeHandler) runConnectRelay(p connectRelayParams) {
 
 	wg.Wait()
 
-	if p.StreamType == aeroproto.StreamType_AI && aiContextID != "" && h.contextStore != nil {
+	if p.StreamType == protocol.StreamType_AI && aiContextID != "" && h.contextStore != nil {
 		var sid uint32
 		var host string
 		var port uint32

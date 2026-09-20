@@ -13,11 +13,10 @@ import (
 	"testing"
 	"time"
 
-	aeroproto "github.com/aero-protocol/proto"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-edge/public/internal/auth"
 	"github.com/aero-protocol/aero-edge/public/internal/contextstore"
 	"github.com/aero-protocol/aero-edge/public/internal/metrics"
-	"github.com/aero-protocol/aero-edge/public/internal/protocol"
 	"github.com/aero-protocol/aero-edge/public/internal/traffic"
 	"github.com/aero-protocol/aero-edge/public/internal/transport"
 	"golang.org/x/net/http2"
@@ -116,8 +115,10 @@ func TestLiveServerHandshake(t *testing.T) {
 		}
 		defer clientConn.Close()
 
-		h2Transport := &http2.Transport{
-			TLSClientConfig: clientTLS,
+		t1 := &http.Transport{TLSClientConfig: clientTLS}
+		h2Transport, err := http2.ConfigureTransports(t1)
+		if err != nil {
+			t.Fatalf("http2 ConfigureTransports failed: %v", err)
 		}
 		h2Conn, err := h2Transport.NewClientConn(clientConn)
 		if err != nil {
@@ -147,17 +148,17 @@ func TestLiveServerHandshake(t *testing.T) {
 
 		// 客户端向服务端写入 Protobuf ConnectRequest
 		nonce := []byte("1234567890abcdef")
-		connectReq := &aeroproto.ConnectRequest{
+		connectReq := &protocol.ConnectRequest{
 			Version:   "aero/2.0",
 			Token:     validToken,
 			Timestamp: uint64(time.Now().UnixMilli()),
 			Nonce:     nonce,
-			Streams: []*aeroproto.StreamSpec{
+			Streams: []*protocol.StreamSpec{
 				{
 					StreamId:   1,
 					TargetHost: "example.com",
 					TargetPort: 443,
-					StreamType: aeroproto.StreamType_AI,
+					StreamType: protocol.StreamType_AI,
 				},
 			},
 		}
@@ -170,7 +171,7 @@ func TestLiveServerHandshake(t *testing.T) {
 		}()
 
 		// 客户端从服务端读取 Protobuf ConnectResponse
-		var connectResp aeroproto.ConnectResponse
+		var connectResp protocol.ConnectResponse
 		if err := protocol.ReadMessage(resp.Body, &connectResp); err != nil {
 			t.Fatalf("read ConnectResponse failed: %v", err)
 		}
@@ -198,8 +199,10 @@ func TestLiveServerHandshake(t *testing.T) {
 		}
 		defer clientConn.Close()
 
-		h2Transport := &http2.Transport{
-			TLSClientConfig: clientTLS,
+		t1 := &http.Transport{TLSClientConfig: clientTLS}
+		h2Transport, err := http2.ConfigureTransports(t1)
+		if err != nil {
+			t.Fatalf("http2 ConfigureTransports failed: %v", err)
 		}
 		h2Conn, err := h2Transport.NewClientConn(clientConn)
 		if err != nil {
@@ -240,8 +243,10 @@ func TestLiveServerHandshake(t *testing.T) {
 		}
 		defer clientConn.Close()
 
-		h2Transport := &http2.Transport{
-			TLSClientConfig: clientTLS,
+		t1 := &http.Transport{TLSClientConfig: clientTLS}
+		h2Transport, err := http2.ConfigureTransports(t1)
+		if err != nil {
+			t.Fatalf("http2 ConfigureTransports failed: %v", err)
 		}
 		h2Conn, err := h2Transport.NewClientConn(clientConn)
 		if err != nil {
@@ -279,8 +284,10 @@ func TestLiveServerHandshake(t *testing.T) {
 		}
 		defer clientConn.Close()
 
-		h2Transport := &http2.Transport{
-			TLSClientConfig: clientTLS,
+		t1 := &http.Transport{TLSClientConfig: clientTLS}
+		h2Transport, err := http2.ConfigureTransports(t1)
+		if err != nil {
+			t.Fatalf("http2 ConfigureTransports failed: %v", err)
 		}
 		h2Conn, err := h2Transport.NewClientConn(clientConn)
 		if err != nil {

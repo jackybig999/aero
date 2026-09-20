@@ -2,16 +2,14 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
-package protocol
+package aero
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
-	aeroproto "github.com/aero-protocol/proto"
-	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -26,6 +24,29 @@ const (
 	MsgTypeMetricsReport  = 0x07
 )
 
+const maxMessageSize = 16 * 1024 * 1024 // 16MB max message safety bound
+
+// bufPool 提供可复用的字节切片缓冲区，实现 0-Alloc 封包
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
+
+func getBuffer() *[]byte {
+	bp := bufPool.Get().(*[]byte)
+	*bp = (*bp)[:0]
+	return bp
+}
+
+func putBuffer(bp *[]byte) {
+	if cap(*bp) > 65536 {
+		return // 防止大缓冲区长久驻留造成内存慢性膨胀
+	}
+	bufPool.Put(bp)
+}
+
 // ReadMessage 从 reader 读取 4 字节大端长度 + Protobuf 消息
 func ReadMessage(r io.Reader, msg proto.Message) error {
 	var lenBuf [4]byte
@@ -33,67 +54,56 @@ func ReadMessage(r io.Reader, msg proto.Message) error {
 		return fmt.Errorf("read length: %w", err)
 	}
 	length := binary.BigEndian.Uint32(lenBuf[:])
-	if length > 16*1024*1024 { // 16MB max
+	if length > maxMessageSize {
 		return fmt.Errorf("message too large: %d", length)
 	}
 
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
+	bp := getBuffer()
+	defer putBuffer(bp)
+
+	if cap(*bp) < int(length) {
+		*bp = make([]byte, length)
+	} else {
+		*bp = (*bp)[:length]
+	}
+
+	if _, err := io.ReadFull(r, *bp); err != nil {
 		return fmt.Errorf("read payload: %w", err)
 	}
 
-	if err := proto.Unmarshal(data, msg); err != nil {
+	if err := proto.Unmarshal(*bp, msg); err != nil {
 		return fmt.Errorf("unmarshal: %w", err)
 	}
 	return nil
 }
 
-// WriteMessage 写入 4 字节大端长度 + 携带随机高熵 Padding 的 Protobuf 消息。
-// 借鉴 XTLS-Vision 核心防御机制：在握手响应中注入 64~256 字节动态高熵 Padding，
-// 彻底打破固定报文长度分布特征，使机器学习流量分析模型无法通过固定长度判定 AERO 握手。
-func WriteMessage(w io.Writer, msg proto.Message) error {
-	data, err := proto.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-
-	// 单次系统调用读取高熵随机数，首字节决定填充长度 [64, 256]，后续字节作为 Padding 载荷 (零堆分配)
-	var entropyBuf [257]byte
-	_, _ = rand.Read(entropyBuf[:])
-	padLen := 64 + int(entropyBuf[0])%193 // [64, 256]
-	padBytes := entropyBuf[1 : 1+padLen]
-
-	// 使用标准 Protobuf Length-Delimited (Tag 15) 注入 Padding
-	padded := protowire.AppendTag(data, 15, protowire.BytesType)
-	padded = protowire.AppendBytes(padded, padBytes)
-
-	buf := make([]byte, 4+len(padded))
-	binary.BigEndian.PutUint32(buf[:4], uint32(len(padded)))
-	copy(buf[4:], padded)
-	if _, err := w.Write(buf); err != nil {
-		return fmt.Errorf("write message: %w", err)
-	}
-	return nil
-}
-
-// TypedWriteMessage 整帧一次 Write，避免并发写交错
+// TypedWriteMessage 整帧一次性 Write，避免多路复用时交错破坏帧结构。
+// 严格按照 0-Alloc 规范：利用 sync.Pool 与 proto.MarshalOptions{}.MarshalAppend，
+// 借出的缓冲切片在同步栈帧内归还（L3 / R4）。
 func TypedWriteMessage(w io.Writer, msgType byte, msg proto.Message) error {
-	data, err := proto.Marshal(msg)
+	bp := getBuffer()
+	defer putBuffer(bp)
+
+	// 预置 5 字节帧头：[1 字节 msgType] + [4 字节大端长度占位符]
+	*bp = append(*bp, msgType, 0, 0, 0, 0)
+
+	var err error
+	*bp, err = proto.MarshalOptions{}.MarshalAppend(*bp, msg)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	buf := make([]byte, 1+4+len(data))
-	buf[0] = msgType
-	binary.BigEndian.PutUint32(buf[1:5], uint32(len(data)))
-	copy(buf[5:], data)
-	if _, err := w.Write(buf); err != nil {
+
+	// 填充实际 Protobuf payload 长度
+	payloadLen := len(*bp) - 5
+	binary.BigEndian.PutUint32((*bp)[1:5], uint32(payloadLen))
+
+	if _, err := w.Write(*bp); err != nil {
 		return fmt.Errorf("write typed message: %w", err)
 	}
 	return nil
 }
 
 // TypedReadMessage 读取 1 字节类型 + 4 字节长度 + Protobuf 消息
-// 返回消息类型和解析后的 proto.Message
 func TypedReadMessage(r io.Reader) (byte, proto.Message, error) {
 	var typeBuf [1]byte
 	if _, err := io.ReadFull(r, typeBuf[:]); err != nil {
@@ -103,13 +113,13 @@ func TypedReadMessage(r io.Reader) (byte, proto.Message, error) {
 
 	msg, err := NewMessageByType(msgType)
 	if err != nil {
-		// 未知类型：跳过 payload
+		// 未知类型：跳过未知 payload，保障协议向前兼容
 		var lenBuf [4]byte
 		if _, readErr := io.ReadFull(r, lenBuf[:]); readErr != nil {
 			return msgType, nil, fmt.Errorf("unknown type 0x%02x, skip len failed: %w", msgType, readErr)
 		}
 		length := binary.BigEndian.Uint32(lenBuf[:])
-		if length > 0 && length <= 16*1024*1024 {
+		if length > 0 && length <= maxMessageSize {
 			if _, copyErr := io.CopyN(io.Discard, r, int64(length)); copyErr != nil {
 				return msgType, nil, fmt.Errorf("unknown type 0x%02x, skip payload failed: %w", msgType, copyErr)
 			}
@@ -123,23 +133,23 @@ func TypedReadMessage(r io.Reader) (byte, proto.Message, error) {
 	return msgType, msg, nil
 }
 
-// NewMessageByType 根据类型创建对应的 proto.Message
+// NewMessageByType 根据 1 字节类型标识创建对应的具体 proto.Message 结构体实例
 func NewMessageByType(msgType byte) (proto.Message, error) {
 	switch msgType {
 	case MsgTypeTcpFrame:
-		return &aeroproto.TcpFrame{}, nil
+		return &TcpFrame{}, nil
 	case MsgTypeUdpFrame:
-		return &aeroproto.UdpFrame{}, nil
+		return &UdpFrame{}, nil
 	case MsgTypeHeartbeat:
-		return &aeroproto.Heartbeat{}, nil
+		return &Heartbeat{}, nil
 	case MsgTypeHeartbeatAck:
-		return &aeroproto.HeartbeatAck{}, nil
+		return &HeartbeatAck{}, nil
 	case MsgTypeAiStreamHeader:
-		return &aeroproto.AiStreamHeader{}, nil
+		return &AiStreamHeader{}, nil
 	case MsgTypeAiStreamFrame:
-		return &aeroproto.AiStreamFrame{}, nil
+		return &AiStreamFrame{}, nil
 	case MsgTypeMetricsReport:
-		return &aeroproto.MetricsReport{}, nil
+		return &MetricsReport{}, nil
 	default:
 		return nil, fmt.Errorf("unknown message type: 0x%02x", msgType)
 	}

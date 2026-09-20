@@ -1,6 +1,6 @@
 module github.com/aero-protocol/aero-ech
 
-go 1.24.1
+go 1.25.0
 
 require (
 	github.com/aero-protocol/proto v0.0.0-00010101000000-000000000000
@@ -11,9 +11,8 @@ require (
 	github.com/refraction-networking/utls v1.8.2
 	github.com/sagernet/gvisor v0.0.0-20250811-sing-box-mod.1
 	github.com/webview/webview_go v0.0.0-20240831120633-6173450d4dd6
-	golang.org/x/crypto v0.41.0
-	golang.org/x/net v0.43.0
-	golang.org/x/sys v0.35.0
+	golang.org/x/net v0.56.0
+	golang.org/x/sys v0.47.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
 	google.golang.org/protobuf v1.34.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -29,12 +28,14 @@ require (
 	github.com/getlantern/ops v0.0.0-20190325191751-d70cb0d6f85f // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
-	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 )
 
-replace github.com/aero-protocol/proto => ./public/proto
+replace github.com/aero-protocol/proto => ../proto

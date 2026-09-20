@@ -18,10 +18,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	aeroproto "github.com/aero-protocol/proto"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-ech/internal/gameqos"
 	"github.com/aero-protocol/aero-ech/internal/h2pool"
-	"github.com/aero-protocol/aero-ech/internal/protocol"
 	"github.com/aero-protocol/aero-ech/internal/split"
 	"github.com/aero-protocol/aero-ech/internal/transport"
 )
@@ -97,16 +96,16 @@ func (d *AERODialer) DialTCP(ctx context.Context, addr string) (net.Conn, error)
 	}
 
 	// 3. 走 AERO 隧道
-	return d.openAEROStream(ctx, addr, aeroproto.StreamType_GENERAL, false)
+	return d.openAEROStream(ctx, addr, protocol.StreamType_GENERAL, false)
 }
 
 // DialUDP 出站 UDP 连接
 func (d *AERODialer) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
-	return d.openAEROStream(ctx, addr, aeroproto.StreamType_UDP, true)
+	return d.openAEROStream(ctx, addr, protocol.StreamType_UDP, true)
 }
 
 // openAEROStream 建立 AERO 协议流
-func (d *AERODialer) openAEROStream(ctx context.Context, target string, defaultType aeroproto.StreamType, udp bool) (net.Conn, error) {
+func (d *AERODialer) openAEROStream(ctx context.Context, target string, defaultType protocol.StreamType, udp bool) (net.Conn, error) {
 	cfg := d.getConfig()
 	st := d.classifyTarget(target, defaultType, udp)
 
@@ -127,7 +126,7 @@ func (d *AERODialer) openAEROStream(ctx context.Context, target string, defaultT
 	_ = tunnel.SetDeadline(time.Time{})
 
 	// 3. AI 协议流头处理
-	if st.StreamType == aeroproto.StreamType_AI {
+	if st.StreamType == protocol.StreamType_AI {
 		d.maybeSendAIHeader(tunnel, st, streamID)
 	}
 
@@ -273,13 +272,13 @@ func (q *quicWrapper) SetReadDeadline(t time.Time) error  { return nil }
 func (q *quicWrapper) SetWriteDeadline(t time.Time) error { return nil }
 
 func (d *AERODialer) handshake(tunnel net.Conn, st streamTarget, streamID uint32, token string) error {
-	req := &aeroproto.ConnectRequest{
+	req := &protocol.ConnectRequest{
 		Version:      "aero/2.0",
 		Token:        token,
 		Nonce:        generateNonce(),
 		Timestamp:    uint64(time.Now().UnixMilli()),
 		UdpAvailable: true,
-		Streams: []*aeroproto.StreamSpec{{
+		Streams: []*protocol.StreamSpec{{
 			StreamId:   streamID,
 			StreamType: st.StreamType,
 			TargetHost: st.Host,
@@ -290,7 +289,7 @@ func (d *AERODialer) handshake(tunnel net.Conn, st streamTarget, streamID uint32
 		return fmt.Errorf("write ConnectRequest: %w", err)
 	}
 
-	var resp aeroproto.ConnectResponse
+	var resp protocol.ConnectResponse
 	if err := protocol.ReadMessage(tunnel, &resp); err != nil {
 		return fmt.Errorf("read ConnectResponse: %w", err)
 	}
@@ -306,7 +305,7 @@ func (d *AERODialer) maybeSendAIHeader(tunnel net.Conn, st streamTarget, streamI
 	if !already {
 		d.aiContext.Store(ctxID, struct{}{})
 	}
-	header := &aeroproto.AiStreamHeader{
+	header := &protocol.AiStreamHeader{
 		StreamId:  streamID,
 		ModelName: inferModelName(st.Host),
 		ContextId: ctxID,
@@ -319,10 +318,10 @@ type streamTarget struct {
 	Raw        string
 	Host       string
 	Port       uint32
-	StreamType aeroproto.StreamType
+	StreamType protocol.StreamType
 }
 
-func (d *AERODialer) classifyTarget(raw string, defaultType aeroproto.StreamType, udp bool) streamTarget {
+func (d *AERODialer) classifyTarget(raw string, defaultType protocol.StreamType, udp bool) streamTarget {
 	st := streamTarget{Raw: raw, StreamType: defaultType}
 	host, portStr, err := net.SplitHostPort(raw)
 	if err != nil {
@@ -335,11 +334,11 @@ func (d *AERODialer) classifyTarget(raw string, defaultType aeroproto.StreamType
 	st.Port = uint32(port)
 
 	if udp && gameqos.IsGameTraffic(raw, port) {
-		st.StreamType = aeroproto.StreamType_UDP
+		st.StreamType = protocol.StreamType_UDP
 		return st
 	}
 	if isAITraffic(host) {
-		st.StreamType = aeroproto.StreamType_AI
+		st.StreamType = protocol.StreamType_AI
 	}
 	return st
 }

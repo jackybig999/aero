@@ -10,9 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aero-protocol/aero-ech/internal/protocol"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-ech/internal/transport"
-	aeroproto "github.com/aero-protocol/proto"
 	"golang.org/x/net/http2"
 )
 
@@ -71,7 +70,11 @@ func TestLiveTunnelDualVPS(t *testing.T) {
 			t.Logf("TLS Handshake OK, ALPN=%s", tlsConn.ConnectionState().NegotiatedProtocol)
 
 			// 3. HTTP/2 CONNECT Stream
-			tr := &http2.Transport{AllowHTTP: false}
+			t1 := &http.Transport{}
+			tr, err := http2.ConfigureTransports(t1)
+			if err != nil {
+				t.Fatalf("ConfigureTransports failed: %v", err)
+			}
 			cc, err := tr.NewClientConn(tlsConn)
 			if err != nil {
 				t.Fatalf("NewClientConn failed: %v", err)
@@ -107,14 +110,14 @@ func TestLiveTunnelDualVPS(t *testing.T) {
 			}()
 
 			// Send ConnectRequest
-			connectReq := &aeroproto.ConnectRequest{
+			connectReq := &protocol.ConnectRequest{
 				Version:   "aero/2.0",
 				Token:     node.token,
 				Nonce:     generateNonce(),
 				Timestamp: uint64(time.Now().UnixMilli()),
-				Streams: []*aeroproto.StreamSpec{{
+				Streams: []*protocol.StreamSpec{{
 					StreamId:   1,
-					StreamType: aeroproto.StreamType_GENERAL,
+					StreamType: protocol.StreamType_GENERAL,
 					TargetHost: "www.google.com",
 					TargetPort: 443,
 				}},
@@ -140,7 +143,7 @@ func TestLiveTunnelDualVPS(t *testing.T) {
 				tunnel := newStreamConn(r.resp.Body, pw, rawTCP)
 				defer tunnel.Close()
 				tunnel.SetDeadline(time.Now().Add(6 * time.Second))
-				var connectResp aeroproto.ConnectResponse
+				var connectResp protocol.ConnectResponse
 				if err := protocol.ReadMessage(tunnel, &connectResp); err != nil {
 					t.Fatalf("Read ConnectResponse failed: %v", err)
 				}

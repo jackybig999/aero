@@ -14,8 +14,7 @@ import (
 	"time"
 
 	"github.com/aero-protocol/aero-edge/public/internal/auth"
-	"github.com/aero-protocol/aero-edge/public/internal/protocol"
-	aeroproto "github.com/aero-protocol/proto"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/quic-go/quic-go"
 )
 
@@ -40,23 +39,23 @@ func (h *quicAEROHandler) HandleAEROStream(stream net.Conn, remoteAddr string) {
 	defer stream.Close()
 
 	// === AERO Protobuf 握手 ===
-	var req aeroproto.ConnectRequest
+	var req protocol.ConnectRequest
 	if err := protocol.ReadMessage(stream, &req); err != nil {
 		log.Printf("[QUIC] read ConnectRequest failed: %v", remoteAddr)
-		resp := &aeroproto.ConnectResponse{Accepted: false, Message: "read failed"}
+		resp := &protocol.ConnectResponse{Accepted: false, Message: "read failed"}
 		protocol.WriteMessage(stream, resp)
 		return
 	}
 
 	if !h.validator.ValidateFull(req.Token, req.Timestamp, req.Nonce) {
 		log.Printf("[QUIC] auth failed: invalid token or replay from %s", remoteAddr)
-		resp := &aeroproto.ConnectResponse{Accepted: false, Message: "invalid token or replay"}
+		resp := &protocol.ConnectResponse{Accepted: false, Message: "invalid token or replay"}
 		protocol.WriteMessage(stream, resp)
 		return
 	}
 
 	// 简化的响应（不实现完整的目标转发，仅认证通过）
-	resp := &aeroproto.ConnectResponse{
+	resp := &protocol.ConnectResponse{
 		Accepted:          true,
 		SessionId:         generateSessionID(),
 		HeartbeatInterval: 30,

@@ -1,4 +1,4 @@
-﻿// Copyright 2025 AERO Protocol Contributors
+// Copyright 2025 AERO Protocol Contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
@@ -11,8 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	aeroproto "github.com/aero-protocol/proto"
-	"github.com/aero-protocol/aero-ech/internal/protocol"
+	protocol "github.com/aero-protocol/proto"
 )
 
 // StreamConn 包装底层网络连接为 AERO 流连接（TCP 或 UDP 帧通信）
@@ -67,7 +66,7 @@ func (c *StreamConn) heartbeatLoop() {
 			}
 			seq++
 			c.writeMu.Lock()
-			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeat, &aeroproto.Heartbeat{
+			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeat, &protocol.Heartbeat{
 				Timestamp: uint64(time.Now().UnixMilli()),
 				Sequence:  seq,
 			})
@@ -92,18 +91,18 @@ func (c *StreamConn) Read(p []byte) (int, error) {
 
 		switch msgType {
 		case protocol.MsgTypeTcpFrame:
-			f := msg.(*aeroproto.TcpFrame)
+			f := msg.(*protocol.TcpFrame)
 			c.readBuf = append(c.readBuf, f.Payload...)
 		case protocol.MsgTypeUdpFrame:
-			f := msg.(*aeroproto.UdpFrame)
+			f := msg.(*protocol.UdpFrame)
 			c.readBuf = append(c.readBuf, f.Payload...)
 		case protocol.MsgTypeAiStreamFrame:
-			f := msg.(*aeroproto.AiStreamFrame)
+			f := msg.(*protocol.AiStreamFrame)
 			c.readBuf = append(c.readBuf, f.Payload...)
 		case protocol.MsgTypeHeartbeat:
-			hb := msg.(*aeroproto.Heartbeat)
+			hb := msg.(*protocol.Heartbeat)
 			c.writeMu.Lock()
-			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeatAck, &aeroproto.HeartbeatAck{
+			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeatAck, &protocol.HeartbeatAck{
 				Timestamp: hb.Timestamp,
 				Sequence:  hb.Sequence,
 			})
@@ -140,14 +139,14 @@ func (c *StreamConn) Write(p []byte) (int, error) {
 		}
 		var err error
 		if c.udp {
-			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeUdpFrame, &aeroproto.UdpFrame{
+			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeUdpFrame, &protocol.UdpFrame{
 				StreamId: c.streamID,
 				Payload:  p[sent:end],
 				SrcAddr:  c.target,
 			})
 		} else {
 			c.seq++
-			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeTcpFrame, &aeroproto.TcpFrame{
+			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeTcpFrame, &protocol.TcpFrame{
 				StreamId: c.streamID,
 				Payload:  p[sent:end],
 				Sequence: c.seq,

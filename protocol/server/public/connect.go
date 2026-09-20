@@ -13,8 +13,7 @@ import (
 	"strings"
 	"time"
 
-	aeroproto "github.com/aero-protocol/proto"
-	"github.com/aero-protocol/aero-edge/public/internal/protocol"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-edge/public/internal/traffic"
 )
 
@@ -102,13 +101,13 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 
-	var req aeroproto.ConnectRequest
+	var req protocol.ConnectRequest
 	if err := protocol.ReadMessage(r.Body, &req); err != nil {
-		_ = protocol.WriteMessage(w, &aeroproto.ConnectResponse{Accepted: false, Message: "read failed"})
+		_ = protocol.WriteMessage(w, &protocol.ConnectResponse{Accepted: false, Message: "read failed"})
 		return
 	}
 	if req.Token != "" && req.Token != tok {
-		_ = protocol.WriteMessage(w, &aeroproto.ConnectResponse{Accepted: false, Message: "token mismatch"})
+		_ = protocol.WriteMessage(w, &protocol.ConnectResponse{Accepted: false, Message: "token mismatch"})
 		return
 	}
 	if req.Token == "" {
@@ -116,7 +115,7 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.validator.ValidateFull(req.Token, req.Timestamp, req.Nonce) {
 		h.failAuth(ip)
-		_ = protocol.WriteMessage(w, &aeroproto.ConnectResponse{Accepted: false, Message: "invalid token or replay"})
+		_ = protocol.WriteMessage(w, &protocol.ConnectResponse{Accepted: false, Message: "invalid token or replay"})
 		return
 	}
 
@@ -124,7 +123,7 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if len(req.GetStreams()) > 0 {
 		s0 := req.GetStreams()[0]
 		streamID = s0.GetStreamId()
-		if s0.GetStreamType() != aeroproto.StreamType_GENERAL {
+		if s0.GetStreamType() != protocol.StreamType_GENERAL {
 			streamType = s0.GetStreamType()
 		}
 		if s0.GetTargetHost() != "" && s0.GetTargetPort() != 0 {
@@ -134,13 +133,13 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 				if !h.quiet {
 					log.Printf("[CONNECT] blocked modified target %s (%s) from %s", target, why, r.RemoteAddr)
 				}
-				_ = protocol.WriteMessage(w, &aeroproto.ConnectResponse{Accepted: false, Message: "forbidden target"})
+				_ = protocol.WriteMessage(w, &protocol.ConnectResponse{Accepted: false, Message: "forbidden target"})
 				return
 			}
 		}
 	}
 
-	resp := &aeroproto.ConnectResponse{
+	resp := &protocol.ConnectResponse{
 		Accepted:            true,
 		SessionId:           generateSessionID(),
 		HeartbeatInterval:   30,
@@ -161,7 +160,7 @@ func (h *edgeHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Req: &req, Resp: resp, Token: tok, onDone: release,
 	}
 
-	if streamType == aeroproto.StreamType_UDP {
+	if streamType == protocol.StreamType_UDP {
 		if !h.quiet {
 			log.Printf("[CONNECT] UDP relay %s", target)
 		}
@@ -215,9 +214,9 @@ type connectRelayParams struct {
 	TargetAddr string
 	Remote     string
 	StreamID   uint32
-	StreamType aeroproto.StreamType
-	Req        *aeroproto.ConnectRequest
-	Resp       *aeroproto.ConnectResponse
+	StreamType protocol.StreamType
+	Req        *protocol.ConnectRequest
+	Resp       *protocol.ConnectResponse
 	Token      string
 	onDone     func()
 }

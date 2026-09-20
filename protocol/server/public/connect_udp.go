@@ -12,8 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	aeroproto "github.com/aero-protocol/proto"
-	"github.com/aero-protocol/aero-edge/public/internal/protocol"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-edge/public/internal/traffic"
 )
 
@@ -62,11 +61,11 @@ func (h *edgeHandler) runUDPRelay(p connectRelayParams) {
 		}
 		switch msgType {
 		case protocol.MsgTypeUdpFrame:
-			handleUDPFrame(ctx, p, msg.(*aeroproto.UdpFrame), udpConns, &udpMu)
+			handleUDPFrame(ctx, p, msg.(*protocol.UdpFrame), udpConns, &udpMu)
 		case protocol.MsgTypeHeartbeat:
-			hb := msg.(*aeroproto.Heartbeat)
+			hb := msg.(*protocol.Heartbeat)
 			lastHB.Store(time.Now().UnixNano())
-			ack := &aeroproto.HeartbeatAck{Timestamp: hb.Timestamp, Sequence: hb.Sequence}
+			ack := &protocol.HeartbeatAck{Timestamp: hb.Timestamp, Sequence: hb.Sequence}
 			if err := protocol.TypedWriteMessage(p.SF, protocol.MsgTypeHeartbeatAck, ack); err != nil {
 				return
 			}
@@ -79,7 +78,7 @@ func (h *edgeHandler) runUDPRelay(p connectRelayParams) {
 func handleUDPFrame(
 	ctx context.Context,
 	p connectRelayParams,
-	frame *aeroproto.UdpFrame,
+	frame *protocol.UdpFrame,
 	udpConns map[string]*net.UDPConn,
 	udpMu *sync.Mutex,
 ) {
@@ -132,7 +131,7 @@ func udpReadLoop(ctx context.Context, p connectRelayParams, addr string, conn *n
 		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
-		resp := &aeroproto.UdpFrame{
+		resp := &protocol.UdpFrame{
 			StreamId: sid,
 			Payload:  payload,
 			SrcAddr:  addr,

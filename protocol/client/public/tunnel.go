@@ -11,11 +11,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"github.com/aero-protocol/aero-ech/internal/protocol"
+	protocol "github.com/aero-protocol/proto"
 	"github.com/aero-protocol/aero-ech/internal/split"
 	"github.com/aero-protocol/aero-ech/internal/tun"
 	"golang.org/x/net/http2"
-	aeroproto "github.com/aero-protocol/proto"
 )
 
 // -----------------------------------------------------------------------------
@@ -41,14 +40,14 @@ type aeroStreamConn struct {
 }
 
 func openAEROStream(target string) (net.Conn, error) {
-	return openAEROTyped(target, aeroproto.StreamType_GENERAL, false)
+	return openAEROTyped(target, protocol.StreamType_GENERAL, false)
 }
 
 func openAEROUDP(target string) (net.Conn, error) {
-	return openAEROTyped(target, aeroproto.StreamType_UDP, true)
+	return openAEROTyped(target, protocol.StreamType_UDP, true)
 }
 
-func openAEROTyped(target string, typ aeroproto.StreamType, udp bool) (net.Conn, error) {
+func openAEROTyped(target string, typ protocol.StreamType, udp bool) (net.Conn, error) {
 	tunnel, _, err := dialBestTransport(target, nil)
 	if err != nil {
 		return nil, err
@@ -84,7 +83,7 @@ func (c *aeroStreamConn) heartbeatLoop() {
 			}
 			seq++
 			c.writeMu.Lock()
-			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeat, &aeroproto.Heartbeat{
+			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeat, &protocol.Heartbeat{
 				Timestamp: uint64(time.Now().UnixMilli()), Sequence: seq,
 			})
 			c.writeMu.Unlock()
@@ -105,18 +104,18 @@ func (c *aeroStreamConn) Read(p []byte) (int, error) {
 		}
 		switch msgType {
 		case protocol.MsgTypeTcpFrame:
-			f := msg.(*aeroproto.TcpFrame)
+			f := msg.(*protocol.TcpFrame)
 			c.readBuf = append(c.readBuf, f.Payload...)
 		case protocol.MsgTypeUdpFrame:
-			f := msg.(*aeroproto.UdpFrame)
+			f := msg.(*protocol.UdpFrame)
 			c.readBuf = append(c.readBuf, f.Payload...)
 		case protocol.MsgTypeAiStreamFrame:
-			f := msg.(*aeroproto.AiStreamFrame)
+			f := msg.(*protocol.AiStreamFrame)
 			c.readBuf = append(c.readBuf, f.Payload...)
 		case protocol.MsgTypeHeartbeat:
-			hb := msg.(*aeroproto.Heartbeat)
+			hb := msg.(*protocol.Heartbeat)
 			c.writeMu.Lock()
-			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeatAck, &aeroproto.HeartbeatAck{
+			_ = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeHeartbeatAck, &protocol.HeartbeatAck{
 				Timestamp: hb.Timestamp, Sequence: hb.Sequence,
 			})
 			c.writeMu.Unlock()
@@ -147,12 +146,12 @@ func (c *aeroStreamConn) Write(p []byte) (int, error) {
 		}
 		var err error
 		if c.udp {
-			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeUdpFrame, &aeroproto.UdpFrame{
+			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeUdpFrame, &protocol.UdpFrame{
 				StreamId: c.streamID, Payload: p[sent:end], SrcAddr: c.target,
 			})
 		} else {
 			c.seq++
-			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeTcpFrame, &aeroproto.TcpFrame{
+			err = protocol.TypedWriteMessage(c.raw, protocol.MsgTypeTcpFrame, &protocol.TcpFrame{
 				StreamId: c.streamID, Payload: p[sent:end], Sequence: c.seq,
 			})
 		}
@@ -324,8 +323,8 @@ var _ net.Conn = (*h2Tunnel)(nil)
 
 
 
-func connectRequest(st streamTarget, streamID uint32) *aeroproto.ConnectRequest {
-	return &aeroproto.ConnectRequest{
+func connectRequest(st streamTarget, streamID uint32) *protocol.ConnectRequest {
+	return &protocol.ConnectRequest{
 		Version:      "aero/2.0",
 		Token:        *token,
 		Nonce:        generateNonce(),
@@ -333,7 +332,7 @@ func connectRequest(st streamTarget, streamID uint32) *aeroproto.ConnectRequest 
 		IspHint:      detectedISP.String(),
 		TestedPorts:  testedPorts,
 		UdpAvailable: udpAvailable,
-		Streams: []*aeroproto.StreamSpec{{
+		Streams: []*protocol.StreamSpec{{
 			StreamId:   streamID,
 			StreamType: st.StreamType,
 			TargetHost: st.Host,
@@ -350,8 +349,8 @@ func marshalConnectRequest(st streamTarget, streamID uint32) []byte {
 	return buf.Bytes()
 }
 
-func aeroHandshakeRead(tunnel net.Conn) (*aeroproto.ConnectResponse, error) {
-	var resp aeroproto.ConnectResponse
+func aeroHandshakeRead(tunnel net.Conn) (*protocol.ConnectResponse, error) {
+	var resp protocol.ConnectResponse
 	if err := protocol.ReadMessage(tunnel, &resp); err != nil {
 		return nil, fmt.Errorf("read ConnectResponse: %w", err)
 	}
@@ -363,7 +362,7 @@ func aeroHandshakeRead(tunnel net.Conn) (*aeroproto.ConnectResponse, error) {
 }
 
 // aeroHandshake 在已建立的传输上完成 ConnectRequest/Response
-func aeroHandshake(tunnel net.Conn, st streamTarget, streamID uint32) (*aeroproto.ConnectResponse, error) {
+func aeroHandshake(tunnel net.Conn, st streamTarget, streamID uint32) (*protocol.ConnectResponse, error) {
 	if err := protocol.WriteMessage(tunnel, connectRequest(st, streamID)); err != nil {
 		return nil, fmt.Errorf("write ConnectRequest: %w", err)
 	}
@@ -372,14 +371,14 @@ func aeroHandshake(tunnel net.Conn, st streamTarget, streamID uint32) (*aeroprot
 
 // maybeSendAIHeader AI 流发送 AiStreamHeader（断线续传元数据）
 func maybeSendAIHeader(tunnel net.Conn, st streamTarget, streamID uint32, contextID string) {
-	if st.StreamType != aeroproto.StreamType_AI || contextID == "" {
+	if st.StreamType != protocol.StreamType_AI || contextID == "" {
 		return
 	}
 	_, already := aiContextSent.Load(contextID)
 	if !already {
 		aiContextSent.Store(contextID, struct{}{})
 	}
-	header := &aeroproto.AiStreamHeader{
+	header := &protocol.AiStreamHeader{
 		StreamId:  streamID,
 		ModelName: inferModelName(st.Host),
 		ContextId: contextID,
@@ -441,7 +440,7 @@ func runHeartbeatLoop(
 			rttMu.Lock()
 			*hbSent = time.Now()
 			rttMu.Unlock()
-			hb := &aeroproto.Heartbeat{
+			hb := &protocol.Heartbeat{
 				Timestamp: uint64(time.Now().UnixMilli()),
 				Sequence:  seq,
 			}
@@ -605,7 +604,7 @@ func serveTarget(client net.Conn, target string, ready replyFn) {
 		}
 
 		_ = tunnel.SetDeadline(time.Now().Add(10 * time.Second))
-		var resp *aeroproto.ConnectResponse
+		var resp *protocol.ConnectResponse
 		if usedProto == "tcp_h2" && len(preface) > 0 {
 			resp, err = aeroHandshakeRead(tunnel)
 		} else {

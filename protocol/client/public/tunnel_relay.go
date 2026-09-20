@@ -11,8 +11,7 @@ import (
 	"github.com/aero-protocol/aero-ech/internal/edgepool"
 	"github.com/aero-protocol/aero-ech/internal/gameqos"
 	"github.com/aero-protocol/aero-ech/internal/h2pool"
-	"github.com/aero-protocol/aero-ech/internal/protocol"
-	aeroproto "github.com/aero-protocol/proto"
+	protocol "github.com/aero-protocol/proto"
 )
 
 // -----------------------------------------------------------------------------
@@ -29,7 +28,7 @@ type relayParams struct {
 	Client       net.Conn
 	Tunnel       net.Conn
 	StreamID     uint32
-	StreamType   aeroproto.StreamType
+	StreamType   protocol.StreamType
 	SessionID    string
 	TargetHost   string
 	TargetPort   uint16
@@ -100,7 +99,7 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 		p.Tunnel = &serialConn{Conn: p.Tunnel}
 	}
 
-	isAI := p.StreamType == aeroproto.StreamType_AI
+	isAI := p.StreamType == protocol.StreamType_AI
 	optimizeTCP(p.Client, isAI)
 	optimizeTCP(p.Tunnel, isAI)
 
@@ -140,7 +139,7 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 	}
 
 	model := inferModelName(p.TargetHost)
-	if p.StreamType == aeroproto.StreamType_AI {
+	if p.StreamType == protocol.StreamType_AI {
 		aimetrics.Default.RecordSession(p.TargetHost, model)
 		if p.Bridge != nil {
 			if dec, err := p.Bridge.SendStreamOpened(
@@ -174,10 +173,10 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 			if err != nil {
 				return
 			}
-			if p.StreamType == aeroproto.StreamType_AI {
+			if p.StreamType == protocol.StreamType_AI {
 				aiOnce.Do(func() { aiStart = time.Now() })
 			}
-			frame := &aeroproto.TcpFrame{
+			frame := &protocol.TcpFrame{
 				StreamId: p.StreamID,
 				Payload:  buf[:n],
 				Sequence: seq,
@@ -206,12 +205,12 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 			}
 			switch msgType {
 			case protocol.MsgTypeTcpFrame:
-				frame := msg.(*aeroproto.TcpFrame)
+				frame := msg.(*protocol.TcpFrame)
 				if _, err := p.Client.Write(frame.Payload); err != nil {
 					return
 				}
 				bytesRecv.Add(uint64(len(frame.Payload)))
-				if p.StreamType == aeroproto.StreamType_AI {
+				if p.StreamType == protocol.StreamType_AI {
 					bridgeOnce.Do(func() {
 						if aiStart.IsZero() {
 							return
@@ -228,7 +227,7 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 					})
 				}
 			case protocol.MsgTypeHeartbeatAck:
-				_ = msg.(*aeroproto.HeartbeatAck)
+				_ = msg.(*protocol.HeartbeatAck)
 				ackMu.Lock()
 				lastAck = time.Now()
 				ackMu.Unlock()
@@ -243,7 +242,7 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 					p.Detector.RecordRTT(cur)
 				}
 			case protocol.MsgTypeAiStreamFrame:
-				frame := msg.(*aeroproto.AiStreamFrame)
+				frame := msg.(*protocol.AiStreamFrame)
 				if _, err := p.Client.Write(frame.Payload); err != nil {
 					return
 				}
@@ -257,7 +256,7 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 	go func() {
 		defer wg.Done()
 		runHeartbeatLoop(ctx, cancel, p.Tunnel, hbInterval, hbTimeout, &lastAck, &ackMu, &hbSent, &rttMu, func() {
-			if p.StreamType == aeroproto.StreamType_AI {
+			if p.StreamType == protocol.StreamType_AI {
 				h2pool.Default.Reset()
 				markSwitch()
 			}
@@ -270,7 +269,7 @@ func runTunnelRelay(p relayParams) (shouldSwitch bool) {
 	}()
 
 	wg.Wait()
-	if p.StreamType == aeroproto.StreamType_AI {
+	if p.StreamType == protocol.StreamType_AI {
 		aimetrics.Default.AddBytes(bytesSent.Load(), bytesRecv.Load())
 		reportTraffic(bytesSent.Load(), bytesRecv.Load())
 	} else {
@@ -295,13 +294,13 @@ type streamTarget struct {
 	Raw        string
 	Host       string
 	Port       uint32
-	StreamType aeroproto.StreamType
+	StreamType protocol.StreamType
 	IsGame     bool
 }
 
 // classifyTarget 根据地址判定 GENERAL / AI / UDP(游戏)
 func classifyTarget(raw string) streamTarget {
-	st := streamTarget{Raw: raw, StreamType: aeroproto.StreamType_GENERAL}
+	st := streamTarget{Raw: raw, StreamType: protocol.StreamType_GENERAL}
 	host, portStr, err := net.SplitHostPort(raw)
 	if err != nil {
 		st.Host = raw
@@ -314,11 +313,11 @@ func classifyTarget(raw string) streamTarget {
 
 	if gameqos.IsGameTraffic(raw, port) {
 		st.IsGame = true
-		st.StreamType = aeroproto.StreamType_UDP
+		st.StreamType = protocol.StreamType_UDP
 		return st
 	}
 	if isAITraffic(host) {
-		st.StreamType = aeroproto.StreamType_AI
+		st.StreamType = protocol.StreamType_AI
 	}
 	return st
 }
@@ -337,7 +336,7 @@ func runMetricsLoop(
 	tunnel net.Conn,
 	sessionID string,
 	streamID uint32,
-	streamType aeroproto.StreamType,
+	streamType protocol.StreamType,
 	bytesSent, bytesRecv *atomic.Uint64,
 	rttMs *uint32,
 	rttMu *sync.Mutex,
@@ -350,11 +349,11 @@ func runMetricsLoop(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			report := &aeroproto.MetricsReport{
+			report := &protocol.MetricsReport{
 				SessionId: sessionID,
 				Timestamp: uint64(time.Now().UnixMilli()),
 			}
-			report.Streams = append(report.Streams, &aeroproto.MetricsReport_StreamMetrics{
+			report.Streams = append(report.Streams, &protocol.MetricsReport_StreamMetrics{
 				StreamId:   streamID,
 				StreamType: streamType,
 				BytesSent:  bytesSent.Load(),

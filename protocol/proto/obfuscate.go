@@ -2,8 +2,7 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 
-// Package protocol 实现 AERO 二进制帧编解码与数据混淆。
-package protocol
+package aero
 
 import (
 	"crypto/rand"
