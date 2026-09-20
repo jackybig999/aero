@@ -239,7 +239,13 @@ func (p *WindowsPlatform) KillProcessGroup() {
 func main() {
 	portFlag := flag.Int("port", 0, "HTTP port (0 for random)")
 	serverOnly := flag.Bool("server-only", false, "Run server only without WebView GUI")
+	cliMode := flag.Bool("cli", false, "Run in interactive terminal CLI mode")
 	flag.Parse()
+
+	if *cliMode {
+		public.RunCLIMenu()
+		return
+	}
 
 	cwd, _ := os.Getwd()
 	configDir := filepath.Join(cwd, "..", "config")

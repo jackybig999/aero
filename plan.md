@@ -98,32 +98,42 @@ D:\jacky\gemini\aisys\
 │   │   ├── codec.go                      # 0-Alloc MarshalAppend 编解码器 (~180行)
 │   │   └── padding.go                    # 前 4 包无锁高熵混淆算法 (~110行)
 │   │
-│   ├── server/                           # 【纯 Linux VPS Edge 生产端】单一静态二进制交付 (N3)
-│   │   ├── main.go                       # 启动入口 (支持 --cli，//go:embed 嵌入 webui) (~120行)
+│   ├── server/                           # 【纯 Linux VPS Edge 生产端】单一静态无头二进制交付 (N3)
+│   │   ├── main.go                       # 启动入口 (纯无头命令行守护进程，由 systemd 托管) (~120行)
 │   │   ├── masque_handler.go             # H3 MASQUE / H2 CONNECT 双栈自适应握手 (~380行)
 │   │   ├── auth_guard.go                 # Token 鉴权、并发槽、SSRF CIDR 拦截 (~180行)
 │   │   ├── relay.go                      # UDP GSO 批处理流中继、RFC 9218 AI 优先流调度 (~250行)
 │   │   ├── camouflage.go                 # 严格防嗅探与 Nginx 200 OK 静态兜底 (无407) (~170行)
 │   │   ├── metrics.go                    # 127.0.0.1 隔离的 expvar 零依赖指标输出 (~100行)
 │   │   ├── memlimit.go                   # cgroup 70% 内存硬保护守卫 (~150行)
-│   │   ├── webui/                        # 【静态资产目录】纯前端资源，内嵌进二进制 (N3)
-│   │   │   └── index.html 等
-│   │   └── install.sh                    # Linux VPS 一键部署 (BBRv3 + 热升级 + 自动回滚)
+│   │   ├── install.sh                    # Linux VPS 一键部署 (BBRv3 + 热升级 + 自动回滚)
+│   │   └── webui/                        # 【静态资产与单机面板】(双模架构：中台嵌入 + VPS单机复用) (N3)
+│   │       ├── cmd/panel/main.go         # 单机轻量控制台 host (纯 Go，复用 Vue 前端)
+│   │       ├── src/components/AeroConsole.vue  # 【核心】双模前端 (mode==='mid' 或 'standalone')
+│   │       └── index.html 等             # 静态构建产物 (内嵌进二进制)
 │   │
-│   └── client/                           # 【跨平台瘦客户端】网络内核平铺无二级目录
+│   └── client/                           # 【AERO 专属客户端】网络内核平铺 + 多端原生外壳 (不要命令版)
 │       ├── masque_dialer.go              # MASQUE 拨号器 (RFC 9218 注入 + 24h 降级缓存) (~280行)
 │       ├── fallback_h2.go                # 【独立降级适配器】H2 备用隧道，300ms 竞速回退 (~190行)
 │       ├── sticky_pool.go                # 粘性连接池 (ctx 生命周期纳管，10min TTL + GoAway) (~230行)
 │       ├── tun.go                        # Wintun 网卡接管 + FakeDNS (65535 LRU 回收) (~220行)
 │       ├── split.go                      # 流量分流路由决策与白名单判定 (~100行)
-│       ├── sub.go                        # 订阅拉取、Base64 解码与节点解析 (~120行)
+│       ├── sub.go                        # 订阅拉取、Base64 解码与 Ed25519/RSA 验签 (~120行)
 │       ├── qos.go                        # 轻量 ISP 测速与 ?isp= 注入 (~100行)
-│       ├── win/                          # Windows 桌面交付外壳
-│       │   ├── main.go                   # aerowin.exe 主程序 (~220行)
+│       ├── ctrl_token.go                 # 本地控制面 IPC Bearer Token 校验保护 (~90行)
+│       ├── ui/                           # 【AERO 原生客户端界面资产】(截图 QQ_1789884342635.png 对应 UI)
+│       │   ├── index.html                # 大圆电源按钮、状态卡片、系统代理/TUN切换、扫码卡片
+│       │   ├── app.js                    # 前端与 127.0.0.1:19877 本地接口交互引擎
+│       │   ├── style.css                 # 深蓝暗色拟态风格样式表
+│       │   ├── jsqr.js                   # 摄像头/本地相册二维码扫码解析引擎
+│       │   └── i18n.js                   # 多语言包（中/繁/英）
+│       ├── win/                          # 【Windows 桌面交付外壳】
+│       │   ├── main.go                   # aerowin.exe 主程序 (启动即 hideOwnConsole，绝无黑窗口) (~220行)
+│       │   ├── app_windows.go            # WebView2 原生视窗 (420x780) + 系统托盘 + 互斥体保活
 │       │   ├── rsrc_windows.syso         # 图标与 UAC 管理员提权清单
 │       │   └── guard/                    # 【唯一合法独立进程子目录】(N1)
 │       │       └── main.go               # aero-guard.exe 独立崩溃防断网守护进程 (~180行)
-│       ├── mac/main.go                   # macOS 桌面外壳 (含 Signal/Defer 自动重置代理) (~200行)
+│       ├── mac/main.go                   # macOS 桌面外壳 (WKWebView 视窗 + 状态栏托盘 + scutil 清理) (~200行)
 │       └── mobile/                       # 移动端 SDK 桥接 (专供 gomobile bind 导出)
 │           ├── api.go                    # 严格安全 5 大通用接口 (含 SetConfig 热更新) (~90行)
 │           ├── android_bridge.go         # //go:build android 专有 JNI 胶水 (~110行)
@@ -152,18 +162,22 @@ D:\jacky\gemini\aisys\
 │   │   └── ledger.db                     # 财务流水 SQLite 事务数据库
 │   └── scripts/install.sh                # 中台 Linux VPS 一键部署脚本 (含 WARP 选装)
 │
-├── connect/desktop/                      # 【AI 桌面连接器】module: github.com/AIsys/connect/desktop
+├── connect/desktop/                      # 【AI 桌面连接器 (ARM)】module: github.com/AIsys/connect/desktop
 │   ├── go.mod                            # 独立 module，严禁 import protocol/sub 源码 (已实地核验)
-│   ├── main.go                           # 桌面启动主程序 (支持 --cli 无头模式)
-│   ├── win_proxy.go                      # //go:build windows 专有代理注入 (~150行)
+│   ├── main.go                           # 桌面启动主程序 (双模：默认 WebView2 GUI 视窗，支持 --cli 菜单)
+│   ├── cli.go                            # 【并入的 CLI 交互模块】(原 connect/cli 移入，提供 0~5 菜单与代理注入)
+│   ├── win_proxy.go                      # //go:build windows 专有代理注入与浏览器扫描 (~150行)
 │   ├── mac_proxy.go                      # //go:build darwin 专有代理注入 (~140行)
-│   └── finger_bridge.go                  # 经由 Bearer ctrl.token 鉴权的本地控制面适配器 (~90行)
+│   ├── finger_bridge.go                  # 经由 Bearer ctrl.token 鉴权的本地控制面适配器 (为合并 finger 预留) (~90行)
+│   └── renderer/                         # 【AI Runtime Manager 界面资产】(960x720 视窗对应 UI)
+│       ├── index.html                    # AI 工具 / 本地浏览器 / 第三方 API / 会话历史 / 日志面板
+│       └── app.js / style.css 等         # 前端交互代码
 │
 ├── build/                                # 【自动化构建矩阵】全部强制 GOWORK=off (N2)
 │   ├── build-win.ps1                     # 一键生成 aerowin.exe + aero-guard.exe + desktop.exe
 │   ├── build-mac.sh                      # 一键生成 aeromac.app + desktop-mac.app
 │   ├── build-mobile.sh                   # 一键导出 AeroKit.aar + AeroKit.xcframework
-│   └── build-vps.sh                      # 一键静态交叉编译 Linux amd64 aero-edge 与 subvps
+│   └── build-vps.sh                      # 一键静态交叉编译 Linux amd64 aero-server 与 subvps
 │
 └── assets/                               # 全系统统一品牌图标与资产真源
 ```
