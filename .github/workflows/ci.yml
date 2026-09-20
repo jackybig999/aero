@@ -20,6 +20,12 @@ jobs:
           go-version: '1.24'
           cache: false
 
+      - name: Test Protocol Proto
+        run: |
+          cd protocol/proto
+          go vet ./...
+          go test -v ./...
+
       - name: Test & Build Protocol Server
         run: |
           cd protocol/server
@@ -27,8 +33,6 @@ jobs:
           go test -v ./...
           cd vps
           go build -v -o aero-edge-linux-amd64 .
-          cd ../cli
-          go build -v -o aero-edge-cli .
 
       - name: Test & Build Subplatform
         run: |
@@ -55,20 +59,12 @@ jobs:
           cd protocol/client
           go vet ./...
           go test -v ./...
-          cd cli
-          go build -v -o aerocli.exe .
-          cd ../win
-          go build -v -o aerowin.exe .
-          cd guard
-          go build -v -o aero-guard.exe .
+          go build -v -o aerowin.exe ./win
+          go build -v -o aero-guard.exe ./win/guard
 
       - name: Test & Build Connect Tools
         run: |
-          cd connect/cli
-          go vet ./...
-          go build -v -o connect-cli.exe .
-          cd ../desktop
+          cd connect/desktop
           go vet ./...
           go test -v ./...
-          cd win
-          go build -v -o desktop.exe .
+          go build -v -o desktop.exe ./win

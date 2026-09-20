@@ -57,3 +57,7 @@ __debug_bin*
 sub/vpn/vpn/
 dist/
 build/dist/
+
+# SQLite WAL and SHM files
+*.db-shm
+*.db-wal
