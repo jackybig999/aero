@@ -171,19 +171,11 @@ func main() {
 	NewPayOutHandler(payOutSvc).RegisterRoutes(api)
 	NewLedgerHandler(ledgerDB).RegisterRoutes(api)
 
-	// Default fallback web handler
-	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if p == "/health" || strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/sub/") {
-			api.ServeHTTP(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><title>AERO Middle Platform</title></head><body><h2>AERO VPS Operations Center (:18080)</h2><p>Health check: <a href="/health">/health</a></p><p>API: /api/v1/</p></body></html>`))
-	})
+	// Static Web SPA Handlers (Admin + User)
+	webDist := FindWebDist()
+	webHandler := NewWebHandler(webDist, api)
 
-	gate := &Gate{Verify: userSvc.VerifyToken, Next: rootHandler}
+	gate := &Gate{Verify: userSvc.VerifyToken, Next: webHandler}
 	chain := CORSPermissive(Recover(gate))
 
 	fmt.Printf("\n=======================================================\n")
