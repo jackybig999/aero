@@ -182,13 +182,13 @@ func main() {
 	nodeSvc := nodeS.New(nodeStore.NewMemoryStore())
 	subSvc := subS.New(subStore.NewMemoryStore())
 
-	ledgerPath := filepath.Join(dataDir, "ledger.json")
+	ledgerPath := filepath.Join(dataDir, "ledger.db")
 	var ledgerDB ledgerStore.Store
-	if lStore, err := ledgerStore.NewFileStore(ledgerPath); err == nil {
+	if lStore, err := ledgerStore.NewSQLiteStore(ledgerPath); err == nil {
 		ledgerDB = lStore
 		log.Printf("ledger store: %s", ledgerPath)
 	} else {
-		log.Printf("[WARN] ledger file store failed (%v), falling back to memory", err)
+		log.Printf("[WARN] ledger sqlite store failed (%v), falling back to memory", err)
 		ledgerDB = ledgerStore.NewMemoryStore()
 	}
 	ledgerSvc := ledgerS.New(ledgerDB)
