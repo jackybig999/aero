@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Runtime Manager</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header-left">
+        <svg class="logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 1v6m0 6v6m11-7h-6m-6 0H1"/>
+        </svg>
+        <h1>AI Runtime Manager</h1>
+      </div>
+      <div class="header-right">
+        <div id="lang-dropdown" class="lang-dropdown">
+          <button id="lang-current" class="lang-current">中文</button>
+          <div id="lang-options" class="lang-options">
+            <div class="lang-option" data-lang="en">English</div>
+            <div class="lang-option" data-lang="zh-CN">中文（简体）</div>
+            <div class="lang-option" data-lang="zh-TW">中文（繁體）</div>
+          </div>
+        </div>
+        <span id="trial-badge" class="trial-badge" style="display:none"></span>
+        <span id="status-dot" class="status-dot"></span>
+        <span id="status-text">就绪</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <!-- 线路：代理 + AERO -->
+      <section class="panel proxy-panel">
+        <div class="panel-header">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+            <path d="M2 17l10 5 10-5"/>
+            <path d="M2 12l10 5 10-5"/>
+          </svg>
+          <h2 id="panel-proxy">代理状态</h2>
+          <button id="btn-refresh" class="btn-icon" title="重新检测">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/>
+              <polyline points="1 20 1 14 7 14"/>
+              <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
+            </svg>
+          </button>
+        </div>
+        <div id="aero-bar" class="aero-bar">
+          <span class="aero-label">AERO</span>
+          <span id="aero-status" class="aero-status">一点连接，替代其它 VPN。工具走 AERO。</span>
+          <button id="btn-aero-connect" class="btn-aero" type="button">连接 AERO</button>
+          <button id="btn-aero-disconnect" class="btn-aero ghost" type="button">断开</button>
+        </div>
+        <div id="proxy-list" class="proxy-list">
+          <div class="proxy-empty">点击刷新检测本地代理…</div>
+        </div>
+      </section>
+
+      <!-- AI 工具 -->
+      <section class="panel apps-panel">
+        <div class="panel-header">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+            <line x1="8" y1="21" x2="16" y2="21"/>
+            <line x1="12" y1="17" x2="12" y2="21"/>
+          </svg>
+          <h2>
+            <span id="panel-ai">AI 工具</span>
+            <button id="btn-third-party" class="btn-history">第三方API</button>
+            <button id="btn-history" class="btn-history">对话历史</button>
+          </h2>
+        </div>
+        <div id="cli-grid" class="apps-grid"></div>
+      </section>
+
+      <!-- 浏览器（始终显示，不折叠） -->
+      <section class="panel browser-panel">
+        <div class="panel-header">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="2" y1="12" x2="22" y2="12"/>
+            <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/>
+          </svg>
+          <h2 id="panel-browser">浏览器</h2>
+        </div>
+        <div id="browser-grid" class="browser-grid"></div>
+      </section>
+
+      <!-- 日志 -->
+      <section class="panel log-panel">
+        <div class="panel-header">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+          <h2 id="panel-logs">运行日志</h2>
+          <button id="btn-copy-log" class="btn-text">复制</button>
+          <button id="btn-clear" class="btn-text">清空</button>
+        </div>
+        <pre id="log-output" class="log-output">等待启动...</pre>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <button id="btn-kill" class="btn-secondary kill-btn">终止所有进程</button>
+      <span id="warn-text" class="warn-text">工具调用代理时，请勿点击</span>
+      <button id="btn-launch" class="btn-primary" disabled>启动选中应用</button>
+    </footer>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
