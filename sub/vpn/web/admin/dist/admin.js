@@ -906,12 +906,51 @@ function renderVpsDetailContent(v) {
       <span class="k">SSH 凭证与端点</span>
       <span class="v mono">${escapeHtml(v.ssh_username)}@${escapeHtml(v.ip)}:${v.ssh_port}</span>
     </div>
-    <div class="detail-grid-item">
-      <span class="k">出口 IP 纯净度</span>
-      <span class="v">${v.purity_score ? (v.purity_score + ' 分') : '待打靶 (Google/CF)'}</span>
+    <div class="detail-grid-item" style="grid-column: 1 / -1; display:flex; justify-content:space-between; align-items:center; background:#0d1527; padding:10px 14px; border:1px solid #1f2c47; border-radius:6px">
+      <div>
+        <div style="font-weight:600; font-size:13px; color:#e2e8f0; margin-bottom:4px">
+          🛡️ 出口 IP 纯净度评测: 
+          <span style="color:${(v.purity_score >= 90) ? 'var(--green)' : ((v.purity_score >= 40) ? 'var(--blue)' : 'var(--amber)')}; font-size:15px; font-weight:700">
+            ${(v.purity_score !== undefined && v.purity_score !== null && v.purity_score > 0) ? (v.purity_score + ' 分') : (v.last_purity_probe_at ? (v.purity_score + ' 分') : '待打靶 (Google/CF)')}
+          </span>
+        </div>
+        <div style="font-size:11px; color:var(--muted); display:flex; gap:12px; flex-wrap:wrap">
+          <span>Google: <b style="color:${v.google_clean ? 'var(--green)' : 'var(--amber)'}">${v.google_clean ? '🟢 畅通 (+60分)' : '🔴 拦截/未测'}</b></span>
+          <span>Cloudflare: <b style="color:${v.cf_clean ? 'var(--green)' : 'var(--amber)'}">${v.cf_clean ? '🟢 畅通 (+40分)' : '🔴 拦截/未测'}</b></span>
+          <span>AI 平台: <b style="color:${!v.ai_blocked ? 'var(--green)' : 'var(--red)'}">${!v.ai_blocked ? '🟢 未封锁' : '🔴 触发拦截'}</b></span>
+          <span>出口状态: <b style="color:#94a3b8">${v.is_warp_egress ? 'WARP 外挂' : '双栈原生出口'}</b></span>
+        </div>
+      </div>
+      <button class="btn btn-sm btn-blue" id="btnDetailPurityProbe" onclick="probeVpsPurityDetail(${v.id})" style="white-space:nowrap">
+        🎯 立即打靶检测
+      </button>
     </div>
   `;
 }
+
+window.probeVpsPurityDetail = async (id) => {
+  const btn = $('btnDetailPurityProbe');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '🎯 正在打靶 (Google/CF/AI)...';
+  }
+  try {
+    const res = await apiCall(`/vps/${id}/purity-probe/`, { method: 'POST' });
+    alert(`打靶完成！评分: ${res.purity_score || 0}分 · Google: ${res.google_clean ? '畅通' : '拦截'} · CF: ${res.cf_clean ? '畅通' : '拦截'}`);
+    const vpsRes = await apiCall('/vps/').catch(() => []);
+    cachedVpsList = (vpsRes && vpsRes.results) || (Array.isArray(vpsRes) ? vpsRes : []);
+    const updated = cachedVpsList.find(x => x.id === id);
+    if (updated) renderVpsDetailContent(updated);
+    renderVPS();
+  } catch (e) {
+    alert(`打靶检测失败: ${e.message}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🎯 重新打靶';
+    }
+  }
+};
 
 async function saveVPS() {
   const name = $('vpsName').value.trim();

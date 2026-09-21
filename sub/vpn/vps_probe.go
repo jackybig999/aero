@@ -93,7 +93,20 @@ func EvaluatePurity(rawOutput string, vpsID uint64) PurityResult {
 		PurityScore: 0,
 	}
 
-	parts := strings.Split(res.RawOutput, ",")
+	// 智能定位打靶特征行，过滤 remote .bashrc 或 motd 的杂音输出
+	var probeLine string
+	for _, line := range strings.Split(rawOutput, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "G:") && strings.Contains(line, "CF:") {
+			probeLine = line
+			break
+		}
+	}
+	if probeLine == "" {
+		probeLine = strings.TrimSpace(rawOutput)
+	}
+
+	parts := strings.Split(probeLine, ",")
 	gCode, cfCode, aiCode, warpOn := "000", "000", "000", "0"
 	for _, p := range parts {
 		kv := strings.SplitN(strings.TrimSpace(p), ":", 2)

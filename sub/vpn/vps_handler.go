@@ -159,6 +159,7 @@ func (h *VPSHandler) Probe(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	met, err := h.svc.Probe(ctx, id)
+	_, _ = h.svc.ProbePurity(ctx, id)
 	v, _ := h.svc.Get(id)
 	ok := met != nil && met.ProbeOK
 	if err != nil && met == nil {

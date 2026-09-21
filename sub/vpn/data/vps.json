@@ -1,46 +1,25 @@
 {
-  "next": 4,
-  "next_id": 4,
+  "next": 6,
+  "next_id": 6,
   "hosts": {
-    "3": {
-      "id": 3,
-      "name": "vps-a",
-      "role": "VPS-A",
+    "5": {
+      "id": 5,
+      "name": "colo",
+      "role": "node",
       "ip": "192.210.193.197",
       "ssh_port": 22,
       "ssh_username": "root",
       "has_password": true,
       "domain": "myconsun.de5.net",
-      "status": "online",
-      "health_score": 80,
-      "tier": 2,
-      "capacity_state": "excellent",
-      "purity_score": 0,
+      "status": "registered",
+      "health_score": 0,
+      "tier": 0,
+      "capacity_state": "",
+      "purity_score": 100,
       "ai_blocked": false,
-      "google_clean": false,
-      "cf_clean": false,
+      "google_clean": true,
+      "cf_clean": true,
       "is_warp_egress": false,
-      "metrics": {
-        "cpu_percent": 0,
-        "mem_total_mb": 0,
-        "mem_used_mb": 0,
-        "mem_percent": 0,
-        "disk_total_gb": 98.3091926574707,
-        "disk_used_gb": 16.337665557861328,
-        "disk_percent": 16.618654996776435,
-        "load_1": 0.03,
-        "load_5": 0.03,
-        "load_15": 0,
-        "net_rx_mbps": 0,
-        "net_tx_mbps": 0,
-        "uptime_sec": 1518344,
-        "os": "Linux",
-        "arch": "x86_64",
-        "collected_at": "2026-09-21T11:34:10.4256653+08:00",
-        "source": "ssh",
-        "probe_ok": true,
-        "latency_ms": 1190
-      },
       "dns_status": {
         "matched": true,
         "is_cf_proxy": false,
@@ -50,73 +29,40 @@
           "192.210.193.197"
         ],
         "status_text": "公网 DNS 已与 VPS IP 匹配 (DNS 直连)",
-        "checked_at": "2026-09-21T12:01:43.8589494+08:00"
+        "checked_at": "2026-09-21T14:31:22.3828299+08:00"
       },
-      "last_probe_at": "2026-09-21T11:34:10.4256653+08:00",
-      "created_at": "2026-09-18T14:08:18.8405146+08:00",
-      "updated_at": "2026-09-21T12:01:43.8589494+08:00"
+      "last_purity_probe_at": "2026-09-21T14:33:34.2555897+08:00",
+      "created_at": "2026-09-21T14:29:44.2118733+08:00",
+      "updated_at": "2026-09-21T14:33:34.2555897+08:00"
     },
-    "4": {
-      "id": 4,
-      "name": "vps-b",
-      "role": "VPS-B",
+    "6": {
+      "id": 6,
+      "name": "host",
+      "role": "node",
       "ip": "128.241.228.161",
       "ssh_port": 22,
       "ssh_username": "root",
       "has_password": true,
       "domain": "myconsun.cc.cd",
-      "status": "online",
-      "health_score": 80,
-      "tier": 1,
-      "capacity_state": "excellent",
+      "status": "registered",
+      "health_score": 0,
+      "tier": 0,
+      "capacity_state": "",
       "purity_score": 0,
       "ai_blocked": false,
       "google_clean": false,
       "cf_clean": false,
       "is_warp_egress": false,
-      "metrics": {
-        "cpu_percent": 3.3,
-        "mem_total_mb": 967.93359375,
-        "mem_used_mb": 408.11328125,
-        "mem_percent": 42.16335540838852,
-        "disk_total_gb": 48.912567138671875,
-        "disk_used_gb": 6.099891662597656,
-        "disk_percent": 12.47101107023042,
-        "load_1": 0,
-        "load_5": 0.03,
-        "load_15": 0,
-        "net_rx_mbps": 0,
-        "net_tx_mbps": 0,
-        "uptime_sec": 4750348,
-        "os": "Linux",
-        "arch": "x86_64",
-        "collected_at": "2026-09-21T12:01:39.5279244+08:00",
-        "source": "ssh",
-        "probe_ok": true,
-        "latency_ms": 994
-      },
-      "dns_status": {
-        "matched": true,
-        "is_cf_proxy": false,
-        "domain": "myconsun.cc.cd",
-        "vps_ip": "128.241.228.161",
-        "resolved_ips": [
-          "128.241.228.161"
-        ],
-        "status_text": "公网 DNS 已与 VPS IP 匹配 (DNS 直连)",
-        "checked_at": "2026-09-21T12:01:47.3301084+08:00"
-      },
-      "last_probe_at": "2026-09-21T12:01:39.5279244+08:00",
-      "created_at": "2026-09-20T17:05:19.7972253+08:00",
-      "updated_at": "2026-09-21T12:01:47.3301084+08:00"
+      "created_at": "2026-09-21T14:30:32.6337822+08:00",
+      "updated_at": "2026-09-21T14:30:32.6337822+08:00"
     }
   },
   "passwords": {
-    "3": "WVUADjC5Twh2uoAGMGK/D8HzEYK8IHEJCeH6Klt+STYeInAyVYY=",
-    "4": "jhnzBAhpgEKftJQBPXmLEX8BB1yI3FQoNFXXnmQiDmFUKMg4yFs="
+    "5": "o6NRJS77u4euxl0YXCH6Lc82M7rlGYXwAXum4IBU3TOaZCTieVw=",
+    "6": "QxDz1AGkDg1anZNskWPuQY8v/yEa6WZWvm0yKxNjv15Yo9GjxI0="
   },
   "ips": {
-    "3": "C4JX01qt7b+G7XIzVdrE8UXyjYX1H9OOToO+0ms6WxUmYxKkObY0qUSuTQ==",
-    "4": "FRm3AM30RLaGe/J3XjxQP5QsqwPGgtyZ9QLvmbvEMBFRH79ihEq0chObjw=="
+    "5": "5uaLXgVoXtLjm6D3aYT0ZPlXmh5negdzqriibwFEj8fTpoQWDFKv/fyaoQ==",
+    "6": "Y4isMOttP3SHiDOwIWiqxDbSfxUuLHUDqlwV3xald6M1hPo68CeMdrAguQ=="
   }
 }
