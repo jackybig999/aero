@@ -228,6 +228,9 @@ function initEvents() {
   // Top Refresh
   $('btnTopRefresh')?.addEventListener('click', () => loadCurrentTab());
 
+  // Dashboard Svc Groups Toggle All
+  $('btnToggleAllSvcGroups')?.addEventListener('click', () => toggleAllSvcGroups());
+
   // User Tab Buttons
   $('btnTabStaff')?.addEventListener('click', () => {
     userKind = 'staff';
@@ -235,7 +238,6 @@ function initEvents() {
     $('btnTabSub').style.background = 'transparent';
     $('btnOpenAddUser').textContent = '+ 新增管理员';
     $('btnBroadcastSubs').style.display = 'none';
-    $('thSubUrl').style.display = 'none';
     renderUsers();
   });
   $('btnTabSub')?.addEventListener('click', () => {
@@ -244,7 +246,6 @@ function initEvents() {
     $('btnTabStaff').style.background = 'transparent';
     $('btnOpenAddUser').textContent = '+ 新增订阅用户';
     $('btnBroadcastSubs').style.display = 'inline-flex';
-    $('thSubUrl').style.display = '';
     renderUsers();
   });
 
@@ -267,18 +268,6 @@ function initEvents() {
   $('btnSaveVPS')?.addEventListener('click', saveVPS);
   $('btnRefreshProbeAll')?.addEventListener('click', () => refreshVpsAll());
   $('btnVerifyAllDomains')?.addEventListener('click', () => verifyAllDomains());
-
-  // Auto Probe Checkbox
-  $('chkAutoProbe')?.addEventListener('change', (e) => {
-    if (autoProbeTimer) {
-      clearInterval(autoProbeTimer);
-      autoProbeTimer = null;
-    }
-    if (e.target.checked) {
-      refreshVpsAll();
-      autoProbeTimer = setInterval(() => refreshVpsAll(), 15000);
-    }
-  });
 
   // CF Sync in Add VPS Modal
   $('btnSyncCfVps')?.addEventListener('click', async () => {
@@ -361,7 +350,7 @@ async function loadDashboard() {
         groupEl.className = 'svc-group';
         groupEl.innerHTML = `
           <div class="svc-group-hd" onclick="toggleSvcGroup(${idx})">
-            <span>${g.title}</span>
+            <span><span class="svc-arrow" id="svcArrow_${idx}">▼</span>${g.title}</span>
             <span class="tag ${g.down ? 'tag-red' : 'tag-green'}">${g.ok}/${g.total}</span>
           </div>
           <div class="svc-group-body" id="svcGroupBody_${idx}">
@@ -413,16 +402,51 @@ async function loadDashboard() {
   }
 }
 
+let allGroupsCollapsed = false;
+
 window.toggleSvcGroup = (idx) => {
-  const el = $(`svcGroupBody_${idx}`);
-  if (el) el.classList.toggle('collapsed');
+  const body = $(`svcGroupBody_${idx}`);
+  const arrow = $(`svcArrow_${idx}`);
+  if (body) {
+    const isCollapsed = body.classList.toggle('collapsed');
+    if (arrow) arrow.textContent = isCollapsed ? '▶' : '▼';
+  }
+};
+
+window.toggleAllSvcGroups = () => {
+  allGroupsCollapsed = !allGroupsCollapsed;
+  const bodies = document.querySelectorAll('.svc-group-body');
+  bodies.forEach(b => b.classList.toggle('collapsed', allGroupsCollapsed));
+  const arrows = document.querySelectorAll('.svc-arrow');
+  arrows.forEach(a => a.textContent = allGroupsCollapsed ? '▶' : '▼');
+  const btn = $('btnToggleAllSvcGroups');
+  if (btn) btn.textContent = allGroupsCollapsed ? '▶ 全部展开' : '▼ 全部折叠';
 };
 
 // ------------------------------------------------------------------------------
 // Pane 2: Users (用户)
 // ------------------------------------------------------------------------------
+function getPrimaryVpsDomain() {
+  if (cachedVpsList && cachedVpsList.length > 0) {
+    const onlineWithDomain = cachedVpsList.find(v => v.domain && v.status === 'online');
+    if (onlineWithDomain) return onlineWithDomain.domain;
+    const withDomain = cachedVpsList.find(v => v.domain);
+    if (withDomain) return withDomain.domain;
+  }
+  return 'myconsun.de5.net';
+}
+
+function subURL(slug) {
+  const domain = getPrimaryVpsDomain();
+  return `https://${domain}/sub/${slug}`;
+}
+
 async function loadUsers() {
   try {
+    if (!cachedVpsList || cachedVpsList.length === 0) {
+      const vpsRes = await apiCall('/vps/').catch(() => []);
+      cachedVpsList = (vpsRes && vpsRes.results) || (Array.isArray(vpsRes) ? vpsRes : []);
+    }
     const res = await apiCall('/users/');
     cachedUserList = (res && res.results) || (Array.isArray(res) ? res : []);
     renderUsers();
@@ -456,7 +480,37 @@ function renderUsers() {
         ? `<span class="tag tag-red">已过期 (${fmtDate(u.expire_at).slice(0, 10)})</span>`
         : `<span class="tag tag-green">${u.expire_at ? fmtDate(u.expire_at).slice(0, 10) : '长期有效'}</span>`);
 
-    const subUrl = u.sub_slug ? `${window.location.origin}/sub/${u.sub_slug}` : '';
+    let subUrl = '';
+    if (u.is_staff) {
+      const slug = u.sub_slug || 'superadmin';
+      subUrl = subURL(slug);
+    } else if (u.sub_slug) {
+      subUrl = subURL(u.sub_slug);
+    }
+
+    let subColHtml = '';
+    if (u.is_staff) {
+      subColHtml = `
+        <td>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="text" class="input-text" value="${subUrl}" readonly style="font-size:11px;width:240px;height:24px;padding:2px 6px;" />
+            <button class="btn btn-sm btn-blue" onclick="copySubUrl('${subUrl}', '${escapeHtml(u.username)}')">复制</button>
+            <span class="tag tag-amber" style="white-space:nowrap">系统管理 · 不限制全节点</span>
+          </div>
+        </td>
+      `;
+    } else {
+      subColHtml = `
+        <td>
+          ${subUrl ? `
+            <div style="display:flex;align-items:center;gap:6px">
+              <input type="text" class="input-text" value="${subUrl}" readonly style="font-size:11px;width:240px;height:24px;padding:2px 6px;" />
+              <button class="btn btn-sm btn-blue" onclick="copySubUrl('${subUrl}', '${escapeHtml(u.username)}')">复制</button>
+            </div>
+          ` : '<span class="tag tag-amber">未生成</span>'}
+        </td>
+      `;
+    }
 
     tr.innerHTML = `
       <td>#${u.id}</td>
@@ -470,16 +524,7 @@ function renderUsers() {
       </td>
       <td>${u.is_staff ? '—' : ('$' + ((u.price_cents || 999) / 100).toFixed(2))}</td>
       <td>${expireTag}</td>
-      ${userKind === 'sub' ? `
-        <td>
-          ${subUrl ? `
-            <div style="display:flex;align-items:center;gap:6px">
-              <input type="text" class="input-text" value="${subUrl}" readonly style="font-size:11px;width:180px;height:24px;padding:2px 6px;" />
-              <button class="btn btn-sm btn-blue" onclick="copySubUrl('${subUrl}', '${escapeHtml(u.username)}')">复制</button>
-            </div>
-          ` : '<span class="tag tag-amber">未生成</span>'}
-        </td>
-      ` : ''}
+      ${subColHtml}
       <td><span class="tag ${u.status ? 'tag-green' : 'tag-red'}">${u.status ? '正常' : '停用'}</span></td>
       <td>
         ${!u.is_staff ? `<button class="btn btn-sm" style="color:var(--green);border-color:var(--green)" onclick="openRenewModal(${u.id}, '${escapeHtml(u.username)}')">续费</button>` : ''}
@@ -493,7 +538,7 @@ function renderUsers() {
 
 window.copySubUrl = (url, username) => {
   navigator.clipboard.writeText(url).then(() => {
-    alert(`用户 [${username}] 专属订阅地址已复制到剪贴板`);
+    alert(`[${username}] 专属订阅地址已复制到剪贴板:\n${url}`);
   }).catch(() => {
     prompt('请手动复制订阅地址：', url);
   });
@@ -636,8 +681,13 @@ function renderVPS() {
 
     // DNS Tag
     let dnsTag = '<span class="tag tag-amber">🟡 DNS未解析</span>';
-    if (v.dns_status === 'ok') dnsTag = '<span class="tag tag-green">🟢 DNS正常</span>';
-    else if (v.dns_status === 'ip_mismatch') dnsTag = '<span class="tag tag-red">🔴 IP不匹配</span>';
+    if (v.dns_status) {
+      if (typeof v.dns_status === 'object' ? v.dns_status.matched : (v.dns_status === 'ok')) {
+        dnsTag = '<span class="tag tag-green">🟢 DNS正常</span>';
+      } else if (typeof v.dns_status === 'object' && v.dns_status.status_text === 'ip_mismatch') {
+        dnsTag = '<span class="tag tag-red">🔴 IP不匹配</span>';
+      }
+    }
 
     // Metrics Row
     const m = v.metrics;
@@ -976,9 +1026,21 @@ window.delNode = async (id) => {
 async function cleanOrphanNodes() {
   if (!confirm('确认批量清理所有失联无归属节点？')) return;
   try {
-    await apiCall('/nodes/orphan/', { method: 'DELETE' });
+    const validIds = cachedVpsList.map(v => v.id);
+    await apiCall('/nodes/orphan/', {
+      method: 'DELETE',
+      body: JSON.stringify({ valid_vps_ids: validIds })
+    });
+    const vpsIds = new Set(cachedVpsList.map(v => v.id));
+    const vpsIps = new Set(cachedVpsList.map(v => v.ip));
+    for (const n of cachedNodeList) {
+      if (!vpsIds.has(n.vps_id) && !vpsIps.has(n.ip)) {
+        await apiCall(`/nodes/${n.id}/`, { method: 'DELETE' }).catch(() => null);
+      }
+    }
     alert('失联节点清理完毕');
     loadNodes();
+    loadDashboard();
   } catch (e) {
     alert(`清理失败: ${e.message}`);
   }

@@ -112,7 +112,7 @@
             <div class="card-title">
               <span>系统运行状态</span>
               <div style="display:flex;align-items:center;gap:8px">
-                <span style="font-size:11px;color:var(--muted);font-weight:normal">点击分组展开</span>
+                <button type="button" class="btn-toggle-all" id="btnToggleAllSvcGroups">▼ 全部折叠</button>
                 <span class="tag tag-green" id="dashCoreStatusTag">运行正常</span>
               </div>
             </div>
@@ -173,7 +173,7 @@
                 <th>套餐类型</th>
                 <th>金额</th>
                 <th>有效期</th>
-                <th id="thSubUrl" style="display:none;min-width:240px">专属订阅地址</th>
+                <th id="thSubUrl" style="min-width:280px">专属订阅地址</th>
                 <th style="width:70px">状态</th>
                 <th style="width:170px">操作</th>
               </tr>
@@ -187,25 +187,15 @@
 
       <!-- Pane 3: VPS -->
       <section class="content-pane" id="pane-vps">
-        <div class="alert-info" style="margin-bottom:12px">
-          <span>ℹ️ 本页管理 VPS 集群资产与域名绑定。已实现公网 DNS 实时复核与 Cloudflare 灰云 (proxied: false) 自动化防封解析。</span>
-        </div>
         <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <button class="btn btn-blue btn-sm" id="btnOpenAddVPS">+ 添加 VPS</button>
             <button class="btn btn-sm" id="btnRefreshProbeAll">刷新探测</button>
             <button class="btn btn-sm" id="btnVerifyAllDomains">批量复核域名/CF</button>
-            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;margin-left:8px">
-              <input type="checkbox" id="chkAutoProbe" style="cursor:pointer" />
-              <span>自动探测</span>
-            </label>
-          </div>
-          <div style="display:flex;align-items:center;gap:8px">
-            <span class="tag tag-green" id="cfStatusBadge">🟢 Cloudflare 灰云自动化: 已就绪</span>
           </div>
         </div>
 
-        <!-- 紧凑响应式多 VPS 网格布局 (100% 还原 yesterday's final vps-grid) -->
+        <!-- 紧凑响应式多 VPS 网格布局 (每行排列) -->
         <div class="vps-grid" id="vpsCardGrid">
           <div class="metric-empty" style="grid-column:1/-1">正在加载 VPS 资产与探测指标...</div>
         </div>

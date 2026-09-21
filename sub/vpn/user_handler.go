@@ -209,12 +209,16 @@ func seedAdmin(svc *UserService, db UserStore) {
 		if existing.PasswordHash == "" {
 			_ = db.SetPassword(existing.ID, HashPassword(initPwd))
 		}
+		if existing.SubSlug != "superadmin" {
+			_ = db.UpdateSubSlug(existing.ID, "superadmin")
+		}
 	} else {
 		u, err := svc.Register(CreateUserParams{
 			Username: "admin", Password: initPwd, Email: "admin@vpn.local", IsStaff: true,
 		})
 		if err == nil && u != nil {
 			_ = db.SetStaff(u.ID, true)
+			_ = db.UpdateSubSlug(u.ID, "superadmin")
 		}
 	}
 }

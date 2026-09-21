@@ -1,30 +1,30 @@
 {
   "items": [
     {
-      "vps_id": 1,
-      "name": "vps-a",
+      "vps_id": 4,
+      "name": "vps-b",
       "region": "US",
       "host": "myconsun.cc.cd",
       "ip": "128.241.228.161",
       "port": 443,
-      "sub_secret": "49adc46eff543149de857a49f89445b0",
+      "sub_secret": "superadmin",
       "admin_key": "d326fae7c2fdfb4bf0a465fca45b493c",
       "has_admin": true,
-      "sub_url": "https://myconsun.cc.cd/sub/49adc46eff543149de857a49f89445b0",
+      "sub_url": "https://myconsun.cc.cd/sub/superadmin",
       "installed": true,
-      "updated_at": "2026-09-19T15:34:15.4781917+08:00"
+      "updated_at": "2026-09-21T11:45:00.0000000+08:00"
     },
     {
       "vps_id": 3,
       "name": "vps-a",
       "host": "myconsun.de5.net",
       "port": 443,
-      "sub_secret": "sub_dlk1nj2whb88",
+      "sub_secret": "superadmin",
       "admin_key": "ak_dlk1nj2whb88",
       "has_admin": true,
-      "sub_url": "https://myconsun.de5.net/sub/sub_dlk1nj2whb88",
+      "sub_url": "https://myconsun.de5.net/sub/superadmin",
       "installed": true,
-      "updated_at": "2026-09-20T17:42:25.9691077+08:00"
+      "updated_at": "2026-09-21T11:45:00.0000000+08:00"
     }
   ]
 }

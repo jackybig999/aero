@@ -140,20 +140,25 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		t.Fatalf("CRITICAL SECURITY FLAW: Alice got Jacky's token!")
 	}
 
-	// 5. 测试老版单节点 32-Hex 兼容密钥访问: GET /sub/{secret}
-	reqLegacy := httptest.NewRequest(http.MethodGet, "/sub/"+legacySecretHK, nil)
-	recLegacy := httptest.NewRecorder()
-	mux.ServeHTTP(recLegacy, reqLegacy)
+	// 5. 测试系统管理员常用不限制全节点订阅: GET /sub/superadmin (无六位随机码)
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil)
+	recAdmin := httptest.NewRecorder()
+	mux.ServeHTTP(recAdmin, reqAdmin)
 
-	if recLegacy.Code != http.StatusOK {
-		t.Fatalf("expected 200 for legacy secret sub, got %d", recLegacy.Code)
+	if recAdmin.Code != http.StatusOK {
+		t.Fatalf("expected 200 for superadmin sub, got %d", recAdmin.Code)
 	}
-	var legDoc struct {
-		Servers []map[string]any `json:"servers"`
+	var adminDoc struct {
+		Role         string           `json:"role"`
+		Unrestricted bool             `json:"unrestricted"`
+		Servers      []map[string]any `json:"servers"`
 	}
-	_ = json.Unmarshal(recLegacy.Body.Bytes(), &legDoc)
-	if len(legDoc.Servers) != 1 || legDoc.Servers[0]["name"] != "HK-Edge-01" {
-		t.Fatalf("expected legacy document for HK-Edge-01, got %+v", legDoc.Servers)
+	_ = json.Unmarshal(recAdmin.Body.Bytes(), &adminDoc)
+	if !adminDoc.Unrestricted || adminDoc.Role != "superadmin" {
+		t.Fatalf("expected unrestricted superadmin subscription document, got %+v", adminDoc)
+	}
+	if len(adminDoc.Servers) == 0 {
+		t.Fatalf("expected servers in superadmin subscription, got 0")
 	}
 
 	// 6. 测试非法或不存在的 Slug

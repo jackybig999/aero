@@ -97,6 +97,13 @@ func (s *EndpointStore) Upsert(ep EndpointInfo) error {
 	return s.persistLocked()
 }
 
+func (s *EndpointStore) Delete(vpsID uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, vpsID)
+	return s.persistLocked()
+}
+
 func (s *EndpointStore) Get(vpsID uint64) (EndpointInfo, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

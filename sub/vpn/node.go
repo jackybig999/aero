@@ -161,6 +161,8 @@ func (h *NodeHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/nodes/", h.Create)
 	mux.HandleFunc("GET /api/v1/nodes/", h.List)
 	mux.HandleFunc("GET /api/v1/nodes/available/", h.Available)
+	mux.HandleFunc("DELETE /api/v1/nodes/orphan/", h.CleanOrphans)
+	mux.HandleFunc("DELETE /api/v1/nodes/orphan", h.CleanOrphans)
 	mux.HandleFunc("DELETE /api/v1/nodes/", h.CascadeDelete)
 	mux.HandleFunc("GET /api/v1/nodes/{id}/", h.Get)
 	mux.HandleFunc("POST /api/v1/nodes/{id}/heartbeat/", h.Heartbeat)
@@ -262,3 +264,25 @@ func (h *NodeHandler) CascadeDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{"deleted_ids": ids, "count": len(ids)}})
 }
+
+func (h *NodeHandler) CleanOrphans(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ValidVPSIDs []uint64 `json:"valid_vps_ids"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	validMap := make(map[uint64]bool)
+	for _, id := range req.ValidVPSIDs {
+		validMap[id] = true
+	}
+	h.svc.mu.Lock()
+	defer h.svc.mu.Unlock()
+	var deleted []uint64
+	for id, n := range h.svc.nodes {
+		if n.VPSID == 0 || (len(validMap) > 0 && !validMap[n.VPSID]) {
+			deleted = append(deleted, id)
+			delete(h.svc.nodes, id)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "message": "orphans cleaned", "data": map[string]any{"deleted_ids": deleted, "count": len(deleted)}})
+}
+

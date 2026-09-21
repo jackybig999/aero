@@ -138,6 +138,17 @@ func main() {
 	}
 
 	for _, ep := range epStore.List() {
+		var hostFound bool
+		for _, h := range existingHosts {
+			if h.ID == ep.VPSID {
+				hostFound = true
+				break
+			}
+		}
+		if !hostFound {
+			_ = epStore.Delete(ep.VPSID)
+			continue
+		}
 		if !ep.Installed {
 			continue
 		}

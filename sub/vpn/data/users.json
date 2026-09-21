@@ -8,11 +8,11 @@
       "email": "admin@vpn.local",
       "status": true,
       "is_staff": true,
-      "sub_slug": "adminmodpyr",
-      "sub_token": "usr_fbaf3400436f1527c70c91182d8f9de0",
-      "expire_at": "2027-09-18T14:06:08.4791575+08:00",
+      "sub_slug": "superadmin",
+      "sub_token": "usr_superadmin",
+      "expire_at": "",
       "created_at": "2026-09-18T14:06:08.4791575+08:00",
-      "updated_at": "2026-09-18T15:12:30.74792+08:00"
+      "updated_at": "2026-09-21T11:45:00.0000000+08:00"
     },
     "2": {
       "id": 2,

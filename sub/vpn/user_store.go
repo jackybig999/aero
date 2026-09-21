@@ -255,6 +255,9 @@ func (s *FileUserStore) UpdateSubSlug(id uint64, slug string) error {
 	defer s.mu.Unlock()
 	if u, ok := s.users[id]; ok {
 		u.SubSlug = slug
+		if slug == "superadmin" {
+			u.SubToken = "usr_superadmin"
+		}
 		u.UpdatedAt = time.Now()
 		return s.save()
 	}
