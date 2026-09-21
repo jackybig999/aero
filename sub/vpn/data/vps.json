@@ -1,46 +1,122 @@
 {
-  "next": 3,
+  "next": 4,
+  "next_id": 4,
   "hosts": {
     "3": {
       "id": 3,
       "name": "vps-a",
       "role": "VPS-A",
-      "ip": "",
+      "ip": "192.210.193.197",
       "ssh_port": 22,
       "ssh_username": "root",
       "has_password": true,
       "domain": "myconsun.de5.net",
       "status": "online",
+      "health_score": 80,
+      "tier": 2,
+      "capacity_state": "excellent",
+      "purity_score": 0,
+      "ai_blocked": false,
+      "google_clean": false,
+      "cf_clean": false,
+      "is_warp_egress": false,
       "metrics": {
-        "cpu_percent": 0,
+        "cpu_percent": 1.1,
         "mem_total_mb": 0,
         "mem_used_mb": 0,
         "mem_percent": 0,
         "disk_total_gb": 98.3091926574707,
-        "disk_used_gb": 16.020233154296875,
-        "disk_percent": 16.29576311354182,
-        "load_1": 0.05,
-        "load_5": 0.04,
-        "load_15": 0.04,
+        "disk_used_gb": 16.26462173461914,
+        "disk_percent": 16.544354902077572,
+        "load_1": 0.11,
+        "load_5": 0.11,
+        "load_15": 0.05,
         "net_rx_mbps": 0,
         "net_tx_mbps": 0,
-        "uptime_sec": 1360268,
+        "uptime_sec": 1453450,
         "os": "Linux",
         "arch": "x86_64",
-        "collected_at": "2026-09-19T15:39:38.4351526+08:00",
+        "collected_at": "2026-09-20T17:32:35.5593053+08:00",
         "source": "ssh",
         "probe_ok": true,
-        "latency_ms": 3272
+        "latency_ms": 1880
       },
-      "last_probe_at": "2026-09-19T15:39:39.7026027+08:00",
+      "dns_status": {
+        "matched": true,
+        "is_cf_proxy": false,
+        "domain": "myconsun.de5.net",
+        "vps_ip": "192.210.193.197",
+        "resolved_ips": [
+          "192.210.193.197"
+        ],
+        "status_text": "公网 DNS 已与 VPS IP 匹配 (DNS 直连)",
+        "checked_at": "2026-09-20T17:59:50.0226162+08:00"
+      },
+      "last_probe_at": "2026-09-20T17:32:35.5593053+08:00",
       "created_at": "2026-09-18T14:08:18.8405146+08:00",
-      "updated_at": "2026-09-19T15:39:39.7026027+08:00"
+      "updated_at": "2026-09-20T17:59:50.0226162+08:00"
+    },
+    "4": {
+      "id": 4,
+      "name": "vps-b",
+      "role": "VPS-B",
+      "ip": "128.241.228.161",
+      "ssh_port": 22,
+      "ssh_username": "root",
+      "has_password": true,
+      "domain": "myconsun.cc.cd",
+      "status": "online",
+      "health_score": 80,
+      "tier": 1,
+      "capacity_state": "excellent",
+      "purity_score": 0,
+      "ai_blocked": false,
+      "google_clean": false,
+      "cf_clean": false,
+      "is_warp_egress": false,
+      "metrics": {
+        "cpu_percent": 0,
+        "mem_total_mb": 967.93359375,
+        "mem_used_mb": 407.75390625,
+        "mem_percent": 42.126227344818815,
+        "disk_total_gb": 48.912567138671875,
+        "disk_used_gb": 6.059226989746094,
+        "disk_percent": 12.387873596099745,
+        "load_1": 0,
+        "load_5": 0.02,
+        "load_15": 0,
+        "net_rx_mbps": 0,
+        "net_tx_mbps": 0,
+        "uptime_sec": 4683816,
+        "os": "Linux",
+        "arch": "x86_64",
+        "collected_at": "2026-09-20T17:32:47.8385528+08:00",
+        "source": "ssh",
+        "probe_ok": true,
+        "latency_ms": 2153
+      },
+      "dns_status": {
+        "matched": true,
+        "is_cf_proxy": false,
+        "domain": "myconsun.cc.cd",
+        "vps_ip": "128.241.228.161",
+        "resolved_ips": [
+          "128.241.228.161"
+        ],
+        "status_text": "公网 DNS 已与 VPS IP 匹配 (DNS 直连)",
+        "checked_at": "2026-09-20T17:59:53.5263748+08:00"
+      },
+      "last_probe_at": "2026-09-20T17:32:47.8385528+08:00",
+      "created_at": "2026-09-20T17:05:19.7972253+08:00",
+      "updated_at": "2026-09-20T17:59:53.5263748+08:00"
     }
   },
   "passwords": {
-    "3": "WVUADjC5Twh2uoAGMGK/D8HzEYK8IHEJCeH6Klt+STYeInAyVYY="
+    "3": "WVUADjC5Twh2uoAGMGK/D8HzEYK8IHEJCeH6Klt+STYeInAyVYY=",
+    "4": "jhnzBAhpgEKftJQBPXmLEX8BB1yI3FQoNFXXnmQiDmFUKMg4yFs="
   },
   "ips": {
-    "3": "Yr2vrNCXnGTpvjXRec2iu3LXDrvVnGM9DhUyud2AlspI94HvQiIn5jyybA=="
+    "3": "KCN9611eQxChTN2JXxugswi3tZv/OzeEkNlAn0EQoGqtrlUKmc/lEKBpNA==",
+    "4": "WfXFRpnoAfYNSqotEpvfriSodT8pfrcQ7DvP5Z5eu6eueyIdRNYx0dkLJw=="
   }
 }

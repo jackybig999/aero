@@ -1,5 +1,6 @@
 # Binaries / release artifacts (attach via GitHub Release, not git)
-dist/
+/dist/
+!public/webui/dist/**
 *.exe
 *.exe~
 *.dll

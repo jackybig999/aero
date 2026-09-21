@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AERO 运维台</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="aero-header">
+    <div class="brand-row">
+      <div class="logo-box">A</div>
+      <div class="brand-title">
+        <h1>AERO 运维台</h1>
+        <div class="sub-note">
+          <span>证书 · 节点 · 订阅 · Token 鉴权</span>
+          <span class="tag tag-blue" id="modeTag">mid-platform</span>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-blue" id="btnRefresh">🔄 全面诊断</button>
+    </div>
+  </header>
+
+  <!-- 官方源检测与状态提示 (严格遵从 GitHub Releases 官方源规范，严禁本地私拷) -->
+  <div class="alert-banner" id="sourceAlert" style="display:none;">
+    <span>⚠️</span>
+    <span id="sourceAlertText">【官方源提示】检测到 GitHub 官方源（jackybig999/aero）尚未发布 Release 包。系统严禁本地私拷分发，请先向 GitHub 推送 Release。点击【安装/升级】可执行前置流水线。</span>
+  </div>
+
+  <!-- 部署与节点选择栏 -->
+  <div class="card" id="deployCard" style="margin-bottom:12px">
+    <div class="card-header">
+      <div class="card-title">🚀 节点运维与部署调度</div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-sm" id="btnRestart">重启 Edge</button>
+        <button class="btn btn-sm btn-blue" id="btnInstall">安装 / 升级</button>
+        <button class="btn btn-sm btn-danger" id="btnUninstall">卸载</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <label style="color:var(--muted);font-size:12px">选择目标 VPS:</label>
+      <select id="vpsSelect" class="input-text" style="width:260px">
+        <option value="">正在拉取 VPS 列表...</option>
+      </select>
+      <span id="deployStatus" style="font-size:11px;color:var(--muted)"></span>
+    </div>
+  </div>
+
+  <!-- 运维 KPI 指标横幅 -->
+  <div class="kpi-row">
+    <div class="kpi-card">
+      <div class="kpi-label">节点状态</div>
+      <div class="kpi-val" id="kpiOverall"><span class="tag tag-green">可运维</span></div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Edge 服务</div>
+      <div class="kpi-val" id="kpiService"><span class="tag tag-green">ACTIVE</span></div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">443 监听</div>
+      <div class="kpi-val" id="kpiPort443"><span class="tag tag-green">LISTEN</span></div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">TLS / ECH 证书</div>
+      <div class="kpi-val" id="kpiCert"><span class="tag tag-green">正常</span></div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">订阅本机连通</div>
+      <div class="kpi-val" id="kpiSubLocal"><span class="tag tag-green">可达</span></div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">订阅公网分发</div>
+      <div class="kpi-val" id="kpiSubPublic"><span class="tag tag-green">可达</span></div>
+    </div>
+  </div>
+
+  <!-- 双列对称布局 -->
+  <div class="grid-two">
+    <!-- 左列: 协议节点与监听状态 -->
+    <div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🌐 协议节点种类与网络监听</div>
+          <button class="btn btn-sm" id="btnTestConn">重测连通</button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width:60px">状态</th>
+              <th>协议类型</th>
+              <th>Kind</th>
+              <th>监听目标</th>
+            </tr>
+          </thead>
+          <tbody id="nodesTableBody">
+            <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无节点信息</td></tr>
+          </tbody>
+        </table>
+        <div id="portsRow" style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📋 运行日志与指标</div>
+        </div>
+        <div class="log-box" id="logBox">正在连接日志流...</div>
+      </div>
+    </div>
+
+    <!-- 右列: Token 矩阵与订阅配置 -->
+    <div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🔑 客户端 Token 授权矩阵</div>
+          <button class="btn btn-sm btn-blue" id="btnOpenAddToken">+ 新增 Token</button>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Token 凭据</th>
+              <th>标签备注</th>
+              <th>有效期</th>
+              <th style="width:60px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tokensTableBody">
+            <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无 Token 凭据</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🔒 证书管理与自动续签</div>
+          <button class="btn btn-sm btn-blue" id="btnRenewCert">强制续签证书</button>
+        </div>
+        <div style="font-size:12px;color:var(--muted)">
+          <p id="certDomainText">当前域名: —</p>
+          <p id="certExpiryText" style="margin-top:4px">到期时间: —</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 新增 Token 弹窗 -->
+  <div class="modal-backdrop" id="tokenModal">
+    <div class="modal-content">
+      <h3 style="margin-bottom:12px">新增客户端授权 Token</h3>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Token 密匙 (留空自动生成)</label>
+          <input type="text" id="newTokenVal" class="input-text" style="width:100%" placeholder="自定义 Token 或留空自动生成" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户/设备标签备注</label>
+          <input type="text" id="newTokenLabel" class="input-text" style="width:100%" placeholder="例如: iPhone_15_Pro 或 Office_Mac" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">有效时长 (小时，0 为永久有效)</label>
+          <input type="number" id="newTokenTTL" class="input-text" style="width:100%" value="0" />
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+        <button class="btn" id="btnCancelToken">取消</button>
+        <button class="btn btn-blue" id="btnSaveToken">保存并分发</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="console.js"></script>
+</body>
+</html>

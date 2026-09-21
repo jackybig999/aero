@@ -62,11 +62,23 @@ type VPSHost struct {
 	GoogleClean       bool         `json:"google_clean"` // Google 打靶正常 (无 429)
 	CFClean           bool         `json:"cf_clean"`     // Cloudflare 打靶正常
 	IsWARPEgress      bool         `json:"is_warp_egress"`
-	Metrics           *HostMetrics `json:"metrics,omitempty"`
-	LastProbeAt       *time.Time   `json:"last_probe_at,omitempty"`
-	LastPurityProbeAt *time.Time   `json:"last_purity_probe_at,omitempty"`
-	CreatedAt         time.Time    `json:"created_at"`
-	UpdatedAt         time.Time    `json:"updated_at"`
+	Metrics           *HostMetrics   `json:"metrics,omitempty"`
+	DNSStatus         *DNSStatusInfo `json:"dns_status,omitempty"`
+	LastProbeAt       *time.Time     `json:"last_probe_at,omitempty"`
+	LastPurityProbeAt *time.Time     `json:"last_purity_probe_at,omitempty"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+// DNSStatusInfo represents cached DNS verification status for a VPS domain.
+type DNSStatusInfo struct {
+	Matched     bool      `json:"matched"`
+	IsCFProxy   bool      `json:"is_cf_proxy"`
+	Domain      string    `json:"domain"`
+	VPSIP       string    `json:"vps_ip"`
+	ResolvedIPs []string  `json:"resolved_ips"`
+	StatusText  string    `json:"status_text"`
+	CheckedAt   time.Time `json:"checked_at"`
 }
 
 // PurityResult 目标 VPS 出口纯净度远程打靶快照

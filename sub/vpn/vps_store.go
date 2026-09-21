@@ -19,6 +19,8 @@ type VPSStore interface {
 	UpdateMetrics(id uint64, m *HostMetrics, probeOK bool, errMsg string, latency int64) error
 	UpdatePurity(id uint64, res *PurityResult) error
 	UpdateDomain(id uint64, domain string) error
+	UpdateDNSStatus(id uint64, st *DNSStatusInfo) error
+	UpdatePassword(id uint64, password string) error
 	GetCredentials(id uint64) (*Credentials, error)
 }
 
@@ -135,8 +137,14 @@ func (m *MemoryVPSStore) UpdateMetrics(id uint64, met *HostMetrics, ok bool, err
 	if ok && met != nil {
 		h.Metrics = met
 		h.Status = "online"
+		score, tier, state := CalculateCapacity(met)
+		h.HealthScore = score
+		h.Tier = tier
+		h.CapacityState = state
 	} else {
 		h.Status = "error"
+		h.HealthScore = 0
+		h.CapacityState = "offline"
 		if h.Metrics != nil {
 			h.Metrics.ProbeOK = false
 			h.Metrics.ProbeError = errMsg
@@ -173,6 +181,31 @@ func (m *MemoryVPSStore) UpdateDomain(id uint64, domain string) error {
 		return errors.New("not found")
 	}
 	h.Domain = strings.TrimSpace(domain)
+	h.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryVPSStore) UpdateDNSStatus(id uint64, st *DNSStatusInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, found := m.hosts[id]
+	if !found {
+		return errors.New("not found")
+	}
+	h.DNSStatus = st
+	h.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *MemoryVPSStore) UpdatePassword(id uint64, password string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, found := m.hosts[id]
+	if !found {
+		return errors.New("not found")
+	}
+	m.passwords[id] = strings.TrimSpace(password)
+	h.HasPassword = password != ""
 	h.UpdatedAt = time.Now()
 	return nil
 }

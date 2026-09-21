@@ -42,7 +42,7 @@ jobs:
           go build -v -o subvps .
 
   build-windows:
-    name: Windows Build & Test (Client & Connect)
+    name: Windows Build & Test (Client & Connect OS)
     runs-on: windows-latest
     steps:
       - name: Checkout Code
@@ -59,12 +59,12 @@ jobs:
           cd protocol/client
           go vet ./...
           go test -v ./...
-          go build -v -o aerowin.exe ./win
-          go build -v -o aero-guard.exe ./win/guard
+          go build -v -o aero-client.exe ./win
+          go build -v -o aero-client-cli.exe ./cli
 
-      - name: Test & Build Connect Tools
+      - name: Test & Build Connect AERO OS
         run: |
-          cd connect/desktop
+          cd connect/os
           go vet ./...
           go test -v ./...
-          go build -v -o desktop.exe ./win
+          go build -v -o aero-os.exe ./win

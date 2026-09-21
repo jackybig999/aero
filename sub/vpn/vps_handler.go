@@ -29,6 +29,12 @@ func (h *VPSHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/v1/vps/{id}/", h.Patch)
 	mux.HandleFunc("DELETE /api/v1/vps/{id}/", h.Delete)
 	mux.HandleFunc("POST /api/v1/vps/{id}/purity-probe/", h.ProbePurity)
+	mux.HandleFunc("POST /api/v1/vps/{id}/probe/", h.Probe)
+	mux.HandleFunc("POST /api/v1/vps/{id}/verify-domain/", h.VerifyDomain)
+	mux.HandleFunc("GET /api/v1/vps/cf-dns/status/", h.CFStatus)
+	mux.HandleFunc("POST /api/v1/vps/cf-dns/sync/", h.SyncCFDNS)
+	mux.HandleFunc("GET /api/v1/vps/{id}/diagnose/", h.Diagnose)
+	mux.HandleFunc("POST /api/v1/vps/{id}/cert/renew/", h.RenewCert)
 	mux.HandleFunc("POST /api/v1/vps/{id}/install-aero/", h.InstallAero)
 }
 
@@ -98,18 +104,34 @@ func (h *VPSHandler) Patch(w http.ResponseWriter, r *http.Request) {
 		Role        string `json:"role"`
 		SSHPort     int    `json:"ssh_port"`
 		SSHUsername string `json:"ssh_username"`
+		SSHPassword string `json:"ssh_password"`
+		Domain      string `json:"domain"`
 		Remark      string `json:"remark"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 422, errResp(1002, "invalid body"))
 		return
 	}
-	if err := h.svc.UpdateMeta(id, UpdateVPSParams{
-		Name: req.Name, Role: req.Role, SSHPort: req.SSHPort,
-		SSHUsername: req.SSHUsername, Remark: req.Remark,
-	}); err != nil {
-		writeJSON(w, 422, errResp(1002, err.Error()))
-		return
+	if req.SSHPassword != "" {
+		if err := h.svc.UpdatePassword(id, req.SSHPassword); err != nil {
+			writeJSON(w, 422, errResp(1002, err.Error()))
+			return
+		}
+	}
+	if req.Domain != "" {
+		if err := h.svc.UpdateDomain(id, req.Domain); err != nil {
+			writeJSON(w, 422, errResp(1002, err.Error()))
+			return
+		}
+	}
+	if req.Name != "" || req.Role != "" || req.SSHPort > 0 || req.SSHUsername != "" || req.Remark != "" {
+		if err := h.svc.UpdateMeta(id, UpdateVPSParams{
+			Name: req.Name, Role: req.Role, SSHPort: req.SSHPort,
+			SSHUsername: req.SSHUsername, Remark: req.Remark,
+		}); err != nil {
+			writeJSON(w, 422, errResp(1002, err.Error()))
+			return
+		}
 	}
 	v, _ := h.svc.Get(id)
 	writeJSON(w, 200, map[string]any{"code": 0, "data": v})
@@ -126,6 +148,97 @@ func (h *VPSHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"code": 0, "message": "deleted"})
+}
+
+func (h *VPSHandler) Probe(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	met, err := h.svc.Probe(ctx, id)
+	v, _ := h.svc.Get(id)
+	ok := met != nil && met.ProbeOK
+	if err != nil && met == nil {
+		writeJSON(w, 500, errResp(1003, err.Error()))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": 0, "data": map[string]any{"metrics": met, "vps": v, "ok": ok}})
+}
+
+func (h *VPSHandler) VerifyDomain(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	res, err := h.svc.VerifyDomain(ctx, id)
+	if err != nil {
+		writeJSON(w, 422, map[string]any{"code": 1002, "message": err.Error(), "data": res})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": 0, "data": res})
+}
+
+func (h *VPSHandler) CFStatus(w http.ResponseWriter, r *http.Request) {
+	ready := h.svc.CFReady()
+	writeJSON(w, 200, map[string]any{"code": 0, "data": map[string]any{"ready": ready}})
+}
+
+func (h *VPSHandler) SyncCFDNS(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Domain string `json:"domain"`
+		IP     string `json:"ip"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	res, err := h.svc.SyncCFDNS(ctx, req.Domain, req.IP)
+	if err != nil {
+		writeJSON(w, 422, map[string]any{"code": 1002, "message": err.Error(), "data": res})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": 0, "data": res})
+}
+
+func (h *VPSHandler) Diagnose(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	diag, err := h.svc.Diagnose(ctx, id)
+	if err != nil {
+		writeJSON(w, 502, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": 0, "data": diag})
+}
+
+func (h *VPSHandler) RenewCert(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	var req struct {
+		Force bool `json:"force"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	res, err := h.svc.RenewCert(ctx, id, req.Force)
+	if err != nil {
+		writeJSON(w, 502, map[string]any{"code": 1006, "message": err.Error(), "data": res})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": 0, "data": res})
 }
 
 func (h *VPSHandler) ProbePurity(w http.ResponseWriter, r *http.Request) {

@@ -1,6 +1,284 @@
-<!DOCTYPE html><html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>VPN 管理后台</title>  <script type="module" crossorigin src="/admin/assets/index-BdGtdSXr.js"></script>
-  <link rel="stylesheet" crossorigin href="/admin/assets/index-DE8sxkRt.css">
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VPN 中台管理系统</title>
+  <link rel="stylesheet" href="styles.css" />
 </head>
-<body><div id="app"></div></body>
+<body>
+  <!-- 1. 登录视图 -->
+  <div class="login-wrap" id="loginWrap" style="display:none;">
+    <div class="login-card">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+        <div class="logo-badge">A</div>
+        <div>
+          <h2 style="font-size:16px;font-weight:700">AERO VPN 中台</h2>
+          <p style="font-size:11px;color:var(--muted)">管理员特权控制通道</p>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">管理员账号</label>
+          <input type="text" id="loginUser" class="input-text" style="width:100%" placeholder="admin" value="admin" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">登录密码</label>
+          <input type="password" id="loginPass" class="input-text" style="width:100%" placeholder="请输入密码" />
+        </div>
+        <button class="btn btn-blue" id="btnLogin" style="width:100%;margin-top:6px;justify-content:center">立即登录</button>
+        <p id="loginErr" style="color:var(--red);font-size:11px;text-align:center;display:none;"></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. 主控大屏视图 -->
+  <div class="admin-layout" id="appLayout" style="display:flex;">
+    <!-- 左侧导航 -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo-badge">A</div>
+        <div class="brand-text">
+          <h1>VPN 中台</h1>
+          <span class="brand-sub">管理后台 v2.5</span>
+        </div>
+      </div>
+      <nav class="nav-menu">
+        <button class="menu-item active" data-tab="dashboard">
+          <span class="menu-icon">📊</span>
+          <span>系统总览</span>
+        </button>
+        <button class="menu-item" data-tab="users">
+          <span class="menu-icon">👥</span>
+          <span>用户中心</span>
+        </button>
+        <button class="menu-item" data-tab="vps">
+          <span class="menu-icon">🖥️</span>
+          <span>VPS 节点编排</span>
+        </button>
+        <button class="menu-item" data-tab="subs">
+          <span class="menu-icon">🔗</span>
+          <span>订阅管理</span>
+        </button>
+        <button class="menu-item" data-tab="ledger">
+          <span class="menu-icon">💰</span>
+          <span>财务账本</span>
+        </button>
+        <button class="menu-item" data-tab="diag">
+          <span class="menu-icon">🩺</span>
+          <span>链路诊断</span>
+        </button>
+      </nav>
+      <div style="padding-top:10px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)">
+        Go 原生标准微前端架构
+      </div>
+    </aside>
+
+    <!-- 右侧主体 -->
+    <main class="main-wrap">
+      <header class="topbar">
+        <div class="page-title" id="pageTitle">系统总览</div>
+        <div class="top-actions">
+          <span class="user-chip" id="topUser">admin</span>
+          <button class="btn btn-sm" id="btnTopRefresh">刷新数据</button>
+          <button class="btn btn-sm btn-danger" id="btnLogout">退出</button>
+        </div>
+      </header>
+
+      <!-- Pane 1: 系统总览 -->
+      <section class="content-pane active" id="pane-dashboard">
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <span class="k">活跃 VPS 节点</span>
+            <span class="v" id="kpiVpsCount">0</span>
+          </div>
+          <div class="kpi-card">
+            <span class="k">今日入账流水</span>
+            <span class="v" id="kpiIncome" style="color:var(--green)">$0.00</span>
+          </div>
+          <div class="kpi-card">
+            <span class="k">今日出账开销</span>
+            <span class="v" id="kpiExpense" style="color:var(--red)">$0.00</span>
+          </div>
+          <div class="kpi-card">
+            <span class="k">今日交易笔数</span>
+            <span class="v" id="kpiTxCount">0</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            <span>🚀 快捷全局编排动作</span>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button class="btn btn-blue" id="btnBroadcastAll">一键同步所有凭据至全部 Edge VPS</button>
+            <button class="btn" id="btnCheckAllProbes">一键执行全量 SSH IP 纯净度打靶</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Pane 2: 用户中心 -->
+      <section class="content-pane" id="pane-users">
+        <div class="toolbar">
+          <div style="display:flex;background:#090e18;border:1px solid var(--line);border-radius:var(--radius-sm);padding:2px">
+            <button class="btn btn-sm" id="btnTabStaff" style="border:0;background:var(--card-active)">管理员</button>
+            <button class="btn btn-sm" id="btnTabSub" style="border:0;background:transparent">订阅用户</button>
+          </div>
+          <button class="btn btn-blue btn-sm" id="btnOpenAddUser">+ 新增用户</button>
+        </div>
+        <div class="card" style="padding:0;overflow:hidden">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width:60px">ID</th>
+                <th>用户名</th>
+                <th>联系方式</th>
+                <th>套餐类型</th>
+                <th>金额 / 余额</th>
+                <th>状态</th>
+                <th style="width:180px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="usersTableBody">
+              <tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted)">正在加载用户数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Pane 3: VPS 资产 -->
+      <section class="content-pane" id="pane-vps">
+        <div class="toolbar">
+          <button class="btn btn-blue btn-sm" id="btnOpenAddVPS">+ 录入 VPS 节点</button>
+          <button class="btn btn-sm" id="btnSyncCF">同步 Cloudflare DNS</button>
+        </div>
+        <div class="card" style="padding:0;overflow:hidden">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width:60px">ID</th>
+                <th>节点标识</th>
+                <th>IP / 端口</th>
+                <th>出口纯净度 (打靶评分)</th>
+                <th>WARP 出口</th>
+                <th>状态</th>
+                <th style="width:200px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="vpsTableBody">
+              <tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted)">正在加载 VPS 资产...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Pane 4: 订阅管理 -->
+      <section class="content-pane" id="pane-subs">
+        <div class="card" style="padding:0;overflow:hidden">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>订阅用户</th>
+                <th>安全 Slug 路径</th>
+                <th>订阅下发链接</th>
+                <th style="width:120px">操作</th>
+              </tr>
+            </thead>
+            <tbody id="subsTableBody">
+              <tr><td colspan="4" style="text-align:center;padding:16px;color:var(--muted)">正在加载订阅列表...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Pane 5: 财务账本 -->
+      <section class="content-pane" id="pane-ledger">
+        <div class="card" style="padding:0;overflow:hidden">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th style="width:60px">ID</th>
+                <th>记录时间</th>
+                <th>收支方向</th>
+                <th>金额</th>
+                <th>业务摘要</th>
+              </tr>
+            </thead>
+            <tbody id="ledgerTableBody">
+              <tr><td colspan="5" style="text-align:center;padding:16px;color:var(--muted)">正在加载账本流水...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Pane 6: 链路诊断 -->
+      <section class="content-pane" id="pane-diag">
+        <div class="card">
+          <div class="card-title">🩺 全链路综合连通性诊断报告</div>
+          <div class="log-box" id="diagOutput" style="height:320px">点击刷新拉取探针打靶日志...</div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- 新增用户弹窗 -->
+  <div class="modal-backdrop" id="userModal">
+    <div class="modal-content">
+      <h3 style="margin-bottom:14px">新增系统用户</h3>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户名</label>
+          <input type="text" id="newUsername" class="input-text" style="width:100%" placeholder="username" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">初始密码</label>
+          <input type="password" id="newUserPass" class="input-text" style="width:100%" placeholder="password" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户角色</label>
+          <select id="newUserRole" class="input-text" style="width:100%">
+            <option value="sub">订阅终端用户</option>
+            <option value="staff">系统管理员</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+        <button class="btn" id="btnCancelUser">取消</button>
+        <button class="btn btn-blue" id="btnSaveUser">创建用户</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 新增 VPS 弹窗 -->
+  <div class="modal-backdrop" id="vpsModal">
+    <div class="modal-content">
+      <h3 style="margin-bottom:14px">录入 VPS 节点</h3>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">节点名称 / 别名</label>
+          <input type="text" id="newVpsName" class="input-text" style="width:100%" placeholder="HK-Edge-01" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">公网 IPv4 / IPv6 地址</label>
+          <input type="text" id="newVpsIP" class="input-text" style="width:100%" placeholder="104.28.19.45" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">SSH 端口</label>
+          <input type="number" id="newVpsPort" class="input-text" style="width:100%" value="22" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">SSH Root 密码</label>
+          <input type="password" id="newVpsPass" class="input-text" style="width:100%" placeholder="ssh password" />
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+        <button class="btn" id="btnCancelVps">取消</button>
+        <button class="btn btn-blue" id="btnSaveVps">保存并建联</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="admin.js"></script>
+</body>
 </html>

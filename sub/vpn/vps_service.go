@@ -117,12 +117,17 @@ func (s *EndpointStore) List() []EndpointInfo {
 // VPSService orchestrates VPS machine asset lifecycle.
 type VPSService struct {
 	store VPSStore
-	box   *SecretBox
-	eps   *EndpointStore
+	box     *SecretBox
+	eps     *EndpointStore
+	nodeSvc *NodeService
 }
 
 func NewVPSService(s VPSStore, box *SecretBox, eps *EndpointStore) *VPSService {
 	return &VPSService{store: s, box: box, eps: eps}
+}
+
+func (s *VPSService) SetNodeService(ns *NodeService) {
+	s.nodeSvc = ns
 }
 
 func (s *VPSService) Create(p CreateVPSParams) (*VPSHost, error) {
@@ -153,12 +158,38 @@ func (s *VPSService) Create(p CreateVPSParams) (*VPSHost, error) {
 	if p.SSHPassword == "" {
 		return nil, fmt.Errorf("ssh_password required")
 	}
-	return s.store.Create(p)
+	host, err := s.store.Create(p)
+	if err != nil {
+		return nil, err
+	}
+
+	// 自动联动创建/同步至代理节点注册表，杜绝不同步与残留
+	if s.nodeSvc != nil && host != nil {
+		targetHost := host.Domain
+		if targetHost == "" {
+			targetHost = host.IP
+		}
+		_, _ = s.nodeSvc.CreateNode(host.Name, host.Role, targetHost, "aero-h2", 443, 500, false, 100, host.ID)
+	}
+	return host, nil
 }
 
 func (s *VPSService) List() ([]*VPSHost, error)     { return s.store.List() }
 func (s *VPSService) Get(id uint64) (*VPSHost, error) { return s.store.Get(id) }
-func (s *VPSService) Delete(id uint64) error         { return s.store.Delete(id) }
+
+func (s *VPSService) Delete(id uint64) error {
+	vps, _ := s.store.Get(id)
+	ip := ""
+	if vps != nil {
+		ip = vps.IP
+	}
+	err := s.store.Delete(id)
+	if err == nil && s.nodeSvc != nil {
+		// 级联彻底清理关联节点与订阅，绝不残留失联孤儿
+		_, _ = s.nodeSvc.DeleteMatching(id, ip)
+	}
+	return err
+}
 
 func (s *VPSService) UpdateMeta(id uint64, p UpdateVPSParams) error {
 	p.Name = strings.TrimSpace(p.Name)
@@ -166,6 +197,19 @@ func (s *VPSService) UpdateMeta(id uint64, p UpdateVPSParams) error {
 	p.Remark = strings.TrimSpace(p.Remark)
 	p.SSHUsername = strings.TrimSpace(p.SSHUsername)
 	_, err := s.store.Update(id, p)
+	return err
+}
+
+func (s *VPSService) UpdatePassword(id uint64, password string) error {
+	return s.store.UpdatePassword(id, password)
+}
+
+func (s *VPSService) UpdateDomain(id uint64, domain string) error {
+	domain = strings.TrimSpace(domain)
+	err := s.store.UpdateDomain(id, domain)
+	if err == nil && s.nodeSvc != nil && domain != "" {
+		s.nodeSvc.UpdateHostByVPS(id, domain)
+	}
 	return err
 }
 

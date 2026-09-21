@@ -1,4 +1,4 @@
-dist/
+/dist/
 *.log
 .host-ip-cache.json
 .last-sub-body

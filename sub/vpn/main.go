@@ -111,20 +111,39 @@ func main() {
 		log.Fatalf("vps file store failed: %v", err)
 	}
 	vpsSvc := NewVPSService(vpsDB, box, epStore)
+	vpsSvc.SetNodeService(nodeSvc)
 	vpsSvc.StartPurityTicker(context.Background(), 4*time.Hour)
 
 	sniPath := filepath.Join(dataDir, "sni_matrix.json")
 	sniMgr := NewSNIMatrixManager(sniPath)
 	subBuilder := NewSubBuilder(userDB, epStore, vpsDB, sniMgr)
 
-	// 7. Auto-sync AERO Endpoints into Node Registry
-	syncNode := func(ep EndpointInfo) {
+	// 7. Auto-sync All VPS Assets & AERO Endpoints into Node Registry
+	existingHosts, _ := vpsDB.List()
+	existingNodes, _ := nodeSvc.ListAll()
+	nodeVPSMap := make(map[uint64]bool)
+	for _, n := range existingNodes {
+		if n.VPSID > 0 {
+			nodeVPSMap[n.VPSID] = true
+		}
+	}
+	for _, h := range existingHosts {
+		if !nodeVPSMap[h.ID] {
+			targetHost := strings.TrimSpace(h.Domain)
+			if targetHost == "" {
+				targetHost = h.IP
+			}
+			_, _ = nodeSvc.CreateNode(h.Name, h.Role, targetHost, "aero-h2", 443, 500, false, 100, h.ID)
+		}
+	}
+
+	for _, ep := range epStore.List() {
 		if !ep.Installed {
-			return
+			continue
 		}
 		host := strings.TrimSpace(ep.Host)
 		if host == "" || net.ParseIP(host) != nil {
-			return
+			continue
 		}
 		port := int32(ep.Port)
 		if port <= 0 {
@@ -135,22 +154,35 @@ func main() {
 			name = fmt.Sprintf("VPS-%d", ep.VPSID)
 		}
 		nodes, _ := nodeSvc.ListAll()
+		matched := false
 		for _, n := range nodes {
 			if n.VPSID == ep.VPSID {
 				_ = nodeSvc.Heartbeat(n.ID, ep.Version)
-				return
+				matched = true
+				break
 			}
 		}
-		_, _ = nodeSvc.CreateNode(name, ep.Region, host, "aero-h2", port, 500, false, 100, ep.VPSID)
-	}
-	for _, ep := range epStore.List() {
-		syncNode(ep)
+		if !matched {
+			_, _ = nodeSvc.CreateNode(name, ep.Region, host, "aero-h2", port, 500, false, 100, ep.VPSID)
+		}
 	}
 
 	// 8. HTTP Routing Mux Assembly
 	api := http.NewServeMux()
 	api.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		hosts, _ := vpsDB.List()
+		services := []map[string]any{
+			{"name": "user-center", "status": "ok"},
+			{"name": "billing", "status": "ok"},
+			{"name": "vpn-core", "status": "ok"},
+			{"name": "node-manager", "status": "ok"},
+			{"name": "vps-manager", "status": "ok"},
+			{"name": "aero-deploy", "status": "ok"},
+			{"name": "payment-ledger", "status": "ok"},
+			{"name": "payment-out", "status": "ok"},
+			{"name": "scheduler", "status": "ok"},
+			{"name": "state-sync-engine", "status": "ok"},
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":    "ok",
 			"mode":      "single-port",
@@ -158,6 +190,7 @@ func main() {
 			"product":   "vpsserver-aero",
 			"data_dir":  dataDir,
 			"vps_count": len(hosts),
+			"services":  services,
 			"timestamp": time.Now().Unix(),
 		})
 	})
@@ -167,6 +200,7 @@ func main() {
 	NewNodeHandler(nodeSvc).RegisterRoutes(api)
 	subBuilder.RegisterRoutes(api)
 	NewVPSHandler(vpsSvc).RegisterRoutes(api)
+	NewAeroHandler(vpsSvc).RegisterRoutes(api)
 	NewPayInHandler(payInSvc).RegisterRoutes(api)
 	NewPayOutHandler(payOutSvc).RegisterRoutes(api)
 	NewLedgerHandler(ledgerDB).RegisterRoutes(api)

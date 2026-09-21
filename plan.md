@@ -11,7 +11,7 @@
 三大子树保持绝对解耦，各自拥有独立 `go.mod`，**绝对禁止源码跨树 Import**：
 - **`protocol/`**：自主高性能网络数据面、TLS/ECH 伪装、MASQUE/H2 双栈协议与分流引擎；
 - **`sub/vpn/`**：纯 Linux VPS 生产中台（端口 18080），账号、节点编排、自适应 SNI 与订阅分发；
-- **`connect/desktop/`**：纯代理消费者（实测确认为 `github.com/AIsys/connect/desktop`），通过本地环回接口（`127.0.0.1:55555`）交互，随时无缝并入 `finger` 浏览器。
+- **`connect/os/`**：AERO OS 超级生产力桌面工作台（module: `aisys/connect/os`，产出 `aero-os.exe`），大一统整合指纹沙箱、便携内核仓、AI 开发工具箱、第三方 API 矩阵与审计日志，零本地 HTTP 端口，通过纯 Go 内存 IPC 通信。
 
 ### 1.2 核心底座演进路线
 - **基石（坚固后盾）**：现有 HTTP/2 CONNECT + uTLS 指纹伪装 + 0-Alloc Protobuf 数据面，生产常驻，绝不废弃；
@@ -107,10 +107,9 @@ D:\jacky\gemini\aisys\
 │   │   ├── metrics.go                    # 127.0.0.1 隔离的 expvar 零依赖指标输出 (~100行)
 │   │   ├── memlimit.go                   # cgroup 70% 内存硬保护守卫 (~150行)
 │   │   ├── install.sh                    # Linux VPS 一键部署 (BBRv3 + 热升级 + 自动回滚)
-│   │   └── webui/                        # 【静态资产与单机面板】(双模架构：中台嵌入 + VPS单机复用) (N3)
-│   │       ├── cmd/panel/main.go         # 单机轻量控制台 host (纯 Go，复用 Vue 前端)
-│   │       ├── src/components/AeroConsole.vue  # 【核心】双模前端 (mode==='mid' 或 'standalone')
-│   │       └── index.html 等             # 静态构建产物 (内嵌进二进制)
+│   │   └── webui/                        # 【静态资产与单机面板】(Plan B 纯 Go 内嵌：0 node_modules / 0 Vite)
+│   │       ├── cmd/panel/main.go         # 单机轻量控制台 host (纯 Go，内置 HTML5/CSS3/Vanilla JS)
+│   │       └── dist/                     # 嵌入静态资源 (console.js, styles.css, index.html)
 │   │
 │   └── client/                           # 【AERO 专属客户端】网络内核平铺 + 多端原生外壳 (不要命令版)
 │       ├── masque_dialer.go              # MASQUE 拨号器 (RFC 9218 注入 + 24h 降级缓存) (~280行)
@@ -162,16 +161,27 @@ D:\jacky\gemini\aisys\
 │   │   └── ledger.db                     # 财务流水 SQLite 事务数据库
 │   └── scripts/install.sh                # 中台 Linux VPS 一键部署脚本 (含 WARP 选装)
 │
-├── connect/desktop/                      # 【AI 桌面连接器 (ARM)】module: github.com/AIsys/connect/desktop
-│   ├── go.mod                            # 独立 module，严禁 import protocol/sub 源码 (已实地核验)
-│   ├── main.go                           # 桌面启动主程序 (双模：默认 WebView2 GUI 视窗，支持 --cli 菜单)
-│   ├── cli.go                            # 【并入的 CLI 交互模块】(原 connect/cli 移入，提供 0~5 菜单与代理注入)
-│   ├── win_proxy.go                      # //go:build windows 专有代理注入与浏览器扫描 (~150行)
-│   ├── mac_proxy.go                      # //go:build darwin 专有代理注入 (~140行)
-│   ├── finger_bridge.go                  # 经由 Bearer ctrl.token 鉴权的本地控制面适配器 (为合并 finger 预留) (~90行)
-│   └── renderer/                         # 【AI Runtime Manager 界面资产】(960x720 视窗对应 UI)
-│       ├── index.html                    # AI 工具 / 本地浏览器 / 第三方 API / 会话历史 / 日志面板
-│       └── app.js / style.css 等         # 前端交互代码
+├── connect/os/                          # 【AERO OS 生产力桌面超级工作台】module: aisys/connect/os
+│   ├── go.mod                            # 独立 module，引入 modernc.org/sqlite, go-webview2
+│   ├── win/                              # //go:build windows 纯 Go (零 CGO) 桌面宿主与 Win32 系统托盘
+│   │   ├── main.go                       # aero-os.exe 入口 (-ldflags="-H=windowsgui -s -w")
+│   │   ├── app_windows.go                # go-webview2 宿主、单例互斥锁、系统目录选择器
+│   │   ├── tray_windows.go               # Win32 系统托盘最小化与右键菜单
+│   │   ├── sys_proxy_windows.go          # Windows 系统代理与环境变量探测
+│   │   └── icon.ico / rsrc_windows.syso  # 应用程序图标与资源清单
+│   ├── mac/                              # //go:build darwin WebKit 桌面宿主
+│   │   ├── main.go                       # macOS 桌面入口
+│   │   ├── app_darwin.go                 # webview_go 宿主
+│   │   └── sys_proxy_darwin.go           # macOS scutil 代理探测
+│   └── internal/                         # AERO OS 内部各业务模块
+│       ├── netcore/                      # Client 守护与本地 REST API 桥接器
+│       ├── browser/                      # 指纹沙箱核心 (SQLite, Canvas/WebGL/WebRTC 随机化)
+│       ├── kernel/                       # 便携内核仓 (Chrome, Firefox, Safari 下载与校验)
+│       ├── aitools/                      # AI 开发工具箱 (扫描 Claude/Cursor/Windsurf/VSCode，自动注入 55555 代理)
+│       ├── apimatrix/                    # API 密钥矩阵 (本地加密存储，连通性测速体检)
+│       ├── audit/                        # 运行审计与日志 (高性能内存环形日志控制台)
+│       ├── ipc/                          # Go ↔ WebView 原生函数指针绑定总线 (w.Bind)
+│       └── ui/dist/                      # 嵌入式前端 (深蓝暗色拟态风格，左侧 5 大模块平铺)
 │
 ├── build/                                # 【自动化构建矩阵】全部强制 GOWORK=off (N2)
 │   ├── build-win.ps1                     # 一键生成 aerowin.exe + aero-guard.exe + desktop.exe

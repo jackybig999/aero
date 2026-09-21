@@ -214,8 +214,14 @@ func (s *FileVPSStore) UpdateMetrics(id uint64, met *HostMetrics, ok bool, errMs
 	if ok && met != nil {
 		h.Metrics = met
 		h.Status = "online"
+		score, tier, state := CalculateCapacity(met)
+		h.HealthScore = score
+		h.Tier = tier
+		h.CapacityState = state
 	} else {
 		h.Status = "error"
+		h.HealthScore = 0
+		h.CapacityState = "offline"
 		if h.Metrics != nil {
 			h.Metrics.ProbeOK = false
 			h.Metrics.ProbeError = errMsg
@@ -252,6 +258,39 @@ func (s *FileVPSStore) UpdateDomain(id uint64, domain string) error {
 		return errors.New("not found")
 	}
 	h.Domain = strings.TrimSpace(domain)
+	h.UpdatedAt = time.Now()
+	return s.save()
+}
+
+func (s *FileVPSStore) UpdateDNSStatus(id uint64, st *DNSStatusInfo) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, found := s.hosts[id]
+	if !found {
+		return errors.New("not found")
+	}
+	h.DNSStatus = st
+	h.UpdatedAt = time.Now()
+	return s.save()
+}
+
+func (s *FileVPSStore) UpdatePassword(id uint64, password string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, found := s.hosts[id]
+	if !found {
+		return errors.New("not found")
+	}
+	password = strings.TrimSpace(password)
+	if s.box != nil && password != "" {
+		if enc, err := s.box.Encrypt(password); err == nil {
+			s.passwords[id] = enc
+			h.HasPassword = true
+		}
+	} else if password == "" {
+		delete(s.passwords, id)
+		h.HasPassword = false
+	}
 	h.UpdatedAt = time.Now()
 	return s.save()
 }

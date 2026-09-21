@@ -28,6 +28,7 @@ yarn-error.log*
 
 # Logs & Runtime Temp
 logs/
+tmp/
 *.log
 *.tmp
 *.temp
@@ -55,8 +56,8 @@ platform.exe
 *.test
 __debug_bin*
 sub/vpn/vpn/
-dist/
-build/dist/
+/dist/
+/build/dist/
 
 # SQLite WAL and SHM files
 *.db-shm

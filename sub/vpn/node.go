@@ -135,6 +135,20 @@ func (s *NodeService) DeleteMatching(vpsID uint64, ip string) ([]uint64, error) 
 	return deleted, nil
 }
 
+func (s *NodeService) UpdateHostByVPS(vpsID uint64, newHost string) {
+	if vpsID == 0 || newHost == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range s.nodes {
+		if n.VPSID == vpsID {
+			n.IP = newHost
+			n.UpdatedAt = time.Now()
+		}
+	}
+}
+
 type NodeHandler struct {
 	svc *NodeService
 }

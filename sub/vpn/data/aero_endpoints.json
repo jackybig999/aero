@@ -18,14 +18,13 @@
       "vps_id": 3,
       "name": "vps-a",
       "host": "myconsun.de5.net",
-      "ip": "192.210.193.197",
       "port": 443,
-      "sub_secret": "8eaba311cc5313881c0172e7dc6994cd",
-      "admin_key": "31acb1e1d48f1017688b507e3aa1a77c",
+      "sub_secret": "sub_dlk1nj2whb88",
+      "admin_key": "ak_dlk1nj2whb88",
       "has_admin": true,
-      "sub_url": "https://myconsun.de5.net/sub/8eaba311cc5313881c0172e7dc6994cd",
+      "sub_url": "https://myconsun.de5.net/sub/sub_dlk1nj2whb88",
       "installed": true,
-      "updated_at": "2026-09-19T15:55:43.426745+08:00"
+      "updated_at": "2026-09-20T17:42:25.9691077+08:00"
     }
   ]
 }
