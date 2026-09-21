@@ -150,11 +150,16 @@ func (s *NodeService) UpdateHostByVPS(vpsID uint64, newHost string) {
 }
 
 type NodeHandler struct {
-	svc *NodeService
+	svc      *NodeService
+	vpsStore VPSStore
 }
 
-func NewNodeHandler(svc *NodeService) *NodeHandler {
-	return &NodeHandler{svc: svc}
+func NewNodeHandler(svc *NodeService, vpsStore ...VPSStore) *NodeHandler {
+	h := &NodeHandler{svc: svc}
+	if len(vpsStore) > 0 {
+		h.vpsStore = vpsStore[0]
+	}
+	return h
 }
 
 func (h *NodeHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -273,6 +278,13 @@ func (h *NodeHandler) CleanOrphans(w http.ResponseWriter, r *http.Request) {
 	validMap := make(map[uint64]bool)
 	for _, id := range req.ValidVPSIDs {
 		validMap[id] = true
+	}
+	if len(validMap) == 0 && h.vpsStore != nil {
+		if hosts, err := h.vpsStore.List(); err == nil {
+			for _, v := range hosts {
+				validMap[v.ID] = true
+			}
+		}
 	}
 	h.svc.mu.Lock()
 	defer h.svc.mu.Unlock()

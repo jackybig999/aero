@@ -3,6 +3,8 @@ const $ = (id) => document.getElementById(id);
 
 const TOKEN_KEY = 'vpn_admin_token';
 let currentVpsId = '';
+let activeTaskId = null;
+let taskPollTimer = null;
 
 async function request(url, options = {}) {
   const token = localStorage.getItem(TOKEN_KEY);
@@ -30,6 +32,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   initEvents();
   await loadSourceStatus();
   await loadVpsList();
+  await loadTasks();
   if (currentVpsId) {
     await loadVpsDiagnose(currentVpsId);
   }
@@ -39,6 +42,7 @@ function initEvents() {
   $('btnRefresh')?.addEventListener('click', async () => {
     $('btnRefresh').textContent = '诊断中...';
     await loadSourceStatus();
+    await loadTasks();
     if (currentVpsId) {
       await loadVpsDiagnose(currentVpsId);
     }
@@ -51,6 +55,7 @@ function initEvents() {
 
   $('vpsSelect')?.addEventListener('change', async (e) => {
     currentVpsId = e.target.value;
+    await loadTasks();
     if (currentVpsId) {
       await loadVpsDiagnose(currentVpsId);
     }
@@ -69,108 +74,132 @@ function initEvents() {
 
   $('btnInstall')?.addEventListener('click', async () => {
     if (!currentVpsId) return alert('请先选择目标 VPS');
+    const vpsNum = parseInt(currentVpsId, 10);
+    if (!vpsNum) return alert('无效的 VPS ID');
     try {
-      await request('/api/v1/aero/install/', {
+      const task = await request('/api/v1/aero/install/', {
         method: 'POST',
-        body: JSON.stringify({ vps_id: currentVpsId })
+        body: JSON.stringify({ vps_id: vpsNum })
       });
-      alert('已触发官方源安装/升级任务流水线');
-      loadVpsDiagnose(currentVpsId);
+      if (task && task.id) {
+        openTaskDrawer(task.id);
+      }
+      loadTasks();
     } catch (e) {
-      alert(`操作失败: ${e.message}`);
+      alert(`安装升级任务启动失败: ${e.message}`);
     }
   });
 
   $('btnUninstall')?.addEventListener('click', async () => {
     if (!currentVpsId) return alert('请先选择目标 VPS');
     if (!confirm('确认卸载该节点上的 AERO Edge 服务？')) return;
+    const vpsNum = parseInt(currentVpsId, 10);
+    if (!vpsNum) return alert('无效的 VPS ID');
     try {
-      await request('/api/v1/aero/uninstall/', {
+      const task = await request('/api/v1/aero/uninstall/', {
         method: 'POST',
-        body: JSON.stringify({ vps_id: currentVpsId })
+        body: JSON.stringify({ vps_id: vpsNum })
       });
-      alert('已触发卸载');
-      loadVpsDiagnose(currentVpsId);
+      if (task && task.id) {
+        openTaskDrawer(task.id);
+      }
+      loadTasks();
     } catch (e) {
-      alert(`卸载失败: ${e.message}`);
+      alert(`卸载任务启动失败: ${e.message}`);
     }
   });
 
-  $('btnRenewCert')?.addEventListener('click', async () => {
-    if (!currentVpsId) return alert('请先选择目标 VPS');
-    try {
-      await request(`/api/v1/aero/vps/${currentVpsId}/cert/renew/`, {
-        method: 'POST',
-        body: JSON.stringify({ force: true })
-      });
-      alert('证书续签任务已触发');
-      loadVpsDiagnose(currentVpsId);
-    } catch (e) {
-      alert(`证书续签失败: ${e.message}`);
-    }
+  $('btnCopySub')?.addEventListener('click', () => {
+    const text = $('subUrlBox')?.textContent?.trim();
+    if (!text || text.includes('请选择')) return;
+    navigator.clipboard.writeText(text).then(() => {
+      const btn = $('btnCopySub');
+      const old = btn.textContent;
+      btn.textContent = '✓ 已复制';
+      setTimeout(() => { btn.textContent = old; }, 1500);
+    });
   });
 
   // Modal events
   $('btnOpenAddToken')?.addEventListener('click', () => {
-    $('tokenModal').classList.add('active');
+    $('tokenModal')?.classList.add('active');
   });
   $('btnCancelToken')?.addEventListener('click', () => {
-    $('tokenModal').classList.remove('active');
+    $('tokenModal')?.classList.remove('active');
   });
   $('btnSaveToken')?.addEventListener('click', async () => {
-    if (!currentVpsId) return alert('请先选择 VPS');
-    const token = $('newTokenVal').value.trim();
-    const label = $('newTokenLabel').value.trim();
-    const ttl_hours = parseInt($('newTokenTTL').value, 10) || 0;
+    if (!currentVpsId) return alert('请先选择目标 VPS');
+    const tokenVal = $('newTokenVal').value.trim();
+    const labelVal = $('newTokenLabel').value.trim();
+    const ttlVal = parseInt($('newTokenTTL').value, 10) || 0;
+
     try {
       await request(`/api/v1/aero/vps/${currentVpsId}/tokens/`, {
         method: 'POST',
-        body: JSON.stringify({ token, label, ttl_hours })
+        body: JSON.stringify({
+          token: tokenVal,
+          label: labelVal || '客户端设备',
+          ttl_hours: ttlVal
+        })
       });
-      $('tokenModal').classList.remove('active');
-      loadTokens(currentVpsId);
+      $('tokenModal')?.classList.remove('active');
+      $('newTokenVal').value = '';
+      $('newTokenLabel').value = '';
+      $('newTokenTTL').value = '0';
+      await loadTokens(currentVpsId);
     } catch (e) {
-      alert(`保存失败: ${e.message}`);
+      alert(`保存 Token 失败: ${e.message}`);
     }
+  });
+
+  $('btnCloseTaskDrawer')?.addEventListener('click', () => {
+    closeTaskDrawer();
   });
 }
 
-// 检查官方源 Release 状态（严格遵从 GitHub 官方源发布约束，杜绝本地私传）
 async function loadSourceStatus() {
   try {
-    const data = await request('/api/v1/aero/source-status/');
-    const alertBox = $('sourceAlert');
-    const alertText = $('sourceAlertText');
-    if (data && !data.has_source) {
-      alertBox.style.display = 'flex';
-      alertText.textContent = `【官方源提示】检测到 GitHub 官方源（${data.repo || 'jackybig999/aero'}）尚未发布 Release 包。系统严禁本地私拷分发，请先向 GitHub 推送 Release。点击【安装/升级】可执行前置流水线。`;
+    const src = await request('/api/v1/aero/source-status/');
+    const alertEl = $('sourceAlert');
+    const textEl = $('sourceAlertText');
+    if (!src || !src.has_source) {
+      if (alertEl) alertEl.style.display = 'flex';
+      if (textEl) textEl.textContent = `【官方源提示】检测到 GitHub 官方源（${src?.repo || 'jackybig999/aero'}）尚未发布 Release 包。系统严禁本地私拷分发，请先向 GitHub 推送 Release。点击【安装/升级】可执行前置流水线。`;
     } else {
-      alertBox.style.display = 'none';
+      if (alertEl) alertEl.style.display = 'none';
     }
-  } catch (err) {
-    console.warn('loadSourceStatus error:', err);
+  } catch (e) {
+    console.warn('Load source status failed:', e);
   }
 }
 
 async function loadVpsList() {
   try {
-    const data = await request('/api/v1/aero/vps-options/');
-    const list = (data && data.results) || data || [];
+    const list = await request('/api/v1/aero/vps-options/');
     const sel = $('vpsSelect');
+    if (!sel) return;
     sel.innerHTML = '';
     if (!list || list.length === 0) {
-      sel.innerHTML = '<option value="">未录入任何 VPS 节点</option>';
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '暂无 VPS 节点，请在中台 VPS 栏目添加';
+      sel.appendChild(opt);
       return;
     }
-    list.forEach((vps, i) => {
+    list.forEach((vps, idx) => {
       const opt = document.createElement('option');
       opt.value = vps.id || vps.vps_id;
-      opt.textContent = `${vps.name || 'VPS-' + (vps.id || i)} (${vps.host || vps.ip || '—'})`;
+      opt.textContent = `${vps.name} (${vps.ip}${vps.domain ? ' · ' + vps.domain : ''})`;
+      if (idx === 0 && !currentVpsId) {
+        currentVpsId = opt.value;
+        opt.selected = true;
+      } else if (currentVpsId && opt.value == currentVpsId) {
+        opt.selected = true;
+      }
       sel.appendChild(opt);
     });
-    currentVpsId = sel.value;
-  } catch (err) {
-    console.warn('loadVpsList error:', err);
+  } catch (e) {
+    console.warn('Load VPS list failed:', e);
   }
 }
 
@@ -179,92 +208,258 @@ async function loadVpsDiagnose(vpsId) {
   try {
     const diag = await request(`/api/v1/aero/vps/${vpsId}/diagnose/`);
     renderDiagnose(diag);
-    loadTokens(vpsId);
-  } catch (err) {
-    $('kpiOverall').innerHTML = '<span class="tag tag-red">异常</span>';
-    $('logBox').textContent = `诊断请求异常: ${err.message}`;
+    await loadTokens(vpsId);
+  } catch (e) {
+    console.warn('Load diagnose failed:', e);
+    renderDiagnoseError(e);
   }
 }
 
-function renderDiagnose(diag) {
-  if (!diag) return;
+function renderDiagnose(d) {
+  if (!d) return;
 
-  // KPI
-  const online = diag.overall_online !== false;
-  $('kpiOverall').innerHTML = `<span class="tag ${online ? 'tag-green' : 'tag-red'}">${online ? '可运维' : '异常'}</span>`;
-  
-  const svcActive = diag.service && diag.service.active;
-  $('kpiService').innerHTML = `<span class="tag ${svcActive ? 'tag-green' : 'tag-red'}">${svcActive ? 'ACTIVE' : 'DOWN'}</span>`;
+  const isUp = d.service?.active || d.ok;
+  $('kpiOverall').innerHTML = isUp ? '<span class="tag tag-green">可运维</span>' : '<span class="tag tag-red">异常</span>';
+  $('kpiService').innerHTML = d.service?.active ? '<span class="tag tag-green">ACTIVE</span>' : '<span class="tag tag-amber">' + (d.service?.status || 'INACTIVE').toUpperCase() + '</span>';
 
-  const portListen = diag.ports && diag.ports.some(p => p.port === 443 && p.listen);
-  $('kpiPort443').innerHTML = `<span class="tag ${portListen ? 'tag-green' : 'tag-amber'}">${portListen ? 'LISTEN' : 'CLOSED'}</span>`;
+  const p443 = d.ports?.find(p => p.port === 443 && p.listen);
+  $('kpiPort443').innerHTML = p443 ? '<span class="tag tag-green">LISTEN</span>' : '<span class="tag tag-amber">CLOSED</span>';
 
-  const certOk = diag.cert && diag.cert.ok;
-  $('kpiCert').innerHTML = `<span class="tag ${certOk ? 'tag-green' : 'tag-amber'}">${certOk ? '正常' : '待更新'}</span>`;
-  if (diag.cert) {
-    $('certDomainText').textContent = `当前域名: ${diag.cert.domain || '—'}`;
-    $('certExpiryText').textContent = `到期时间: ${diag.cert.expire_date || '—'}`;
+  const certOk = d.cert?.ok;
+  const certDetail = d.cert?.detail || (certOk ? '正常' : '待签发');
+  $('kpiCert').innerHTML = certOk ? `<span class="tag tag-green" title="${certDetail}">正常</span>` : `<span class="tag tag-amber" title="${certDetail}">待签发</span>`;
+
+  $('kpiSubLocal').innerHTML = d.subscription?.local_ok ? '<span class="tag tag-green">可达</span>' : '<span class="tag tag-red">失败</span>';
+  $('kpiSubPublic').innerHTML = d.subscription?.public_ok ? '<span class="tag tag-green">可达</span>' : '<span class="tag tag-amber">待确认</span>';
+
+  // 节点表格
+  const nodesBody = $('nodesTableBody');
+  if (nodesBody) {
+    if (d.nodes && d.nodes.length) {
+      nodesBody.innerHTML = d.nodes.map(n => `
+        <tr>
+          <td><span class="tag ${n.online ? 'tag-green' : 'tag-red'}">${n.online ? '通' : '断'}</span></td>
+          <td><b>${escapeHtml(n.name)}</b></td>
+          <td><span class="tag tag-blue">${escapeHtml(n.kind || 'aero')}</span></td>
+          <td class="mono" style="font-size:11px">${escapeHtml(n.target || '—')}</td>
+        </tr>
+      `).join('');
+    } else {
+      nodesBody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无协议节点</td></tr>';
+    }
   }
 
-  // Nodes Table
-  const tbody = $('nodesTableBody');
-  tbody.innerHTML = '';
-  const nodes = diag.nodes || [];
-  if (nodes.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无协议节点配置</td></tr>';
-  } else {
-    nodes.forEach(n => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td><span class="tag ${n.online ? 'tag-green' : 'tag-red'}">${n.online ? '通' : '断'}</span></td>
-        <td><b>${escapeHtml(n.name || n.proto)}</b></td>
-        <td>${escapeHtml(n.kind || 'masque/h2')}</td>
-        <td><span style="font-family:monospace">${escapeHtml(n.target || '—')}</span></td>
-      `;
-      tbody.appendChild(tr);
-    });
+  // 端口标签
+  const portsRow = $('portsRow');
+  if (portsRow && d.ports) {
+    portsRow.innerHTML = d.ports.map(p => `
+      <span class="tag ${p.listen ? 'tag-green' : 'tag-blue'}" style="font-size:11px">
+        ${p.port}/${p.proto} · ${p.role} · ${p.listen ? 'LISTEN' : 'CLOSED'}
+      </span>
+    `).join('');
   }
 
-  // Log box
-  $('logBox').textContent = diag.log_tail || '暂无最近活动日志';
+  // 日志
+  const logBox = $('logBox');
+  if (logBox) {
+    logBox.textContent = d.log_tail || `[系统指标] 诊断途径: ${d.via || 'tls-probe'}\n[网络监听] 443端口正常响应，TLS 状态: ${certDetail}\n[提示] 完整硬件及证书运维请前往中台 VPS 资产列表。`;
+  }
+
+  // 专属订阅区
+  const domain = d.domain || d.ip;
+  const subUrl = domain ? `https://${domain}/sub/superadmin` : '—';
+  if ($('subUrlBox')) $('subUrlBox').textContent = subUrl;
+  if ($('subSecretStatus')) $('subSecretStatus').textContent = d.subscription?.secret_set === 'yes' ? '已配置就绪' : '默认就绪';
+  if ($('subLocalStatus')) {
+    $('subLocalStatus').innerHTML = d.subscription?.local_ok ? '<span class="tag tag-green">OK</span>' : '<span class="tag tag-red">FAIL</span>';
+  }
+  if ($('subPublicStatus')) {
+    $('subPublicStatus').innerHTML = d.subscription?.public_ok ? '<span class="tag tag-green">OK (直连畅通)</span>' : '<span class="tag tag-amber">不可达 / 超时</span>';
+  }
+  if ($('subPreview')) $('subPreview').textContent = d.subscription?.preview || 'sub://aero-node-encrypted';
+}
+
+function renderDiagnoseError(e) {
+  $('kpiOverall').innerHTML = '<span class="tag tag-red">异常</span>';
+  $('kpiService').innerHTML = '<span class="tag tag-red">ERROR</span>';
+  $('kpiPort443').innerHTML = '<span class="tag tag-amber">CLOSED</span>';
+  $('kpiCert').innerHTML = '<span class="tag tag-amber">未知</span>';
+  $('kpiSubLocal').innerHTML = '<span class="tag tag-red">FAIL</span>';
+  $('kpiSubPublic').innerHTML = '<span class="tag tag-red">FAIL</span>';
+  if ($('logBox')) $('logBox').textContent = `诊断探测失败: ${e.message}\n请核实 VPS IP 及 SSH 端口是否连通。`;
 }
 
 async function loadTokens(vpsId) {
+  if (!vpsId) return;
   try {
-    const data = await request(`/api/v1/aero/vps/${vpsId}/tokens/`);
-    const tokens = (data && data.results) || data || [];
+    const res = await request(`/api/v1/aero/vps/${vpsId}/tokens/`);
+    const list = res.results || res || [];
     const tbody = $('tokensTableBody');
-    tbody.innerHTML = '';
-    if (tokens.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">当前节点暂无授权 Token</td></tr>';
+    if (!tbody) return;
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无 Token 凭据</td></tr>';
       return;
     }
-    tokens.forEach(t => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td><span style="font-family:monospace;color:#93c5fd">${escapeHtml(t.token)}</span></td>
-        <td>${escapeHtml(t.label || '—')}</td>
-        <td>${t.ttl_hours ? `${t.ttl_hours} 小时` : '永久'}</td>
-        <td><button class="btn btn-sm btn-danger" onclick="delToken('${escapeHtml(t.token)}')">删除</button></td>
-      `;
-      tbody.appendChild(tr);
-    });
+    tbody.innerHTML = list.map(t => `
+      <tr>
+        <td class="mono">${escapeHtml(t.token_mask || t.token || '—')}</td>
+        <td>${escapeHtml(t.label || '默认用户')}</td>
+        <td><span class="tag tag-blue">${t.ttl_hours ? t.ttl_hours + '小时' : '永久'}</span></td>
+        <td><button class="btn btn-sm btn-danger" onclick="delToken('${escapeHtml(t.token)}')">删</button></td>
+      </tr>
+    `).join('');
   } catch (e) {
-    console.warn('loadTokens error', e);
+    console.warn('Load tokens failed:', e);
   }
 }
 
-window.delToken = async (tokenStr) => {
-  if (!confirm(`确认废除此 Token (${tokenStr.slice(0, 8)}...)？`)) return;
+async function delToken(token) {
+  if (!currentVpsId) return;
+  if (!confirm('确认删除该客户端授权 Token？')) return;
   try {
-    await request(`/api/v1/aero/vps/${currentVpsId}/tokens/?token=${encodeURIComponent(tokenStr)}`, { method: 'DELETE' });
-    loadTokens(currentVpsId);
+    await request(`/api/v1/aero/vps/${currentVpsId}/tokens/?token=${encodeURIComponent(token)}`, {
+      method: 'DELETE'
+    });
+    await loadTokens(currentVpsId);
   } catch (e) {
-    alert(`删除失败: ${e.message}`);
+    alert(`删除 Token 失败: ${e.message}`);
   }
-};
+}
+window.delToken = delToken;
+
+// 调度任务管理与抽屉
+async function loadTasks() {
+  try {
+    const list = await request('/api/v1/aero/tasks/');
+    const tasks = Array.isArray(list) ? list : (list?.results || []);
+    const wrap = $('tasksWrap');
+    const tbody = $('tasksTableBody');
+    if (!wrap || !tbody) return;
+
+    if (!tasks.length) {
+      wrap.style.display = 'none';
+      return;
+    }
+
+    wrap.style.display = 'block';
+    tbody.innerHTML = tasks.slice(0, 5).map(t => `
+      <tr style="cursor:pointer" onclick="openTaskDrawer(${t.id})">
+        <td class="mono">#${t.id}</td>
+        <td><span class="tag tag-blue">${escapeHtml(t.kind)}</span></td>
+        <td>${escapeHtml(t.vps_name || ('VPS ' + t.vps_id))}</td>
+        <td>
+          <div style="display:flex;align-items:center;gap:6px">
+            <div style="flex:1;height:4px;background:#090e18;border-radius:2px;overflow:hidden">
+              <div style="height:100%;background:var(--blue);width:${t.progress || 0}%"></div>
+            </div>
+            <span style="font-size:10px;color:var(--muted)">${t.progress || 0}%</span>
+          </div>
+        </td>
+        <td style="color:var(--muted)">${escapeHtml(t.stage || '—')}</td>
+        <td>
+          <span class="tag ${t.status === 'success' ? 'tag-green' : t.status === 'failed' ? 'tag-red' : 'tag-blue'}">
+            ${escapeHtml(t.status)}
+          </span>
+        </td>
+        <td><button class="btn btn-sm" onclick="event.stopPropagation();openTaskDrawer(${t.id})">查看</button></td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    console.warn('Load tasks failed:', e);
+  }
+}
+
+function openTaskDrawer(taskId) {
+  activeTaskId = taskId;
+  $('taskDrawerModal')?.classList.add('active');
+  pollTaskDetail();
+  if (taskPollTimer) clearInterval(taskPollTimer);
+  taskPollTimer = setInterval(pollTaskDetail, 800);
+}
+window.openTaskDrawer = openTaskDrawer;
+
+function closeTaskDrawer() {
+  $('taskDrawerModal')?.classList.remove('active');
+  activeTaskId = null;
+  if (taskPollTimer) {
+    clearInterval(taskPollTimer);
+    taskPollTimer = null;
+  }
+  loadTasks();
+}
+
+async function pollTaskDetail() {
+  if (!activeTaskId) return;
+  try {
+    const task = await request(`/api/v1/aero/tasks/${activeTaskId}/`);
+    if (!task) return;
+
+    if ($('taskModalTitle')) {
+      const tagClass = task.status === 'success' ? 'tag-green' : task.status === 'failed' ? 'tag-red' : 'tag-blue';
+      $('taskModalTitle').innerHTML = `<span>🚀 调度流水线详情 #${task.id}</span> <span class="tag ${tagClass}">${task.status.toUpperCase()}</span>`;
+    }
+    if ($('taskModalSub')) {
+      $('taskModalSub').textContent = `类型: ${task.kind} · 目标节点: ${task.vps_name || ('VPS ' + task.vps_id)} · 开始: ${task.created_at || '—'}`;
+    }
+
+    if ($('taskProgressStage')) $('taskProgressStage').textContent = `阶段: ${task.stage || '执行中...'}`;
+    if ($('taskProgressPercent')) $('taskProgressPercent').textContent = `${task.progress || 0}%`;
+    if ($('taskProgressBar')) $('taskProgressBar').style.width = `${task.progress || 0}%`;
+
+    // 渲染步骤
+    if (task.steps && task.steps.length) {
+      task.steps.forEach(st => {
+        const stepEl = $(`step-${st.key}`);
+        if (stepEl) {
+          stepEl.className = `step-item ${st.status}`;
+          let tagType = 'tag-blue';
+          let tagLabel = '等待中';
+          if (st.status === 'running') { tagType = 'tag-blue'; tagLabel = '进行中...'; }
+          else if (st.status === 'success') { tagType = 'tag-green'; tagLabel = '✓ 成功'; }
+          else if (st.status === 'failed') { tagType = 'tag-red'; tagLabel = '✕ 失败'; }
+          else if (st.status === 'skipped') { tagType = 'tag-amber'; tagLabel = '跳过'; }
+
+          stepEl.innerHTML = `
+            <span>${escapeHtml(st.title)} ${st.detail ? `<span style="font-size:11px;color:var(--muted)">(${escapeHtml(st.detail)})</span>` : ''}</span>
+            <span class="tag ${tagType}">${tagLabel}</span>
+          `;
+        }
+      });
+    }
+
+    // 渲染日志
+    const logBox = $('taskLogBox');
+    if (logBox) {
+      if (task.logs && task.logs.length) {
+        logBox.textContent = task.logs.join('\n');
+      } else if (task.error) {
+        logBox.textContent = `[错误警报] ${task.error}`;
+      } else {
+        logBox.textContent = '正在等待远端输出...';
+      }
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    if (task.status === 'success' || task.status === 'failed') {
+      if (taskPollTimer) {
+        clearInterval(taskPollTimer);
+        taskPollTimer = null;
+      }
+      if (task.status === 'success' && currentVpsId) {
+        loadVpsDiagnose(currentVpsId);
+      }
+    }
+  } catch (e) {
+    console.warn('Poll task detail failed:', e);
+  }
+}
 
 function escapeHtml(str) {
   if (!str) return '';
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 }

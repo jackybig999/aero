@@ -7,8 +7,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -103,39 +105,65 @@ func (h *AeroHandler) ClearFailed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"code": 0, "data": map[string]any{"deleted": cnt}})
 }
 
-func (h *AeroHandler) Install(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		VPSID uint64 `json:"vps_id"`
+func parseReqVPSID(r *http.Request) (uint64, error) {
+	var raw map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		return 0, fmt.Errorf("invalid json: %w", err)
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.VPSID == 0 {
+	v, ok := raw["vps_id"]
+	if !ok || v == nil {
+		return 0, fmt.Errorf("vps_id required")
+	}
+	switch val := v.(type) {
+	case float64:
+		if val <= 0 {
+			return 0, fmt.Errorf("vps_id must be positive")
+		}
+		return uint64(val), nil
+	case string:
+		s := strings.TrimSpace(val)
+		if s == "" {
+			return 0, fmt.Errorf("vps_id required")
+		}
+		id, err := strconv.ParseUint(s, 10, 64)
+		if err != nil || id == 0 {
+			return 0, fmt.Errorf("invalid vps_id string: %s", val)
+		}
+		return id, nil
+	default:
+		return 0, fmt.Errorf("vps_id required")
+	}
+}
+
+func (h *AeroHandler) Install(w http.ResponseWriter, r *http.Request) {
+	vpsID, err := parseReqVPSID(r)
+	if err != nil {
 		writeJSON(w, 422, errResp(1002, "vps_id required"))
 		return
 	}
-	cred, err := h.svc.store.GetCredentials(req.VPSID)
+	cred, err := h.svc.store.GetCredentials(vpsID)
 	if err != nil {
 		writeJSON(w, 404, errResp(1001, "vps not found: "+err.Error()))
 		return
 	}
-	task := globalTaskManager.CreateTask("install", req.VPSID, cred.Name, DefaultInstallSteps())
-	go RunInstallTask(task.ID, req.VPSID, h.svc)
+	task := globalTaskManager.CreateTask("install", vpsID, cred.Name, DefaultInstallSteps())
+	go RunInstallTask(task.ID, vpsID, h.svc)
 	writeJSON(w, 201, map[string]any{"code": 0, "data": task})
 }
 
 func (h *AeroHandler) Uninstall(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		VPSID uint64 `json:"vps_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.VPSID == 0 {
+	vpsID, err := parseReqVPSID(r)
+	if err != nil {
 		writeJSON(w, 422, errResp(1002, "vps_id required"))
 		return
 	}
-	cred, err := h.svc.store.GetCredentials(req.VPSID)
+	cred, err := h.svc.store.GetCredentials(vpsID)
 	if err != nil {
 		writeJSON(w, 404, errResp(1001, "vps not found: "+err.Error()))
 		return
 	}
-	task := globalTaskManager.CreateTask("uninstall", req.VPSID, cred.Name, DefaultUninstallSteps())
-	go RunUninstallTask(task.ID, req.VPSID, h.svc)
+	task := globalTaskManager.CreateTask("uninstall", vpsID, cred.Name, DefaultUninstallSteps())
+	go RunUninstallTask(task.ID, vpsID, h.svc)
 	writeJSON(w, 200, map[string]any{"code": 0, "data": task})
 }
 

@@ -269,6 +269,31 @@ function initEvents() {
   $('btnRefreshProbeAll')?.addEventListener('click', () => refreshVpsAll());
   $('btnVerifyAllDomains')?.addEventListener('click', () => verifyAllDomains());
 
+  $('vpsSelectAll')?.addEventListener('change', (e) => {
+    const on = e.target.checked;
+    document.querySelectorAll('.vps-checkbox').forEach(cb => { cb.checked = on; });
+    updateVpsSelectedCount();
+  });
+
+  // Cert Modal Listeners
+  $('btnCloseCertModal')?.addEventListener('click', () => $('certModal')?.classList.remove('active'));
+  $('btnCancelCertModal')?.addEventListener('click', () => $('certModal')?.classList.remove('active'));
+  $('btnRefreshCert')?.addEventListener('click', () => {
+    if (currentCertVpsId) refreshCertModal(currentCertVpsId);
+  });
+  $('btnRenewCertNormal')?.addEventListener('click', () => renewVpsCert(false));
+  $('btnRenewCertForce')?.addEventListener('click', () => renewVpsCert(true));
+
+  // VPS Detail Modal Listeners
+  $('btnCloseVpsDetailModal')?.addEventListener('click', () => $('vpsDetailModal')?.classList.remove('active'));
+  $('btnCancelVpsDetail')?.addEventListener('click', () => $('vpsDetailModal')?.classList.remove('active'));
+  $('btnProbeFromDetail')?.addEventListener('click', async () => {
+    if (!currentDetailVpsId) return;
+    await probeVPS(currentDetailVpsId);
+    const v = cachedVpsList.find(x => x.id === currentDetailVpsId);
+    if (v) renderVpsDetailContent(v);
+  });
+
   // CF Sync in Add VPS Modal
   $('btnSyncCfVps')?.addEventListener('click', async () => {
     const ip = $('vpsIp').value.trim();
@@ -642,12 +667,16 @@ async function broadcastAllSubs() {
 // ------------------------------------------------------------------------------
 // Pane 3: VPS (VPS 资产与域名绑定 - 紧凑网格与实时指标)
 // ------------------------------------------------------------------------------
+let currentCertVpsId = null;
+let currentDetailVpsId = null;
+const vpsCertCache = {};
+
 async function loadVPS() {
   try {
     // 1. Check CF status
     const cf = await apiCall('/vps/cf-dns/status/').catch(() => null);
     cfReady = !!(cf && cf.configured);
-    const badge = $('cfStatusBadge');
+    const badge = $('cfStatusTag');
     if (badge) {
       badge.textContent = cfReady ? '🟢 Cloudflare 灰云自动化: 已就绪' : '⚪ Cloudflare: 未配置 Token (仅公网DNS)';
       badge.className = `tag ${cfReady ? 'tag-green' : 'tag-blue'}`;
@@ -662,113 +691,226 @@ async function loadVPS() {
   }
 }
 
+function updateVpsSelectedCount() {
+  const all = document.querySelectorAll('.vps-checkbox');
+  const checked = document.querySelectorAll('.vps-checkbox:checked');
+  const countText = $('vpsCountText');
+  if (countText) {
+    countText.textContent = `共 ${all.length} 台 VPS 节点 · 已选中 ${checked.length} 台`;
+  }
+}
+window.updateVpsSelectedCount = updateVpsSelectedCount;
+
+function getSelectedVpsIds() {
+  const checked = document.querySelectorAll('.vps-checkbox:checked');
+  return Array.from(checked).map(cb => parseInt(cb.value, 10)).filter(Boolean);
+}
+
 function renderVPS() {
-  const container = $('vpsCardGrid');
-  container.innerHTML = '';
+  const tbody = $('vpsTableBody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
 
   if (cachedVpsList.length === 0) {
-    container.innerHTML = '<div class="metric-empty" style="grid-column:1/-1">尚未登记 VPS 节点</div>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--muted)">尚未登记 VPS 节点</td></tr>';
+    updateVpsSelectedCount();
     return;
   }
 
   cachedVpsList.forEach(v => {
-    const card = document.createElement('div');
-    card.className = 'vps-card';
-
-    // Status label & tag
+    const tr = document.createElement('tr');
     const isOnline = v.status === 'online';
-    const statusTag = `<span class="tag ${isOnline ? 'tag-green' : 'tag-amber'}">${isOnline ? '在线' : (v.status || '离线')}</span>`;
+    const statusTag = `<span class="tag ${isOnline ? 'tag-green' : 'tag-amber'}">${isOnline ? '正常' : (v.status || '离线')}</span>`;
 
     // DNS Tag
-    let dnsTag = '<span class="tag tag-amber">🟡 DNS未解析</span>';
-    if (v.dns_status) {
-      if (typeof v.dns_status === 'object' ? v.dns_status.matched : (v.dns_status === 'ok')) {
+    let dnsTag = '<span class="tag tag-amber">⚪ 待复核</span>';
+    const d = v.dns_status;
+    if (d) {
+      if (typeof d === 'object') {
+        if (d.is_cf_proxy) dnsTag = '<span class="tag tag-red">⚠️ 开启了CF代理(橙云)</span>';
+        else if (d.matched) dnsTag = '<span class="tag tag-green">🟢 灰云直连正常</span>';
+        else dnsTag = '<span class="tag tag-red">🔴 IP不匹配</span>';
+      } else if (d === 'ok') {
         dnsTag = '<span class="tag tag-green">🟢 DNS正常</span>';
-      } else if (typeof v.dns_status === 'object' && v.dns_status.status_text === 'ip_mismatch') {
-        dnsTag = '<span class="tag tag-red">🔴 IP不匹配</span>';
       }
     }
 
-    // Metrics Row
-    const m = v.metrics;
-    let metricsHtml = '';
-    if (m && m.probe_ok) {
-      const cpu = clampPct(m.cpu_percent);
-      const mem = clampPct(m.mem_percent);
-      const disk = clampPct(m.disk_percent);
-      metricsHtml = `
-        <div class="metric-compact-row">
-          <div class="mc-item">
-            <span class="mc-label">CPU</span>
-            <span class="mc-val">${fmtNum(m.cpu_percent, 1)}%</span>
-            <div class="progress-mini">
-              <div class="progress-mini-bar" style="width:${cpu}%;background:${cpu >= 85 ? 'var(--red)' : (cpu >= 70 ? 'var(--amber)' : 'var(--blue)')}"></div>
-            </div>
-          </div>
-          <div class="mc-divider"></div>
-          <div class="mc-item">
-            <span class="mc-label">内存</span>
-            <span class="mc-val">${fmtNum(m.mem_percent, 1)}%</span>
-            <span class="mc-sub">(${fmtNum(m.mem_used_mb)}M)</span>
-          </div>
-          <div class="mc-divider"></div>
-          <div class="mc-item">
-            <span class="mc-label">磁盘</span>
-            <span class="mc-val">${fmtNum(m.disk_percent, 1)}%</span>
-            <span class="mc-sub">(${fmtNum(m.disk_used_gb)}G)</span>
-          </div>
-          <div class="mc-divider"></div>
-          <div class="mc-item">
-            <span class="mc-label">负载</span>
-            <span class="mc-val">${fmtNum(m.load_1, 2)}</span>
-          </div>
-          <div class="mc-divider"></div>
-          <div class="mc-item">
-            <span class="mc-label">网络</span>
-            <span class="mc-val">↓${fmtNum(m.net_rx_mbps, 1)} / ↑${fmtNum(m.net_tx_mbps, 1)}M</span>
-          </div>
-          <div class="mc-divider"></div>
-          <div class="mc-item">
-            <span class="mc-label">运行</span>
-            <span class="mc-val">${fmtUptime(m.uptime_sec)}</span>
-          </div>
-        </div>
-      `;
-    } else {
-      metricsHtml = `
-        <div class="metric-empty">
-          ${m && m.probe_error ? `探测失败: ${escapeHtml(m.probe_error)}` : '尚未采集运行状态，点击「探测」或开启自动探测'}
-        </div>
-      `;
+    // TLS Cert Tag
+    const cert = vpsCertCache[v.id] || (v.metrics && v.metrics.cert);
+    let certTag = '<span class="tag tag-blue">⚪ 待检测</span>';
+    if (cert) {
+      if (cert.ok) {
+        const days = cert.days_left != null ? `${cert.days_left}天` : '有效';
+        certTag = `<span class="tag tag-green" title="${escapeHtml(cert.detail || '')}">🟢 有效 (${days})</span>`;
+      } else {
+        certTag = `<span class="tag tag-red" title="${escapeHtml(cert.detail || '')}">🔴 异常 / 待签发</span>`;
+      }
     }
 
-    card.innerHTML = `
-      <div class="vps-card-hd">
-        <div class="vps-id">
+    // Latency / Health Tag
+    const m = v.metrics;
+    let latencyTag = '<span class="tag tag-blue">⚪ 待探测</span>';
+    if (m && m.probe_ok) {
+      const ms = m.latency_ms;
+      if (ms != null) {
+        if (ms < 100) latencyTag = `<span class="tag tag-green">🟢 极速 (${ms}ms)</span>`;
+        else if (ms < 250) latencyTag = `<span class="tag tag-blue">🔵 良好 (${ms}ms)</span>`;
+        else latencyTag = `<span class="tag tag-amber">🟡 延迟 (${ms}ms)</span>`;
+      } else {
+        latencyTag = '<span class="tag tag-green">🟢 运行正常</span>';
+      }
+    } else if (v.status === 'offline') {
+      latencyTag = '<span class="tag tag-red">🔴 离线</span>';
+    }
+
+    tr.innerHTML = `
+      <td style="text-align:center"><input type="checkbox" class="vps-checkbox" value="${v.id}" onchange="updateVpsSelectedCount()" /></td>
+      <td>
+        <div style="display:flex;align-items:center;gap:6px">
           <span class="tag tag-blue">${escapeHtml(v.role || 'node')}</span>
-          <span class="vps-name">${escapeHtml(v.name)}</span>
+          <b style="font-size:13px">${escapeHtml(v.name)}</b>
           ${statusTag}
+        </div>
+      </td>
+      <td><span class="mono">${escapeHtml(v.ip)}:${v.ssh_port}</span></td>
+      <td>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span class="mono" style="font-weight:500">${escapeHtml(v.domain || '（未绑定）')}</span>
           ${dnsTag}
         </div>
-        <div class="vps-actions">
+      </td>
+      <td>
+        <div style="display:flex;align-items:center;gap:6px">
+          ${certTag}
+          <button class="btn btn-sm btn-blue" onclick="openCertModal(${v.id})">管理</button>
+        </div>
+      </td>
+      <td>
+        <div style="display:flex;align-items:center;gap:6px">
+          ${latencyTag}
+          <button class="btn btn-sm" onclick="openVpsDetailModal(${v.id})">详情</button>
+        </div>
+      </td>
+      <td style="text-align:right">
+        <div class="vps-row-actions">
           <button class="btn btn-sm" onclick="probeVPS(${v.id})">探测</button>
-          <button class="btn btn-sm btn-blue" onclick="verifyDomainVPS(${v.id})">复核域名/CF</button>
+          <button class="btn btn-sm btn-blue" onclick="verifyDomainVPS(${v.id})">复核/CF</button>
           <button class="btn btn-sm" onclick="openEditDomain(${v.id})">改域名</button>
           <button class="btn btn-sm" onclick="openEditPass(${v.id})">改密码</button>
           <button class="btn btn-sm btn-danger" onclick="delVPS(${v.id})">删除</button>
         </div>
-      </div>
-      <div class="vps-meta">
-        <span>${escapeHtml(v.ssh_username)}@${escapeHtml(v.ip)}:${v.ssh_port}</span>
-        ${v.domain ? `<span>· <b>域名: ${escapeHtml(v.domain)}</b></span>` : ''}
-        ${m && m.latency_ms != null ? `<span>· 延迟 ${m.latency_ms}ms</span>` : ''}
-        ${m && m.os ? `<span>· ${escapeHtml(m.os)}/${escapeHtml(m.arch)}</span>` : ''}
-        ${v.last_probe_at ? `<span>· 探测 ${fmtDate(v.last_probe_at).slice(5)}</span>` : ''}
-      </div>
-      ${metricsHtml}
+      </td>
     `;
-    container.appendChild(card);
+    tbody.appendChild(tr);
   });
+
+  updateVpsSelectedCount();
+}
+
+window.openCertModal = async (id) => {
+  const v = cachedVpsList.find(x => x.id === id);
+  if (!v) return;
+  currentCertVpsId = id;
+  $('certModalTitle').innerHTML = `<span>🔒 TLS 证书管理 · ${escapeHtml(v.name)} (${escapeHtml(v.domain || v.ip)})</span>`;
+  $('certDomainText').textContent = v.domain || '未绑定域名';
+  $('certModal')?.classList.add('active');
+  await refreshCertModal(id);
+};
+
+async function refreshCertModal(id) {
+  const v = cachedVpsList.find(x => x.id === id);
+  try {
+    $('certStatusTag').innerHTML = '<span class="tag tag-blue">正在进行 443 原生 TLS 探测...</span>';
+    const diag = await apiCall(`/vps/${id}/diagnose/`);
+    if (diag && diag.cert) {
+      vpsCertCache[id] = diag.cert;
+      const c = diag.cert;
+      $('certModeText').textContent = c.mode || 'autocert (Let\'s Encrypt ECC-256)';
+      $('certDomainText').textContent = c.domain || (v?.domain || '—');
+      $('certStatusTag').innerHTML = c.ok
+        ? `<span class="tag tag-green">🟢 有效正常 (${c.detail || ''})</span>`
+        : `<span class="tag tag-red">🔴 异常 / 待签发 (${c.detail || ''})</span>`;
+      $('certExpiryText').textContent = c.not_after || '—';
+      $('certDaysLeftText').textContent = c.days_left != null ? `${c.days_left} 天` : '—';
+      $('certDirText').textContent = `${c.file_count || 1} 个证书文件 · ${c.dir || '/var/lib/aero/certs'}`;
+    } else {
+      $('certStatusTag').innerHTML = '<span class="tag tag-amber">未检测到有效证书</span>';
+    }
+    renderVPS();
+  } catch (e) {
+    $('certStatusTag').innerHTML = `<span class="tag tag-red">探测失败: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function renewVpsCert(force) {
+  if (!currentCertVpsId) return;
+  const btn = force ? $('btnRenewCertForce') : $('btnRenewCertNormal');
+  const oldText = btn.textContent;
+  btn.textContent = '执行中...';
+  btn.disabled = true;
+  try {
+    const res = await apiCall(`/vps/${currentCertVpsId}/cert/renew/`, {
+      method: 'POST',
+      body: JSON.stringify({ force })
+    });
+    alert(res.message || '证书签发/续签流程执行完毕，已通知服务重载');
+    await refreshCertModal(currentCertVpsId);
+  } catch (e) {
+    alert(`证书操作失败: ${e.message}`);
+  } finally {
+    btn.textContent = oldText;
+    btn.disabled = false;
+  }
+}
+
+window.openVpsDetailModal = (id) => {
+  const v = cachedVpsList.find(x => x.id === id);
+  if (!v) return;
+  currentDetailVpsId = id;
+  $('vpsDetailTitle').innerHTML = `<span>🖥️ [${escapeHtml(v.name)}] 节点硬件与系统底层明细</span>`;
+  renderVpsDetailContent(v);
+  $('vpsDetailModal')?.classList.add('active');
+};
+
+function renderVpsDetailContent(v) {
+  const m = v.metrics || {};
+  const container = $('vpsDetailContent');
+  if (!container) return;
+
+  container.innerHTML = `
+    <div class="detail-grid-item">
+      <span class="k">操作系统 / 架构</span>
+      <span class="v">${escapeHtml(m.os || 'Linux')} / ${escapeHtml(m.arch || 'x86_64')}</span>
+    </div>
+    <div class="detail-grid-item">
+      <span class="k">系统负载 (1m / 5m / 15m)</span>
+      <span class="v">${fmtNum(m.load_1, 2)} / ${fmtNum(m.load_5, 2)} / ${fmtNum(m.load_15, 2)}</span>
+    </div>
+    <div class="detail-grid-item">
+      <span class="k">实时网络带宽</span>
+      <span class="v">↓ ${fmtNum(m.net_rx_mbps, 1)} Mbps · ↑ ${fmtNum(m.net_tx_mbps, 1)} Mbps</span>
+    </div>
+    <div class="detail-grid-item">
+      <span class="k">系统运行时间</span>
+      <span class="v">${fmtUptime(m.uptime_sec)}</span>
+    </div>
+    <div class="detail-grid-item">
+      <span class="k">物理内存使用</span>
+      <span class="v">${fmtNum(m.mem_used_mb)} MB / ${fmtNum(m.mem_total_mb)} MB (${fmtNum(m.mem_percent)}%)</span>
+    </div>
+    <div class="detail-grid-item">
+      <span class="k">磁盘存储使用</span>
+      <span class="v">${fmtNum(m.disk_used_gb)} GB / ${fmtNum(m.disk_total_gb)} GB (${fmtNum(m.disk_percent)}%)</span>
+    </div>
+    <div class="detail-grid-item">
+      <span class="k">SSH 凭证与端点</span>
+      <span class="v mono">${escapeHtml(v.ssh_username)}@${escapeHtml(v.ip)}:${v.ssh_port}</span>
+    </div>
+    <div class="detail-grid-item">
+      <span class="k">出口 IP 纯净度</span>
+      <span class="v">${v.purity_score ? (v.purity_score + ' 分') : '待打靶 (Google/CF)'}</span>
+    </div>
+  `;
 }
 
 async function saveVPS() {
@@ -888,17 +1030,29 @@ window.delVPS = async (id) => {
 };
 
 async function refreshVpsAll() {
-  for (const v of cachedVpsList) {
+  const selected = getSelectedVpsIds();
+  const targets = selected.length ? cachedVpsList.filter(v => selected.includes(v.id)) : cachedVpsList;
+  const btn = $('btnRefreshProbeAll');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = `探测中 (${targets.length})...`; btn.disabled = true; }
+  for (const v of targets) {
     await apiCall(`/vps/${v.id}/probe/`, { method: 'POST' }).catch(() => null);
   }
+  if (btn) { btn.textContent = oldText; btn.disabled = false; }
   loadVPS();
 }
 
 async function verifyAllDomains() {
-  for (const v of cachedVpsList) {
+  const selected = getSelectedVpsIds();
+  const targets = selected.length ? cachedVpsList.filter(v => selected.includes(v.id)) : cachedVpsList;
+  const btn = $('btnVerifyAllDomains');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = `复核中 (${targets.length})...`; btn.disabled = true; }
+  for (const v of targets) {
     await apiCall(`/vps/${v.id}/verify-domain/`, { method: 'POST' }).catch(() => null);
   }
-  alert('批量复核完成');
+  if (btn) { btn.textContent = oldText; btn.disabled = false; }
+  alert('批量复核域名与 Cloudflare 完成');
   loadVPS();
 }
 
@@ -923,9 +1077,11 @@ async function loadNodes() {
     // Cross-check orphans
     const vpsIds = new Set(cachedVpsList.map(v => v.id));
     const vpsIps = new Set(cachedVpsList.map(v => v.ip));
+    const vpsDomains = new Set(cachedVpsList.map(v => v.domain).filter(Boolean));
     const orphans = cachedNodeList.filter(n => {
       if (n.vps_id && vpsIds.has(n.vps_id)) return false;
       if (n.ip && vpsIps.has(n.ip)) return false;
+      if (n.ip && vpsDomains.has(n.ip)) return false;
       return true;
     });
 
@@ -1033,8 +1189,9 @@ async function cleanOrphanNodes() {
     });
     const vpsIds = new Set(cachedVpsList.map(v => v.id));
     const vpsIps = new Set(cachedVpsList.map(v => v.ip));
+    const vpsDomains = new Set(cachedVpsList.map(v => v.domain).filter(Boolean));
     for (const n of cachedNodeList) {
-      if (!vpsIds.has(n.vps_id) && !vpsIps.has(n.ip)) {
+      if (!vpsIds.has(n.vps_id) && !vpsIps.has(n.ip) && !vpsDomains.has(n.ip)) {
         await apiCall(`/nodes/${n.id}/`, { method: 'DELETE' }).catch(() => null);
       }
     }

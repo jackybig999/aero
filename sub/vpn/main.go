@@ -208,7 +208,7 @@ func main() {
 
 	NewUserHandler(userSvc).RegisterRoutes(api)
 	NewBillingHandler(billingSvc).RegisterRoutes(api)
-	NewNodeHandler(nodeSvc).RegisterRoutes(api)
+	NewNodeHandler(nodeSvc, vpsDB).RegisterRoutes(api)
 	subBuilder.RegisterRoutes(api)
 	NewVPSHandler(vpsSvc).RegisterRoutes(api)
 	NewAeroHandler(vpsSvc).RegisterRoutes(api)

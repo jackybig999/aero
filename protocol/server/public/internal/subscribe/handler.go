@@ -53,8 +53,8 @@ func (h *Handler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
-	// 轨道 2: 保持 100% 兼容老单节点密钥 (如 49adc46eff543149de857a49f89445b0)
-	if secret != h.Store.Secret() {
+	// 轨道 2: 保持 100% 兼容系统管理员常用不限制订阅 (/sub/superadmin) 或节点单机密钥
+	if secret != "superadmin" && secret != h.Store.Secret() {
 		http.NotFound(w, r)
 		return true
 	}

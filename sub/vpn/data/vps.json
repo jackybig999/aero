@@ -50,11 +50,11 @@
           "192.210.193.197"
         ],
         "status_text": "公网 DNS 已与 VPS IP 匹配 (DNS 直连)",
-        "checked_at": "2026-09-20T17:59:50.0226162+08:00"
+        "checked_at": "2026-09-21T12:01:43.8589494+08:00"
       },
       "last_probe_at": "2026-09-21T11:34:10.4256653+08:00",
       "created_at": "2026-09-18T14:08:18.8405146+08:00",
-      "updated_at": "2026-09-21T11:34:10.4256653+08:00"
+      "updated_at": "2026-09-21T12:01:43.8589494+08:00"
     },
     "4": {
       "id": 4,
@@ -75,25 +75,25 @@
       "cf_clean": false,
       "is_warp_egress": false,
       "metrics": {
-        "cpu_percent": 0,
+        "cpu_percent": 3.3,
         "mem_total_mb": 967.93359375,
-        "mem_used_mb": 410.71484375,
-        "mem_percent": 42.432130303360495,
+        "mem_used_mb": 408.11328125,
+        "mem_percent": 42.16335540838852,
         "disk_total_gb": 48.912567138671875,
-        "disk_used_gb": 6.092079162597656,
-        "disk_percent": 12.455038692461224,
-        "load_1": 0.01,
+        "disk_used_gb": 6.099891662597656,
+        "disk_percent": 12.47101107023042,
+        "load_1": 0,
         "load_5": 0.03,
         "load_15": 0,
         "net_rx_mbps": 0,
         "net_tx_mbps": 0,
-        "uptime_sec": 4748700,
+        "uptime_sec": 4750348,
         "os": "Linux",
         "arch": "x86_64",
-        "collected_at": "2026-09-21T11:34:12.1287543+08:00",
+        "collected_at": "2026-09-21T12:01:39.5279244+08:00",
         "source": "ssh",
         "probe_ok": true,
-        "latency_ms": 1031
+        "latency_ms": 994
       },
       "dns_status": {
         "matched": true,
@@ -104,11 +104,11 @@
           "128.241.228.161"
         ],
         "status_text": "公网 DNS 已与 VPS IP 匹配 (DNS 直连)",
-        "checked_at": "2026-09-20T17:59:53.5263748+08:00"
+        "checked_at": "2026-09-21T12:01:47.3301084+08:00"
       },
-      "last_probe_at": "2026-09-21T11:34:12.1287543+08:00",
+      "last_probe_at": "2026-09-21T12:01:39.5279244+08:00",
       "created_at": "2026-09-20T17:05:19.7972253+08:00",
-      "updated_at": "2026-09-21T11:34:12.1287543+08:00"
+      "updated_at": "2026-09-21T12:01:47.3301084+08:00"
     }
   },
   "passwords": {
@@ -116,7 +116,7 @@
     "4": "jhnzBAhpgEKftJQBPXmLEX8BB1yI3FQoNFXXnmQiDmFUKMg4yFs="
   },
   "ips": {
-    "3": "sTtlYsi8832Pu6Jby6hTxWAkzK9b2UjfhWp93KSOSoYBKWRRtzmBCHg/WA==",
-    "4": "/3kmKI7agBWslxQ8U3HoxddAROtEcg/HTyrbVRJkj+AeI6R3o8f/DNofnw=="
+    "3": "C4JX01qt7b+G7XIzVdrE8UXyjYX1H9OOToO+0ms6WxUmYxKkObY0qUSuTQ==",
+    "4": "FRm3AM30RLaGe/J3XjxQP5QsqwPGgtyZ9QLvmbvEMBFRH79ihEq0chObjw=="
   }
 }

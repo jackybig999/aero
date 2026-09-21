@@ -13,7 +13,7 @@
       <div class="brand-title">
         <h1>AERO 运维台</h1>
         <div class="sub-note">
-          <span>证书 · 节点 · 订阅 · Token 鉴权</span>
+          <span>节点 · 订阅 · Token 鉴权 · 集群运维</span>
           <span class="tag tag-blue" id="modeTag">mid-platform</span>
         </div>
       </div>
@@ -29,7 +29,7 @@
     <span id="sourceAlertText">【官方源提示】检测到 GitHub 官方源（jackybig999/aero）尚未发布 Release 包。系统严禁本地私拷分发，请先向 GitHub 推送 Release。点击【安装/升级】可执行前置流水线。</span>
   </div>
 
-  <!-- 部署与节点选择栏 -->
+  <!-- 部署与节点调度栏 -->
   <div class="card" id="deployCard" style="margin-bottom:12px">
     <div class="card-header">
       <div class="card-title">🚀 节点运维与部署调度</div>
@@ -39,12 +39,33 @@
         <button class="btn btn-sm btn-danger" id="btnUninstall">卸载</button>
       </div>
     </div>
-    <div style="display:flex;gap:10px;align-items:center">
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <label style="color:var(--muted);font-size:12px">选择目标 VPS:</label>
-      <select id="vpsSelect" class="input-text" style="width:260px">
+      <select id="vpsSelect" class="input-text" style="width:280px">
         <option value="">正在拉取 VPS 列表...</option>
       </select>
-      <span id="deployStatus" style="font-size:11px;color:var(--muted)"></span>
+      <span id="deployStatus" style="font-size:11px;color:var(--muted)">中台经 SSH 远程运维；状态与指标不依赖公网 Admin</span>
+    </div>
+
+    <!-- 运维任务列表 (平铺展示最近执行的部署任务) -->
+    <div id="tasksWrap" style="margin-top:10px;display:none">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:4px">近期调度任务流水线:</div>
+      <table class="data-table" style="font-size:11px">
+        <thead>
+          <tr>
+            <th style="width:50px">ID</th>
+            <th style="width:70px">类型</th>
+            <th style="width:100px">目标 VPS</th>
+            <th style="width:120px">进度</th>
+            <th>阶段</th>
+            <th style="width:70px">状态</th>
+            <th style="width:60px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="tasksTableBody">
+          <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:8px">暂无任务</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
@@ -76,10 +97,10 @@
     </div>
   </div>
 
-  <!-- 双列对称布局 -->
+  <!-- 双列对称布局 (左: 节点与指标; 右: Token与运维说明) -->
   <div class="grid-two">
-    <!-- 左列: 协议节点与监听状态 -->
-    <div>
+    <!-- 左列: 协议节点与网络监听 -->
+    <div style="display:flex;flex-direction:column;gap:12px">
       <div class="card">
         <div class="card-header">
           <div class="card-title">🌐 协议节点种类与网络监听</div>
@@ -95,7 +116,7 @@
             </tr>
           </thead>
           <tbody id="nodesTableBody">
-            <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无节点信息</td></tr>
+            <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">请选择 VPS 节点以诊断</td></tr>
           </tbody>
         </table>
         <div id="portsRow" style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap"></div>
@@ -109,8 +130,8 @@
       </div>
     </div>
 
-    <!-- 右列: Token 矩阵与订阅配置 -->
-    <div>
+    <!-- 右列: Token 矩阵与安全说明 -->
+    <div style="display:flex;flex-direction:column;gap:12px">
       <div class="card">
         <div class="card-header">
           <div class="card-title">🔑 客户端 Token 授权矩阵</div>
@@ -133,13 +154,35 @@
 
       <div class="card">
         <div class="card-header">
-          <div class="card-title">🔒 证书管理与自动续签</div>
-          <button class="btn btn-sm btn-blue" id="btnRenewCert">强制续签证书</button>
+          <div class="card-title">🛡️ 安全与运维说明</div>
         </div>
-        <div style="font-size:12px;color:var(--muted)">
-          <p id="certDomainText">当前域名: —</p>
-          <p id="certExpiryText" style="margin-top:4px">到期时间: —</p>
+        <div style="font-size:12px;line-height:1.8;color:var(--muted)">
+          <p>• <b>Token 鉴权</b>：客户端连接 Edge 时凭此 Token 进行 Bearer 验证，未授权无法建立隧道。</p>
+          <p style="margin-top:6px">• <b>TLS 与证书</b>：证书已交由 <b>VPS 资产模块</b> 统一管理，与域名绑定及 Cloudflare 灰云解析无缝联动，直连 443 探测。</p>
+          <p style="margin-top:6px">• <b>专属订阅</b>：可通过下方专属链接或二维码扫码导入至客户端，多节点自动负载。</p>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 底部全宽: 专属订阅服务 -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-header">
+      <div class="card-title">📡 客户端专属订阅服务</div>
+      <button class="btn btn-sm btn-blue" id="btnCopySub">复制订阅链接</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div id="subUrlBox" class="mono" style="padding:10px 12px;background:#090e18;border:1px solid var(--line);border-radius:6px;word-break:break-all;font-size:12px">
+        （请选择 VPS 节点以生成专属订阅链接）
+      </div>
+      <div class="sub-kv-box">
+        <div class="sub-kv-item"><span class="k">Secret 密匙:</span><span class="v" id="subSecretStatus">已配置就绪</span></div>
+        <div class="sub-kv-item"><span class="k">VPS 本机拉取:</span><span class="v" id="subLocalStatus"><span class="tag tag-green">OK</span></span></div>
+        <div class="sub-kv-item"><span class="k">中台公网拉取:</span><span class="v" id="subPublicStatus"><span class="tag tag-green">OK (直连畅通)</span></span></div>
+        <div class="sub-kv-item"><span class="k">内容预览:</span><span class="v mono" id="subPreview">—</span></div>
+      </div>
+      <div class="alert-banner" style="margin:0;padding:8px 12px;background:rgba(59,130,246,0.1);border-color:#1e40af;color:#93c5fd;font-size:11px">
+        <span>💡 提示：VPS 本机拉取 OK 即代表 Edge 内核工作正常；中台公网如果提示不可达多为公网 DNS 未生效或云厂商安全组未放行 443 端口。</span>
       </div>
     </div>
   </div>
@@ -166,6 +209,59 @@
         <button class="btn" id="btnCancelToken">取消</button>
         <button class="btn btn-blue" id="btnSaveToken">保存并分发</button>
       </div>
+    </div>
+  </div>
+
+  <!-- 部署任务流水线抽屉弹窗 (Task Drawer) -->
+  <div class="modal-backdrop" id="taskDrawerModal">
+    <div class="modal-content-lg">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid var(--line);padding-bottom:10px">
+        <div>
+          <h3 id="taskModalTitle" style="font-size:15px;display:flex;align-items:center;gap:8px">
+            <span>🚀 调度流水线详情</span>
+            <span class="tag tag-blue" id="taskModalStatusTag">RUNNING</span>
+          </h3>
+          <div id="taskModalSub" style="font-size:11px;color:var(--muted);margin-top:2px">任务 #— · 安装 Edge</div>
+        </div>
+        <button class="btn btn-sm" id="btnCloseTaskDrawer">✕ 关闭</button>
+      </div>
+
+      <!-- 进度条 -->
+      <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted)">
+        <span id="taskProgressStage">阶段：正在初始化...</span>
+        <span id="taskProgressPercent" style="font-weight:700;color:var(--blue)">0%</span>
+      </div>
+      <div class="task-progress-bar">
+        <div class="task-progress-val" id="taskProgressBar" style="width:0%"></div>
+      </div>
+
+      <!-- 5 步流水线步骤 -->
+      <div class="stepper" id="taskStepper">
+        <div class="step-item" id="step-source_check">
+          <span>1. 官方源前置检测 (jackybig999/aero Release 资产校验)</span>
+          <span class="tag tag-blue">等待中</span>
+        </div>
+        <div class="step-item" id="step-ssh_connect">
+          <span>2. SSH 连通与 Linux 运行环境探测</span>
+          <span class="tag tag-blue">等待中</span>
+        </div>
+        <div class="step-item" id="step-binary_deploy">
+          <span>3. 远端 VPS 执行官方 Release 组件拉取 (严禁本地私拷)</span>
+          <span class="tag tag-blue">等待中</span>
+        </div>
+        <div class="step-item" id="step-service_config">
+          <span>4. 配置 systemd 进程守护与 TLS 证书</span>
+          <span class="tag tag-blue">等待中</span>
+        </div>
+        <div class="step-item" id="step-verify_health">
+          <span>5. 服务启动与 443 / 订阅健康验收</span>
+          <span class="tag tag-blue">等待中</span>
+        </div>
+      </div>
+
+      <!-- 实时日志流 -->
+      <div style="font-size:11px;color:var(--muted);margin:8px 0 4px">实时执行日志:</div>
+      <div class="log-box" id="taskLogBox" style="max-height:180px;height:180px">正在等待远端输出...</div>
     </div>
   </div>
 

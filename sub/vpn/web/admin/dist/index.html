@@ -187,17 +187,43 @@
 
       <!-- Pane 3: VPS -->
       <section class="content-pane" id="pane-vps">
+        <div class="alert-info" style="margin-bottom:10px">
+          <span>🛡️ 本页管理 VPS 集群资产与域名绑定。已实现公网 DNS 实时复核与 Cloudflare 灰云 (proxied: false) 自动化防封解析及 TLS 证书统一运维。</span>
+        </div>
         <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <button class="btn btn-blue btn-sm" id="btnOpenAddVPS">+ 添加 VPS</button>
-            <button class="btn btn-sm" id="btnRefreshProbeAll">刷新探测</button>
+            <button class="btn btn-sm" id="btnRefreshProbeAll">批量刷新探测</button>
             <button class="btn btn-sm" id="btnVerifyAllDomains">批量复核域名/CF</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="tag tag-green" id="cfStatusTag">🟢 Cloudflare 灰云自动化: 已就绪</span>
           </div>
         </div>
 
-        <!-- 紧凑响应式多 VPS 网格布局 (每行排列) -->
-        <div class="vps-grid" id="vpsCardGrid">
-          <div class="metric-empty" style="grid-column:1/-1">正在加载 VPS 资产与探测指标...</div>
+        <div class="card" style="padding:0;overflow:hidden;margin-top:8px">
+          <div class="table-hscroll-wrap">
+            <table class="data-table" style="min-width:1220px">
+              <thead>
+                <tr>
+                  <th style="width:40px;text-align:center"><input type="checkbox" id="vpsSelectAll" /></th>
+                  <th style="min-width:160px">节点名称 / 角色</th>
+                  <th style="min-width:145px">公网 IP / 端口</th>
+                  <th style="min-width:210px">绑定域名 / DNS 复核</th>
+                  <th style="min-width:160px">TLS 证书状态</th>
+                  <th style="min-width:160px">延迟 / 运行状态</th>
+                  <th style="width:345px;text-align:right">快捷操作</th>
+                </tr>
+              </thead>
+              <tbody id="vpsTableBody">
+                <tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted)">正在加载 VPS 资产列表...</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-foot-bar" style="display:flex;justify-content:space-between;align-items:center;padding:8px 14px;background:#090e18;border-top:1px solid var(--line);font-size:11px;color:var(--muted)">
+            <span id="vpsCountText">共 0 台 VPS 节点 · 已选中 0 台</span>
+            <span>提示：支持横向左右滑动查看完整字段，右侧快捷按钮一步直达。</span>
+          </div>
         </div>
       </section>
 
@@ -495,6 +521,57 @@
           <button class="btn btn-sm" id="btnCancelNode">取消</button>
           <button class="btn btn-blue btn-sm" id="btnSaveNode">确定</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: TLS 证书独立管理 (从 AERO 迁入 VPS 统一管理) -->
+  <div class="modal-backdrop" id="certModal">
+    <div class="modal-content" style="width:560px;max-width:95vw">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid var(--line);padding-bottom:10px">
+        <h3 id="certModalTitle" style="font-size:15px;display:flex;align-items:center;gap:6px">
+          <span>🔒 TLS 证书管理与自动续签</span>
+        </h3>
+        <button class="btn btn-sm" id="btnCloseCertModal">✕</button>
+      </div>
+      <div class="alert-info" style="margin-bottom:12px;font-size:11px">
+        <span>证书用于 VPS 节点的客户端 TLS 链路加密，由 ACME 自动签发 443 端口。绑定域名指向 VPS 后可点「安装/续签」。</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:12px">
+        <div class="ledger-row"><span style="color:var(--muted)">签发模式:</span><b id="certModeText" class="mono">autocert (Let's Encrypt ECC-256)</b></div>
+        <div class="ledger-row"><span style="color:var(--muted)">绑定域名:</span><b id="certDomainText" class="mono">—</b></div>
+        <div class="ledger-row">
+          <span style="color:var(--muted)">证书状态:</span>
+          <span id="certStatusTag"><span class="tag tag-green">🟢 有效正常</span></span>
+        </div>
+        <div class="ledger-row"><span style="color:var(--muted)">到期时间:</span><b id="certExpiryText" class="mono">—</b></div>
+        <div class="ledger-row"><span style="color:var(--muted)">剩余天数:</span><b id="certDaysLeftText">—</b></div>
+        <div class="ledger-row"><span style="color:var(--muted)">证书文件:</span><span id="certDirText" class="mono" style="color:var(--dim)">/var/lib/aero/certs</span></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:18px;border-top:1px solid var(--line);padding-top:12px">
+        <button class="btn btn-sm" id="btnRefreshCert">🔄 刷新诊断</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-sm btn-blue" id="btnRenewCertNormal">安装 / 续签</button>
+          <button class="btn btn-sm" id="btnRenewCertForce">清空重签</button>
+          <button class="btn btn-sm" id="btnCancelCertModal">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: VPS 硬件与底层监控明细 -->
+  <div class="modal-backdrop" id="vpsDetailModal">
+    <div class="modal-content" style="width:580px;max-width:95vw">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid var(--line);padding-bottom:10px">
+        <h3 id="vpsDetailTitle" style="font-size:15px">🖥️ VPS 节点硬件与系统底层明细</h3>
+        <button class="btn btn-sm" id="btnCloseVpsDetailModal">✕</button>
+      </div>
+      <div id="vpsDetailContent" style="display:grid;grid-template-columns:repeat(2, 1fr);gap:10px;font-size:12px">
+        <!-- 动态填充明细字段 -->
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;border-top:1px solid var(--line);padding-top:12px">
+        <button class="btn btn-sm btn-blue" id="btnProbeFromDetail">重新探测采集</button>
+        <button class="btn btn-sm" id="btnCancelVpsDetail">关闭</button>
       </div>
     </div>
   </div>

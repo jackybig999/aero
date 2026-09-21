@@ -191,9 +191,14 @@ func (s *VPSService) Delete(id uint64) error {
 		ip = vps.IP
 	}
 	err := s.store.Delete(id)
-	if err == nil && s.nodeSvc != nil {
-		// 级联彻底清理关联节点与订阅，绝不残留失联孤儿
-		_, _ = s.nodeSvc.DeleteMatching(id, ip)
+	if err == nil {
+		if s.eps != nil {
+			_ = s.eps.Delete(id)
+		}
+		if s.nodeSvc != nil {
+			// 级联彻底清理关联节点与订阅，绝不残留失联孤儿
+			_, _ = s.nodeSvc.DeleteMatching(id, ip)
+		}
 	}
 	return err
 }
@@ -214,8 +219,21 @@ func (s *VPSService) UpdatePassword(id uint64, password string) error {
 func (s *VPSService) UpdateDomain(id uint64, domain string) error {
 	domain = strings.TrimSpace(domain)
 	err := s.store.UpdateDomain(id, domain)
-	if err == nil && s.nodeSvc != nil && domain != "" {
-		s.nodeSvc.UpdateHostByVPS(id, domain)
+	if err == nil {
+		if s.nodeSvc != nil && domain != "" {
+			s.nodeSvc.UpdateHostByVPS(id, domain)
+		}
+		if s.eps != nil && domain != "" {
+			if ep, ok := s.eps.Get(id); ok {
+				ep.Host = domain
+				sec := ep.SubSecret
+				if sec == "" {
+					sec = "superadmin"
+				}
+				ep.SubURL = fmt.Sprintf("https://%s/sub/%s", domain, sec)
+				_ = s.eps.Upsert(ep)
+			}
+		}
 	}
 	return err
 }
