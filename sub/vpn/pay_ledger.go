@@ -6,6 +6,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -32,11 +33,21 @@ type LedgerEntry struct {
 	CreatedAt    time.Time  `json:"created_at"`
 }
 
+type LedgerSummary struct {
+	TotalInCents  int64 `json:"total_in_cents"`
+	TotalOutCents int64 `json:"total_out_cents"`
+	EntryCount    int64 `json:"entry_count"`
+}
+
 type LedgerStore interface {
 	Append(e *LedgerEntry) (uint64, error)
 	Get(id uint64) (*LedgerEntry, error)
 	GetByLedgerNo(no string) (*LedgerEntry, error)
 	List(offset, limit int) ([]*LedgerEntry, int64, error)
+	ListUnsettled(direction string) ([]*LedgerEntry, error)
+	MarkSettled(ledgerNo, settlementNo string) error
+	SettleBatch(channel, targetRef string) (*LedgerEntry, int, error)
+	GetDailySummary(date time.Time) (*LedgerSummary, error)
 	Close() error
 }
 
@@ -172,6 +183,97 @@ func (s *SQLiteLedgerStore) List(offset, limit int) ([]*LedgerEntry, int64, erro
 	return out, total, nil
 }
 
+func (s *SQLiteLedgerStore) ListUnsettled(direction string) ([]*LedgerEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if direction == "" {
+		direction = "IN"
+	}
+	query := `SELECT id, ledger_no, user_id, amount_cents, direction, channel, channel_ref, settled, settled_at, settlement_no, created_at FROM ledger_entries WHERE settled = 0 AND direction = ? ORDER BY id DESC`
+	rows, err := s.db.Query(query, direction)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*LedgerEntry
+	for rows.Next() {
+		e, err := scanLedgerRows(rows)
+		if err == nil {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *SQLiteLedgerStore) MarkSettled(ledgerNo, settlementNo string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	_, err := s.db.Exec(`UPDATE ledger_entries SET settled = 1, settled_at = ?, settlement_no = ? WHERE ledger_no = ?`, now.Format(time.RFC3339), settlementNo, ledgerNo)
+	return err
+}
+
+func (s *SQLiteLedgerStore) SettleBatch(channel, targetRef string) (*LedgerEntry, int, error) {
+	unsettled, err := s.ListUnsettled("IN")
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(unsettled) == 0 {
+		return nil, 0, nil
+	}
+	var totalCents int64
+	for _, it := range unsettled {
+		totalCents += it.AmountCents
+	}
+	now := time.Now()
+	setNo := fmt.Sprintf("SET-%s-%04x", now.Format("20060102"), now.UnixNano()%0xffff)
+	for _, it := range unsettled {
+		_ = s.MarkSettled(it.LedgerNo, setNo)
+	}
+	if channel == "" {
+		channel = "PingPong"
+	}
+	if targetRef == "" {
+		targetRef = "资金归集结算: " + setNo
+	}
+	outEntry := &LedgerEntry{
+		LedgerNo:     fmt.Sprintf("LED-%s-OUT-%04x", now.Format("20060102"), now.UnixNano()%0xffff),
+		UserID:       0,
+		AmountCents:  totalCents,
+		Direction:    "OUT",
+		Channel:      channel,
+		ChannelRef:   targetRef,
+		Settled:      true,
+		SettledAt:    &now,
+		SettlementNo: setNo,
+		CreatedAt:    now,
+	}
+	if _, err := s.Append(outEntry); err != nil {
+		return nil, len(unsettled), err
+	}
+	return outEntry, len(unsettled), nil
+}
+
+func (s *SQLiteLedgerStore) GetDailySummary(date time.Time) (*LedgerSummary, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	summary := &LedgerSummary{}
+	dateStr := date.Format("2006-01-02")
+
+	// Daily IN
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_entries WHERE direction = 'IN' AND substr(created_at, 1, 10) = ?`, dateStr).Scan(&summary.TotalInCents)
+	// Daily OUT
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_entries WHERE direction = 'OUT' AND substr(created_at, 1, 10) = ?`, dateStr).Scan(&summary.TotalOutCents)
+	// Daily Count
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM ledger_entries WHERE substr(created_at, 1, 10) = ?`, dateStr).Scan(&summary.EntryCount)
+
+	return summary, nil
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -217,13 +319,20 @@ func NewLedgerHandler(store LedgerStore) *LedgerHandler {
 
 func (h *LedgerHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/ledger/entries", h.ListEntries)
+	mux.HandleFunc("GET /api/v1/ledger/entries/", h.ListEntries)
+	mux.HandleFunc("GET /api/v1/ledger/entries/unsettled", h.ListUnsettled)
+	mux.HandleFunc("GET /api/v1/ledger/entries/unsettled/", h.ListUnsettled)
+	mux.HandleFunc("GET /api/v1/ledger/summary", h.Summary)
+	mux.HandleFunc("GET /api/v1/ledger/summary/", h.Summary)
+	mux.HandleFunc("POST /api/v1/ledger/settle/batch", h.SettleBatch)
+	mux.HandleFunc("POST /api/v1/ledger/settle/batch/", h.SettleBatch)
 }
 
 func (h *LedgerHandler) ListEntries(w http.ResponseWriter, r *http.Request) {
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 || limit > 100 {
-		limit = 20
+	if limit <= 0 || limit > 1000 {
+		limit = 100
 	}
 	entries, total, err := h.store.List(offset, limit)
 	if err != nil {
@@ -237,6 +346,60 @@ func (h *LedgerHandler) ListEntries(w http.ResponseWriter, r *http.Request) {
 			"offset":  offset,
 			"limit":   limit,
 			"entries": entries,
+			"results": entries,
+		},
+	})
+}
+
+func (h *LedgerHandler) ListUnsettled(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("direction")
+	entries, err := h.store.ListUnsettled(dir)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"code": 0,
+		"data": map[string]any{
+			"results": entries,
+			"entries": entries,
+		},
+	})
+}
+
+func (h *LedgerHandler) Summary(w http.ResponseWriter, r *http.Request) {
+	dateStr := r.URL.Query().Get("date")
+	t := time.Now()
+	if dateStr != "" {
+		if parsed, err := time.Parse("2006-01-02", dateStr); err == nil {
+			t = parsed
+		}
+	}
+	summary, err := h.store.GetDailySummary(t)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": summary})
+}
+
+func (h *LedgerHandler) SettleBatch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Channel   string `json:"channel"`
+		TargetRef string `json:"target_ref"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	outEntry, count, err := h.store.SettleBatch(req.Channel, req.TargetRef)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp(1002, err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"code":    0,
+		"message": "归集结算成功",
+		"data": map[string]any{
+			"settled_count": count,
+			"out_entry":     outEntry,
 		},
 	})
 }

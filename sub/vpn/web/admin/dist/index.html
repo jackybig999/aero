@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VPN 中台管理系统</title>
+  <title>VPN 中台管理后台</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -14,7 +14,7 @@
         <div class="logo-badge">A</div>
         <div>
           <h2 style="font-size:16px;font-weight:700">AERO VPN 中台</h2>
-          <p style="font-size:11px;color:var(--muted)">管理员特权控制通道</p>
+          <p style="font-size:11px;color:var(--muted)">管理后台控制通道</p>
         </div>
       </div>
       <div style="display:flex;flex-direction:column;gap:12px">
@@ -32,7 +32,7 @@
     </div>
   </div>
 
-  <!-- 2. 主控大屏视图 -->
+  <!-- 2. 主控管理视图 -->
   <div class="admin-layout" id="appLayout" style="display:flex;">
     <!-- 左侧导航 -->
     <aside class="sidebar">
@@ -40,41 +40,33 @@
         <div class="logo-badge">A</div>
         <div class="brand-text">
           <h1>VPN 中台</h1>
-          <span class="brand-sub">管理后台 v2.5</span>
+          <span class="brand-sub">管理后台</span>
         </div>
       </div>
       <nav class="nav-menu">
         <button class="menu-item active" data-tab="dashboard">
           <span class="menu-icon">📊</span>
-          <span>系统总览</span>
+          <span>总览</span>
         </button>
         <button class="menu-item" data-tab="users">
           <span class="menu-icon">👥</span>
-          <span>用户中心</span>
+          <span>用户</span>
         </button>
         <button class="menu-item" data-tab="vps">
           <span class="menu-icon">🖥️</span>
-          <span>VPS 节点编排</span>
+          <span>VPS</span>
         </button>
         <button class="menu-item" data-tab="aero">
           <span class="menu-icon">📦</span>
-          <span>AERO 管理台</span>
+          <span>AERO</span>
         </button>
         <button class="menu-item" data-tab="nodes">
           <span class="menu-icon">🌐</span>
-          <span>订阅节点</span>
-        </button>
-        <button class="menu-item" data-tab="subs">
-          <span class="menu-icon">🔗</span>
-          <span>订阅管理</span>
+          <span>节点</span>
         </button>
         <button class="menu-item" data-tab="ledger">
           <span class="menu-icon">💰</span>
-          <span>财务账本</span>
-        </button>
-        <button class="menu-item" data-tab="diag">
-          <span class="menu-icon">🩺</span>
-          <span>链路诊断</span>
+          <span>账本</span>
         </button>
       </nav>
       <div style="padding-top:10px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)">
@@ -85,55 +77,88 @@
     <!-- 右侧主体 -->
     <main class="main-wrap">
       <header class="topbar">
-        <div class="page-title" id="pageTitle">系统总览</div>
+        <div class="page-title" id="pageTitle">总览</div>
         <div class="top-actions">
           <span class="user-chip" id="topUser">admin</span>
-          <button class="btn btn-sm" id="btnTopRefresh">刷新数据</button>
+          <button class="btn btn-sm" id="btnTopRefresh">刷新</button>
           <button class="btn btn-sm btn-danger" id="btnLogout">退出</button>
         </div>
       </header>
 
-      <!-- Pane 1: 系统总览 -->
+      <!-- Pane 1: 总览 -->
       <section class="content-pane active" id="pane-dashboard">
         <div class="kpi-grid">
           <div class="kpi-card">
-            <span class="k">活跃 VPS 节点</span>
-            <span class="v" id="kpiVpsCount">0</span>
+            <span class="k">在线服务</span>
+            <span class="v" id="kpiSvcCount">0/0</span>
           </div>
           <div class="kpi-card">
-            <span class="k">今日入账流水</span>
+            <span class="k">今日入账</span>
             <span class="v" id="kpiIncome" style="color:var(--green)">$0.00</span>
           </div>
           <div class="kpi-card">
-            <span class="k">今日出账开销</span>
-            <span class="v" id="kpiExpense" style="color:var(--amber)">$0.00</span>
+            <span class="k">活跃节点</span>
+            <span class="v" id="kpiActiveNodes" style="color:var(--blue)">0/0</span>
           </div>
           <div class="kpi-card">
-            <span class="k">账本交易笔数</span>
-            <span class="v" id="kpiTxCount">0</span>
+            <span class="k">注册用户</span>
+            <span class="v" id="kpiUserCount">0人</span>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-title">
-            <span>底层服务运行健康状态 (单端口内部组件)</span>
-            <span class="tag tag-green">全部就绪</span>
+        <div class="dash-grid">
+          <!-- 左侧卡片：系统运行状态 (按分类折叠展开) -->
+          <div class="card" style="margin-bottom:0">
+            <div class="card-title">
+              <span>系统运行状态</span>
+              <div style="display:flex;align-items:center;gap:8px">
+                <span style="font-size:11px;color:var(--muted);font-weight:normal">点击分组展开</span>
+                <span class="tag tag-green" id="dashCoreStatusTag">运行正常</span>
+              </div>
+            </div>
+            <div id="svcGroupsContainer">
+              <!-- 动态填充用户与订阅、VPS与节点、资金、系统各组 -->
+            </div>
           </div>
-          <div id="serviceGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;">
-            <!-- 动态填充 -->
+
+          <!-- 右侧卡片：今日账本 -->
+          <div class="card" style="margin-bottom:0">
+            <div class="card-title">
+              <span>今日账本</span>
+              <button class="btn btn-sm btn-blue" id="btnDashSettle">一键资金归集/结算</button>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px">
+              <div class="ledger-row">
+                <span style="color:var(--muted)">今日入账</span>
+                <b id="dashLedgerIn" style="color:var(--green);font-size:15px">+$0.00</b>
+              </div>
+              <div class="ledger-row">
+                <span style="color:var(--muted)">今日出账</span>
+                <b id="dashLedgerOut" style="color:var(--amber);font-size:15px">-$0.00</b>
+              </div>
+              <div class="ledger-row">
+                <span style="color:var(--muted)">交易笔数</span>
+                <b id="dashLedgerCount" style="font-size:14px">0 笔</b>
+              </div>
+              <div class="ledger-row">
+                <span style="color:var(--muted)">待归集金额</span>
+                <b id="dashLedgerUnsettled" style="color:#60a5fa;font-size:14px">$0.00</b>
+              </div>
+            </div>
           </div>
         </div>
       </section>
 
-      <!-- Pane 2: 用户中心 -->
+      <!-- Pane 2: 用户 -->
       <section class="content-pane" id="pane-users">
-        <div class="toolbar" style="justify-content:space-between">
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-blue btn-sm" id="btnOpenAddUser">+ 新增用户</button>
+        <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <div style="display:flex;background:#090e18;border:1px solid var(--line);border-radius:var(--radius-sm)">
-              <button class="btn btn-sm" id="btnTabStaff" style="border:0;background:var(--card-active)">管理员</button>
-              <button class="btn btn-sm" id="btnTabSub" style="border:0;background:transparent">订阅用户</button>
+              <button class="btn btn-sm" id="btnTabStaff" style="border:0;background:var(--card-active)">管理员 (0)</button>
+              <button class="btn btn-sm" id="btnTabSub" style="border:0;background:transparent">订阅用户 (0)</button>
             </div>
+            <button class="btn btn-blue btn-sm" id="btnOpenAddUser">+ 新增管理员</button>
+            <button class="btn btn-sm" id="btnBroadcastSubs" style="display:none">一键同步用户凭证至所有 Edge VPS</button>
           </div>
           <button class="btn btn-sm" id="btnRefreshUsers">刷新</button>
         </div>
@@ -141,91 +166,70 @@
           <table class="data-table">
             <thead>
               <tr>
-                <th style="width:60px">ID</th>
+                <th style="width:50px">ID</th>
                 <th>用户名</th>
-                <th>联系方式</th>
+                <th>手机号</th>
+                <th>邮箱</th>
                 <th>套餐类型</th>
-                <th>金额 / 余额</th>
-                <th>专属订阅地址</th>
-                <th>状态</th>
-                <th style="width:190px">操作</th>
+                <th>金额</th>
+                <th>有效期</th>
+                <th id="thSubUrl" style="display:none;min-width:240px">专属订阅地址</th>
+                <th style="width:70px">状态</th>
+                <th style="width:170px">操作</th>
               </tr>
             </thead>
             <tbody id="usersTableBody">
-              <tr><td colspan="8" style="text-align:center;padding:16px;color:var(--muted)">正在加载用户数据...</td></tr>
+              <tr><td colspan="10" style="text-align:center;padding:16px;color:var(--muted)">正在加载用户数据...</td></tr>
             </tbody>
           </table>
         </div>
       </section>
 
-      <!-- Pane 3: VPS 节点编排 -->
+      <!-- Pane 3: VPS -->
       <section class="content-pane" id="pane-vps">
         <div class="alert-info" style="margin-bottom:12px">
           <span>ℹ️ 本页管理 VPS 集群资产与域名绑定。已实现公网 DNS 实时复核与 Cloudflare 灰云 (proxied: false) 自动化防封解析。</span>
         </div>
         <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-            <button class="btn btn-blue btn-sm" id="btnOpenAddVPS">+ 录入 VPS 节点</button>
+            <button class="btn btn-blue btn-sm" id="btnOpenAddVPS">+ 添加 VPS</button>
             <button class="btn btn-sm" id="btnRefreshProbeAll">刷新探测</button>
             <button class="btn btn-sm" id="btnVerifyAllDomains">批量复核域名/CF</button>
-            <button class="btn btn-sm" id="btnPurityProbeAll">全量打靶巡检</button>
-            <div style="display:flex;background:#090e18;border:1px solid var(--line);border-radius:var(--radius-sm)">
-              <button class="btn btn-sm" id="btnVpsViewCard" style="border:0;background:var(--card-active)">卡片视图</button>
-              <button class="btn btn-sm" id="btnVpsViewTable" style="border:0;background:transparent">表格视图</button>
-            </div>
+            <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;margin-left:8px">
+              <input type="checkbox" id="chkAutoProbe" style="cursor:pointer" />
+              <span>自动探测</span>
+            </label>
           </div>
           <div style="display:flex;align-items:center;gap:8px">
-            <span class="tag tag-green" id="cfStatusBadge">🟢 Cloudflare: 检测中...</span>
+            <span class="tag tag-green" id="cfStatusBadge">🟢 Cloudflare 灰云自动化: 已就绪</span>
           </div>
         </div>
 
-        <!-- 1. 卡片视图 -->
+        <!-- 紧凑响应式多 VPS 网格布局 (100% 还原 yesterday's final vps-grid) -->
         <div class="vps-grid" id="vpsCardGrid">
           <div class="metric-empty" style="grid-column:1/-1">正在加载 VPS 资产与探测指标...</div>
         </div>
-
-        <!-- 2. 表格视图 (默认隐藏) -->
-        <div class="card" id="vpsTableContainer" style="padding:0;overflow:hidden;display:none;margin-top:12px">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th style="width:60px">ID</th>
-                <th>节点标识</th>
-                <th>角色</th>
-                <th>IP / SSH端口</th>
-                <th>绑定域名</th>
-                <th>出口纯净度 (打靶评分)</th>
-                <th>WARP 出口</th>
-                <th>状态</th>
-                <th style="width:280px">操作</th>
-              </tr>
-            </thead>
-            <tbody id="vpsTableBody">
-              <tr><td colspan="9" style="text-align:center;padding:16px;color:var(--muted)">正在加载 VPS 资产...</td></tr>
-            </tbody>
-          </table>
-        </div>
       </section>
 
-      <!-- Pane 4: AERO 管理台 (模块化嵌入) -->
+      <!-- Pane 4: AERO -->
       <section class="content-pane" id="pane-aero">
         <div class="aero-embed-wrap">
           <div class="alert-info">
-            <span>📦 模块化 AERO Console (嵌入式)。中台多 VPS 部署 + 订阅/Token 鉴权矩阵；同一套 UI 也可在独立 VPS 用 aero-panel 运行。</span>
+            <span>📦 模块化 AERO Console（aero/webui）。中台多 VPS 部署 + 订阅/Token；同一套 UI 也可在独立 VPS 用 aero-panel 运行。</span>
           </div>
           <iframe class="aero-embed" id="aeroIframe" src="/aero-ui/?mode=mid&embed=1" title="AERO Console"></iframe>
         </div>
       </section>
 
-      <!-- Pane 5: 订阅节点 (Node Registry) -->
+      <!-- Pane 5: 节点 -->
       <section class="content-pane" id="pane-nodes">
-        <div class="toolbar" style="justify-content:space-between">
-          <div style="display:flex;gap:8px">
+        <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <button class="btn btn-blue btn-sm" id="btnOpenAddNode">+ 手动登记节点</button>
             <button class="btn btn-sm" id="btnSyncNodes">刷新并校验联动</button>
-            <button class="btn btn-sm btn-danger" id="btnCleanOrphanNodes">清理失联节点</button>
+            <button class="btn btn-sm btn-danger" id="btnCleanOrphanNodes" style="display:none">清理失联节点</button>
           </div>
-          <span style="font-size:11px;color:var(--muted)">删除 VPS 会自动联动节点与订阅清理</span>
+          <span style="font-size:11px;color:var(--muted)">删除 VPS 会自动删关联节点并清理订阅；失联节点可一键清理</span>
         </div>
         <div class="card" style="padding:0;overflow:hidden">
           <table class="data-table">
@@ -233,12 +237,12 @@
               <tr>
                 <th style="width:60px">ID</th>
                 <th>名称</th>
-                <th>出口地址</th>
+                <th>地址</th>
                 <th>协议</th>
-                <th>关联 VPS</th>
+                <th>VPS</th>
                 <th>状态</th>
-                <th>订阅 / 容量</th>
-                <th style="width:160px">操作</th>
+                <th>订阅/容量</th>
+                <th style="width:140px">操作</th>
               </tr>
             </thead>
             <tbody id="nodesTableBody">
@@ -248,35 +252,17 @@
         </div>
       </section>
 
-      <!-- Pane 6: 订阅管理 -->
-      <section class="content-pane" id="pane-subs">
-        <div class="card" style="padding:0;overflow:hidden">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th style="width:60px">用户ID</th>
-                <th>用户名</th>
-                <th>专属私有订阅 Slug</th>
-                <th>订阅下发完整 URL</th>
-                <th>节点挂载情况</th>
-                <th style="width:140px">快捷操作</th>
-              </tr>
-            </thead>
-            <tbody id="subsTableBody">
-              <tr><td colspan="6" style="text-align:center;padding:16px;color:var(--muted)">正在加载订阅关系...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- Pane 7: 财务账本 -->
+      <!-- Pane 6: 账本 -->
       <section class="content-pane" id="pane-ledger">
-        <div class="toolbar" style="justify-content:space-between">
-          <div style="display:flex;gap:8px">
-            <button class="btn btn-sm" id="btnLedgerAll" style="background:var(--card-active)">全部流水</button>
-            <button class="btn btn-sm" id="btnLedgerIn">收入 IN</button>
-            <button class="btn btn-sm" id="btnLedgerOut">支出 OUT</button>
-            <button class="btn btn-sm" id="btnLedgerUnsettled">待归集</button>
+        <div class="toolbar" style="justify-content:space-between;flex-wrap:wrap">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <div style="display:flex;background:#090e18;border:1px solid var(--line);border-radius:var(--radius-sm)">
+              <button class="btn btn-sm" id="btnLedgerAll" style="border:0;background:var(--card-active)">全部明细 (0)</button>
+              <button class="btn btn-sm" id="btnLedgerIn" style="border:0;background:transparent">入账 IN (0)</button>
+              <button class="btn btn-sm" id="btnLedgerOut" style="border:0;background:transparent">出账 OUT (0)</button>
+              <button class="btn btn-sm" id="btnLedgerUnsettled" style="border:0;background:transparent">待归集 (0)</button>
+            </div>
+            <span style="font-size:12px;color:var(--muted)" id="ledgerCumulativeText">累计入账: $0.00 · 累计出账: $0.00</span>
           </div>
           <button class="btn btn-blue btn-sm" id="btnBatchSettle">一键资金归集/结算</button>
         </div>
@@ -284,13 +270,13 @@
           <table class="data-table">
             <thead>
               <tr>
-                <th>账本流水号</th>
-                <th>方向</th>
-                <th>金额</th>
-                <th>渠道</th>
-                <th>结算状态</th>
+                <th style="min-width:180px">账本流水号</th>
+                <th style="width:90px">方向</th>
+                <th style="width:110px">金额</th>
+                <th style="width:130px">支付/归集渠道</th>
+                <th style="width:120px">归集结算状态</th>
                 <th>关联单号 / 备注</th>
-                <th>时间</th>
+                <th style="width:160px">流水时间</th>
               </tr>
             </thead>
             <tbody id="ledgerTableBody">
@@ -299,40 +285,39 @@
           </table>
         </div>
       </section>
-
-      <!-- Pane 8: 链路诊断 -->
-      <section class="content-pane" id="pane-diag">
-        <div class="toolbar">
-          <button class="btn btn-blue btn-sm" id="btnRunAllDiag">启动全网节点深度体检</button>
-        </div>
-        <div id="diagResults" class="card">
-          <p style="color:var(--muted)">点击上方按钮启动诊断链路</p>
-        </div>
-      </section>
     </main>
   </div>
 
-  <!-- Modal: 新增用户 -->
+  <!-- Modal: 新增 / 编辑用户 -->
   <div class="modal-backdrop" id="userModal">
     <div class="modal-content">
-      <h3 style="margin-bottom:14px;font-size:14px">新增中台用户</h3>
+      <h3 style="margin-bottom:14px;font-size:14px" id="userModalTitle">新增用户</h3>
+      <input type="hidden" id="editUserId" />
       <div style="display:flex;flex-direction:column;gap:10px">
         <div>
           <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户名</label>
           <input type="text" id="newUsername" class="input-text" style="width:100%" placeholder="jacky" />
         </div>
-        <div>
+        <div id="pwdFieldWrap">
           <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">初始密码</label>
           <input type="password" id="newUserPass" class="input-text" style="width:100%" placeholder="123456" />
         </div>
         <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户角色</label>
-          <select id="newUserRole" class="input-text" style="width:100%">
-            <option value="sub">订阅用户 (普通租户)</option>
-            <option value="staff">运维管理员 (拥有特权)</option>
-          </select>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">手机号</label>
+          <input type="text" id="newUserPhone" class="input-text" style="width:100%" placeholder="选填，如 13800138000" />
         </div>
         <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">邮箱</label>
+          <input type="text" id="newUserEmail" class="input-text" style="width:100%" placeholder="选填，如 user@domain.com" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户角色</label>
+          <select id="newUserRole" class="input-text" style="width:100%">
+            <option value="staff">管理员</option>
+            <option value="sub">订阅用户</option>
+          </select>
+        </div>
+        <div id="planFieldWrap">
           <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">开通套餐</label>
           <select id="newUserPlan" class="input-text" style="width:100%">
             <option value="1">月度套餐 (1个月) - $9.99</option>
@@ -376,28 +361,27 @@
 
   <!-- Modal: 添加 VPS -->
   <div class="modal-backdrop" id="addVpsModal">
-    <div class="modal-content" style="width:520px">
-      <h3 style="margin-bottom:14px;font-size:14px">录入 VPS 节点资产</h3>
+    <div class="modal-content" style="width:500px">
+      <h3 style="margin-bottom:14px;font-size:14px">添加 VPS（测试机）</h3>
       <div style="display:flex;flex-direction:column;gap:10px">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">节点标识</label>
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">名称</label>
             <input type="text" id="vpsName" class="input-text" style="width:100%" placeholder="vps-a" />
           </div>
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">节点角色</label>
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">角色</label>
             <select id="vpsRole" class="input-text" style="width:100%">
-              <option value="VPS-A">VPS-A (首节点)</option>
-              <option value="VPS-B">VPS-B (第二节点)</option>
-              <option value="edge">Edge 边缘接入点</option>
-              <option value="node">通用节点</option>
+              <option value="VPS-A">VPS-A（首节点）</option>
+              <option value="VPS-B">VPS-B（第二节点）</option>
+              <option value="node">其他</option>
             </select>
           </div>
         </div>
         <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px">
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">公网 IPv4 / IPv6</label>
-            <input type="text" id="vpsIp" class="input-text" style="width:100%" placeholder="192.210.193.197" />
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">公网 IP</label>
+            <input type="text" id="vpsIp" class="input-text" style="width:100%" placeholder="x.x.x.x" />
           </div>
           <div>
             <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">SSH 端口</label>
@@ -406,28 +390,28 @@
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">SSH 用户名</label>
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">SSH 用户</label>
             <input type="text" id="vpsSshUser" class="input-text" style="width:100%" value="root" />
           </div>
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">SSH 密码 (AES加密存储)</label>
-            <input type="password" id="vpsSshPass" class="input-text" style="width:100%" placeholder="root 密码" />
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">SSH 密码</label>
+            <input type="password" id="vpsSshPass" class="input-text" style="width:100%" placeholder="root 密码 · AES 加密" />
           </div>
         </div>
         <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">绑定域名 (严禁纯IP访问)</label>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">节点域名 (必填，严禁纯 IP)</label>
           <div style="display:flex;gap:8px">
-            <input type="text" id="vpsDomain" class="input-text" style="flex:1" placeholder="a.example.com" />
+            <input type="text" id="vpsDomain" class="input-text" style="flex:1" placeholder="必填 a.example.com" />
             <button class="btn btn-sm" id="btnSyncCfVps">CF 灰云同步</button>
           </div>
         </div>
         <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">备注信息 (选填)</label>
-          <input type="text" id="vpsRemark" class="input-text" style="width:100%" placeholder="生产机房备用" />
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">备注 (可选)</label>
+          <input type="text" id="vpsRemark" class="input-text" style="width:100%" placeholder="可选" />
         </div>
         <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
           <button class="btn btn-sm" id="btnCancelVPS">取消</button>
-          <button class="btn btn-blue btn-sm" id="btnSaveVPS">登记并保存</button>
+          <button class="btn btn-blue btn-sm" id="btnSaveVPS">登记</button>
         </div>
       </div>
     </div>
@@ -436,17 +420,17 @@
   <!-- Modal: 修改 VPS 域名 -->
   <div class="modal-backdrop" id="editDomainModal">
     <div class="modal-content">
-      <h3 style="margin-bottom:14px;font-size:14px">修改 VPS 节点绑定域名</h3>
+      <h3 style="margin-bottom:14px;font-size:14px" id="editDomainModalTitle">修改 VPS 域名与 CF 绑定</h3>
       <input type="hidden" id="editDomainVpsId" />
       <div style="display:flex;flex-direction:column;gap:10px">
         <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">节点公网 IP</label>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">公网 IP</label>
           <input type="text" id="editDomainVpsIp" class="input-text" style="width:100%" readonly disabled />
         </div>
         <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">新域名 (FQDN)</label>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">新域名</label>
           <div style="display:flex;gap:8px">
-            <input type="text" id="editDomainVal" class="input-text" style="flex:1" placeholder="myconsun.cc.cd" />
+            <input type="text" id="editDomainVal" class="input-text" style="flex:1" placeholder="a.example.com" />
             <button class="btn btn-sm" id="btnSyncEditCf">CF 灰云同步</button>
           </div>
         </div>
@@ -461,7 +445,7 @@
   <!-- Modal: 修改 VPS 密码 -->
   <div class="modal-backdrop" id="editPassModal">
     <div class="modal-content">
-      <h3 style="margin-bottom:14px;font-size:14px">修改 VPS SSH 密码凭据</h3>
+      <h3 style="margin-bottom:14px;font-size:14px">修改 VPS SSH 密码</h3>
       <input type="hidden" id="editPassVpsId" />
       <div style="display:flex;flex-direction:column;gap:10px">
         <div>
@@ -483,39 +467,43 @@
   <!-- Modal: 手动登记节点 -->
   <div class="modal-backdrop" id="nodeModal">
     <div class="modal-content">
-      <h3 style="margin-bottom:14px;font-size:14px">手动登记订阅节点</h3>
+      <h3 style="margin-bottom:14px;font-size:14px">新增节点</h3>
       <div style="display:flex;flex-direction:column;gap:10px">
         <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">节点名称</label>
-          <input type="text" id="newNodeName" class="input-text" style="width:100%" placeholder="sg-node-1" />
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">名称</label>
+          <input type="text" id="newNodeName" class="input-text" style="width:100%" placeholder="sg-1" />
         </div>
         <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px">
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">主机地址 (IP或域名)</label>
-            <input type="text" id="newNodeIp" class="input-text" style="width:100%" placeholder="a.example.com" />
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">IP</label>
+            <input type="text" id="newNodeIp" class="input-text" style="width:100%" placeholder="1.2.3.4" />
           </div>
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">服务端口</label>
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">端口</label>
             <input type="number" id="newNodePort" class="input-text" style="width:100%" value="443" />
           </div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">承载协议</label>
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">协议</label>
             <select id="newNodeProto" class="input-text" style="width:100%">
-              <option value="aero-h2">aero-h2 (标准)</option>
-              <option value="aero-h3">aero-h3 (MASQUE)</option>
-              <option value="vmess">vmess (旧)</option>
+              <option value="aero">aero（推荐）</option>
+              <option value="vmess">vmess（旧）</option>
+              <option value="vless">vless（旧）</option>
             </select>
           </div>
           <div>
-            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">最大承载用户</label>
+            <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">最大用户</label>
             <input type="number" id="newNodeMaxUsers" class="input-text" style="width:100%" value="100" />
           </div>
         </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">地区 (选填)</label>
+          <input type="text" id="newNodeRegion" class="input-text" style="width:100%" placeholder="sg" />
+        </div>
         <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">
           <button class="btn btn-sm" id="btnCancelNode">取消</button>
-          <button class="btn btn-blue btn-sm" id="btnSaveNode">确认登记</button>
+          <button class="btn btn-blue btn-sm" id="btnSaveNode">确定</button>
         </div>
       </div>
     </div>
