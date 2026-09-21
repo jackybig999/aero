@@ -300,3 +300,166 @@ body {
   padding: 28px 24px;
   box-shadow: 0 16px 40px rgba(0,0,0,0.6);
 }
+
+/* VPS Grid & Mini Metrics Dashboard */
+.vps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(460px, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.vps-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: all 0.2s ease;
+}
+
+.vps-card:hover {
+  border-color: #3b82f6;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+}
+
+.vps-card-hd {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid #1a2336;
+  padding-bottom: 10px;
+}
+
+.vps-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.vps-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: #fff;
+}
+
+.vps-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.vps-meta {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.vps-meta b {
+  color: var(--text);
+}
+
+.metric-compact-row {
+  background: #0e1424;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mc-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+}
+
+.mc-label {
+  font-size: 10px;
+  color: var(--dim);
+  text-transform: uppercase;
+}
+
+.mc-val {
+  font-size: 11px;
+  font-weight: 700;
+  color: #e2e8f0;
+}
+
+.mc-sub {
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.mc-divider {
+  width: 1px;
+  height: 22px;
+  background: var(--line);
+}
+
+.progress-mini {
+  width: 44px;
+  height: 4px;
+  background: #1e293b;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+
+.progress-mini-bar {
+  height: 100%;
+  background: var(--blue);
+  transition: width 0.3s;
+}
+
+.metric-empty {
+  padding: 8px 12px;
+  background: #0e1424;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--dim);
+  text-align: center;
+}
+
+/* AERO Embedded Console */
+.aero-embed-wrap {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 84px);
+  gap: 10px;
+}
+
+.aero-embed {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: #0c111c;
+}
+
+.alert-info {
+  background: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #93c5fd;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
