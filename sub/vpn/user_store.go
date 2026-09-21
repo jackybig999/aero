@@ -53,6 +53,8 @@ func (s *FileUserStore) load() error {
 	if err != nil {
 		return err
 	}
+	// Normalize any empty expire_at string to null for robust parsing
+	data = []byte(strings.ReplaceAll(string(data), `"expire_at": ""`, `"expire_at": null`))
 	var list []*User
 	if err := json.Unmarshal(data, &list); err == nil {
 		s.mu.Lock()

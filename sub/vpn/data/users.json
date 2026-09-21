@@ -10,7 +10,7 @@
       "is_staff": true,
       "sub_slug": "superadmin",
       "sub_token": "usr_superadmin",
-      "expire_at": "",
+      "expire_at": "2099-12-31T23:59:59Z",
       "created_at": "2026-09-18T14:06:08.4791575+08:00",
       "updated_at": "2026-09-21T11:45:00.0000000+08:00"
     },
