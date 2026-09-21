@@ -65,7 +65,7 @@ func (h *AeroHandler) VPSOptions(w http.ResponseWriter, r *http.Request) {
 	for _, v := range hosts {
 		res = append(res, item{ID: v.ID, Name: v.Name, IP: v.IP, Domain: v.Domain})
 	}
-	writeJSON(w, 200, map[string]any{"code": 0, "data": map[string]any{"results": res}})
+	writeJSON(w, 200, map[string]any{"code": 0, "data": res, "results": res})
 }
 
 func (h *AeroHandler) SourceStatus(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +75,7 @@ func (h *AeroHandler) SourceStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *AeroHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
 	tasks := globalTaskManager.List()
-	writeJSON(w, 200, map[string]any{"code": 0, "data": map[string]any{"results": tasks}})
+	writeJSON(w, 200, map[string]any{"code": 0, "data": tasks, "results": tasks})
 }
 
 func (h *AeroHandler) GetTask(w http.ResponseWriter, r *http.Request) {

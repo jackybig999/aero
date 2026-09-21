@@ -6,8 +6,28 @@ let currentVpsId = '';
 let activeTaskId = null;
 let taskPollTimer = null;
 
+function getToken() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const qToken = urlParams.get('token');
+  if (qToken) {
+    try { localStorage.setItem(TOKEN_KEY, qToken); } catch (_) {}
+    return qToken;
+  }
+  let tok = '';
+  try { tok = localStorage.getItem(TOKEN_KEY); } catch (_) {}
+  if (!tok) {
+    try {
+      if (window.parent && window.parent !== window && window.parent.localStorage) {
+        tok = window.parent.localStorage.getItem(TOKEN_KEY);
+        if (tok) localStorage.setItem(TOKEN_KEY, tok);
+      }
+    } catch (_) {}
+  }
+  return tok || '';
+}
+
 async function request(url, options = {}) {
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = getToken();
   const headers = Object.assign({}, options.headers || {});
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
@@ -175,7 +195,8 @@ async function loadSourceStatus() {
 
 async function loadVpsList() {
   try {
-    const list = await request('/api/v1/aero/vps-options/');
+    const res = await request('/api/v1/aero/vps-options/');
+    const list = Array.isArray(res) ? res : (res?.results || (res?.data && Array.isArray(res.data) ? res.data : []));
     const sel = $('vpsSelect');
     if (!sel) return;
     sel.innerHTML = '';
@@ -191,9 +212,9 @@ async function loadVpsList() {
       opt.value = vps.id || vps.vps_id;
       opt.textContent = `${vps.name} (${vps.ip}${vps.domain ? ' · ' + vps.domain : ''})`;
       if (idx === 0 && !currentVpsId) {
-        currentVpsId = opt.value;
+        currentVpsId = String(opt.value);
         opt.selected = true;
-      } else if (currentVpsId && opt.value == currentVpsId) {
+      } else if (currentVpsId && String(opt.value) === String(currentVpsId)) {
         opt.selected = true;
       }
       sel.appendChild(opt);

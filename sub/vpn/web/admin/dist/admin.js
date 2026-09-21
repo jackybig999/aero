@@ -1062,7 +1062,9 @@ async function verifyAllDomains() {
 function loadAERO() {
   const iframe = $('aeroIframe');
   if (iframe) {
-    iframe.src = '/aero-ui/?mode=mid&embed=1';
+    const token = localStorage.getItem(TOKEN_KEY) || '';
+    const src = '/aero-ui/?mode=mid&embed=1' + (token ? '&token=' + encodeURIComponent(token) : '');
+    iframe.src = src;
   }
 }
 
