@@ -9,13 +9,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
 type DeployStep struct {
@@ -45,11 +42,10 @@ type DeployTask struct {
 
 type SourceStatus struct {
 	HasSource   bool   `json:"has_source"`
-	SourceType  string `json:"source_type"` // "github" | "official_bundle" | "none"
+	SourceType  string `json:"source_type"` // "github" | "none"
 	Repo        string `json:"repo"`
 	ReleaseTag  string `json:"release_tag,omitempty"`
 	DownloadURL string `json:"download_url,omitempty"`
-	LocalPath   string `json:"local_path,omitempty"`
 	Prompt      string `json:"prompt"`
 }
 
@@ -58,55 +54,6 @@ var (
 	cachedSourceStatus SourceStatus
 	cachedSourceTime   time.Time
 )
-
-// findOfficialEdgeBinary searches candidate directories for the official Linux AMD64 binary
-func findOfficialEdgeBinary() string {
-	candidates := []string{
-		"../../protocol/server/vps/aero-edge-linux-amd64",
-		"../protocol/server/vps/aero-edge-linux-amd64",
-		"protocol/server/vps/aero-edge-linux-amd64",
-		"./aero-edge-linux-amd64",
-		"aero-edge-linux-amd64",
-		"D:/jacky/gemini/aisys/protocol/server/vps/aero-edge-linux-amd64",
-	}
-	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
-		candidates = append(candidates,
-			filepath.Join(dir, "aero-edge-linux-amd64"),
-			filepath.Join(dir, "protocol", "server", "vps", "aero-edge-linux-amd64"),
-			filepath.Join(dir, "..", "protocol", "server", "vps", "aero-edge-linux-amd64"),
-			filepath.Join(dir, "..", "..", "protocol", "server", "vps", "aero-edge-linux-amd64"),
-		)
-	}
-	for _, p := range candidates {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() && fi.Size() > 1024*1024 {
-			if abs, err := filepath.Abs(p); err == nil {
-				return abs
-			}
-			return p
-		}
-	}
-	return ""
-}
-
-// streamBinaryToRemote streams local binary directly via SSH session stdin to remote destination
-func streamBinaryToRemote(client *ssh.Client, localPath, remotePath string) error {
-	f, err := os.Open(localPath)
-	if err != nil {
-		return fmt.Errorf("open local binary: %w", err)
-	}
-	defer f.Close()
-
-	sess, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("create ssh session: %w", err)
-	}
-	defer sess.Close()
-
-	sess.Stdin = f
-	cmd := fmt.Sprintf("cat > %s && chmod 755 %s", remotePath, remotePath)
-	return sess.Run(cmd)
-}
 
 func DetectAeroSource() SourceStatus {
 	cachedSourceMu.RLock()
@@ -130,22 +77,54 @@ func DetectAeroSource() SourceStatus {
 
 func queryGitHubRelease(repo string) SourceStatus {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return fallbackOfficialSource(repo, fmt.Sprintf("构建 GitHub 官方源请求失败: %v", err))
+		return SourceStatus{
+			HasSource:  false,
+			SourceType: "none",
+			Repo:       repo,
+			Prompt:     fmt.Sprintf("构建 GitHub 官方源请求失败: %v", err),
+		}
 	}
 	req.Header.Set("User-Agent", "AERO-MidPlatform/1.0")
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
+	token := os.Getenv("AERO_GITHUB_TOKEN")
+	if token == "" {
+		token = os.Getenv("GITHUB_TOKEN")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return fallbackOfficialSource(repo, fmt.Sprintf("GitHub 官方源连接超时: %v", err))
+		return SourceStatus{
+			HasSource:  false,
+			SourceType: "none",
+			Repo:       repo,
+			Prompt:     fmt.Sprintf("官方源（GitHub: %s）连接超时或未发布。请先向 GitHub 推送 Release，严禁本地私拷分发。", repo),
+		}
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode != http.StatusOK {
-		return fallbackOfficialSource(repo, fmt.Sprintf("官方源暂未挂载 Release 资产 (HTTP %d)", resp.StatusCode))
+	if resp.StatusCode == http.StatusNotFound {
+		return SourceStatus{
+			HasSource:  false,
+			SourceType: "none",
+			Repo:       repo,
+			Prompt:     fmt.Sprintf("官方源（GitHub: %s）尚未发布任何可用 Release 资产。若仓库为私有，需在环境变量或 .env 中配置 GITHUB_TOKEN，或将 GitHub 仓库设为公开（Public）。", repo),
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return SourceStatus{
+			HasSource:  false,
+			SourceType: "none",
+			Repo:       repo,
+			Prompt:     fmt.Sprintf("官方源（GitHub: %s）返回状态码 %d，暂无可用 Release。", repo, resp.StatusCode),
+		}
 	}
 
 	var gh struct {
@@ -157,7 +136,12 @@ func queryGitHubRelease(repo string) SourceStatus {
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&gh); err != nil {
-		return fallbackOfficialSource(repo, "解析 GitHub Release 数据异常")
+		return SourceStatus{
+			HasSource:  false,
+			SourceType: "none",
+			Repo:       repo,
+			Prompt:     "解析 GitHub Release 数据异常",
+		}
 	}
 
 	var dlURL string
@@ -177,39 +161,22 @@ func queryGitHubRelease(repo string) SourceStatus {
 	}
 
 	if dlURL == "" {
-		return fallbackOfficialSource(repo, fmt.Sprintf("GitHub 官方源 %s 缺少 Linux aero-edge 发布包", gh.TagName))
+		return SourceStatus{
+			HasSource:  false,
+			SourceType: "none",
+			Repo:       repo,
+			ReleaseTag: gh.TagName,
+			Prompt:     fmt.Sprintf("GitHub 官方源（%s）最新版本 %s 缺少 Linux aero-edge 发布包！", repo, gh.TagName),
+		}
 	}
 
-	localBin := findOfficialEdgeBinary()
 	return SourceStatus{
 		HasSource:   true,
 		SourceType:  "github",
 		Repo:        repo,
 		ReleaseTag:  gh.TagName,
 		DownloadURL: dlURL,
-		LocalPath:   localBin,
 		Prompt:      fmt.Sprintf("GitHub 官方源已就绪（版本：%s）：%s", gh.TagName, dlURL),
-	}
-}
-
-func fallbackOfficialSource(repo string, reason string) SourceStatus {
-	localBin := findOfficialEdgeBinary()
-	if localBin != "" {
-		return SourceStatus{
-			HasSource:   true,
-			SourceType:  "official_bundle",
-			Repo:        repo,
-			ReleaseTag:  "main (Official)",
-			DownloadURL: "",
-			LocalPath:   localBin,
-			Prompt:      fmt.Sprintf("官方源已就绪（%s:main · 官方编译核心组件已就绪）", repo),
-		}
-	}
-	return SourceStatus{
-		HasSource:  false,
-		SourceType: "none",
-		Repo:       repo,
-		Prompt:     fmt.Sprintf("官方源前置检测提示: %s，且未找到本地官方编译组件", reason),
 	}
 }
 
@@ -432,52 +399,35 @@ func RunInstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
 	globalTaskManager.AppendLog(taskID, "[SSH 连通] 安全终端连接建立成功，目标系统环境正常。")
 	globalTaskManager.SetStep(taskID, "ssh_connect", "success", "已连通", 40, "拉取官方源")
 
-	// 步骤 3：分发并部署核心组件（优先官方源，网络阻断时自动启用官方通道安全分发）
-	globalTaskManager.SetStep(taskID, "binary_deploy", "running", "部署核心组件...", 45, "部署组件")
+	// 步骤 3：由目标 VPS 直接从 GitHub 官方源拉取并部署核心组件（严禁中台本地私拷）
+	globalTaskManager.SetStep(taskID, "binary_deploy", "running", "从官方源拉取组件...", 45, "远端拉取")
+	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方源拉取] 目标 VPS 正在从 GitHub 官方源拉取发布包: %s...", src.DownloadURL))
 
 	_, _ = runSSH(client, "mkdir -p /usr/local/bin /var/lib/aero /var/lib/aero/tls /etc/aero /var/log /tmp", 10*time.Second)
 
-	deployed := false
-	if src.DownloadURL != "" {
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方源拉取] 目标 VPS 正在从 GitHub 官方源拉取发布包: %s...", src.DownloadURL))
-		downloadCmd := fmt.Sprintf("curl -fsSL -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge", src.DownloadURL)
-		out, err := runSSH(client, downloadCmd, 60*time.Second)
-		if err == nil {
-			deployed = true
-			globalTaskManager.AppendLog(taskID, "[部署 成功] 已成功从官方源下载并置入 /usr/local/bin/aero-edge (0755)。")
-		} else {
-			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[拉取提示] 远端直接拉取未完成 (%v: %s)，自动转入官方安全通道直连部署...", err, strings.TrimSpace(out)))
-		}
+	token := os.Getenv("AERO_GITHUB_TOKEN")
+	if token == "" {
+		token = os.Getenv("GITHUB_TOKEN")
+	}
+	var downloadCmd string
+	if token != "" {
+		downloadCmd = fmt.Sprintf("curl -fsSL -H %q -H %q -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge",
+			"Authorization: Bearer "+token, "Accept: application/octet-stream", src.DownloadURL)
+	} else {
+		downloadCmd = fmt.Sprintf("curl -fsSL -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge", src.DownloadURL)
 	}
 
-	if !deployed {
-		localBin := src.LocalPath
-		if localBin == "" {
-			localBin = findOfficialEdgeBinary()
-		}
-		if localBin == "" {
-			errMsg := "未找到官方 AERO Edge 核心组件二进制文件"
-			globalTaskManager.AppendLog(taskID, "[部署 错误] "+errMsg)
-			globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "组件缺失")
-			globalTaskManager.Finish(taskID, "failed", errMsg)
-			return
-		}
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方分发] 正在通过安全通道分发官方组件 (%s)...", filepath.Base(localBin)))
-		err := streamBinaryToRemote(client, localBin, "/usr/local/bin/aero-edge")
-		if err != nil {
-			errMsg := fmt.Sprintf("组件安全分发失败: %v", err)
-			globalTaskManager.AppendLog(taskID, "[部署 错误] "+errMsg)
-			globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "分发失败")
-			globalTaskManager.Finish(taskID, "failed", errMsg)
-			return
-		}
-		globalTaskManager.AppendLog(taskID, "[部署 成功] 已通过官方安全通道分发并置入 /usr/local/bin/aero-edge (0755)。")
+	out, err := runSSH(client, downloadCmd, 120*time.Second)
+	if err != nil {
+		errMsg := fmt.Sprintf("从官方源拉取并安装失败: %v (输出: %s)", err, strings.TrimSpace(out))
+		globalTaskManager.AppendLog(taskID, "[拉取 错误] "+errMsg)
+		globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "官方源拉取失败")
+		globalTaskManager.Finish(taskID, "failed", errMsg)
+		return
 	}
 
-	// 验收远端核心组件
-	vOut, _ := runSSH(client, "/usr/local/bin/aero-edge -version 2>/dev/null || /usr/local/bin/aero-edge --help 2>&1 | head -n 1 || echo 'ready'", 10*time.Second)
-	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[组件验收] 节点响应: %s", strings.TrimSpace(vOut)))
-	globalTaskManager.SetStep(taskID, "binary_deploy", "success", "部署就绪", 65, "配置服务")
+	globalTaskManager.AppendLog(taskID, "[部署 成功] 已成功从官方源下载并置入 /usr/local/bin/aero-edge (0755)。")
+	globalTaskManager.SetStep(taskID, "binary_deploy", "success", "拉取部署完成", 65, "配置服务")
 
 	// 步骤 4：配置 systemd 服务与运行环境
 	globalTaskManager.SetStep(taskID, "service_config", "running", "写入服务配置...", 70, "配置服务")
