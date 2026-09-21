@@ -54,18 +54,37 @@ func (s *FileUserStore) load() error {
 		return err
 	}
 	var list []*User
-	if err := json.Unmarshal(data, &list); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, u := range list {
-		s.users[u.ID] = u
-		if u.ID >= s.nextID {
-			s.nextID = u.ID + 1
+	if err := json.Unmarshal(data, &list); err == nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, u := range list {
+			s.users[u.ID] = u
+			if u.ID >= s.nextID {
+				s.nextID = u.ID + 1
+			}
 		}
+		return nil
 	}
-	return nil
+
+	var wrapper struct {
+		NextID uint64           `json:"next_id"`
+		Users  map[string]*User `json:"users"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err == nil && len(wrapper.Users) > 0 {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if wrapper.NextID > 0 {
+			s.nextID = wrapper.NextID
+		}
+		for _, u := range wrapper.Users {
+			s.users[u.ID] = u
+			if u.ID >= s.nextID {
+				s.nextID = u.ID + 1
+			}
+		}
+		return nil
+	}
+	return errors.New("unrecognized users format")
 }
 
 func (s *FileUserStore) save() error {
