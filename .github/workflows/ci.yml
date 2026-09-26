@@ -1,0 +1,93 @@
+name: AIsys CI Build & Test
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Linux Build & Test (Server & Subplatform)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Test Protocol Proto
+        run: |
+          cd protocol/proto
+          go vet ./...
+          go test -race -v ./...
+
+      - name: Test & Build Protocol Server
+        run: |
+          cd protocol/server
+          go vet ./...
+          go test -race -v ./...
+          cd vps
+          go build -v -o aero-edge-linux-amd64 .
+
+      - name: Test & Build Subplatform
+        run: |
+          cd sub/vpn
+          go vet ./...
+          go test -race -v ./...
+          go build -v -o subvps .
+
+      - name: Upload Edge Server Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aero-edge-linux-amd64
+          path: protocol/server/vps/aero-edge-linux-amd64
+
+      - name: Auto Publish GitHub Release Asset (on main)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.2.0
+          name: "AERO OS v2.2.0 Official Release"
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: |
+            protocol/server/vps/aero-edge-linux-amd64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    name: Windows Build & Test (Client & Connect OS)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: Test & Build Protocol Client
+        run: |
+          cd protocol/client
+          go vet ./...
+          go test -v ./...
+          go build -v -o aero-client.exe ./win
+          go build -v -o aero-client-cli.exe ./cli
+
+      - name: Test & Build Connect AERO OS
+        run: |
+          cd connect/os
+          go vet ./...
+          go test -v ./...
+          go build -v -o aero-os.exe ./win

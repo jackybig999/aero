@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package aero;
+option go_package = "github.com/aero-protocol/proto/aero";
+
+// ============================================
+// Phase 1-2: 基础握手与 Stream 复用
+// ============================================
+
+message ConnectRequest {
+  string version = 1;           // "aero/2.0"
+  string token = 2;             // Bearer token
+  bytes nonce = 3;              // 32 字节随机数
+  uint64 timestamp = 4;         // Unix 毫秒
+  repeated StreamSpec streams = 5;
+
+  // Phase 4: 运营商自适应
+  string isp_hint = 6;          // "china_telecom" / "china_unicom" / "china_mobile"
+  repeated uint32 tested_ports = 7;
+  bool udp_available = 8;
+}
+
+message ConnectResponse {
+  bool accepted = 1;
+  string session_id = 2;        // UUID
+  uint32 heartbeat_interval = 3; // 秒，默认 30
+  string message = 4;
+  map<string, string> server_params = 5;
+
+  // Phase 4: 服务端推荐
+  string recommended_protocol = 6; // "quic" / "tcp_h2" / "tcp_ws"
+  uint32 recommended_port = 7;
+}
+
+message StreamSpec {
+  uint32 stream_id = 1;
+  StreamType stream_type = 2;
+  string target_host = 3;
+  uint32 target_port = 4;
+}
+
+enum StreamType {
+  CONTROL = 0;
+  GENERAL = 1;
+  UDP = 2;
+  AI = 3;
+  BROWSER = 4;
+}
+
+// Stream 数据帧
+message TcpFrame {
+  uint32 stream_id = 1;
+  bytes payload = 2;
+  uint64 sequence = 3;
+}
+
+message UdpFrame {
+  uint32 stream_id = 1;
+  bytes payload = 2;
+  string src_addr = 3;
+}
+
+// ============================================
+// Phase 3: AI Stream
+// ============================================
+
+message AiStreamHeader {
+  uint32 stream_id = 1;
+  string model_name = 2;        // "gpt-4", "claude-3" 等
+  string context_id = 3;        // 断线续传标识
+  bool resume = 4;              // 是否续传
+}
+
+message AiStreamFrame {
+  uint32 stream_id = 1;
+  bytes payload = 2;
+  bool is_token = 3;            // 是否为 token 边界
+  uint32 token_index = 4;       // token 序号
+  uint64 timestamp_us = 5;      // 发送时间戳（微秒）
+}
+
+// ============================================
+// Phase 2: 心跳与指标
+// ============================================
+
+message Heartbeat {
+  uint64 timestamp = 1;
+  uint32 sequence = 2;
+}
+
+message HeartbeatAck {
+  uint64 timestamp = 1;
+  uint32 sequence = 2;
+}
+
+message MetricsReport {
+  string session_id = 1;
+  uint64 timestamp = 2;
+
+  // Stream 流量统计
+  message StreamMetrics {
+    uint32 stream_id = 1;
+    StreamType stream_type = 2;
+    uint64 bytes_sent = 3;
+    uint64 bytes_recv = 4;
+    uint64 packets_sent = 5;
+    uint64 packets_recv = 6;
+  }
+  repeated StreamMetrics streams = 3;
+
+  // AI 指标
+  uint64 ai_first_token_latency_ms = 4;
+  uint64 ai_avg_token_interval_ms = 5;
+  uint32 ai_tokens_total = 6;
+
+  // 网络质量
+  uint32 rtt_ms = 7;
+  uint32 jitter_ms = 8;
+  float loss_rate = 9;
+}
+
+// ============================================
+// Phase 6: 调度命令
+// ============================================
+
+message SchedulerCommand {
+  enum CommandType {
+    KEEP = 0;
+    SWITCH_PATH = 1;
+    SWITCH_NODE = 2;
+    DEGRADE = 3;
+  }
+  CommandType type = 1;
+  string target_addr = 2;
+  string protocol = 3;
+  map<string, string> params = 4;
+}
+
+// ============================================
+// Phase 6: Bridge 协议 (Rust <-> Go)
+// ============================================
+
+message TunnelRequest {
+  string target_host = 1;
+  uint32 target_port = 2;
+  string protocol = 3;          // "tcp_h2" / "quic" / "tcp_ws"
+  map<string, string> options = 4;
+}
+
+message TunnelResponse {
+  bool success = 1;
+  string local_addr = 2;
+  string error = 3;
+}
+
+message ProbeConfig {
+  repeated string targets = 1;   // ["udp:443", "tcp:443", "tcp:8443"]
+  uint32 timeout_ms = 2;
+  uint32 parallel = 3;
+}
+
+message ProbeResult {
+  message PathResult {
+    string protocol = 1;
+    string addr = 2;
+    uint32 rtt_ms = 3;
+    bool reachable = 4;
+    float loss_rate = 5;
+  }
+  repeated PathResult results = 1;
+  string recommended = 2;
+}
+
+message PathSwitchRequest {
+  string current_path = 1;
+  string new_path = 2;
+  string session_id = 3;
+  string context_id = 4;
+}
+
+message PathSwitchResponse {
+  bool accepted = 1;
+  string message = 2;
+}

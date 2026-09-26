@@ -1,0 +1,8 @@
+{
+  "version": "aero/2.0",
+  "secret": "49adc46eff543149de857a49f89445b0",
+  "primaryPort": 443,
+  "advertiseHost": "myconsun.cc.cd",
+  "protocol": "tcp_h2",
+  "createdAt": 1786593501
+}

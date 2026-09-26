@@ -1,0 +1,79 @@
+# ==============================================================================
+# AIsys Unified .gitignore
+# ==============================================================================
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Node.js & Web build
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Binaries & Executables (preserve required embedded wintun.dll)
+*.exe
+*.exe~
+*.dll
+!protocol/client/win/wintun.dll
+*.so
+*.dylib
+
+# Logs & Runtime Temp
+logs/
+**/logs/
+tmp/
+**/tmp/
+*.log
+**/*.log
+*.tmp
+*.temp
+*.out
+*.test
+.host-ip-cache.json
+**/.host-ip-cache.json
+.last-sub-body
+**/.last-sub-body
+.last-sub-url
+**/.last-sub-url
+.saved-proxy.json
+**/.saved-proxy.json
+.runtime-port
+**/.runtime-port
+
+# Environment & Local Secrets (preserve examples)
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# Local Testing Binaries
+platform.exe
+**/platform.exe
+
+# Go Test Artifacts
+*.test
+__debug_bin*
+sub/vpn/vpn/
+/dist/
+/build/dist/
+
+# SQLite WAL and SHM and DB files
+*.db
+*.db-shm
+*.db-wal
+
+# Private subsystems (Strictly excluded from public repo)
+sub/
+connect/
+AERO_OS_FRAMEWORK_SPEC.md
+plan.md
+
+

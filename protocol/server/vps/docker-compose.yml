@@ -1,0 +1,40 @@
+# AERO Edge Server — 一键部署
+#
+# 用法:
+#   1. 填写环境变量
+#   2. docker compose up -d
+#   3. 完成！
+#
+version: "3.8"
+
+services:
+  aero-edge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aero-edge
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - AERO_TOKEN=${AERO_TOKEN}
+      - AERO_DOMAIN=${AERO_DOMAIN}
+      - AERO_EMAIL=${AERO_EMAIL}
+      - AERO_PORTS=443,8443,80
+      - AERO_SNI=cdn-aero.com
+      - AERO_LOG_FORMAT=json
+    volumes:
+      - ./certs:/certs          # Let's Encrypt 证书持久化
+      - ./aero_context.db:/aero_context.db  # AI 上下文持久化
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 可选：Prometheus 监控
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  #   ports:
+  #     - "9090:9090"

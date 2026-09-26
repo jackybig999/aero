@@ -1,0 +1,8 @@
+go 1.27.1
+
+use (
+	./protocol/client
+	./protocol/proto
+	./protocol/server
+)
+

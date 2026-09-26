@@ -1,0 +1,32 @@
+# AERO Edge Server — systemd 服务
+#
+# 安装:
+#   sudo cp deploy/aero-edge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now aero-edge
+#
+[Unit]
+Description=AERO Edge Server
+Documentation=https://github.com/aero-protocol/aero-protocol
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Restart=always
+RestartSec=5
+EnvironmentFile=/etc/aero/edge.conf
+ExecStart=/usr/local/bin/aero-edge \
+  -token ${AERO_TOKEN} \
+  -autocert ${AERO_DOMAIN} \
+  -autocert-email ${AERO_EMAIL} \
+  -ports ${AERO_PORTS:-443,8443,80} \
+  -sni ${AERO_SNI:-cdn-aero.com} \
+  -autocert-dir ${AERO_CERT_DIR:-/var/lib/aero/certs} \
+  -log-file /var/log/aero-edge.log \
+  -log-format json
+LimitNOFILE=65535
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
