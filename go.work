@@ -4,5 +4,5 @@ use (
 	./protocol/client
 	./protocol/proto
 	./protocol/server
+	./protocol/server/public/webui
 )
-

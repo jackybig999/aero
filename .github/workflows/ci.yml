@@ -1,17 +1,20 @@
-name: AIsys CI Build & Test
+name: AERO CI Build & Test
 
 on:
   push:
-    branches: [ "**" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "**" ]
+    branches: [ "main" ]
 
 permissions:
   contents: write
 
 jobs:
-  build-linux:
-    name: Linux Build & Test (Server & Subplatform)
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1: Linux — Proto + Edge Server + aero-panel
+  # ──────────────────────────────────────────────────────────────────────────
+  build-server:
+    name: Linux Build & Test (Proto + Edge Server + Panel)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -20,52 +23,68 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache: false
 
-      - name: Test Protocol Proto
+      - name: Vet & Test Protocol Proto
         run: |
           cd protocol/proto
           go vet ./...
-          go test -race -v ./...
+          go test -race -shuffle=on -v ./...
 
-      - name: Test & Build Protocol Server
+      - name: Vet & Test Protocol Server
         run: |
           cd protocol/server
           go vet ./...
-          go test -race -v ./...
-          cd vps
-          go build -v -o aero-edge-linux-amd64 .
+          go test -race -shuffle=on -v ./...
 
-      - name: Test & Build Subplatform
+      - name: Build Edge Server (linux/amd64 & linux/arm64)
         run: |
-          cd sub/vpn
-          go vet ./...
-          go test -race -v ./...
-          go build -v -o subvps .
+          cd protocol/server/vps
+          GOOS=linux GOARCH=amd64 go build -v \
+            -ldflags="-s -w -X main.Version=${{ github.ref_name }}" \
+            -o aero-edge-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -v \
+            -ldflags="-s -w -X main.Version=${{ github.ref_name }}" \
+            -o aero-edge-linux-arm64 .
 
-      - name: Upload Edge Server Artifact
+      - name: Build Standalone VPS Panel (aero-panel)
+        run: |
+          cd protocol/server/public/webui/cmd/panel
+          GOWORK=off GOOS=linux GOARCH=amd64 go build -v \
+            -ldflags="-s -w" \
+            -o aero-panel-linux-amd64 .
+
+      - name: Upload Server Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aero-edge-linux-amd64
-          path: protocol/server/vps/aero-edge-linux-amd64
+          name: aero-server-linux
+          path: |
+            protocol/server/vps/aero-edge-linux-amd64
+            protocol/server/vps/aero-edge-linux-arm64
+            protocol/server/public/webui/cmd/panel/aero-panel-linux-amd64
 
-      - name: Auto Publish GitHub Release Asset (on main)
+      - name: Auto Publish GitHub Release (on main)
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.2.0
-          name: "AERO OS v2.2.0 Official Release"
+          name: "AERO VPN Framework v2.2.0 Official Release"
           draft: false
           prerelease: false
           make_latest: true
           files: |
             protocol/server/vps/aero-edge-linux-amd64
+            protocol/server/vps/aero-edge-linux-arm64
+            protocol/server/public/webui/cmd/panel/aero-panel-linux-amd64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  build-windows:
-    name: Windows Build & Test (Client & Connect OS)
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2: Windows — Client GUI + CLI + Watchdog Guard
+  # ──────────────────────────────────────────────────────────────────────────
+  build-client-windows:
+    name: Windows Build & Test (Client GUI + CLI + Guard)
     runs-on: windows-latest
     steps:
       - name: Checkout Code
@@ -74,20 +93,78 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache: false
 
-      - name: Test & Build Protocol Client
+      - name: Vet & Test Protocol Client
         run: |
           cd protocol/client
           go vet ./...
-          go test -v ./...
-          go build -v -o aero-client.exe ./win
-          go build -v -o aero-client-cli.exe ./cli
+          go test -v -shuffle=on ./...
 
-      - name: Test & Build Connect AERO OS
+      - name: Build Client GUI (windows/amd64)
         run: |
-          cd connect/os
+          cd protocol/client
+          go build -v -ldflags="-s -w -H windowsgui" -o aero-client.exe ./win
+
+      - name: Build Client CLI (windows/amd64)
+        run: |
+          cd protocol/client
+          go build -v -ldflags="-s -w" -o aero-cli.exe ./cli
+
+      - name: Build Watchdog Guard (windows/amd64)
+        run: |
+          cd protocol/client
+          go build -v -ldflags="-s -w" -o aero-guard.exe ./win/guard
+
+      - name: Upload Windows Client Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aero-client-windows
+          path: |
+            protocol/client/aero-client.exe
+            protocol/client/aero-cli.exe
+            protocol/client/aero-guard.exe
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 3: macOS — Client GUI (aeromac) + CLI (arm64 & amd64)
+  # ──────────────────────────────────────────────────────────────────────────
+  build-client-macos:
+    name: macOS Build & Test (Client GUI + CLI)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Vet Protocol Client
+        run: |
+          cd protocol/client
           go vet ./...
-          go test -v ./...
-          go build -v -o aero-os.exe ./win
+
+      - name: Build Client GUI (aeromac arm64 & amd64)
+        run: |
+          cd protocol/client
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aeromac-arm64 ./mac
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aeromac-amd64 ./mac
+
+      - name: Build Client CLI (darwin arm64 & amd64)
+        run: |
+          cd protocol/client
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aero-cli-darwin-arm64 ./cli
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aero-cli-darwin-amd64 ./cli
+
+      - name: Upload macOS Client Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aero-client-macos
+          path: |
+            protocol/client/aeromac-arm64
+            protocol/client/aeromac-amd64
+            protocol/client/aero-cli-darwin-arm64
+            protocol/client/aero-cli-darwin-amd64

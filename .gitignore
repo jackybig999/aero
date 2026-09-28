@@ -1,5 +1,5 @@
 # ==============================================================================
-# AIsys Unified .gitignore
+# AERO Unified .gitignore
 # ==============================================================================
 
 # OS & Editor
@@ -18,11 +18,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Binaries & Executables (preserve required embedded wintun.dll)
+# Binaries & Executables
 *.exe
 *.exe~
 *.dll
-!protocol/client/win/wintun.dll
 *.so
 *.dylib
 
@@ -61,7 +60,6 @@ platform.exe
 # Go Test Artifacts
 *.test
 __debug_bin*
-sub/vpn/vpn/
 /dist/
 /build/dist/
 
@@ -70,10 +68,12 @@ sub/vpn/vpn/
 *.db-shm
 *.db-wal
 
-# Private subsystems (Strictly excluded from public repo)
-sub/
-connect/
+# Private subsystems (Strictly excluded from public repo — root-anchored)
+/sub/
+/connect/
 AERO_OS_FRAMEWORK_SPEC.md
 plan.md
 
-
+# Embedded assets whitelist (Required for //go:embed)
+!protocol/client/win/wintun.dll
+!protocol/client/public/assets/wintun.dll
