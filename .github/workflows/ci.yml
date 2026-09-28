@@ -188,13 +188,13 @@ jobs:
       - name: Build Android Client (arm64 CLI & Mobile Core)
         run: |
           cd protocol/client
-          GOOS=android GOARCH=arm64 go build -v -ldflags="-s -w" -o aero-cli-android-arm64 ./cli
-          GOOS=android GOARCH=arm64 go build -v ./mobile
+          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -v -ldflags="-s -w" -o aero-cli-android-arm64 ./cli
+          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -v ./mobile
 
       - name: Build iOS Client (Mobile Core)
         run: |
           cd protocol/client
-          GOOS=ios GOARCH=arm64 go build -v ./mobile
+          CGO_ENABLED=0 GOOS=ios GOARCH=arm64 go build -v ./mobile
 
       - name: Build gomobile SDK Bindings (AeroKit.aar & AeroKit.xcframework)
         run: |
@@ -211,8 +211,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: aero-client-mobile
+          if-no-files-found: warn
           path: |
             protocol/client/aero-cli-android-arm64
-            protocol/client/dist/mobile/AeroKit.aar
-            protocol/client/dist/mobile/AeroKit.xcframework
+            protocol/client/dist/mobile/**
 
