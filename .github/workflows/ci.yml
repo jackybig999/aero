@@ -55,6 +55,12 @@ jobs:
             -ldflags="-s -w" \
             -o aero-panel-linux-amd64 .
 
+      - name: Verify Mobile Cross-Compilation (Android & iOS arm64)
+        run: |
+          cd protocol/client
+          GOOS=android GOARCH=arm64 go build -v ./mobile
+          GOOS=ios GOARCH=arm64 go build -v ./mobile
+
       - name: Upload Server Artifacts
         uses: actions/upload-artifact@v4
         with:
