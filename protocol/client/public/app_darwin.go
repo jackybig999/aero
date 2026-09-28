@@ -49,6 +49,7 @@ func runAppShell(uiURL string) error {
 func ensureSingleInstance() bool { return true }
 func restoreExistingAERO()       {}
 func hookTrayWindowClick()       {}
+func hookTrayLeftClick(func())   {}
 func ensureWintunDLL() error     { return nil }
 func startCrashGuard()           {}
 func stopCrashGuard()            {}

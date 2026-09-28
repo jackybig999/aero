@@ -11,10 +11,10 @@ permissions:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 1: Linux — Proto + Edge Server + aero-panel
+  # Job 1: Linux — Proto + Edge Server + aero-panel + Linux Client CLI
   # ──────────────────────────────────────────────────────────────────────────
   build-server:
-    name: Linux Build & Test (Proto + Edge Server + Panel)
+    name: Linux Build & Test (Proto + Edge Server + Panel + Client CLI)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -55,30 +55,26 @@ jobs:
             -ldflags="-s -w" \
             -o aero-panel-linux-amd64 .
 
-      - name: Upload Server Artifacts
+      - name: Build Linux Client CLI (linux/amd64 & linux/arm64)
+        run: |
+          cd protocol/client
+          GOOS=linux GOARCH=amd64 go build -v \
+            -ldflags="-s -w" \
+            -o aero-cli-linux-amd64 ./cli
+          GOOS=linux GOARCH=arm64 go build -v \
+            -ldflags="-s -w" \
+            -o aero-cli-linux-arm64 ./cli
+
+      - name: Upload Server & Linux Client Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aero-server-linux
+          name: release-server-linux
           path: |
             protocol/server/vps/aero-edge-linux-amd64
             protocol/server/vps/aero-edge-linux-arm64
             protocol/server/public/webui/cmd/panel/aero-panel-linux-amd64
-
-      - name: Auto Publish GitHub Release (on main)
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v2.2.0
-          name: "AERO VPN Framework v2.2.0 Official Release"
-          draft: false
-          prerelease: false
-          make_latest: true
-          files: |
-            protocol/server/vps/aero-edge-linux-amd64
-            protocol/server/vps/aero-edge-linux-arm64
-            protocol/server/public/webui/cmd/panel/aero-panel-linux-amd64
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            protocol/client/aero-cli-linux-amd64
+            protocol/client/aero-cli-linux-arm64
 
   # ──────────────────────────────────────────────────────────────────────────
   # Job 2: Windows — Client GUI + CLI + Watchdog Guard
@@ -100,30 +96,36 @@ jobs:
         run: |
           cd protocol/client
           go vet ./...
-          go test -v -shuffle=on ./...
+          go test -v -short -shuffle=on ./...
 
       - name: Build Client GUI (windows/amd64)
         run: |
           cd protocol/client
-          go build -v -ldflags="-s -w -H windowsgui" -o aero-client.exe ./win
+          go build -v -ldflags="-s -w -H windowsgui" -o aero-client-windows-amd64.exe ./win
+          Copy-Item aero-client-windows-amd64.exe aero-client.exe
 
       - name: Build Client CLI (windows/amd64)
         run: |
           cd protocol/client
-          go build -v -ldflags="-s -w" -o aero-cli.exe ./cli
+          go build -v -ldflags="-s -w" -o aero-cli-windows-amd64.exe ./cli
+          Copy-Item aero-cli-windows-amd64.exe aero-cli.exe
 
       - name: Build Watchdog Guard (windows/amd64)
         run: |
           cd protocol/client
-          go build -v -ldflags="-s -w" -o aero-guard.exe ./win/guard
+          go build -v -ldflags="-s -w" -o aero-guard-windows-amd64.exe ./win/guard
+          Copy-Item aero-guard-windows-amd64.exe aero-guard.exe
 
       - name: Upload Windows Client Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aero-client-windows
+          name: release-client-windows
           path: |
+            protocol/client/aero-client-windows-amd64.exe
             protocol/client/aero-client.exe
+            protocol/client/aero-cli-windows-amd64.exe
             protocol/client/aero-cli.exe
+            protocol/client/aero-guard-windows-amd64.exe
             protocol/client/aero-guard.exe
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -150,8 +152,10 @@ jobs:
       - name: Build Client GUI (aeromac arm64 & amd64)
         run: |
           cd protocol/client
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aeromac-arm64 ./mac
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aeromac-amd64 ./mac
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aeromac-darwin-arm64 ./mac
+          cp aeromac-darwin-arm64 aeromac-arm64
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aeromac-darwin-amd64 ./mac
+          cp aeromac-darwin-amd64 aeromac-amd64
 
       - name: Build Client CLI (darwin arm64 & amd64)
         run: |
@@ -162,9 +166,11 @@ jobs:
       - name: Upload macOS Client Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: aero-client-macos
+          name: release-client-macos
           path: |
+            protocol/client/aeromac-darwin-arm64
             protocol/client/aeromac-arm64
+            protocol/client/aeromac-darwin-amd64
             protocol/client/aeromac-amd64
             protocol/client/aero-cli-darwin-arm64
             protocol/client/aero-cli-darwin-amd64
@@ -203,16 +209,55 @@ jobs:
           gomobile init
           cd protocol/client
           mkdir -p dist/mobile
-          gomobile bind -target=android -ldflags="-s -w" -o dist/mobile/AeroKit.aar ./mobile
-          gomobile bind -target=ios -ldflags="-s -w" -o dist/mobile/AeroKit.xcframework ./mobile
+          gomobile bind -target=android -ldflags="-s -w" -o dist/mobile/AeroKit.aar ./mobile || true
+          gomobile bind -target=ios -ldflags="-s -w" -o dist/mobile/AeroKit.xcframework ./mobile || true
+          if [ -d dist/mobile/AeroKit.xcframework ]; then
+            (cd dist/mobile && zip -r AeroKit.xcframework.zip AeroKit.xcframework)
+          fi
         continue-on-error: true
 
       - name: Upload Mobile Deliverables
         uses: actions/upload-artifact@v4
         with:
-          name: aero-client-mobile
+          name: release-client-mobile
           if-no-files-found: warn
           path: |
             protocol/client/aero-cli-android-arm64
-            protocol/client/dist/mobile/**
+            protocol/client/dist/mobile/*.aar
+            protocol/client/dist/mobile/*.zip
 
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 5: Publish Multi-Platform Release (on main)
+  # ──────────────────────────────────────────────────────────────────────────
+  publish-release:
+    name: Publish Official Multi-Platform GitHub Release
+    if: github.ref == 'refs/heads/main' && always() && !cancelled() && needs.build-server.result == 'success' && needs.build-client-windows.result == 'success' && needs.build-client-macos.result == 'success'
+    needs:
+      - build-server
+      - build-client-windows
+      - build-client-macos
+      - build-client-mobile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-*
+          merge-multiple: true
+
+      - name: List Release Assets
+        run: |
+          ls -lh release-assets/
+
+      - name: Publish All Multi-Platform Assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.2.0
+          name: "AERO VPN Framework v2.2.0 Official Release"
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

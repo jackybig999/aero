@@ -8,6 +8,9 @@ import (
 )
 
 func TestLiveDualVPS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live VPS test in short mode")
+	}
 	targets := []struct {
 		addr string
 		sni  string
