@@ -3,8 +3,10 @@
 package public
 
 import (
-	webview "github.com/webview/webview_go"
 	"log"
+	"os/exec"
+
+	webview "github.com/webview/webview_go"
 )
 
 // -----------------------------------------------------------------------------
@@ -22,6 +24,15 @@ func runNativeWindow(uiURL string) error {
 	w.Run()
 	return nil
 }
+
+func openSystemBrowser(uiURL string) error {
+	cmd := exec.Command("open", uiURL)
+	return cmd.Start()
+}
+
+func ensureWintun() {}
+
+func hideConsole(cmd *exec.Cmd) {}
 
 func nativeAlert(title, body string) {
 	log.Printf("[UI] %s: %s", title, body)
