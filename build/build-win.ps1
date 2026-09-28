@@ -8,9 +8,9 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
 $LdFlags = "-s -w"
 
-Write-Host "==> [1/3] Building aero-client.exe..." -ForegroundColor Cyan
+Write-Host "==> [1/3] Building aero-client.exe (GUI)..." -ForegroundColor Cyan
 Push-Location (Join-Path $Root "protocol\client")
-go build -ldflags $LdFlags -o (Join-Path $Dist "aero-client.exe") .\win
+go build -ldflags "-s -w -H windowsgui" -o (Join-Path $Dist "aero-client.exe") .\win
 Pop-Location
 
 Write-Host "==> [2/3] Building aero-cli.exe..." -ForegroundColor Cyan
