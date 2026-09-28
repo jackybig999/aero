@@ -55,12 +55,6 @@ jobs:
             -ldflags="-s -w" \
             -o aero-panel-linux-amd64 .
 
-      - name: Verify Mobile Cross-Compilation (Android & iOS arm64)
-        run: |
-          cd protocol/client
-          GOOS=android GOARCH=arm64 go build -v ./mobile
-          GOOS=ios GOARCH=arm64 go build -v ./mobile
-
       - name: Upload Server Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -174,3 +168,51 @@ jobs:
             protocol/client/aeromac-amd64
             protocol/client/aero-cli-darwin-arm64
             protocol/client/aero-cli-darwin-amd64
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 4: Mobile — Android & iOS Client CLI + Mobile SDK (AeroKit)
+  # ──────────────────────────────────────────────────────────────────────────
+  build-client-mobile:
+    name: Mobile Build & Test (Android + iOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Build Android Client (arm64 CLI & Mobile Core)
+        run: |
+          cd protocol/client
+          GOOS=android GOARCH=arm64 go build -v -ldflags="-s -w" -o aero-cli-android-arm64 ./cli
+          GOOS=android GOARCH=arm64 go build -v ./mobile
+
+      - name: Build iOS Client (Mobile Core)
+        run: |
+          cd protocol/client
+          GOOS=ios GOARCH=arm64 go build -v ./mobile
+
+      - name: Build gomobile SDK Bindings (AeroKit.aar & AeroKit.xcframework)
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+          cd protocol/client
+          mkdir -p dist/mobile
+          gomobile bind -target=android -ldflags="-s -w" -o dist/mobile/AeroKit.aar ./mobile
+          gomobile bind -target=ios -ldflags="-s -w" -o dist/mobile/AeroKit.xcframework ./mobile
+        continue-on-error: true
+
+      - name: Upload Mobile Deliverables
+        uses: actions/upload-artifact@v4
+        with:
+          name: aero-client-mobile
+          path: |
+            protocol/client/aero-cli-android-arm64
+            protocol/client/dist/mobile/AeroKit.aar
+            protocol/client/dist/mobile/AeroKit.xcframework
+

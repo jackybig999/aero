@@ -1,3 +1,5 @@
+//go:build windows
+
 // aero-guard: detached watchdog for Windows. If aerowin/aero-ech dies (crash, taskkill, cmd closed),
 // restore Windows network so proxy or TUN leftovers cannot blackhole the PC.
 // Does not touch third-party adapters (sing-box / Clash).
