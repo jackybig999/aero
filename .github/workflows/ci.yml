@@ -40,41 +40,37 @@ jobs:
 
       - name: Build Edge Server (linux/amd64 & linux/arm64)
         run: |
+          mkdir -p dist/server
           cd protocol/server/vps
           GOOS=linux GOARCH=amd64 go build -v \
-            -ldflags="-s -w -X main.Version=${{ github.ref_name }}" \
-            -o aerosys-server-linux-amd64 .
+            -ldflags="-s -w" \
+            -o ../../../dist/server/aerosys-server-linux-amd64 .
           GOOS=linux GOARCH=arm64 go build -v \
-            -ldflags="-s -w -X main.Version=${{ github.ref_name }}" \
-            -o aerosys-server-linux-arm64 .
+            -ldflags="-s -w" \
+            -o ../../../dist/server/aerosys-server-linux-arm64 .
 
       - name: Build Standalone VPS Panel (aerosys-panel)
         run: |
           cd protocol/server/public/webui/cmd/panel
           GOWORK=off GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o aerosys-panel-linux-amd64 .
+            -o ../../../../../../dist/server/aerosys-panel-linux-amd64 .
 
       - name: Build Linux Client CLI (linux/amd64 & linux/arm64)
         run: |
           cd protocol/client
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o aerosys-cli-linux-amd64 ./cli
+            -o ../../dist/server/aerosys-cli-linux-amd64 ./cli
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o aerosys-cli-linux-arm64 ./cli
+            -o ../../dist/server/aerosys-cli-linux-arm64 ./cli
 
       - name: Upload Server & Linux Client Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-server-linux
-          path: |
-            protocol/server/vps/aerosys-server-linux-amd64
-            protocol/server/vps/aerosys-server-linux-arm64
-            protocol/server/public/webui/cmd/panel/aerosys-panel-linux-amd64
-            protocol/client/aerosys-cli-linux-amd64
-            protocol/client/aerosys-cli-linux-arm64
+          path: dist/server/*
 
   # ──────────────────────────────────────────────────────────────────────────
   # Job 2: Windows — Client GUI + CLI + Watchdog Guard
@@ -236,9 +232,11 @@ jobs:
           pattern: release-*
           merge-multiple: true
 
-      - name: List Release Assets
+      - name: Flatten and List Release Assets
         run: |
-          ls -lh release-assets/
+          mkdir -p release-dist
+          find release-assets/ -type f -exec cp -f {} release-dist/ \;
+          ls -lh release-dist/
 
       - name: Publish All Multi-Platform Assets to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -248,6 +246,6 @@ jobs:
           draft: false
           prerelease: false
           make_latest: true
-          files: release-assets/*
+          files: release-dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
