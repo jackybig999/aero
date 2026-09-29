@@ -252,6 +252,15 @@ var (
 	lastPhysDefTime time.Time
 )
 
+// InvalidatePhysicalDefault 强制清除物理默认网卡缓存，确保 Wi-Fi 漫游后立即感知新网关
+func InvalidatePhysicalDefault() {
+	physDefMu.Lock()
+	lastPhysDef = ipv4Default{}
+	lastPhysDefIdx = ""
+	lastPhysDefTime = time.Time{}
+	physDefMu.Unlock()
+}
+
 func livePhysicalDefault() (ipv4Default, string, error) {
 	physDefMu.Lock()
 	if time.Since(lastPhysDefTime) < 1*time.Second && lastPhysDef.gw != "" {

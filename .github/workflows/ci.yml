@@ -43,38 +43,38 @@ jobs:
           cd protocol/server/vps
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w -X main.Version=${{ github.ref_name }}" \
-            -o aero-edge-linux-amd64 .
+            -o aerosys-server-linux-amd64 .
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w -X main.Version=${{ github.ref_name }}" \
-            -o aero-edge-linux-arm64 .
+            -o aerosys-server-linux-arm64 .
 
-      - name: Build Standalone VPS Panel (aero-panel)
+      - name: Build Standalone VPS Panel (aerosys-panel)
         run: |
           cd protocol/server/public/webui/cmd/panel
           GOWORK=off GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o aero-panel-linux-amd64 .
+            -o aerosys-panel-linux-amd64 .
 
       - name: Build Linux Client CLI (linux/amd64 & linux/arm64)
         run: |
           cd protocol/client
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o aero-cli-linux-amd64 ./cli
+            -o aerosys-cli-linux-amd64 ./cli
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o aero-cli-linux-arm64 ./cli
+            -o aerosys-cli-linux-arm64 ./cli
 
       - name: Upload Server & Linux Client Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-server-linux
           path: |
-            protocol/server/vps/aero-edge-linux-amd64
-            protocol/server/vps/aero-edge-linux-arm64
-            protocol/server/public/webui/cmd/panel/aero-panel-linux-amd64
-            protocol/client/aero-cli-linux-amd64
-            protocol/client/aero-cli-linux-arm64
+            protocol/server/vps/aerosys-server-linux-amd64
+            protocol/server/vps/aerosys-server-linux-arm64
+            protocol/server/public/webui/cmd/panel/aerosys-panel-linux-amd64
+            protocol/client/aerosys-cli-linux-amd64
+            protocol/client/aerosys-cli-linux-arm64
 
   # ──────────────────────────────────────────────────────────────────────────
   # Job 2: Windows — Client GUI + CLI + Watchdog Guard
@@ -101,35 +101,29 @@ jobs:
       - name: Build Client GUI (windows/amd64)
         run: |
           cd protocol/client
-          go build -v -ldflags="-s -w -H windowsgui" -o aero-client-windows-amd64.exe ./win
-          Copy-Item aero-client-windows-amd64.exe aero-client.exe
+          go build -v -ldflags="-s -w -H windowsgui" -o aerosys-client-windows-amd64.exe ./win
 
       - name: Build Client CLI (windows/amd64)
         run: |
           cd protocol/client
-          go build -v -ldflags="-s -w" -o aero-cli-windows-amd64.exe ./cli
-          Copy-Item aero-cli-windows-amd64.exe aero-cli.exe
+          go build -v -ldflags="-s -w" -o aerosys-cli-windows-amd64.exe ./cli
 
       - name: Build Watchdog Guard (windows/amd64)
         run: |
           cd protocol/client
-          go build -v -ldflags="-s -w" -o aero-guard-windows-amd64.exe ./win/guard
-          Copy-Item aero-guard-windows-amd64.exe aero-guard.exe
+          go build -v -ldflags="-s -w" -o aerosys-guard-windows-amd64.exe ./win/guard
 
       - name: Upload Windows Client Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-client-windows
           path: |
-            protocol/client/aero-client-windows-amd64.exe
-            protocol/client/aero-client.exe
-            protocol/client/aero-cli-windows-amd64.exe
-            protocol/client/aero-cli.exe
-            protocol/client/aero-guard-windows-amd64.exe
-            protocol/client/aero-guard.exe
+            protocol/client/aerosys-client-windows-amd64.exe
+            protocol/client/aerosys-cli-windows-amd64.exe
+            protocol/client/aerosys-guard-windows-amd64.exe
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 3: macOS — Client GUI (aeromac) + CLI (arm64 & amd64)
+  # Job 3: macOS — Client GUI + CLI (arm64 & amd64)
   # ──────────────────────────────────────────────────────────────────────────
   build-client-macos:
     name: macOS Build & Test (Client GUI + CLI)
@@ -149,34 +143,30 @@ jobs:
           cd protocol/client
           go vet ./...
 
-      - name: Build Client GUI (aeromac arm64 & amd64)
+      - name: Build Client GUI (mac arm64 & amd64)
         run: |
           cd protocol/client
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aeromac-darwin-arm64 ./mac
-          cp aeromac-darwin-arm64 aeromac-arm64
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aeromac-darwin-amd64 ./mac
-          cp aeromac-darwin-amd64 aeromac-amd64
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aerosys-client-mac-arm64 ./mac
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aerosys-client-mac-amd64 ./mac
 
-      - name: Build Client CLI (darwin arm64 & amd64)
+      - name: Build Client CLI (mac arm64 & amd64)
         run: |
           cd protocol/client
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aero-cli-darwin-arm64 ./cli
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aero-cli-darwin-amd64 ./cli
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aerosys-cli-mac-arm64 ./cli
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aerosys-cli-mac-amd64 ./cli
 
       - name: Upload macOS Client Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-client-macos
           path: |
-            protocol/client/aeromac-darwin-arm64
-            protocol/client/aeromac-arm64
-            protocol/client/aeromac-darwin-amd64
-            protocol/client/aeromac-amd64
-            protocol/client/aero-cli-darwin-arm64
-            protocol/client/aero-cli-darwin-amd64
+            protocol/client/aerosys-client-mac-arm64
+            protocol/client/aerosys-client-mac-amd64
+            protocol/client/aerosys-cli-mac-arm64
+            protocol/client/aerosys-cli-mac-amd64
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 4: Mobile — Android & iOS Client CLI + Mobile SDK (AeroKit)
+  # Job 4: Mobile — Android & iOS Client CLI + Mobile SDK
   # ──────────────────────────────────────────────────────────────────────────
   build-client-mobile:
     name: Mobile Build & Test (Android + iOS)
@@ -194,7 +184,7 @@ jobs:
       - name: Build Android Client (arm64 CLI & Mobile Core)
         run: |
           cd protocol/client
-          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -v -ldflags="-s -w" -o aero-cli-android-arm64 ./cli
+          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -v -ldflags="-s -w" -o aerosys-cli-android-arm64 ./cli
           CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -v ./mobile
 
       - name: Build iOS Client (Mobile Core)
@@ -202,17 +192,17 @@ jobs:
           cd protocol/client
           CGO_ENABLED=0 GOOS=ios GOARCH=arm64 go build -v ./mobile
 
-      - name: Build gomobile SDK Bindings (AeroKit.aar & AeroKit.xcframework)
+      - name: Build gomobile SDK Bindings (aerosys-android-sdk.aar & aerosys-ios-sdk.zip)
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
           gomobile init
           cd protocol/client
           mkdir -p dist/mobile
-          gomobile bind -target=android -ldflags="-s -w" -o dist/mobile/AeroKit.aar ./mobile || true
+          gomobile bind -target=android -ldflags="-s -w" -o dist/mobile/aerosys-android-sdk.aar ./mobile || true
           gomobile bind -target=ios -ldflags="-s -w" -o dist/mobile/AeroKit.xcframework ./mobile || true
           if [ -d dist/mobile/AeroKit.xcframework ]; then
-            (cd dist/mobile && zip -r AeroKit.xcframework.zip AeroKit.xcframework)
+            (cd dist/mobile && zip -r aerosys-ios-sdk.zip AeroKit.xcframework)
           fi
         continue-on-error: true
 
@@ -222,9 +212,9 @@ jobs:
           name: release-client-mobile
           if-no-files-found: warn
           path: |
-            protocol/client/aero-cli-android-arm64
-            protocol/client/dist/mobile/*.aar
-            protocol/client/dist/mobile/*.zip
+            protocol/client/aerosys-cli-android-arm64
+            protocol/client/dist/mobile/aerosys-android-sdk.aar
+            protocol/client/dist/mobile/aerosys-ios-sdk.zip
 
   # ──────────────────────────────────────────────────────────────────────────
   # Job 5: Publish Multi-Platform Release (on main)
@@ -253,8 +243,8 @@ jobs:
       - name: Publish All Multi-Platform Assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.2.0
-          name: "AERO VPN Framework v2.2.0 Official Release"
+          tag_name: v1.0.0
+          name: "AEROSYS v1.0.0 Official Release"
           draft: false
           prerelease: false
           make_latest: true

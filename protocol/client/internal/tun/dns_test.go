@@ -59,10 +59,34 @@ func TestDNSHandler_EdgeNodeProtection(t *testing.T) {
 func TestDNSHandler_NCSIBypass(t *testing.T) {
 	h := NewDNSHandler([]string{"223.5.5.5"})
 
-	query := buildDNSQueryPacket("www.msftconnecttest.com", 0x0001)
-	resp := h.HandleQuery(query, net.ParseIP("127.0.0.1"), 12345)
-	if resp != nil {
-		t.Fatalf("Expected NCSI domain to return nil (passthrough), got response")
+	for _, domain := range []string{
+		"www.msftconnecttest.com",
+		"www.msftncsi.com",
+		"captive.apple.com",
+		"connectivitycheck.gstatic.com",
+	} {
+		query := buildDNSQueryPacket(domain, 0x0001)
+		resp := h.HandleQuery(query, net.ParseIP("127.0.0.1"), 12345)
+		if resp != nil {
+			t.Fatalf("Expected captive portal domain %s to return nil (passthrough), got response", domain)
+		}
+	}
+}
+
+func TestDNSHandler_DirectCaseInsensitive(t *testing.T) {
+	h := NewDNSHandler([]string{"223.5.5.5"})
+	h.SetSplit(&mockSplitDecider{decisions: map[string]string{
+		"baidu.com": "DIRECT", // uppercase from split.Engine
+	}})
+
+	// Query for baidu.com should attempt forwardToUpstream (bypassing Fake-IP allocation)
+	query := buildDNSQueryPacket("baidu.com", 0x0001)
+	fakeIP := NewFakeIPTable("198.18.0.0/15", 1000)
+	h.SetFakeIP(fakeIP)
+
+	_ = h.HandleQuery(query, net.ParseIP("127.0.0.1"), 12345)
+	if fakeIP.Size() != 0 {
+		t.Fatalf("DIRECT domain baidu.com must NOT be allocated in Fake-IP table! got size %d", fakeIP.Size())
 	}
 }
 

@@ -338,7 +338,7 @@ func applyConfig(cfg *config.AeroConfig) {
 }
 
 func Version() string {
-	return "aero-ech v2.0.0"
+	return "aerosys v1.0.0"
 }
 
 // startTUN 鍚姩 TUN 妯″紡寮曟搸
@@ -450,6 +450,20 @@ func startBackgroundServices() {
 		netMonitor.Start()
 		netMonitor.StartPlatformMonitor()
 		log.Printf("[MONITOR] Network monitor started")
+
+		// 睡眠/唤醒时钟跳变感知器：休眠唤醒后 8 秒以上时间跳跃立即触发 TUN 路由原子重迁
+		go func() {
+			lastTick := time.Now()
+			ticker := time.NewTicker(3 * time.Second)
+			defer ticker.Stop()
+			for t := range ticker.C {
+				if t.Sub(lastTick) > 8*time.Second {
+					log.Printf("[MONITOR] Clock jump detected (%v elapsed) - system woke from sleep/suspend", t.Sub(lastTick))
+					scheduleTUNRefresh("wake_from_sleep")
+				}
+				lastTick = t
+			}
+		}()
 
 		go runISPAndPathProbe()
 	})

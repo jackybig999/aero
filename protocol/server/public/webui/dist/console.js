@@ -1,7 +1,7 @@
 // AERO Console Native Application Script
 const $ = (id) => document.getElementById(id);
 
-const TOKEN_KEY = 'vpn_admin_token';
+const TOKEN_KEY = 'aerosys_admin_token';
 let currentVpsId = '';
 let activeTaskId = null;
 let taskPollTimer = null;

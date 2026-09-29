@@ -49,6 +49,15 @@ var (
 	lastRouteIF string
 )
 
+func getEdgeRealIP() net.IP {
+	tunMu.Lock()
+	defer tunMu.Unlock()
+	if tunEdgeIP != "" {
+		return net.ParseIP(tunEdgeIP)
+	}
+	return nil
+}
+
 // startTUNIfPossible starts Wintun global capture (admin + wintun.dll next to exe).
 // Protect the Edge host route BEFORE catch-all routes or the tunnel blackholes itself.
 
@@ -179,7 +188,12 @@ func startTUNIfPossible() error {
 	}
 	var edgeRealIP net.IP
 	if edgeHost != "" {
-		if ips, err := net.LookupIP(edgeHost); err == nil {
+		if ip := net.ParseIP(edgeHost); ip != nil {
+			if v4 := ip.To4(); v4 != nil {
+				tunEdgeIP = v4.String()
+				edgeRealIP = v4
+			}
+		} else if ips, err := net.LookupIP(edgeHost); err == nil {
 			for _, ip := range ips {
 				if v4 := ip.To4(); v4 != nil {
 					tunEdgeIP = v4.String()
@@ -277,12 +291,13 @@ var (
 )
 
 func scheduleTUNRefresh(reason string) {
+	tun.InvalidatePhysicalDefault()
 	netChangeMu.Lock()
 	defer netChangeMu.Unlock()
 	if netChangeTimer != nil {
 		netChangeTimer.Stop()
 	}
-	netChangeTimer = time.AfterFunc(500*time.Millisecond, func() {
+	netChangeTimer = time.AfterFunc(300*time.Millisecond, func() {
 		refreshTUNAfterNetChange(reason)
 	})
 }
@@ -299,11 +314,25 @@ func refreshTUNAfterNetChange(reason string) {
 	if !running {
 		return
 	}
-	gw, idx, err := tun.PhysicalDefaultGateway()
+
+	var gw, idx string
+	var err error
+	// Wi-Fi 漫游后 DHCP 分配通常需要 300ms~1.5s，进行最多 6 次自适应轮询
+	for attempt := 1; attempt <= 6; attempt++ {
+		tun.InvalidatePhysicalDefault()
+		gw, idx, err = tun.PhysicalDefaultGateway()
+		if err == nil && gw != "" && idx != "" {
+			break
+		}
+		if attempt < 6 {
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
 	if err != nil || gw == "" {
-		log.Printf("[TUN] network change (%s): no physical gw yet (%v)", reason, err)
+		log.Printf("[TUN] network change (%s): no physical gw after retries (%v)", reason, err)
 		return
 	}
+
 	tunMu.Lock()
 	same := lastRouteGW == gw && lastRouteIF == idx && lastRouteGW != ""
 	tunMu.Unlock()
@@ -318,6 +347,9 @@ func refreshTUNAfterNetChange(reason string) {
 			return
 		}
 	}
+	// 原子同步保护国内 DNS，防止 Wi-Fi 切换后 DNS 死在旧网关上
+	_ = tun.ProtectHostRoute("223.5.5.5")
+
 	if err := tun.EnsureCatchAll(devName); err != nil {
 		log.Printf("[TUN] ensure catch-all: %v", err)
 	}

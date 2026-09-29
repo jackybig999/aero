@@ -110,14 +110,14 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 	}
 
 	// 3. 分流决策：如果规则库判定为 DIRECT 直连（国内域名、.cn、各大国内厂商）
-	if h.split != nil && h.split.Decide(qname) == "direct" {
+	if h.split != nil && strings.EqualFold(h.split.Decide(qname), "direct") {
 		if resp := h.forwardToUpstream(qnameLower, pkt); resp != nil {
 			return resp
 		}
 		return nil
 	}
 
-	// 4. 国外 / 被墙域名 (PROXY / AI)
+	// 4. 国外 / 被墙域名 (PROXY / AI) 及所有未在纯国内白名单中的域名
 	// 如果是 Type AAAA (IPv6) 查询，快速返回空响应，避免客户端双栈等待 1-2 秒超时
 	if qtype == 0x001C {
 		return buildEmptyResponse(pkt, qname, qtype)
@@ -139,7 +139,9 @@ func isLocalOrSystemDomain(host string) bool {
 	h := strings.ToLower(strings.TrimSpace(host))
 	if h == "" || h == "localhost" || strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".lan") ||
 		strings.HasSuffix(h, ".internal") || strings.HasSuffix(h, ".home.arpa") ||
-		strings.HasSuffix(h, "msftconnecttest.com") || strings.HasSuffix(h, "msftncsi.com") {
+		strings.HasSuffix(h, "msftconnecttest.com") || strings.HasSuffix(h, "msftncsi.com") ||
+		strings.HasSuffix(h, "ipv6.msftncsi.com") || strings.HasSuffix(h, "captive.apple.com") ||
+		strings.HasSuffix(h, "connectivitycheck.gstatic.com") {
 		return true
 	}
 	return false
@@ -309,18 +311,22 @@ func (h *DNSHandler) queryUDP(pkt []byte) []byte {
 		if !strings.Contains(s, ":") {
 			s = net.JoinHostPort(s, "53")
 		}
-		conn, err := net.DialTimeout("udp", s, 800*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+		conn, err := DialPhysicalDirect(ctx, "udp", s)
 		if err != nil {
+			cancel()
 			continue
 		}
 		_ = conn.SetDeadline(time.Now().Add(1200 * time.Millisecond))
 		if _, err := conn.Write(pkt); err != nil {
 			conn.Close()
+			cancel()
 			continue
 		}
 		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		conn.Close()
+		cancel()
 		if err == nil && n >= 12 {
 			return buf[:n]
 		}

@@ -29,7 +29,7 @@ var sessionOn atomic.Bool
 
 var (
 	modeMu      sync.RWMutex
-	clientMode  = "sysproxy"
+	clientMode  = "tun"
 	sysProxyOn  bool
 	osRuntime   appruntime.Interface
 	cleanupOnce sync.Once
@@ -80,16 +80,19 @@ func (apiRuntime) Connect() error {
 			log.Printf("[API] TUN unavailable (%v); not falling back to sysproxy", err)
 			return err
 		}
-		log.Printf("[API] TUN up, system proxy OFF (fingerprint uses 55555 directly)")
-	case "socks":
-		stopTUN()
-		clearSysProxySafe()
-		appruntime.ApplySocksPrivacy()
-	case "", "sysproxy":
+		log.Printf("[API] TUN up, system proxy OFF (127.0.0.1:55555 resident in background)")
+	case "sysproxy":
 		stopTUN()
 		if err := enableSystemProxy(); err != nil {
 			return fmt.Errorf("系统代理接管失败: %w", err)
 		}
+	default:
+		clearSysProxySafe()
+		if err := startTUNIfPossible(); err != nil {
+			log.Printf("[API] TUN unavailable (%v)", err)
+			return err
+		}
+		log.Printf("[API] TUN up, system proxy OFF (127.0.0.1:55555 resident in background)")
 	}
 	sessionOn.Store(true)
 	return nil
@@ -98,9 +101,10 @@ func (apiRuntime) Connect() error {
 func (apiRuntime) Disconnect() error {
 	sessionOn.Store(false)
 	stopTUN()
-	stopMixedListen()
+	clearSysProxySafe()
+	// 本地模式常驻：保持 127.0.0.1:55555 混合口后台常开，供指纹浏览器/应用随时连接
 	transport.GlobalSessionPool.Reset()
-	log.Printf("[API] disconnect: TUN, mixed stopped, session pool reset, zero residual")
+	log.Printf("[API] disconnect: TUN/sysproxy stopped, mixed port 55555 resident, session pool reset")
 	return nil
 }
 

@@ -90,6 +90,8 @@ func physicalDefaultName() (gw, iface string, err error) {
 	return gw, iface, nil
 }
 
+func InvalidatePhysicalDefault() {}
+
 func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	gw, iface, err := physicalDefaultName()
 	if err != nil {

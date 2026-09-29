@@ -21,6 +21,7 @@ func ProtectHostRoute(string) error                      { return nil }
 func UnprotectHostRoute(string)                          {}
 func RefreshCatchAll(string) error                       { return nil }
 func EnsureCatchAll(string) error                        { return nil }
+func InvalidatePhysicalDefault()                         {}
 
 func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	ip, name := firstPhysicalIPv4()

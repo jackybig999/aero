@@ -29,7 +29,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.1.0"
+VERSION="1.0.0"
 REPO="jackybig999/aero"
 
 usage() {
@@ -155,21 +155,21 @@ CONF
 chmod 600 "$CONFIG_DIR/edge.conf"
 
 # --- binary: backup existing for rollback ---
-echo "[bin] install aero-edge -> $INSTALL_DIR/aero-edge"
-if [[ -f "$INSTALL_DIR/aero-edge" ]]; then
-    cp -f "$INSTALL_DIR/aero-edge" "$INSTALL_DIR/aero-edge.bak" 2>/dev/null || true
+echo "[bin] install aerosys-server -> $INSTALL_DIR/aerosys-server"
+if [[ -f "$INSTALL_DIR/aerosys-server" ]]; then
+    cp -f "$INSTALL_DIR/aerosys-server" "$INSTALL_DIR/aerosys-server.bak" 2>/dev/null || true
 fi
 
-BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/aero-edge-linux-${ARCH}"
-LATEST_URL="https://github.com/${REPO}/releases/latest/download/aero-edge-linux-${ARCH}"
+BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/aerosys-server-linux-${ARCH}"
+LATEST_URL="https://github.com/${REPO}/releases/latest/download/aerosys-server-linux-${ARCH}"
 installed_ok=0
 
 if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL "$BINARY_URL" -o "$INSTALL_DIR/aero-edge" 2>/dev/null; then
-        echo "[bin] 成功从官方 Release (v${VERSION}) 拉取二进制产物。"
+    if curl -fsSL "$BINARY_URL" -o "$INSTALL_DIR/aerosys-server" 2>/dev/null; then
+        echo "[bin] 成功从官方 Release (v${VERSION}) 拉取服务端二进制产物。"
         installed_ok=1
-    elif curl -fsSL "$LATEST_URL" -o "$INSTALL_DIR/aero-edge" 2>/dev/null; then
-        echo "[bin] 成功从官方最新 Release 拉取二进制产物。"
+    elif curl -fsSL "$LATEST_URL" -o "$INSTALL_DIR/aerosys-server" 2>/dev/null; then
+        echo "[bin] 成功从官方最新 Release 拉取服务端二进制产物。"
         installed_ok=1
     fi
 fi
@@ -182,7 +182,7 @@ if [[ "$installed_ok" -eq 0 ]]; then
             echo "[bin] 目标主机缺少 go 编译器，正在自动安装..."
             apt-get update -y && apt-get install -y golang-go >/dev/null 2>&1 || yum install -y golang >/dev/null 2>&1 || true
         fi
-        (cd "$TMP_SRC/protocol/server/vps" && go build -v -o "$INSTALL_DIR/aero-edge" .)
+        (cd "$TMP_SRC/protocol/server/vps" && go build -v -o "$INSTALL_DIR/aerosys-server" .)
         rm -rf "$TMP_SRC"
         echo "[bin] 官方公开源直接构建完成。"
         installed_ok=1
@@ -192,7 +192,8 @@ if [[ "$installed_ok" -eq 0 ]]; then
         exit 1
     fi
 fi
-chmod 755 "$INSTALL_DIR/aero-edge"
+chmod 755 "$INSTALL_DIR/aerosys-server"
+ln -sf "$INSTALL_DIR/aerosys-server" "$INSTALL_DIR/aero-edge"
 
 # --- TLS: detect → copy → issue (LE → ZeroSSL) → never self-sign ---
 need_issue=1

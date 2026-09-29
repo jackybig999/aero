@@ -55,8 +55,24 @@ func currentEdgeSNI() string {
 // dialQUIC 建立 QUIC 连接并打开双向流（复用全局持久 SessionPool）
 func dialQUIC(ctx context.Context, target string) (net.Conn, error) {
 	_ = target
-	cfg := transport.DefaultQUICConfig(*edgeAddr, *publicName)
-	cfg.TLSConfig = transport.BuildClientConfig(*publicName)
+	currAddr := ""
+	if edgeAddr != nil {
+		currAddr = *edgeAddr
+	}
+	dialAddr := currAddr
+	sni := currentEdgeSNI()
+
+	// 节点 IP 内存死钉：若已知节点的物理真实 IP，直接将 IP:Port 传给底层 QUIC 拨号器
+	// 彻底杜绝在网络漫游 / Wi-Fi 切换过程中调用系统 getaddrinfow 产生死锁黑洞
+	if rip := getEdgeRealIP(); rip != nil && rip.To4() != nil && currAddr != "" {
+		_, port, err := net.SplitHostPort(currAddr)
+		if err == nil && port != "" {
+			dialAddr = net.JoinHostPort(rip.String(), port)
+		}
+	}
+
+	cfg := transport.DefaultQUICConfig(dialAddr, sni)
+	cfg.TLSConfig = transport.BuildClientConfig(sni)
 	cfg.TLSConfig.NextProtos = []string{"h3"}
 
 	client, err := transport.GlobalSessionPool.Get(ctx, cfg)
@@ -66,7 +82,10 @@ func dialQUIC(ctx context.Context, target string) (net.Conn, error) {
 
 	stream, err := client.OpenStreamAsync(ctx)
 	if err != nil {
-		transport.GlobalSessionPool.Remove(*edgeAddr)
+		transport.GlobalSessionPool.Remove(dialAddr)
+		if currAddr != "" && currAddr != dialAddr {
+			transport.GlobalSessionPool.Remove(currAddr)
+		}
 		return nil, err
 	}
 

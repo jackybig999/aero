@@ -47,7 +47,7 @@ func RunApp() {
 	enginePaused.Store(false)
 	sessionOn.Store(false)
 	modeMu.Lock()
-	clientMode = "socks"
+	clientMode = "tun"
 	modeMu.Unlock()
 
 	defer cleanupOnExit()
@@ -79,9 +79,9 @@ func RunApp() {
 		st.Connected = false
 		st.Listen = *listenAddr
 		st.HTTPListen = *listenAddr
-		st.Mode = "socks"
+		st.Mode = "tun"
 		st.Protocol = "aero/2.0"
-		st.Version = "aeroapp"
+		st.Version = "aerosys v1.0.0"
 		if *subURL != "" {
 			st.SubURL = *subURL
 		}
@@ -94,7 +94,7 @@ func RunApp() {
 	defer apiSrv.Stop()
 	setAPIServer(apiSrv)
 
-	if m := strings.ToLower(strings.TrimSpace(*initMode)); m == "tun" || m == "sysproxy" || m == "socks" {
+	if m := strings.ToLower(strings.TrimSpace(*initMode)); m == "tun" || m == "sysproxy" {
 		modeMu.Lock()
 		clientMode = m
 		modeMu.Unlock()

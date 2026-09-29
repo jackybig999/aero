@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#0c111c" />
-    <title>AERO</title>
+    <title>AEROSYS</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
@@ -13,7 +13,7 @@
         <div class="brand">
           <span class="logo">A</span>
           <div>
-            <h1>AERO</h1>
+            <h1>AEROSYS</h1>
             <p class="hint" data-i18n="tagline">本地口已开</p>
           </div>
         </div>
@@ -108,23 +108,23 @@
         </div>
       </section>
 
-      <!-- 代理接管模式选择：仅提供系统代理与 TUN 接管选项；未选择即默认纯本地 55555 专线 -->
+      <!-- 代理接管模式选择：仅提供 TUN 与系统代理两种接管选项；本地 55555 专线常驻 -->
       <section class="card">
         <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;">
-          <span data-i18n="mode">代理接管</span>
-          <span style="font-size:10px;color:var(--muted)">未勾选即纯本地 55555</span>
+          <span data-i18n="mode">接管模式</span>
+          <span style="font-size:10px;color:var(--muted)">127.0.0.1:55555 本地常驻</span>
         </div>
         <div class="mode-row">
+          <label class="mode selected" data-mode="tun">
+            <input type="radio" name="mode" value="tun" checked />
+            <b>TUN 全局模式</b>
+          </label>
           <label class="mode" data-mode="sysproxy">
             <input type="radio" name="mode" value="sysproxy" />
-            <b data-i18n="modeSys">系统代理</b>
-          </label>
-          <label class="mode" data-mode="tun">
-            <input type="radio" name="mode" value="tun" />
-            <b>TUN</b>
+            <b data-i18n="modeSys">系统代理模式</b>
           </label>
         </div>
-        <p id="modeTip" class="muted" data-i18n="tipZero">未启用接管，仅 55555 端口就绪，指纹浏览器专用</p>
+        <p id="modeTip" class="muted">TUN 虚拟网卡驱动接管全局流量 (零改动系统注册表)</p>
       </section>
 
       <!-- 状态指示条（紧凑精炼） -->

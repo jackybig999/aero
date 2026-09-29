@@ -28,21 +28,19 @@ function applyI18n() {
 }
 
 function productMode(mode) {
-  if (mode === 'tun') return 'tun'
   if (mode === 'sysproxy') return 'sysproxy'
-  return 'socks' // 纯本地 55555 专线 (默认)
+  return 'tun' // 默认 TUN 全局模式 (零改动系统注册表)
 }
 
 function modeLabel(mode) {
   const m = productMode(mode)
-  if (m === 'tun') return 'TUN 全局模式'
   if (m === 'sysproxy') return '系统代理模式'
-  return '纯本地 55555'
+  return 'TUN 全局模式'
 }
 
 function selectedMode() {
   const el = document.querySelector('input[name="mode"]:checked')
-  return productMode(el ? el.value : 'socks')
+  return productMode(el ? el.value : 'tun')
 }
 
 function paintModeCards() {
@@ -52,9 +50,8 @@ function paintModeCards() {
   })
   const tip = $('modeTip')
   if (!tip) return
-  if (cur === 'tun') tip.textContent = t('tipTun') || 'TUN 虚拟网卡已接管整机流量'
+  if (cur === 'tun') tip.textContent = t('tipTun') || 'TUN 虚拟网卡驱动接管全局流量 (零改动系统注册表)'
   else if (cur === 'sysproxy') tip.textContent = t('tipSys') || '系统代理已接管浏览器，流量走 55555'
-  else tip.textContent = t('tipZero') || '未启用接管，仅 55555 端口就绪，指纹浏览器专用'
 }
 
 function setModeUI(mode) {
