@@ -257,6 +257,9 @@ func TestMasterSystem_ChinaDirect_Bypass(t *testing.T) {
 
 // 5. Windows 平台纯内存 WinINET 模式防流氓注册表测试
 func TestMasterSystem_WindowsSystemProxy_MemoryOnly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-only test")
 	}
