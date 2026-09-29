@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -42,11 +43,27 @@ func DefaultConfig(addr, sni string) *TransportConfig {
 	}
 }
 
+// PacketConnFactory creates a net.PacketConn for QUIC outbounds (e.g. pinned to physical NIC)
+type PacketConnFactory func(ctx context.Context, network string) (net.PacketConn, error)
+
+var (
+	globalPacketConnFactory PacketConnFactory
+	factoryMu               sync.RWMutex
+)
+
+// SetPacketConnFactory 注册底层物理接口绑定的 UDP Socket 工厂函数
+func SetPacketConnFactory(f PacketConnFactory) {
+	factoryMu.Lock()
+	defer factoryMu.Unlock()
+	globalPacketConnFactory = f
+}
+
 // Client QUIC 客户端
 type Client struct {
-	conn   *quic.Conn
-	stream *quic.Stream
-	config *TransportConfig
+	conn       *quic.Conn
+	stream     *quic.Stream
+	config     *TransportConfig
+	lastActive atomic.Int64 // unix milli
 }
 
 var (
@@ -87,25 +104,56 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 		InitialPacketSize:       1350,             // 限制单包尺寸，杜绝跨洋公网 IP 分片丢包
 	}
 
-	var conn *quic.Conn
-	var err error
-	if cfg.Enable0RTT {
-		conn, err = quic.DialAddrEarly(ctx, cfg.Address, cfg.TLSConfig, quicConfig)
-	} else {
-		conn, err = quic.DialAddr(ctx, cfg.Address, cfg.TLSConfig, quicConfig)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("quic dial %s: %w", cfg.Address, err)
+	var pconn net.PacketConn
+	factoryMu.RLock()
+	factory := globalPacketConnFactory
+	factoryMu.RUnlock()
+
+	if factory != nil {
+		if pc, perr := factory(ctx, "udp4"); perr == nil {
+			pconn = pc
+		}
 	}
 
-	return &Client{
+	var conn *quic.Conn
+	var err error
+	if pconn != nil {
+		udpAddr, rerr := net.ResolveUDPAddr("udp", cfg.Address)
+		if rerr != nil {
+			_ = pconn.Close()
+			return nil, fmt.Errorf("resolve quic addr %s: %w", cfg.Address, rerr)
+		}
+		if cfg.Enable0RTT {
+			conn, err = quic.DialEarly(ctx, pconn, udpAddr, cfg.TLSConfig, quicConfig)
+		} else {
+			conn, err = quic.Dial(ctx, pconn, udpAddr, cfg.TLSConfig, quicConfig)
+		}
+		if err != nil {
+			_ = pconn.Close()
+			return nil, fmt.Errorf("quic dial %s: %w", cfg.Address, err)
+		}
+	} else {
+		if cfg.Enable0RTT {
+			conn, err = quic.DialAddrEarly(ctx, cfg.Address, cfg.TLSConfig, quicConfig)
+		} else {
+			conn, err = quic.DialAddr(ctx, cfg.Address, cfg.TLSConfig, quicConfig)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("quic dial %s: %w", cfg.Address, err)
+		}
+	}
+
+	client := &Client{
 		conn:   conn,
 		config: cfg,
-	}, nil
+	}
+	client.lastActive.Store(time.Now().UnixMilli())
+	return client, nil
 }
 
 // OpenStream 打开新的双向流（类似 TCP 连接）
 func (c *Client) OpenStream() (io.ReadWriteCloser, error) {
+	c.lastActive.Store(time.Now().UnixMilli())
 	stream, err := c.conn.OpenStreamSync(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("open stream: %w", err)
@@ -115,6 +163,7 @@ func (c *Client) OpenStream() (io.ReadWriteCloser, error) {
 
 // OpenStreamAsync 异步打开流
 func (c *Client) OpenStreamAsync(ctx context.Context) (io.ReadWriteCloser, error) {
+	c.lastActive.Store(time.Now().UnixMilli())
 	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open stream: %w", err)
@@ -258,8 +307,14 @@ func (p *SessionPool) Get(ctx context.Context, cfg *TransportConfig) (*Client, e
 	p.mu.Lock()
 	c, ok := p.clients[cfg.Address]
 	if ok && c != nil && c.conn != nil && c.conn.Context().Err() == nil {
-		p.mu.Unlock()
-		return c, nil
+		last := c.lastActive.Load()
+		if last > 0 && time.Since(time.UnixMilli(last)) <= 45*time.Second {
+			p.mu.Unlock()
+			return c, nil
+		}
+		// 若距上次通信已超 45 秒（服务端空闲超时通常为 60s），判定为休眠挂起陈旧连接，主动剔除并重新极速建连
+		_ = c.Close()
+		delete(p.clients, cfg.Address)
 	}
 	p.mu.Unlock()
 

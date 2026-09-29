@@ -254,6 +254,7 @@ func startTUNIfPossible() error {
 	if edgeHost != "" && edgeRealIP != nil {
 		eng.SetEdge(edgeHost, edgeRealIP)
 	}
+	transport.SetPacketConnFactory(tun.ListenPhysicalPacket)
 	tunDev = dev
 	tunEngine = eng
 	tunRunning = true
@@ -398,6 +399,7 @@ func stopTUN() {
 	}
 	quietFirewall("delete", "AERO-NoIPv6")
 	quietFirewall("delete", "AERO-WebRTC-Shield")
+	transport.SetPacketConnFactory(nil)
 	log.Printf("[TUN] stopped cleanly, zero residual")
 }
 

@@ -168,3 +168,19 @@ func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, er
 	}
 	return dialer.DialContext(ctx, network, addr)
 }
+
+// ListenPhysicalPacket 绑定 Linux 物理网络适配器（SO_BINDTODEVICE），100% 绕过 TUN 路由表发包
+func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, error) {
+	_, ifaceName, err := PhysicalDefaultGateway()
+	var lc net.ListenConfig
+	if err == nil && ifaceName != "" {
+		lc.Control = func(netw, address string, c syscall.RawConn) error {
+			var opErr error
+			_ = c.Control(func(fd uintptr) {
+				opErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifaceName)
+			})
+			return opErr
+		}
+	}
+	return lc.ListenPacket(ctx, network, ":0")
+}

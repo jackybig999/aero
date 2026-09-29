@@ -215,15 +215,11 @@ func parseIPv4Defaults(routePrint string) []ipv4Default {
 			continue
 		}
 		cand := fields[2]
-		if net.ParseIP(cand) == nil || strings.HasPrefix(cand, "10.88.") || strings.HasPrefix(cand, "169.254.") {
+		if net.ParseIP(cand) == nil || IsTUNIPv4(cand) {
 			continue
 		}
 		ip := net.ParseIP(fields[3])
-		if ip == nil || ip.To4() == nil {
-			continue
-		}
-		v4 := ip.To4()
-		if v4[0] == 169 && v4[1] == 254 {
+		if ip == nil || ip.To4() == nil || IsTUNIPv4(ip.String()) {
 			continue
 		}
 		metric := 9999
@@ -419,4 +415,24 @@ func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, er
 		}
 	}
 	return dialer.DialContext(ctx, network, addr)
+}
+
+// ListenPhysicalPacket 绑定 Windows 物理网络适配器（IP_UNICAST_IF），100% 绕过 TUN 路由表发包
+func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, error) {
+	_, idxStr, err := PhysicalDefaultGateway()
+	var lc net.ListenConfig
+	if err == nil && idxStr != "" {
+		if idx, err := strconv.Atoi(idxStr); err == nil && idx > 0 {
+			lc.Control = func(netw, address string, c syscall.RawConn) error {
+				var opErr error
+				_ = c.Control(func(fd uintptr) {
+					var buf [4]byte
+					binary.BigEndian.PutUint32(buf[:], uint32(idx))
+					opErr = syscall.Setsockopt(syscall.Handle(fd), syscall.IPPROTO_IP, 31, (*byte)(unsafe.Pointer(&buf[0])), 4)
+				})
+				return opErr
+			}
+		}
+	}
+	return lc.ListenPacket(ctx, network, ":0")
 }

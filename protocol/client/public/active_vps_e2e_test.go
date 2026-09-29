@@ -33,12 +33,12 @@ func TestLiveProxy_ActiveVPS_E2E(t *testing.T) {
 	testPort := ln.Addr().String()
 	*listenAddr = testPort
 
-	// 2. 注入当前健康在线的 VPS 节点
+	// 2. 注入当前真实存活的 VPS 节点 (myconsun.de5.net:443)
 	vpsOnline := edgepool.ServerConfig{
-		Name:     "VPS-Online (cc.cd)",
-		Address:  "myconsun.cc.cd:443",
-		Token:    "aero_080381bf99afebe5bab9a5c92e84a59d",
-		SNI:      "myconsun.cc.cd",
+		Name:     "VPS-Online (de5)",
+		Address:  "myconsun.de5.net:443",
+		Token:    "tok_colo",
+		SNI:      "myconsun.de5.net",
 		Protocol: "quic",
 	}
 

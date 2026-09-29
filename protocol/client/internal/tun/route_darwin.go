@@ -173,3 +173,21 @@ func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, er
 	}
 	return dialer.DialContext(ctx, network, addr)
 }
+
+// ListenPhysicalPacket 绑定 Darwin 物理网络适配器（IP_BOUND_IF），100% 绕过 TUN 路由表发包
+func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, error) {
+	_, ifaceName, err := PhysicalDefaultGateway()
+	var lc net.ListenConfig
+	if err == nil && ifaceName != "" {
+		if ifi, err := net.InterfaceByName(ifaceName); err == nil && ifi != nil {
+			lc.Control = func(netw, address string, c syscall.RawConn) error {
+				var opErr error
+				_ = c.Control(func(fd uintptr) {
+					opErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 25, ifi.Index)
+				})
+				return opErr
+			}
+		}
+	}
+	return lc.ListenPacket(ctx, network, ":0")
+}

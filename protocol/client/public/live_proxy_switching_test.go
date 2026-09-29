@@ -31,9 +31,8 @@ func TestLiveProxySwitching(t *testing.T) {
 	vps1 := edgepool.ServerConfig{
 		Name:     "VPS 1 (de5)",
 		Address:  "myconsun.de5.net:443",
-		Token:    "aero_65aa450a49293a85888d8195bbc81940",
+		Token:    "tok_colo",
 		SNI:      "myconsun.de5.net",
-		PinSPKI:  []string{"N75oS2cgnhLGCuVcdWhBeyXX40746PDH3UqVghF9mzw="},
 		Protocol: "quic",
 	}
 	vps2 := edgepool.ServerConfig{

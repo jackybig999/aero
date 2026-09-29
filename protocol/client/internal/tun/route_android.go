@@ -45,3 +45,8 @@ func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, er
 	dialer.Timeout = 8 * time.Second
 	return dialer.DialContext(ctx, network, addr)
 }
+
+func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, error) {
+	var lc net.ListenConfig
+	return lc.ListenPacket(ctx, network, ":0")
+}

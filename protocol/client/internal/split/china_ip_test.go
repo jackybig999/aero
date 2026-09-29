@@ -89,4 +89,3 @@ func TestEngine_ChinaIPAndPreParsedRules(t *testing.T) {
 		t.Fatalf("Expected GitHub IP to match PROXY, got %v", s)
 	}
 }
-

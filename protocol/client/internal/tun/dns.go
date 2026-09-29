@@ -56,8 +56,8 @@ func NewDNSHandler(servers []string) *DNSHandler {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
 		},
-		MaxIdleConns:        16,
-		IdleConnTimeout:     60 * time.Second,
+		MaxIdleConns:       16,
+		IdleConnTimeout:    60 * time.Second,
 		DisableCompression: true,
 	}
 
