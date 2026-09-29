@@ -9,6 +9,7 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -152,7 +153,18 @@ func run(name string, args ...string) error {
 }
 
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
+	_, ifaceName, err := PhysicalDefaultGateway()
 	var dialer net.Dialer
 	dialer.Timeout = 8 * time.Second
+	if err == nil && ifaceName != "" {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			_ = c.Control(func(fd uintptr) {
+				// SO_BINDTODEVICE = 25 (Linux socket option to bind outbound socket to physical network device)
+				opErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, ifaceName)
+			})
+			return opErr
+		}
+	}
 	return dialer.DialContext(ctx, network, addr)
 }

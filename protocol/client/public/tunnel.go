@@ -79,7 +79,7 @@ func openAEROTyped(target string, typ protocol.StreamType, udp bool) (net.Conn, 
 			continue
 		}
 		streamID := uint32(contextIDCounter.Add(1))
-		_ = tunnel.SetDeadline(time.Now().Add(15 * time.Second))
+		_ = tunnel.SetDeadline(time.Now().Add(4 * time.Second))
 		if _, err := aeroHandshake(tunnel, st, streamID); err != nil {
 			_ = tunnel.Close()
 			lastErr = err

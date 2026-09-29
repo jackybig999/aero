@@ -350,6 +350,8 @@ func TeardownRoutes(devName string) {
 	_ = runCmd("route", "delete", "0.0.0.0", "mask", "128.0.0.0")
 	_ = runCmd("route", "delete", "128.0.0.0", "mask", "128.0.0.0")
 	if devName != "" {
+		_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
+		_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
 		_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
 		_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", devName)
 	}

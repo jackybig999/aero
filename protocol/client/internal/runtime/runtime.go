@@ -22,7 +22,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -353,31 +352,15 @@ func (w *windowsRuntime) SetSystemProxy(proxyAddr string) error {
 	}
 
 	bypass := "localhost;127.*;10.*;192.168.*;172.16.*;172.17.*;172.18.*;172.19.*;172.2*.*;172.30.*;172.31.*;<local>;*.local;*.cn;*.baidu.com;*.qq.com;*.taobao.com;*.jd.com;*.alipay.com;*.bilibili.com;*.zhihu.com;*.163.com;*.weibo.com;*.csdn.net;*.douyin.com;*.feishu.cn;*.aliyun.com;*.tencent.com"
-	regPath := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	quietRun("reg", "delete", regPath, "/v", "AutoConfigURL", "/f")
-	// Same string Clash/v2rayN write: HTTP CONNECT + SOCKS on the mixed port.
 	spec := "http=" + mixed + ";https=" + mixed + ";socks=" + mixed
-	cmds := [][]string{
-		{"reg", "add", regPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"},
-		{"reg", "add", regPath, "/v", "ProxyServer", "/t", "REG_SZ", "/d", spec, "/f"},
-		{"reg", "add", regPath, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", bypass, "/f"},
-	}
-	for _, args := range cmds {
-		cmd := cmdHidden(args[0], args[1:]...)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("set proxy reg failed: %v, output: %s", err, string(out))
-		}
-	}
+
+	// 严格遵循零注册表污染准则：使用纯内存 WinINET API 挂载代理
 	if err := applyLANProxy(spec, bypass); err != nil {
-		log.Printf("[PROXY] WinINET per-conn: %v (registry still set)", err)
+		return fmt.Errorf("apply WinINET per-connection proxy: %w", err)
 	}
-	quietRun("netsh", "winhttp", "reset", "proxy")
-	quietRun("netsh", "winhttp", "set", "proxy", "proxy-server="+mixed, "bypass-list="+bypass)
 
 	winNotifyProxyChange()
-	w.setUserProxyEnv(mixed)
-	log.Printf("[PROXY] system proxy ON %s (WinINET+WinHTTP+temp HTTP_PROXY)", mixed)
+	log.Printf("[PROXY] system proxy ON via WinINET in-memory API -> %s (zero registry modification)", mixed)
 	return nil
 }
 
@@ -404,48 +387,19 @@ func setChromiumQUICOff(enable bool) {
 }
 
 func (w *windowsRuntime) ClearSystemProxy() error {
-	regPath := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	// Flip WinINET off first and notify immediately so browsers leave 55555
-	// before the slower QUIC/firewall/env cleanup.
+	// 严格遵循零注册表污染准则：使用纯内存 WinINET API 还原直连
 	clearLANProxy()
-	quietRun("reg", "delete", regPath, "/v", "AutoConfigURL", "/f")
+	winNotifyProxyChange()
+	WipeAEROFirewall()
+
+	// 清理历史残留可能遗留的注册表脏数据，确保完全干净
+	regPath := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	quietRun("reg", "add", regPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f")
 	quietRun("reg", "delete", regPath, "/v", "ProxyServer", "/f")
-	winNotifyProxyChange()
-	// Sync: grok.exe reads HKCU Environment. Async leftover HTTP_PROXY=55555
-	// is why box TUN still cannot talk to Grok after AERO is dismissed.
-	w.clearUserProxyEnv()
 	quietRun("netsh", "winhttp", "reset", "proxy")
-	WipeAEROFirewall()
-	// Sync: WebRtcIPHandling / QuicAllowed leftover makes Chrome/Grok
-	// disagree with box after AERO window close.
-	setChromiumQUICOff(false)
-	setBrowserQUICBlock(false)
 
 	epoch := proxyEpoch.Add(1)
-	prevEnable, prevServer, prevOverride, prevPAC := w.prevEnable, w.prevServer, w.prevOverride, w.prevPAC
-	pacPath := w.pacPath
-	w.proxySnap = false
-	w.pacPath = ""
-	go func() {
-		if proxyEpoch.Load() != epoch {
-			return
-		}
-		if prevServer != "" && !strings.Contains(prevServer, "55555") && !strings.Contains(prevServer, "19877") && prevEnable == "1" {
-			quietRun("reg", "add", regPath, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f")
-			quietRun("reg", "add", regPath, "/v", "ProxyServer", "/t", "REG_SZ", "/d", prevServer, "/f")
-			winNotifyProxyChange()
-		}
-		if prevOverride != "" && !strings.Contains(prevOverride, "aero") {
-			quietRun("reg", "add", regPath, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", prevOverride, "/f")
-		}
-		if prevPAC != "" && !strings.Contains(prevPAC, "19877") && !strings.Contains(prevPAC, "aero") {
-			quietRun("reg", "add", regPath, "/v", "AutoConfigURL", "/t", "REG_SZ", "/d", prevPAC, "/f")
-		}
-		if pacPath != "" {
-			_ = os.Remove(pacPath)
-		}
-	}()
+	log.Printf("[PROXY] system proxy OFF (released via WinINET memory API, epoch=%d)", epoch)
 	return nil
 }
 

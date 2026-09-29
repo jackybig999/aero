@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wintun"
@@ -27,20 +28,43 @@ type windowsDevice struct {
 }
 
 func NewDevice(name string, mtu int) (Device, error) {
-	// Stable GUID so we do not create a new NLA pool / sweep other Wintun adapters.
-	guid := windows.GUID{
-		Data1: 0x7f5a2c10, Data2: 0x9b4e, Data3: 0x4d21,
-		Data4: [8]byte{0x8f, 0x6a, 0xa1, 0x1e, 0x00, 0x00, 0xae, 0x01},
+	var adapter *wintun.Adapter
+	var session wintun.Session
+	var err error
+
+	// 1. 优先尝试 OpenAdapter 复用现有已加载的网卡（免去 Windows PnP 设备增删耗时与重叠冲突）
+	adapter, err = wintun.OpenAdapter(name)
+	if err == nil {
+		session, err = adapter.StartSession(0x800000)
+		if err == nil {
+			d := &windowsDevice{name: name, mtu: mtu, adapter: adapter, session: session}
+			d.sessionOK.Store(true)
+			log.Printf("[TUN] Reusing existing Windows adapter: %s (MTU=%d)", name, mtu)
+			return d, nil
+		}
+		// 若旧网卡 session 启动失败，关闭旧句柄并走重建逻辑
+		log.Printf("[TUN] StartSession on existing adapter failed: %v, will recreate", err)
+		_ = adapter.Close()
+		adapter = nil
 	}
-	adapter, err := wintun.CreateAdapter(name, "AERO", &guid)
+
+	// 2. 动态创建全新网卡：传入 nil GUID 让 Windows 动态分配全新唯一标识，杜绝硬编码固定 GUID 导致的 15s PnP 查询超时与 0x1F / 0xC00002F0 错误
+	adapter, err = wintun.CreateAdapter(name, "AERO", nil)
 	if err != nil {
-		return nil, fmt.Errorf("wintun create adapter: %w", err)
+		log.Printf("[TUN] wintun create adapter failed: %v, attempting single retry after brief pause", err)
+		time.Sleep(300 * time.Millisecond)
+		adapter, err = wintun.CreateAdapter(name, "AERO", nil)
+		if err != nil {
+			return nil, fmt.Errorf("wintun create adapter: %w", err)
+		}
 	}
-	session, err := adapter.StartSession(0x800000)
+
+	session, err = adapter.StartSession(0x800000)
 	if err != nil {
-		adapter.Close()
+		_ = adapter.Close()
 		return nil, fmt.Errorf("wintun start session: %w", err)
 	}
+
 	d := &windowsDevice{name: name, mtu: mtu, adapter: adapter, session: session}
 	d.sessionOK.Store(true)
 	log.Printf("[TUN] Windows adapter created: %s (MTU=%d)", name, mtu)

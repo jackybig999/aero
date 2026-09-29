@@ -451,14 +451,15 @@ func startBackgroundServices() {
 		netMonitor.StartPlatformMonitor()
 		log.Printf("[MONITOR] Network monitor started")
 
-		// 睡眠/唤醒时钟跳变感知器：休眠唤醒后 8 秒以上时间跳跃立即触发 TUN 路由原子重迁
+		// 睡眠/唤醒时钟跳变感知器：休眠唤醒后 5 秒以上时间跳跃立即触发会话重置与 TUN 路由原子重迁
 		go func() {
 			lastTick := time.Now()
-			ticker := time.NewTicker(3 * time.Second)
+			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			for t := range ticker.C {
-				if t.Sub(lastTick) > 8*time.Second {
+				if t.Sub(lastTick) > 5*time.Second {
 					log.Printf("[MONITOR] Clock jump detected (%v elapsed) - system woke from sleep/suspend", t.Sub(lastTick))
+					transport.GlobalSessionPool.Reset()
 					scheduleTUNRefresh("wake_from_sleep")
 				}
 				lastTick = t

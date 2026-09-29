@@ -9,6 +9,7 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -155,7 +156,20 @@ func runMac(name string, args ...string) error {
 }
 
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
+	_, ifaceName, err := PhysicalDefaultGateway()
 	var dialer net.Dialer
 	dialer.Timeout = 8 * time.Second
+	if err == nil && ifaceName != "" {
+		if ifi, err := net.InterfaceByName(ifaceName); err == nil && ifi != nil {
+			dialer.Control = func(network, address string, c syscall.RawConn) error {
+				var opErr error
+				_ = c.Control(func(fd uintptr) {
+					// IP_BOUND_IF = 25 (Darwin BSD socket option to bind outbound socket to physical interface index)
+					opErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 25, ifi.Index)
+				})
+				return opErr
+			}
+		}
+	}
 	return dialer.DialContext(ctx, network, addr)
 }

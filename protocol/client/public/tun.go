@@ -61,16 +61,10 @@ func getEdgeRealIP() net.IP {
 // startTUNIfPossible starts Wintun global capture (admin + wintun.dll next to exe).
 // Protect the Edge host route BEFORE catch-all routes or the tunnel blackholes itself.
 
-// otherVPNActive reports another tool's *global capture* (TUN adapter Up, or
-// catch-all/wide public routes). Resident box/Clash/v2ray using only their own
-// mixed ports, or WinINET system proxy alone, is not a conflict.
+// otherVPNActive reports another tool's *global capture* (catch-all/wide public routes).
+// Inactive adapters or resident box/Clash/v2ray using only their own mixed ports,
+// or WinINET system proxy alone, is not a conflict.
 func otherVPNActive() string {
-	ifacesCmd := exec.Command("netsh", "interface", "ipv4", "show", "interfaces")
-	hideConsole(ifacesCmd)
-	ifaces, _ := ifacesCmd.Output()
-	if who := otherGlobalFromIfaces(string(ifaces)); who != "" {
-		return who
-	}
 	routesCmd := exec.Command("netsh", "interface", "ipv4", "show", "route")
 	hideConsole(routesCmd)
 	routes, _ := routesCmd.Output()
@@ -312,19 +306,23 @@ func refreshTUNAfterNetChange(reason string) {
 	}
 	tunMu.Unlock()
 	if !running {
+		transport.GlobalSessionPool.Reset()
+		if edgePool != nil {
+			go edgePool.ProbeAll(0)
+		}
 		return
 	}
 
 	var gw, idx string
 	var err error
-	// Wi-Fi 漫游后 DHCP 分配通常需要 300ms~1.5s，进行最多 6 次自适应轮询
-	for attempt := 1; attempt <= 6; attempt++ {
+	// Wi-Fi 漫游 / 休眠唤醒后 DHCP 分配通常需要 300ms~1.5s，进行最多 8 次自适应轮询
+	for attempt := 1; attempt <= 8; attempt++ {
 		tun.InvalidatePhysicalDefault()
 		gw, idx, err = tun.PhysicalDefaultGateway()
 		if err == nil && gw != "" && idx != "" {
 			break
 		}
-		if attempt < 6 {
+		if attempt < 8 {
 			time.Sleep(300 * time.Millisecond)
 		}
 	}
@@ -336,11 +334,11 @@ func refreshTUNAfterNetChange(reason string) {
 	tunMu.Lock()
 	same := lastRouteGW == gw && lastRouteIF == idx && lastRouteGW != ""
 	tunMu.Unlock()
-	if same {
+	if same && reason != "wake_from_sleep" {
 		log.Printf("[TUN] network event ignored (gw %s if=%s unchanged)", gw, idx)
 		return
 	}
-	log.Printf("[TUN] network change (%s): move edge protect via %s if=%s (leave aero0)", reason, gw, idx)
+	log.Printf("[TUN] network change (%s): refresh edge protect via %s if=%s (aero0)", reason, gw, idx)
 	if eip != "" {
 		if err := tun.ProtectHostRoute(eip); err != nil {
 			log.Printf("[TUN] protect after net change: %v", err)
@@ -356,6 +354,7 @@ func refreshTUNAfterNetChange(reason string) {
 	tunMu.Lock()
 	lastRouteGW, lastRouteIF = gw, idx
 	tunMu.Unlock()
+	// 休眠唤醒与网络切换后旧 TCP/QUIC 套接字已被系统内核切断，强制清空会话池使后续请求极速新建活跃长连接
 	transport.GlobalSessionPool.Reset()
 	if edgePool != nil {
 		go edgePool.ProbeAll(0)
