@@ -316,22 +316,27 @@ func refreshTUNAfterNetChange(reason string) {
 
 	var gw, idx string
 	var err error
-	// Wi-Fi 漫游 / 休眠唤醒后 DHCP 分配通常需要 300ms~1.5s，进行最多 8 次自适应轮询
-	for attempt := 1; attempt <= 8; attempt++ {
+	// Wi-Fi 漫游 / 休眠唤醒后 DHCP 分配通常需要 300ms~2s，进行最多 10 次自适应轮询
+	for attempt := 1; attempt <= 10; attempt++ {
 		tun.InvalidatePhysicalDefault()
 		gw, idx, err = tun.PhysicalDefaultGateway()
 		if err == nil && gw != "" && idx != "" {
 			break
 		}
-		if attempt < 8 {
+		if attempt < 10 {
 			time.Sleep(300 * time.Millisecond)
 		}
 	}
 	if err != nil || gw == "" {
-		log.Printf("[TUN] network change (%s): no physical gw after retries (%v)", reason, err)
+		log.Printf("[TUN] network change (%s): physical gw not ready yet, starting persistent recovery loop...", reason)
+		go runPersistentGatewayRecovery(reason, devName, eip)
 		return
 	}
 
+	applyTUNNetworkRefresh(reason, devName, eip, gw, idx)
+}
+
+func applyTUNNetworkRefresh(reason, devName, eip, gw, idx string) {
 	tunMu.Lock()
 	same := lastRouteGW == gw && lastRouteIF == idx && lastRouteGW != ""
 	tunMu.Unlock()
@@ -340,14 +345,7 @@ func refreshTUNAfterNetChange(reason string) {
 		return
 	}
 	log.Printf("[TUN] network change (%s): refresh edge protect via %s if=%s (aero0)", reason, gw, idx)
-	if eip != "" {
-		if err := tun.ProtectHostRoute(eip); err != nil {
-			log.Printf("[TUN] protect after net change: %v", err)
-			return
-		}
-	}
-	// 原子同步保护国内 DNS，防止 Wi-Fi 切换后 DNS 死在旧网关上
-	_ = tun.ProtectHostRoute("223.5.5.5")
+	protectAllKnownEdgeRoutes(eip)
 
 	if err := tun.EnsureCatchAll(devName); err != nil {
 		log.Printf("[TUN] ensure catch-all: %v", err)
@@ -360,6 +358,53 @@ func refreshTUNAfterNetChange(reason string) {
 	if edgePool != nil {
 		go edgePool.ProbeAll(0)
 	}
+}
+
+func runPersistentGatewayRecovery(reason, devName, eip string) {
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(1 * time.Second)
+		tun.InvalidatePhysicalDefault()
+		gw, idx, err := tun.PhysicalDefaultGateway()
+		if err == nil && gw != "" && idx != "" {
+			log.Printf("[TUN] persistent recovery (%s) succeeded: gw=%s if=%s", reason, gw, idx)
+			tunMu.Lock()
+			running := tunRunning
+			tunMu.Unlock()
+			if !running {
+				return
+			}
+			applyTUNNetworkRefresh(reason, devName, eip, gw, idx)
+			return
+		}
+	}
+	log.Printf("[TUN] persistent recovery (%s) timed out after 45s", reason)
+}
+
+func protectAllKnownEdgeRoutes(eip string) {
+	if eip != "" {
+		_ = tun.ProtectHostRoute(eip)
+	}
+	if edgeAddr != nil && *edgeAddr != "" {
+		host, _, _ := net.SplitHostPort(*edgeAddr)
+		if host != "" {
+			if ip := net.ParseIP(host); ip != nil {
+				_ = tun.ProtectHostRoute(ip.String())
+			}
+		}
+	}
+	if edgePool != nil {
+		for _, srv := range edgePool.Snapshot() {
+			host, _, _ := net.SplitHostPort(srv.Address)
+			if host != "" {
+				if ip := net.ParseIP(host); ip != nil {
+					_ = tun.ProtectHostRoute(ip.String())
+				}
+			}
+		}
+	}
+	_ = tun.ProtectHostRoute("223.5.5.5")
+	_ = tun.ProtectHostRoute("119.29.29.29")
 }
 
 func stopTUN() {
@@ -389,6 +434,7 @@ func stopTUN() {
 		tun.UnprotectHostRoute(eip)
 	}
 	tun.UnprotectHostRoute("223.5.5.5")
+	tun.UnprotectHostRoute("119.29.29.29")
 
 	if eng != nil {
 		eng.Stop()
@@ -403,15 +449,42 @@ func stopTUN() {
 	log.Printf("[TUN] stopped cleanly, zero residual")
 }
 
+func isEdgeIPTun(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if rip := getEdgeRealIP(); rip != nil && rip.Equal(ip) {
+		return true
+	}
+	if edgeAddr != nil && *edgeAddr != "" {
+		host, _, err := net.SplitHostPort(*edgeAddr)
+		if err != nil {
+			host = *edgeAddr
+		}
+		if ep := net.ParseIP(host); ep != nil && ep.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 type tunAERODialer struct{}
 
 func (d *tunAERODialer) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	if isEdgeSelfTarget(addr) {
+		log.Printf("[TUN] DIRECT edge-self target: %s", addr)
+		return tun.DialPhysicalDirect(ctx, "tcp", addr)
+	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 		port = ""
 	}
 	if ip := net.ParseIP(host); ip != nil {
+		if isEdgeIPTun(ip) {
+			log.Printf("[TUN] DIRECT edge-self IP: %s", addr)
+			return tun.DialPhysicalDirect(ctx, "tcp", addr)
+		}
 		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 			var dialer net.Dialer
 			dialer.Timeout = 10 * time.Second
@@ -424,6 +497,10 @@ func (d *tunAERODialer) DialTCP(ctx context.Context, addr string) (net.Conn, err
 					addr = net.JoinHostPort(domain, port)
 				} else {
 					addr = domain
+				}
+				if isEdgeSelfTarget(addr) {
+					log.Printf("[TUN] DIRECT edge-self target restored: %s", addr)
+					return tun.DialPhysicalDirect(ctx, "tcp", addr)
 				}
 				if splitEngine != nil && splitEngine.MatchDomain(domain) == split.DIRECT {
 					return tun.DialPhysicalDirect(ctx, "tcp", addr)
@@ -442,12 +519,20 @@ func (d *tunAERODialer) DialTCP(ctx context.Context, addr string) (net.Conn, err
 }
 
 func (d *tunAERODialer) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
+	if isEdgeSelfTarget(addr) {
+		log.Printf("[TUN] DIRECT edge-self target UDP: %s", addr)
+		return tun.DialPhysicalDirect(ctx, "udp", addr)
+	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 		port = ""
 	}
 	if ip := net.ParseIP(host); ip != nil {
+		if isEdgeIPTun(ip) {
+			log.Printf("[TUN] DIRECT edge-self IP UDP: %s", addr)
+			return tun.DialPhysicalDirect(ctx, "udp", addr)
+		}
 		// Fake-IP (198.18.0.0/15) 内存 0ms 反查还原
 		if v4 := ip.To4(); v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
 			if domain, ok := tun.DefaultFakeIPTable.Lookup(ip); ok {
@@ -456,9 +541,15 @@ func (d *tunAERODialer) DialUDP(ctx context.Context, addr string) (net.Conn, err
 				} else {
 					addr = domain
 				}
+				if isEdgeSelfTarget(addr) {
+					log.Printf("[TUN] DIRECT edge-self target restored UDP: %s", addr)
+					return tun.DialPhysicalDirect(ctx, "udp", addr)
+				}
 				if splitEngine != nil && splitEngine.MatchDomain(domain) == split.DIRECT {
 					return tun.DialPhysicalDirect(ctx, "udp", addr)
 				}
+			} else {
+				return nil, fmt.Errorf("unknown fake-ip %s", addr)
 			}
 		} else {
 			// Real IP direct

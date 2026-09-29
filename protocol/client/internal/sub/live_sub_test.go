@@ -9,6 +9,7 @@ func TestLiveFetchBothVPS(t *testing.T) {
 		t.Skip("skipping live VPS test in short mode")
 	}
 	urls := []string{
+		"https://myconsun.de5.net/sub/superadmin",
 		"https://myconsun.de5.net/sub/d4248fda1bb4a5802dbd174b814571fd",
 		"https://myconsun.cc.cd/sub/49adc46eff543149de857a49f89445b0",
 	}

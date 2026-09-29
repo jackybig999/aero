@@ -33,30 +33,44 @@ func NewDevice(name string, mtu int) (Device, error) {
 	var err error
 
 	// 1. 优先尝试 OpenAdapter 复用现有已加载的网卡（免去 Windows PnP 设备增删耗时与重叠冲突）
-	adapter, err = wintun.OpenAdapter(name)
-	if err == nil {
-		session, err = adapter.StartSession(0x800000)
+	for attempt := 0; attempt < 3; attempt++ {
+		adapter, err = wintun.OpenAdapter(name)
 		if err == nil {
-			d := &windowsDevice{name: name, mtu: mtu, adapter: adapter, session: session}
-			d.sessionOK.Store(true)
-			log.Printf("[TUN] Reusing existing Windows adapter: %s (MTU=%d)", name, mtu)
-			return d, nil
+			session, err = adapter.StartSession(0x800000)
+			if err == nil {
+				d := &windowsDevice{name: name, mtu: mtu, adapter: adapter, session: session}
+				d.sessionOK.Store(true)
+				log.Printf("[TUN] Reusing existing Windows adapter: %s (MTU=%d)", name, mtu)
+				return d, nil
+			}
+			log.Printf("[TUN] StartSession on existing adapter failed: %v (attempt %d)", err, attempt)
+			_ = adapter.Close()
+			adapter = nil
+			time.Sleep(200 * time.Millisecond)
 		}
-		// 若旧网卡 session 启动失败，关闭旧句柄并走重建逻辑
-		log.Printf("[TUN] StartSession on existing adapter failed: %v, will recreate", err)
-		_ = adapter.Close()
-		adapter = nil
 	}
 
 	// 2. 动态创建全新网卡：传入 nil GUID 让 Windows 动态分配全新唯一标识，杜绝硬编码固定 GUID 导致的 15s PnP 查询超时与 0x1F / 0xC00002F0 错误
-	adapter, err = wintun.CreateAdapter(name, "AERO", nil)
-	if err != nil {
-		log.Printf("[TUN] wintun create adapter failed: %v, attempting single retry after brief pause", err)
-		time.Sleep(300 * time.Millisecond)
+	for attempt := 0; attempt < 5; attempt++ {
 		adapter, err = wintun.CreateAdapter(name, "AERO", nil)
-		if err != nil {
-			return nil, fmt.Errorf("wintun create adapter: %w", err)
+		if err == nil {
+			break
 		}
+		log.Printf("[TUN] wintun create adapter failed: %v, retrying (%d/5)...", err, attempt+1)
+		time.Sleep(500 * time.Millisecond)
+		// 检查在重试期间旧网卡是否已注销完成或可直接 Open
+		if a, oerr := wintun.OpenAdapter(name); oerr == nil {
+			if s, serr := a.StartSession(0x800000); serr == nil {
+				d := &windowsDevice{name: name, mtu: mtu, adapter: a, session: s}
+				d.sessionOK.Store(true)
+				log.Printf("[TUN] Successfully opened adapter during retry: %s", name)
+				return d, nil
+			}
+			_ = a.Close()
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("wintun create adapter: %w", err)
 	}
 
 	session, err = adapter.StartSession(0x800000)
@@ -90,6 +104,17 @@ func (d *windowsDevice) Read(p []byte) (int, error) {
 				}
 				continue
 			}
+			// 休眠唤醒 / 驱动重置自愈机制：若 session 异常中断，自动重建 session 保证隧道长效存活
+			if !d.closed.Load() && d.adapter != nil {
+				log.Printf("[TUN] wintun session interrupted (%v), attempting auto-recovery...", err)
+				d.session.End()
+				time.Sleep(300 * time.Millisecond)
+				if newSess, nerr := d.adapter.StartSession(0x800000); nerr == nil {
+					d.session = newSess
+					log.Printf("[TUN] wintun session recovered successfully!")
+					continue
+				}
+			}
 			return 0, err
 		}
 		n := copy(p, packet)
@@ -110,11 +135,18 @@ func (d *windowsDevice) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	// MUST allocate from the wintun send ring. Sending a Go heap slice
-	// corrupts the driver ring and exits with 0xC0000374.
 	buf, err := d.session.AllocateSendPacket(len(p))
 	if err != nil {
-		return 0, err
+		if !d.closed.Load() && d.adapter != nil {
+			d.session.End()
+			if newSess, nerr := d.adapter.StartSession(0x800000); nerr == nil {
+				d.session = newSess
+				buf, err = d.session.AllocateSendPacket(len(p))
+			}
+		}
+		if err != nil {
+			return 0, err
+		}
 	}
 	copy(buf, p)
 	d.session.SendPacket(buf)

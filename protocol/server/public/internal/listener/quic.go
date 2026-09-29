@@ -314,4 +314,3 @@ func (q *quicStreamWrapper) RemoteAddr() net.Addr               { return q.remot
 func (q *quicStreamWrapper) SetDeadline(t time.Time) error      { return q.stream.SetDeadline(t) }
 func (q *quicStreamWrapper) SetReadDeadline(t time.Time) error  { return q.stream.SetReadDeadline(t) }
 func (q *quicStreamWrapper) SetWriteDeadline(t time.Time) error { return q.stream.SetWriteDeadline(t) }
-

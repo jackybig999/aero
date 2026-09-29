@@ -70,19 +70,15 @@ var (
 	globalSessionCache = tls.NewLRUClientSessionCache(128)
 )
 
-// defaultTLSConfig 构造默认 QUIC TLS 配置，若全局 CA 池已设置则启用验证
+// defaultTLSConfig 构造默认 QUIC TLS 配置，全面对接双轨证书钉扎与系统 CA 校验
 func defaultTLSConfig(serverName string) *tls.Config {
 	cfg := &tls.Config{
 		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS13,
 		NextProtos:         []string{"h3"},
 		ClientSessionCache: globalSessionCache,
-		InsecureSkipVerify: true,
 	}
-	if pool := RootCAs(); pool != nil {
-		cfg.RootCAs = pool
-		cfg.InsecureSkipVerify = false
-	}
+	applyVerifyPolicy(cfg, serverName)
 	return cfg
 }
 

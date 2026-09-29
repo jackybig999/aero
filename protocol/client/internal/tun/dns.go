@@ -95,11 +95,15 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 	}
 	qnameLower := strings.ToLower(qname)
 
-	// 1. 节点自身绝对白名单防护：绝不能将 Fake-IP 分配给节点自身（杜绝自回环黑洞）
-	if h.edgeHost != "" && (qnameLower == h.edgeHost || strings.HasSuffix(qnameLower, "."+h.edgeHost)) {
-		if h.edgeIP != nil {
+	// 1. 节点自身与直连白名单防护：绝不能将 Fake-IP 分配给节点自身或订阅域名（杜绝自回环黑洞）
+	if (h.edgeHost != "" && (qnameLower == h.edgeHost || strings.HasSuffix(qnameLower, "."+h.edgeHost))) ||
+		strings.HasSuffix(qnameLower, ".de5.net") || strings.HasSuffix(qnameLower, ".cc.cd") {
+		if h.edgeIP != nil && (qnameLower == h.edgeHost || strings.HasSuffix(qnameLower, "."+h.edgeHost)) {
 			log.Printf("[DNS] edge node %s -> real ip %s", qname, h.edgeIP)
 			return buildAResponse(pkt, qname, h.edgeIP)
+		}
+		if resp := h.forwardToUpstream(qnameLower, pkt); resp != nil {
+			return resp
 		}
 		return nil
 	}
@@ -242,11 +246,11 @@ func (h *DNSHandler) forwardToUpstream(qname string, pkt []byte) []byte {
 	}
 	h.cacheMu.RUnlock()
 
-	// 2. 优先通过 DoH (DNS-over-HTTPS) 阿里公共 DNS 请求（彻底防 DNS 污染与监听）
-	resp := h.queryDoH(pkt)
+	// 2. 优先通过高速并行物理 UDP (223.5.5.5:53, 119.29.29.29:53) 发起直连解析（通常 5-15ms 极速返回）
+	resp := h.queryFastUDP(pkt)
 	if resp == nil {
-		// 3. Fallback 到多上游明文 UDP (223.5.5.5, 119.29.29.29)
-		resp = h.queryUDP(pkt)
+		// 3. Fallback 到 DoH (DNS-over-HTTPS) 阿里公共 DNS 请求（彻底防 DNS 污染与监听）
+		resp = h.queryDoH(pkt)
 	}
 
 	if resp != nil && len(resp) >= 12 {
@@ -264,11 +268,59 @@ func (h *DNSHandler) forwardToUpstream(qname string, pkt []byte) []byte {
 		}
 		h.cache[qname] = dnsCacheEntry{
 			data:      resp,
-			expiresAt: time.Now().Add(60 * time.Second),
+			expiresAt: time.Now().Add(300 * time.Second),
 		}
 		h.cacheMu.Unlock()
 	}
 	return resp
+}
+
+// queryFastUDP 并行向多个上游发起明文 UDP DNS 查询，竞速返回最快的结果（毫秒级响应）
+func (h *DNSHandler) queryFastUDP(pkt []byte) []byte {
+	upstreams := []string{"223.5.5.5:53", "119.29.29.29:53"}
+	if len(h.servers) > 0 {
+		upstreams = h.servers
+	}
+
+	type dnsRes struct {
+		data []byte
+	}
+	ch := make(chan dnsRes, len(upstreams))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	for _, upstream := range upstreams {
+		s := upstream
+		go func(target string) {
+			if !strings.Contains(target, ":") {
+				target = net.JoinHostPort(target, "53")
+			}
+			conn, err := DialPhysicalDirect(ctx, "udp", target)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			if _, err := conn.Write(pkt); err != nil {
+				return
+			}
+			buf := make([]byte, 1024)
+			n, err := conn.Read(buf)
+			if err == nil && n >= 12 {
+				select {
+				case ch <- dnsRes{data: buf[:n]}:
+				default:
+				}
+			}
+		}(s)
+	}
+
+	select {
+	case res := <-ch:
+		return res.data
+	case <-time.After(500 * time.Millisecond):
+		return nil
+	}
 }
 
 // queryDoH 发起 RFC 8484 标准 DoH 请求
@@ -301,35 +353,5 @@ func (h *DNSHandler) queryDoH(pkt []byte) []byte {
 
 // queryUDP 发起明文 UDP DNS 查询，支持多上游 fallback
 func (h *DNSHandler) queryUDP(pkt []byte) []byte {
-	upstreams := []string{"223.5.5.5:53", "119.29.29.29:53"}
-	if len(h.servers) > 0 {
-		upstreams = h.servers
-	}
-
-	for _, upstream := range upstreams {
-		s := upstream
-		if !strings.Contains(s, ":") {
-			s = net.JoinHostPort(s, "53")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
-		conn, err := DialPhysicalDirect(ctx, "udp", s)
-		if err != nil {
-			cancel()
-			continue
-		}
-		_ = conn.SetDeadline(time.Now().Add(1200 * time.Millisecond))
-		if _, err := conn.Write(pkt); err != nil {
-			conn.Close()
-			cancel()
-			continue
-		}
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		conn.Close()
-		cancel()
-		if err == nil && n >= 12 {
-			return buf[:n]
-		}
-	}
-	return nil
+	return h.queryFastUDP(pkt)
 }

@@ -78,10 +78,12 @@ func switchActiveNode(srv *edgepool.Server) {
 		*token = srv.Token
 	}
 	sni := srv.SNI
-	if (sni == "" || sni == "cdn-aero.com") && srv.Address != "" {
+	if srv.Address != "" {
 		host, _, err := net.SplitHostPort(srv.Address)
 		if err == nil && net.ParseIP(host) == nil && host != "" {
-			sni = host
+			if sni == "" || sni == "cdn-aero.com" || sni == "edge.microsoft.com" || sni == "azureedge.net" || sni == "cloudflare.com" {
+				sni = host
+			}
 		}
 	}
 	if sni != "" && publicName != nil {

@@ -397,6 +397,19 @@ func cidrToMask(cidr string) string {
 
 // DialPhysicalDirect 绑定 Windows 物理网络适配器（IP_UNICAST_IF），100% 绕过 TUN 路由表直连
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, serr := net.SplitHostPort(addr)
+	if serr == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			var dialer net.Dialer
+			dialer.Timeout = 8 * time.Second
+			return dialer.DialContext(ctx, network, addr)
+		}
+		if strings.EqualFold(host, "localhost") {
+			var dialer net.Dialer
+			dialer.Timeout = 8 * time.Second
+			return dialer.DialContext(ctx, network, addr)
+		}
+	}
 	_, idxStr, err := PhysicalDefaultGateway()
 	var dialer net.Dialer
 	dialer.Timeout = 8 * time.Second

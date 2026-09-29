@@ -153,6 +153,19 @@ func run(name string, args ...string) error {
 }
 
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, serr := net.SplitHostPort(addr)
+	if serr == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			var dialer net.Dialer
+			dialer.Timeout = 8 * time.Second
+			return dialer.DialContext(ctx, network, addr)
+		}
+		if strings.EqualFold(host, "localhost") {
+			var dialer net.Dialer
+			dialer.Timeout = 8 * time.Second
+			return dialer.DialContext(ctx, network, addr)
+		}
+	}
 	_, ifaceName, err := PhysicalDefaultGateway()
 	var dialer net.Dialer
 	dialer.Timeout = 8 * time.Second

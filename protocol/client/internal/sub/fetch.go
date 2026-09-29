@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"github.com/aero-protocol/aero-ech/internal/tun"
 	"io"
 	"net"
 	"net/http"
@@ -243,6 +244,69 @@ func ClearLastBody() {
 	}
 }
 
+func isFakeIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	v4 := ip.To4()
+	return v4 != nil && v4[0] == 198 && (v4[1] == 18 || v4[1] == 19)
+}
+
+func filterRealIPs(ips []string) []string {
+	var realIPs []string
+	for _, ip := range ips {
+		if !isFakeIP(ip) {
+			realIPs = append(realIPs, ip)
+		}
+	}
+	return realIPs
+}
+
+func resolveDirect(ctx context.Context, host string) ([]string, error) {
+	if parsed := net.ParseIP(host); parsed != nil {
+		return []string{host}, nil
+	}
+	// 优先使用物理接口直连公共 DNS 解析真实 IP（100% 免疫 TUN 内 Fake-IP 劫持）
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(dctx context.Context, network, address string) (net.Conn, error) {
+			return tun.DialPhysicalDirect(dctx, "udp", "223.5.5.5:53")
+		},
+	}
+	tctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	resolved, err := r.LookupHost(tctx, host)
+	if err == nil {
+		if reals := filterRealIPs(resolved); len(reals) > 0 {
+			return reals, nil
+		}
+	}
+	// Fallback 1: 119.29.29.29
+	r2 := &net.Resolver{
+		PreferGo: true,
+		Dial: func(dctx context.Context, network, address string) (net.Conn, error) {
+			return tun.DialPhysicalDirect(dctx, "udp", "119.29.29.29:53")
+		},
+	}
+	tctx2, cancel2 := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel2()
+	resolved2, err2 := r2.LookupHost(tctx2, host)
+	if err2 == nil {
+		if reals := filterRealIPs(resolved2); len(reals) > 0 {
+			return reals, nil
+		}
+	}
+	// Fallback 2: 系统默认解析器（过滤 Fake-IP）
+	resolvedSys, errSys := net.DefaultResolver.LookupHost(ctx, host)
+	if errSys == nil {
+		if reals := filterRealIPs(resolvedSys); len(reals) > 0 {
+			return reals, nil
+		}
+	}
+	return nil, fmt.Errorf("resolveDirect %s failed (r1: %v, r2: %v, sys: %v)", host, err, err2, errSys)
+}
+
 func dialWithHostCache(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -251,11 +315,11 @@ func dialWithHostCache(ctx context.Context, network, addr string) (net.Conn, err
 	var ips []string
 	if parsed := net.ParseIP(host); parsed != nil {
 		ips = []string{host}
-	} else if resolved, lerr := net.DefaultResolver.LookupHost(ctx, host); lerr == nil && len(resolved) > 0 {
+	} else if resolved, lerr := resolveDirect(ctx, host); lerr == nil && len(resolved) > 0 {
 		ips = resolved
 		saveHostIPs(host, resolved)
 	} else {
-		ips = loadHostIPs(host)
+		ips = filterRealIPs(loadHostIPs(host))
 		if len(ips) == 0 {
 			if lerr != nil {
 				return nil, lerr
@@ -263,10 +327,10 @@ func dialWithHostCache(ctx context.Context, network, addr string) (net.Conn, err
 			return nil, fmt.Errorf("lookup %s: no such host", host)
 		}
 	}
-	d := net.Dialer{Timeout: 8 * time.Second}
 	var last error
 	for _, ip := range ips {
-		c, derr := d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		// 强制绑定物理默认网卡发包，100% 绕过 TUN 虚拟网卡路由表（杜绝拉取订阅自回环黑洞死锁）
+		c, derr := tun.DialPhysicalDirect(ctx, network, net.JoinHostPort(ip, port))
 		if derr == nil {
 			return c, nil
 		}

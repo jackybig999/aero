@@ -252,8 +252,13 @@ func RunServer() {
 	}
 	subSNI := publicName
 	if ed := tokStore.EdgeDB(); ed != nil {
-		if best := ed.BestActiveSNI(); best != "" {
-			subSNI = best
+		// 严正约束：仅在节点未绑定合法公网域名（纯 IP 或默认占位）时，才回退至 edge.db 探测的伪装 SNI。
+		// 拥有正式公网域名（如 Let's Encrypt 证书域名）的节点，SNI 必须保持为 publicName 原生域名，
+		// 严禁改写为 edge.microsoft.com，杜绝 TLS 证书不匹配阻断！
+		if publicName == "" || net.ParseIP(publicName) != nil || publicName == "cdn-aero.com" {
+			if best := ed.BestActiveSNI(); best != "" {
+				subSNI = best
+			}
 		}
 	}
 	subStore, dataDirResolved, err := bootstrapSubscription(*dataDir, adv, listenPort, tok, subSNI, certManager.Certificate())

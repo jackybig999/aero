@@ -186,4 +186,3 @@ func (m *ECHManager) StartAutoRotation(interval time.Duration, stopCh <-chan str
 		}
 	}()
 }
-

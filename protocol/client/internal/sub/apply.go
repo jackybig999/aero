@@ -6,6 +6,7 @@ package sub
 
 import (
 	"fmt"
+	"net"
 	"strings"
 )
 
@@ -49,6 +50,15 @@ func Apply(s *Subscription) (*Applied, error) {
 		addr := strings.TrimSpace(srv.Address)
 		if addr == "" {
 			continue
+		}
+		// 关键防护：如果节点地址是合法的公网域名且未配置自签 SPKI Pinning，
+		// 严禁使用与证书域名不匹配的第三方伪装 SNI（如 edge.microsoft.com），
+		// 必须自动修正为节点原生 host，保证标准 TLS 证书链校验 100% 通过！
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil && net.ParseIP(host) == nil && host != "" {
+			if srv.SNI == "" || srv.SNI == "cdn-aero.com" || srv.SNI == "edge.microsoft.com" || srv.SNI == "azureedge.net" || srv.SNI == "cloudflare.com" {
+				srv.SNI = host
+			}
 		}
 		validServers = append(validServers, srv)
 		addrs = append(addrs, addr)

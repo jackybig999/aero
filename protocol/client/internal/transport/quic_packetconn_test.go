@@ -61,6 +61,7 @@ func TestQUICWithCustomPacketConn(t *testing.T) {
 
 	clientTLS := defaultTLSConfig("localhost")
 	clientTLS.InsecureSkipVerify = true
+	clientTLS.VerifyPeerCertificate = nil
 	quicConn, err := quic.Dial(ctx, pconn, serverLn.Addr(), clientTLS, &quic.Config{
 		HandshakeIdleTimeout: 2 * time.Second,
 	})
