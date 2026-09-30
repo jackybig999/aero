@@ -179,22 +179,8 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		return nil, fmt.Errorf("subscription revoked or expired: %w", err)
 	}
 
-	// 端口自适应智能轮试：若标准 HTTPS (443) 获取失败或被第三方霸占 (非 200/连接断开)，
-	// 客户端在后台对标准候选 HTTPS 端口进行静默轮试探测，保持外部订阅 URL 绝对纯净
-	u, parseErr := url.Parse(rawURL)
-	if parseErr == nil && u.Port() == "" && strings.HasPrefix(u.Path, "/sub/") {
-		candidatePorts := []string{"8443", "2053", "2083", "2087", "2096"}
-		for _, cp := range candidatePorts {
-			altU := *u
-			altU.Host = net.JoinHostPort(u.Hostname(), cp)
-			if altSub, altBody, altErr := fetchSingleSubURL(ctx, altU.String(), opt); altErr == nil && altSub != nil {
-				SaveLastBody(altBody)
-				return altSub, nil
-			}
-		}
-	}
-
 	// 主 URL 失败时，尝试故障漂移
+	u, parseErr := url.Parse(rawURL)
 	if parseErr == nil && u.Path != "" && strings.HasPrefix(u.Path, "/sub/") {
 		if cached := LoadLastBody(); len(cached) > 0 {
 			if lastSub, perr := ParseSubscriptionBytes(cached); perr == nil && len(lastSub.Servers) > 0 {
