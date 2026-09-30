@@ -6,7 +6,9 @@ package edge
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aero-protocol/aero/internal/proto"
+	"github.com/quic-go/quic-go"
 )
 
 func TestDatagramFramingAndProtoCodec(t *testing.T) {
@@ -441,7 +444,7 @@ func TestUDPContextLimits(t *testing.T) {
 	v.AddToken("tok_user1", "user", 1*time.Hour)
 	v.AddToken("tok_user2", "user", 1*time.Hour)
 
-	server := NewQUICServer(v, nil, nil, nil)
+	server := NewQUICServer(v, nil, nil, nil, nil)
 
 	// Acquire up to MaxUDPContextsPerToken (64)
 	for i := 0; i < MaxUDPContextsPerToken; i++ {
@@ -523,5 +526,270 @@ func TestServerCoverAndHealth(t *testing.T) {
 	}
 	if !strings.Contains(recC.Body.String(), "Global Anycast Acceleration Edge Node") {
 		t.Fatalf("cover page missing expected text")
+	}
+}
+
+// ==========================================
+// 8. Tests for QUIC Hardening (E-1, E-2, E-3, E-4)
+// ==========================================
+
+func TestQUICConfigHardening(t *testing.T) {
+	cfg := DefaultQUICConfig()
+	if cfg.Allow0RTT {
+		t.Fatal("expected Allow0RTT to be false")
+	}
+	if cfg.MaxIdleTimeout != 30*time.Second {
+		t.Fatalf("expected MaxIdleTimeout 30s, got %v", cfg.MaxIdleTimeout)
+	}
+	if cfg.KeepAlivePeriod != 12*time.Second {
+		t.Fatalf("expected KeepAlivePeriod 12s, got %v", cfg.KeepAlivePeriod)
+	}
+	if !cfg.EnableDatagrams {
+		t.Fatal("expected EnableDatagrams to be true")
+	}
+}
+
+func TestQUICConnContextRateLimiterAndGracefulShutdown(t *testing.T) {
+	cert, err := generateSelfSignedCert("127.0.0.1")
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	}
+
+	// Rate limiter allows strictly 1 connection per IP
+	rl := NewRateLimiter(1)
+	v := NewValidator()
+	qs := NewQUICServer(v, nil, nil, nil, rl)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln, err := StartQUIC("127.0.0.1:0", tlsCfg, qs, ctx)
+	if err != nil {
+		t.Fatalf("StartQUIC failed: %v", err)
+	}
+	defer ln.Close()
+
+	serverAddr := ln.Addr().String()
+
+	clientTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	clientQUIC := &quic.Config{
+		MaxIdleTimeout: 5 * time.Second,
+	}
+
+	// 1. First connection should succeed
+	dialCtx1, cancel1 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel1()
+	conn1, err := quic.DialAddr(dialCtx1, serverAddr, clientTLS, clientQUIC)
+	if err != nil {
+		t.Fatalf("expected first connection to succeed, got: %v", err)
+	}
+	defer conn1.CloseWithError(0, "normal")
+
+	// 2. Second connection from same IP should be rejected by ConnContext rateLimiter
+	dialCtx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	_, err = quic.DialAddr(dialCtx2, serverAddr, clientTLS, clientQUIC)
+	if err == nil {
+		t.Fatal("expected second connection to be rejected by rate limiter, but dial succeeded")
+	}
+
+	// 3. Test graceful shutdown via context cancellation
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+
+	// After cancellation, dial must fail
+	dialCtx3, cancel3 := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel3()
+	_, err = quic.DialAddr(dialCtx3, serverAddr, clientTLS, clientQUIC)
+	if err == nil {
+		t.Fatal("expected dial to fail after server context cancellation")
+	}
+}
+
+func TestUDPRegisterLRUEviction(t *testing.T) {
+	cert, err := generateSelfSignedCert("127.0.0.1")
+	if err != nil {
+		t.Fatalf("generate cert: %v", err)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	}
+
+	v := NewValidator()
+	token := "tok_lru_test_001"
+	v.AddToken(token, "user", 1*time.Hour)
+
+	qs := NewQUICServer(v, nil, nil, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ln, err := StartQUIC("127.0.0.1:0", tlsCfg, qs, ctx)
+	if err != nil {
+		t.Fatalf("StartQUIC failed: %v", err)
+	}
+	defer ln.Close()
+
+	clientTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	clientQUIC := &quic.Config{
+		MaxIdleTimeout: 10 * time.Second,
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer dialCancel()
+	conn, err := quic.DialAddr(dialCtx, ln.Addr().String(), clientTLS, clientQUIC)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.CloseWithError(0, "normal")
+
+	// Helper to send UDP register stream
+	registerUDP := func(ctxID uint32, isFirst bool) (*proto.ConnectResponse, error) {
+		stCtx, stCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer stCancel()
+		stream, err := conn.OpenStreamSync(stCtx)
+		if err != nil {
+			return nil, err
+		}
+		defer stream.Close()
+
+		req := &proto.ConnectRequest{
+			Token:     token,
+			Timestamp: uint64(time.Now().UnixMilli()),
+			Nonce:     []byte(fmt.Sprintf("nonce_%d", ctxID)),
+			Streams: []*proto.StreamSpec{
+				{
+					StreamId:   ctxID,
+					StreamType: proto.StreamType_UDP,
+					TargetHost: "1.1.1.1",
+					TargetPort: 53,
+				},
+			},
+		}
+		if err := proto.WriteMessage(stream, req); err != nil {
+			return nil, err
+		}
+		var resp proto.ConnectResponse
+		if err := proto.ReadMessage(stream, &resp); err != nil {
+			return nil, err
+		}
+		return &resp, nil
+	}
+
+	// Register 64 UDP contexts (contextID 1..64)
+	for i := uint32(1); i <= 64; i++ {
+		resp, err := registerUDP(i, i == 1)
+		if err != nil {
+			t.Fatalf("registerUDP context %d failed: %v", i, err)
+		}
+		if !resp.Accepted {
+			t.Fatalf("registerUDP context %d was rejected: %s", i, resp.Message)
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	// Register 65th context: triggers LRU eviction (context 1 is the oldest) and succeeds
+	resp65, err := registerUDP(65, false)
+	if err != nil {
+		t.Fatalf("registerUDP context 65 failed: %v", err)
+	}
+	if !resp65.Accepted {
+		t.Fatalf("expected context 65 to be accepted via LRU eviction, got rejected: %s", resp65.Message)
+	}
+
+	// Now context 1 should have been evicted; registering context 1 again should succeed!
+	resp1Again, err := registerUDP(1, false)
+	if err != nil {
+		t.Fatalf("registerUDP context 1 again failed: %v", err)
+	}
+	if !resp1Again.Accepted {
+		t.Fatalf("expected re-registering context 1 to succeed after previous eviction, got: %s", resp1Again.Message)
+	}
+}
+
+func TestUDPReadDeadlineTimeout(t *testing.T) {
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewValidator()
+	qs := NewQUICServer(v, nil, nil, nil, nil)
+	qc := &quicConnState{
+		server:   qs,
+		contexts: make(map[uint32]*udpContext),
+	}
+	u := &udpContext{
+		id:    101,
+		token: "test_tok",
+		conn:  conn,
+		qConn: qc,
+	}
+	qc.contexts[101] = u
+
+	// Close conn to cause readLoop to exit immediately
+	_ = conn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		u.readLoop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop did not exit after close")
+	}
+
+	if !u.closed.Load() {
+		t.Fatal("expected u.closed to be true after readLoop termination")
+	}
+}
+
+func TestServerGracefulShutdownContext(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "aero-shutdown-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := ServerConfig{
+		Listen:   "127.0.0.1:18446",
+		Domain:   "localhost",
+		DataDir:  tmpDir,
+		AdminKey: "adminkey",
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+
+	// Verify server context is active
+	if srv.ctx.Err() != nil {
+		t.Fatal("expected active server ctx")
+	}
+
+	// Close server and verify cancel() shuts down context
+	srv.Close()
+	if srv.ctx.Err() == nil {
+		t.Fatal("expected server ctx to be canceled after Close()")
 	}
 }

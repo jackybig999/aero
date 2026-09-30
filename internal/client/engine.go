@@ -54,8 +54,13 @@ type Engine struct {
 	listenAddr    string
 	mixedListener net.Listener
 
-	running   atomic.Bool
-	stopMixed chan struct{}
+	running     atomic.Bool
+	stopMixed   chan struct{}
+	rootCtx     context.Context
+	rootCancel  context.CancelFunc
+	netMon      NetworkMonitor
+	activeConns sync.Map
+	killSwitch  atomic.Bool
 }
 
 // NewEngine 创建客户端引擎
@@ -78,7 +83,28 @@ func NewEngine() *Engine {
 		mode:         "tun",
 		listenAddr:   "127.0.0.1:55555",
 		stopMixed:    make(chan struct{}),
+		netMon:       NewNetworkMonitor(),
 	}
+}
+
+// SetNetworkMonitor 允许注入自定义网络监控器 (用于单元测试与调试)
+func (e *Engine) SetNetworkMonitor(nm NetworkMonitor) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.netMon = nm
+}
+
+// SetKillSwitch 激活或关闭客户端纯内存 Kill Switch
+func (e *Engine) SetKillSwitch(active bool) {
+	e.killSwitch.Store(active)
+	if e.stackEngine != nil {
+		e.stackEngine.SetKillSwitch(active)
+	}
+}
+
+// KillSwitch 返回当前 Kill Switch 激活状态
+func (e *Engine) KillSwitch() bool {
+	return e.killSwitch.Load()
 }
 
 // Apply 应用已解析好的订阅配置
@@ -194,16 +220,22 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	return nil
 }
 
-// Start 启动客户端数据面（TUN 虚拟网卡 + gVisor 协议栈 + 混合代理端口）
+// Start 启动客户端数据面（TUN 虚拟网卡 + gVisor 协议栈 + 物理网络监控 + 混合代理端口）
 func (e *Engine) Start() error {
 	if e.running.Swap(true) {
 		return nil
 	}
 
+	e.rootCtx, e.rootCancel = context.WithCancel(context.Background())
+	e.stopMixed = make(chan struct{})
+
 	// 1. 打开虚拟网卡与网络栈
 	dev, err := OpenTunDevice("aero0", 1224)
 	if err != nil {
 		e.running.Store(false)
+		if e.rootCancel != nil {
+			e.rootCancel()
+		}
 		return fmt.Errorf("open tun device: %w", err)
 	}
 	e.tunDevice = dev
@@ -211,22 +243,103 @@ func (e *Engine) Start() error {
 	if err := SetupRoutes("aero0", "10.88.0.2/24"); err != nil {
 		_ = dev.Close()
 		e.running.Store(false)
+		if e.rootCancel != nil {
+			e.rootCancel()
+		}
 		return fmt.Errorf("setup routes: %w", err)
 	}
 
 	e.stackEngine = NewStackEngine(dev, e.tunnelClient, e.dnsHandler)
+	e.stackEngine.SetKillSwitch(e.killSwitch.Load())
 	if err := e.stackEngine.Start(); err != nil {
 		TeardownRoutes("aero0")
 		_ = dev.Close()
 		e.running.Store(false)
+		if e.rootCancel != nil {
+			e.rootCancel()
+		}
 		return fmt.Errorf("start stack: %w", err)
 	}
 
-	// 2. 启动本地 127.0.0.1:55555 混合代理监听器
+	// 2. 启动物理网络变动监控 (Netmon)
+	e.mu.Lock()
+	if e.netMon == nil {
+		e.netMon = NewNetworkMonitor()
+	}
+	nm := e.netMon
+	e.mu.Unlock()
+
+	nm.Start(func(newGW, ifName string) {
+		e.onNetworkChange(newGW, ifName)
+	})
+
+	// 3. 启动本地 127.0.0.1:55555 混合代理监听器
 	go e.startMixedProxy()
 
 	log.Printf("[ENGINE] data plane started successfully (TUN aero0, mixed proxy %s)", e.listenAddr)
 	return nil
+}
+
+// onNetworkChange 响应底层物理网络切换事件
+// 规则：原子级刷新 ProtectHostRoute、清理存量悬挂连接、重置会话池、更新物理解析、异步预热 QUIC
+func (e *Engine) onNetworkChange(newGW, ifName string) {
+	log.Printf("[ENGINE] onNetworkChange triggered: newGW=%s, ifName=%s", newGW, ifName)
+
+	e.mu.RLock()
+	activeAddr := e.activeAddr
+	activeSNI := e.activeSNI
+	e.mu.RUnlock()
+
+	// 1. 刷新活跃节点保护路由
+	if activeAddr != "" {
+		host, _, _ := net.SplitHostPort(activeAddr)
+		if host != "" {
+			_ = ProtectHostRoute(host)
+		}
+	}
+
+	// 2. 斩断前一网络留存的悬挂连接
+	e.closeActiveConns()
+
+	// 3. 重置 QUIC 会话池
+	e.sessionPool.Reset()
+
+	// 4. 更新物理 DNS
+	if e.dnsHandler != nil {
+		if newGW != "" && net.ParseIP(newGW) != nil {
+			e.dnsHandler.SetPhysicalDNS(newGW + ":53")
+		} else {
+			e.dnsHandler.SetPhysicalDNS("223.5.5.5:53")
+		}
+	}
+
+	// 5. 异步预热新网络接口上的 QUIC 拨号
+	go func() {
+		if activeAddr == "" {
+			return
+		}
+		cfg := DefaultTransportConfig(activeAddr, activeSNI)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = e.sessionPool.Get(ctx, cfg)
+	}()
+}
+
+func (e *Engine) closeActiveConns() {
+	e.activeConns.Range(func(key, value any) bool {
+		if c, ok := key.(io.Closer); ok {
+			_ = c.Close()
+		}
+		e.activeConns.Delete(key)
+		return true
+	})
+}
+
+func (e *Engine) getContext() context.Context {
+	if e.rootCtx != nil {
+		return e.rootCtx
+	}
+	return context.Background()
 }
 
 // Stop 停止客户端数据面
@@ -235,8 +348,27 @@ func (e *Engine) Stop() error {
 		return nil
 	}
 
+	if e.rootCancel != nil {
+		e.rootCancel()
+	}
+
+	e.mu.Lock()
+	nm := e.netMon
+	e.mu.Unlock()
+	if nm != nil {
+		nm.Stop()
+	}
+
+	e.closeActiveConns()
+
 	if e.mixedListener != nil {
 		_ = e.mixedListener.Close()
+		e.mixedListener = nil
+	}
+	select {
+	case <-e.stopMixed:
+	default:
+		close(e.stopMixed)
 	}
 
 	if e.stackEngine != nil {
@@ -291,9 +423,30 @@ func (e *Engine) SetListenAddr(addr string) {
 	e.listenAddr = addr
 }
 
-// DialTCP 导出供外部使用的 TCP 拨号接口
+// DialTCP 导出供外部使用的 TCP 拨号接口，并注册至活跃连接池
 func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
-	return e.tunnelClient.DialTCP(ctx, target)
+	conn, err := e.tunnelClient.DialTCP(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	e.activeConns.Store(conn, struct{}{})
+	return &trackedConn{
+		Conn: conn,
+		onClose: func() {
+			e.activeConns.Delete(conn)
+		},
+	}, nil
+}
+
+type trackedConn struct {
+	net.Conn
+	onClose func()
+	once    sync.Once
+}
+
+func (c *trackedConn) Close() error {
+	c.once.Do(c.onClose)
+	return c.Conn.Close()
 }
 
 // startMixedProxy 启动 SOCKS5 + HTTP CONNECT 混合端口监听
@@ -313,12 +466,18 @@ func (e *Engine) startMixedProxy() {
 		if err != nil {
 			return
 		}
-		go e.serveMixedConn(conn)
+		e.activeConns.Store(conn, struct{}{})
+		go func(c net.Conn) {
+			defer func() {
+				_ = c.Close()
+				e.activeConns.Delete(c)
+			}()
+			e.serveMixedConn(c)
+		}(conn)
 	}
 }
 
 func (e *Engine) serveMixedConn(conn net.Conn) {
-	defer conn.Close()
 	br := bufio.NewReader(conn)
 	peek, err := br.Peek(1)
 	if err != nil {
@@ -396,8 +555,8 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 	port := binary.BigEndian.Uint16(portBuf[:])
 	target := fmt.Sprintf("%s:%d", host, port)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	remote, err := e.tunnelClient.DialTCP(ctx, target)
+	ctx, cancel := context.WithTimeout(e.getContext(), 10*time.Second)
+	remote, err := e.DialTCP(ctx, target)
 	cancel()
 	if err != nil {
 		_, _ = conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -421,8 +580,8 @@ func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
 	}
 
 	target := req.RequestURI
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	remote, err := e.tunnelClient.DialTCP(ctx, target)
+	ctx, cancel := context.WithTimeout(e.getContext(), 10*time.Second)
+	remote, err := e.DialTCP(ctx, target)
 	cancel()
 	if err != nil {
 		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))

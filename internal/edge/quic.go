@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -199,6 +200,7 @@ type QUICServer struct {
 	connLimiter      *ConnLimiter
 	bandwidthLimiter *BandwidthLimiter
 	dialGuard        *DialGuard
+	rateLimiter      *RateLimiter
 	dnsResolver      *DNSResolver
 
 	udpMu        sync.Mutex
@@ -208,12 +210,13 @@ type QUICServer struct {
 }
 
 // NewQUICServer creates a new QUICServer instance
-func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard) *QUICServer {
+func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter) *QUICServer {
 	return &QUICServer{
 		validator:        v,
 		connLimiter:      cl,
 		bandwidthLimiter: bl,
 		dialGuard:        dg,
+		rateLimiter:      rl,
 		dnsResolver:      NewDNSResolver(),
 		tokenUDPCtx:      make(map[string]int),
 		maxGlobalUDP:     DefaultMaxGlobalUDP,
@@ -320,36 +323,71 @@ func (qc *quicConnState) closeAllContexts() {
 // 4. QUIC Listener & Connection Loop
 // ==========================================
 
-// StartQUIC starts the QUIC listener on addr
-func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer) (*quic.Listener, error) {
-	quicCfg := &quic.Config{
+// DefaultQUICConfig returns the hardened QUIC configuration for AERO edge nodes
+func DefaultQUICConfig() *quic.Config {
+	return &quic.Config{
+		Allow0RTT:                      false,
 		MaxIncomingStreams:             1000,
 		MaxIncomingUniStreams:          1000,
-		MaxIdleTimeout:                 60 * time.Second,
+		MaxIdleTimeout:                 30 * time.Second,
 		EnableDatagrams:                true,
 		InitialStreamReceiveWindow:     16 * 1024 * 1024,  // 16 MB single stream window (Rule L6)
 		MaxStreamReceiveWindow:         32 * 1024 * 1024,  // 32 MB
 		InitialConnectionReceiveWindow: 64 * 1024 * 1024,  // 64 MB
 		MaxConnectionReceiveWindow:     128 * 1024 * 1024, // 128 MB connection window (Rule L6)
-		KeepAlivePeriod:                20 * time.Second,  // 20s KeepAlive
+		KeepAlivePeriod:                12 * time.Second,  // 12s KeepAlive
 		InitialPacketSize:              1350,
 	}
+}
+
+// StartQUIC starts the QUIC listener on addr
+func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx context.Context) (*quic.Listener, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	quicCfg := DefaultQUICConfig()
 
 	quicTLS := tlsConfig.Clone()
 	quicTLS.NextProtos = []string{"h3"}
 
-	ln, err := quic.ListenAddr(addr, quicTLS, quicCfg)
+	conn, err := net.ListenPacket("udp4", addr)
 	if err != nil {
+		return nil, fmt.Errorf("quic listen packet %s: %w", addr, err)
+	}
+
+	tr := &quic.Transport{
+		Conn: conn,
+		ConnContext: func(c context.Context, info *quic.ClientInfo) (context.Context, error) {
+			host, _, err := net.SplitHostPort(info.RemoteAddr.String())
+			if err != nil || host == "" {
+				host = info.RemoteAddr.String()
+			}
+			if server != nil && server.rateLimiter != nil && !server.rateLimiter.Allow(host) {
+				return nil, errors.New("rate limited")
+			}
+			return c, nil
+		},
+	}
+
+	ln, err := tr.Listen(quicTLS, quicCfg)
+	if err != nil {
+		_ = tr.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("quic listen %s: %w", addr, err)
 	}
 
 	go func() {
+		defer func() {
+			_ = tr.Close()
+			_ = conn.Close()
+		}()
 		for {
-			conn, err := ln.Accept(context.Background())
+			c, err := ln.Accept(ctx)
 			if err != nil {
 				return
 			}
-			go server.handleQUICConn(conn)
+			go server.handleQUICConn(c)
 		}
 	}()
 
@@ -623,13 +661,51 @@ func (qc *quicConnState) handleUDPRegister(stream *quic.Stream, token string, co
 		_ = proto.WriteMessage(stream, resp)
 		return
 	}
+
+	// LRU eviction if slots are full (>= MaxUDPContextsPerToken)
+	var lruCtx *udpContext
+	if len(qc.contexts) >= MaxUDPContextsPerToken {
+		var oldest int64
+		for _, u := range qc.contexts {
+			last := u.lastActive.Load()
+			if lruCtx == nil || last < oldest {
+				oldest = last
+				lruCtx = u
+			}
+		}
+	}
 	qc.ctxMu.Unlock()
+
+	if lruCtx != nil {
+		lruCtx.close()
+	}
 
 	// Max 64 Contexts per Token & global UDP cap
 	if !qc.server.acquireUDPSlot(token) {
-		resp := &proto.ConnectResponse{Accepted: false, Message: "udp context limit exceeded"}
-		_ = proto.WriteMessage(stream, resp)
-		return
+		// If acquire still failed but we have contexts on this connection, evict LRU
+		qc.ctxMu.Lock()
+		var fallbackLRU *udpContext
+		var oldest int64
+		for _, u := range qc.contexts {
+			last := u.lastActive.Load()
+			if fallbackLRU == nil || last < oldest {
+				oldest = last
+				fallbackLRU = u
+			}
+		}
+		qc.ctxMu.Unlock()
+		if fallbackLRU != nil {
+			fallbackLRU.close()
+			if !qc.server.acquireUDPSlot(token) {
+				resp := &proto.ConnectResponse{Accepted: false, Message: "udp context limit exceeded"}
+				_ = proto.WriteMessage(stream, resp)
+				return
+			}
+		} else {
+			resp := &proto.ConnectResponse{Accepted: false, Message: "udp context limit exceeded"}
+			_ = proto.WriteMessage(stream, resp)
+			return
+		}
 	}
 
 	dstAddr, err := net.ResolveUDPAddr("udp", target)
@@ -677,6 +753,7 @@ func (u *udpContext) readLoop() {
 
 	buf := make([]byte, 65535)
 	for {
+		_ = u.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := u.conn.Read(buf)
 		if err != nil {
 			return

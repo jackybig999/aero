@@ -242,7 +242,21 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 	}
 	req.Header.Set("User-Agent", "AeroClient/2.0")
 
-	client := &http.Client{Timeout: timeout}
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
+			return DialPhysicalDirect(c, network, addr)
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   timeout,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("fetch subscription network error: %w", err)

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -148,16 +149,44 @@ func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	return gw, ifIndex, nil
 }
 
-// DialPhysicalDirect 绑定物理网卡直连
+const ipBoundIF = 25
+
+// DialPhysicalDirect 绑定 macOS 物理网卡直连 (IP_BOUND_IF)
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
 	var dialer net.Dialer
 	dialer.Timeout = 8 * time.Second
+	if !isLoopbackHost(addr) {
+		_, ifName, err := PhysicalDefaultGateway()
+		if err == nil && ifName != "" && !strings.Contains(strings.ToLower(ifName), "aero") {
+			if ifi, ierr := net.InterfaceByName(ifName); ierr == nil && ifi.Index > 0 {
+				dialer.Control = func(netw, address string, c syscall.RawConn) error {
+					var opErr error
+					_ = c.Control(func(fd uintptr) {
+						opErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, ipBoundIF, ifi.Index)
+					})
+					return opErr
+				}
+			}
+		}
+	}
 	return dialer.DialContext(ctx, network, addr)
 }
 
-// ListenPhysicalPacket 监听物理网络包
+// ListenPhysicalPacket 监听物理网络包 (IP_BOUND_IF)
 func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, error) {
+	_, ifName, err := PhysicalDefaultGateway()
 	var lc net.ListenConfig
+	if err == nil && ifName != "" && !strings.Contains(strings.ToLower(ifName), "aero") {
+		if ifi, ierr := net.InterfaceByName(ifName); ierr == nil && ifi.Index > 0 {
+			lc.Control = func(netw, address string, c syscall.RawConn) error {
+				var opErr error
+				_ = c.Control(func(fd uintptr) {
+					opErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, ipBoundIF, ifi.Index)
+				})
+				return opErr
+			}
+		}
+	}
 	return lc.ListenPacket(ctx, network, ":0")
 }
 

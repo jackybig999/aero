@@ -13,6 +13,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/gvisor/pkg/buffer"
@@ -49,8 +50,9 @@ type StackEngine struct {
 	dialer    *TunnelClient
 	dns       *DNSHandler
 	gatewayIP net.IP
-	wg        sync.WaitGroup
-	udpSess   sync.Map
+	wg         sync.WaitGroup
+	udpSess    sync.Map
+	killSwitch atomic.Bool
 }
 
 // NewStackEngine 创建网络栈引擎
@@ -143,6 +145,16 @@ func (e *StackEngine) Stop() {
 	e.wg.Wait()
 }
 
+// SetKillSwitch 激活或关闭纯内存 Kill Switch
+func (e *StackEngine) SetKillSwitch(active bool) {
+	e.killSwitch.Store(active)
+}
+
+// KillSwitch 返回当前 Kill Switch 激活状态
+func (e *StackEngine) KillSwitch() bool {
+	return e.killSwitch.Load()
+}
+
 // pumpTunToStack 从虚拟网卡读包注入网络栈
 // 规则：在栈入口读取 IPv4 头 DF 标志：
 // 若 len(packet) > currentMaxDatagramSize + 24：
@@ -230,6 +242,10 @@ func (e *StackEngine) pumpStackToTun() {
 }
 
 func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
+	if e.killSwitch.Load() {
+		r.Complete(true)
+		return
+	}
 	id := r.ID()
 	dst := joinHostPort(id.LocalAddress, id.LocalPort)
 	if isPrivateOrLoopbackAddr(id.LocalAddress) {
@@ -272,6 +288,12 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 }
 
 func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
+	if e.killSwitch.Load() {
+		if r.Packet() != nil {
+			r.Packet().DecRef()
+		}
+		return true
+	}
 	id := r.ID()
 	dst := joinHostPort(id.LocalAddress, id.LocalPort)
 	if isPrivateOrLoopbackAddr(id.LocalAddress) {
@@ -403,6 +425,20 @@ func isPrivateOrLoopbackAddr(addr tcpip.Address) bool {
 			return true
 		}
 		return true
+	}
+	return false
+}
+
+func isLoopbackHost(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
 	}
 	return false
 }

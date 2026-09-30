@@ -59,6 +59,9 @@ type Server struct {
 	adminHandler *AdminHandler
 	subHandler   *SubHandler
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	tlsCert      *tls.Certificate
 	httpServer   *http.Server
 	tcpListener  net.Listener
@@ -170,11 +173,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	rateLimit := NewRateLimiter(cfg.RateIP)
 
 	// 5. QUIC Server
-	quicServer := NewQUICServer(validator, connLimit, bwLimit, dialGuard)
+	quicServer := NewQUICServer(validator, connLimit, bwLimit, dialGuard, rateLimit)
 
 	// 6. Admin & Sub HTTP Handlers
 	adminHandler := NewAdminHandler(cfg.AdminKey, validator, tokenStore, subStore, connLimit, bwLimit, dialGuard)
 	subHandler := &SubHandler{Store: subStore}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	srv := &Server{
 		cfg:          cfg,
@@ -188,6 +193,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		quicServer:   quicServer,
 		adminHandler: adminHandler,
 		subHandler:   subHandler,
+		ctx:          ctx,
+		cancel:       cancel,
 		tlsCert:      cert,
 		startedAt:    time.Now(),
 	}
@@ -221,7 +228,7 @@ func (s *Server) Start() error {
 	}()
 
 	// 2. QUIC Listener
-	quicLn, err := StartQUIC(s.cfg.Listen, tlsCfg, s.quicServer)
+	quicLn, err := StartQUIC(s.cfg.Listen, tlsCfg, s.quicServer, s.ctx)
 	if err != nil {
 		_ = s.tcpListener.Close()
 		return fmt.Errorf("quic listen %s: %w", s.cfg.Listen, err)
@@ -288,6 +295,9 @@ func (s *Server) serveCover(w http.ResponseWriter, r *http.Request) {
 
 // Close gracefully closes all listeners and servers
 func (s *Server) Close() {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = s.httpServer.Shutdown(ctx)

@@ -155,6 +155,9 @@ type TunnelClient struct {
 	pool        ISessionPool
 	splitEngine *SplitEngine
 	activeConn  atomic.Pointer[Client]
+	ctx         context.Context
+	cancel      context.CancelFunc
+	cancelLoop  atomic.Pointer[context.CancelFunc]
 }
 
 // NewTunnelClient 创建隧道客户端
@@ -162,9 +165,22 @@ func NewTunnelClient(pool ISessionPool, split *SplitEngine) *TunnelClient {
 	if pool == nil {
 		pool = GlobalSessionPool
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &TunnelClient{
 		pool:        pool,
 		splitEngine: split,
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+}
+
+// Close 关闭隧道客户端及其后台接收循环
+func (tc *TunnelClient) Close() {
+	if tc.cancel != nil {
+		tc.cancel()
+	}
+	if prevCancel := tc.cancelLoop.Swap(nil); prevCancel != nil {
+		(*prevCancel)()
 	}
 }
 
@@ -182,14 +198,23 @@ func (tc *TunnelClient) getActiveQUICClient(ctx context.Context) (*Client, error
 	// 确保该 Client 启动了数据报接收监听
 	old := tc.activeConn.Swap(client)
 	if old != client {
-		go tc.runDatagramReceiveLoop(client)
+		loopCtx, loopCancel := context.WithCancel(tc.ctx)
+		if prevCancel := tc.cancelLoop.Swap(&loopCancel); prevCancel != nil {
+			(*prevCancel)()
+		}
+		go tc.runDatagramReceiveLoop(loopCtx, client)
 	}
 	return client, nil
 }
 
-func (tc *TunnelClient) runDatagramReceiveLoop(client *Client) {
+func (tc *TunnelClient) runDatagramReceiveLoop(ctx context.Context, client *Client) {
 	for {
-		dg, err := client.ReceiveDatagram(context.Background())
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		dg, err := client.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}
@@ -203,12 +228,20 @@ func (tc *TunnelClient) runDatagramReceiveLoop(client *Client) {
 }
 
 // DialTCP 拨号建立经由 AERO 隧道的 TCP 业务流连接
-// 规则：单流最多重试 1 次（不睡眠）；单流超时绝对不调用 GlobalSessionPool.Remove！
+// 规则：单流最多重试 1 次（不睡眠，使用 select 和 ctx.Done() 退避）；单流超时绝对不调用 GlobalSessionPool.Remove！
 func (tc *TunnelClient) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 	st := classifyTarget(target)
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+
 		client, err := tc.getActiveQUICClient(ctx)
 		if err != nil {
 			lastErr = err

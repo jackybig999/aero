@@ -172,14 +172,13 @@ func MakeVerifyPeerCertificate(serverName string) func([][]byte, [][]*x509.Certi
 
 // TransportConfig QUIC 传输配置
 type TransportConfig struct {
-	Address             string
-	TLSServerName       string
-	TLSConfig           *tls.Config
-	Enable0RTT          bool
-	ConnectionMigration bool
-	MaxStreams          int64
-	IdleTimeout         time.Duration
-	ConnectTimeout      time.Duration
+	Address        string
+	TLSServerName  string
+	TLSConfig      *tls.Config
+	Enable0RTT     bool
+	MaxStreams     int64
+	IdleTimeout    time.Duration
+	ConnectTimeout time.Duration
 }
 
 // DefaultTransportConfig 构造默认传输配置，锁定物理域名 SNI
@@ -194,13 +193,12 @@ func DefaultTransportConfig(addr, sni string) *TransportConfig {
 	}
 
 	return &TransportConfig{
-		Address:             addr,
-		TLSServerName:       sni,
-		Enable0RTT:          true,
-		ConnectionMigration: true,
-		MaxStreams:          100,
-		IdleTimeout:         45 * time.Second,
-		ConnectTimeout:      10 * time.Second,
+		Address:        addr,
+		TLSServerName:  sni,
+		Enable0RTT:     true,
+		MaxStreams:     100,
+		IdleTimeout:    45 * time.Second,
+		ConnectTimeout: 10 * time.Second,
 	}
 }
 
@@ -299,6 +297,9 @@ type Stream interface {
 
 // OpenStream 打开双向流
 func (c *Client) OpenStream(ctx context.Context) (Stream, error) {
+	if c == nil || c.conn == nil {
+		return nil, errors.New("client connection closed")
+	}
 	c.lastActive.Store(time.Now().UnixMilli())
 	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -309,6 +310,9 @@ func (c *Client) OpenStream(ctx context.Context) (Stream, error) {
 
 // SendDatagram 发送数据报并捕获 DatagramTooLargeError
 func (c *Client) SendDatagram(payload []byte) error {
+	if c == nil || c.conn == nil {
+		return errors.New("client connection closed")
+	}
 	c.lastActive.Store(time.Now().UnixMilli())
 	maxSize := GetCurrentMaxDatagramSize()
 	if len(payload) > maxSize {
@@ -332,6 +336,9 @@ func (c *Client) SendDatagram(payload []byte) error {
 
 // ReceiveDatagram 接收数据报
 func (c *Client) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	if c == nil || c.conn == nil {
+		return nil, errors.New("client connection closed")
+	}
 	c.lastActive.Store(time.Now().UnixMilli())
 	return c.conn.ReceiveDatagram(ctx)
 }

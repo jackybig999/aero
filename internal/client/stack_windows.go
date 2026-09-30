@@ -376,19 +376,21 @@ func liveIfIndexForIPv4(ip net.IP) string {
 
 // DialPhysicalDirect 绑定物理网卡发包
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
-	_, idxStr, err := PhysicalDefaultGateway()
 	var dialer net.Dialer
 	dialer.Timeout = 8 * time.Second
-	if err == nil && idxStr != "" {
-		if idx, err := strconv.Atoi(idxStr); err == nil && idx > 0 {
-			dialer.Control = func(netw, address string, c syscall.RawConn) error {
-				var opErr error
-				_ = c.Control(func(fd uintptr) {
-					var buf [4]byte
-					binary.BigEndian.PutUint32(buf[:], uint32(idx))
-					opErr = syscall.Setsockopt(syscall.Handle(fd), syscall.IPPROTO_IP, 31, (*byte)(unsafe.Pointer(&buf[0])), 4)
-				})
-				return opErr
+	if !isLoopbackHost(addr) {
+		_, idxStr, err := PhysicalDefaultGateway()
+		if err == nil && idxStr != "" {
+			if idx, err := strconv.Atoi(idxStr); err == nil && idx > 0 {
+				dialer.Control = func(netw, address string, c syscall.RawConn) error {
+					var opErr error
+					_ = c.Control(func(fd uintptr) {
+						var buf [4]byte
+						binary.BigEndian.PutUint32(buf[:], uint32(idx))
+						opErr = syscall.Setsockopt(syscall.Handle(fd), syscall.IPPROTO_IP, 31, (*byte)(unsafe.Pointer(&buf[0])), 4)
+					})
+					return opErr
+				}
 			}
 		}
 	}

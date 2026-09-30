@@ -441,3 +441,258 @@ func TestNativeAeroSubParsing(t *testing.T) {
 		t.Fatalf("unexpected applied: %+v", applied)
 	}
 }
+
+// 验收项：物理网卡直连拉取订阅
+func TestSubPhysicalDial(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+			"version": "aero/2.0",
+			"servers": [
+				{"name": "DirectNode", "address": "direct.example.com:443", "token": "tok_direct"}
+			]
+		}`)
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sub, body, err := fetchSingleSubURL(ctx, ts.URL, SubFetchOptions{})
+	if err != nil {
+		t.Fatalf("fetchSingleSubURL with DialPhysicalDirect failed: %v", err)
+	}
+	if sub == nil || len(sub.Servers) != 1 || sub.Servers[0].Token != "tok_direct" {
+		t.Fatalf("unexpected fetched sub: %+v", sub)
+	}
+	if len(body) == 0 {
+		t.Fatalf("expected non-empty body")
+	}
+}
+
+// 验收项：Netmon 防抖与指纹去重
+func TestNetmonDebounceAndFingerprint(t *testing.T) {
+	w := newDebounceWatcher()
+	w.debounce = 40 * time.Millisecond
+
+	var triggerCount atomic.Int32
+	w.start(func(newGW, ifName string) {
+		triggerCount.Add(1)
+	})
+	defer w.stop()
+
+	// 初始指纹已采样，连续多次触发由于指纹相同应全部去重
+	for i := 0; i < 5; i++ {
+		w.trigger()
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	if count := triggerCount.Load(); count != 0 {
+		t.Fatalf("expected 0 triggers due to deduplication, got %d", count)
+	}
+
+	// 模拟指纹发生变化（网关或物理网卡改变）
+	w.mu.Lock()
+	w.lastFingerprint = "old-gw@old-iface"
+	w.mu.Unlock()
+
+	// 连续快速触发 10 次（模拟网卡状态震荡）
+	for i := 0; i < 10; i++ {
+		w.trigger()
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// 防抖应将 10 次震荡压缩为恰好 1 次有效触发
+	if count := triggerCount.Load(); count != 1 {
+		t.Fatalf("expected exactly 1 trigger after debounce, got %d", count)
+	}
+}
+
+// 验收项：纯内存 Kill Switch
+func TestKillSwitchInMemory(t *testing.T) {
+	eng := NewEngine()
+	if eng.KillSwitch() {
+		t.Fatalf("expected kill switch disabled by default")
+	}
+
+	eng.SetKillSwitch(true)
+	if !eng.KillSwitch() {
+		t.Fatalf("expected kill switch enabled on Engine")
+	}
+
+	stackEng := NewStackEngine(nil, nil, nil)
+	if stackEng.KillSwitch() {
+		t.Fatalf("expected stack kill switch false by default")
+	}
+
+	stackEng.SetKillSwitch(true)
+	if !stackEng.KillSwitch() {
+		t.Fatalf("expected stack kill switch true")
+	}
+
+	eng.stackEngine = stackEng
+	eng.SetKillSwitch(false)
+	if stackEng.KillSwitch() {
+		t.Fatalf("expected stackEngine killswitch synchronized to false")
+	}
+	eng.SetKillSwitch(true)
+	if !stackEng.KillSwitch() {
+		t.Fatalf("expected stackEngine killswitch synchronized to true")
+	}
+}
+
+// 验收项：数据报接收循环 Context 取消立即退出
+func TestTunnelDatagramReceiveLoopContextCancel(t *testing.T) {
+	tc := NewTunnelClient(nil, nil)
+	defer tc.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		// client with nil conn: ReceiveDatagram returns error when context canceled or immediately
+		client := &Client{}
+		tc.runDatagramReceiveLoop(ctx, client)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+		// success: exited cleanly
+	case <-time.After(1 * time.Second):
+		t.Fatalf("runDatagramReceiveLoop did not exit immediately upon context cancel")
+	}
+}
+
+// 验收项：DialTCP 退避重试响应 ctx.Done()
+func TestTunnelDialTCPBackoffRetryCancel(t *testing.T) {
+	tc := NewTunnelClient(nil, nil)
+	defer tc.Close()
+
+	// 激活一个空地址，使首次 getActiveQUICClient 失败触发重试分支
+	SetActiveEdge("", "", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := tc.DialTCP(ctx, "target.com:80")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected dial to fail")
+	}
+	// 退避应在 ctx 超时后立即终止，耗时应在合理范围内 (< 500ms)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("DialTCP took too long (%v), expected quick exit via ctx.Done()", elapsed)
+	}
+}
+
+// 验收项：强制门户检测 (Captive Portal Detection)
+func TestDetectCaptivePortal(t *testing.T) {
+	origURL := captivePortalURL
+	defer func() { captivePortalURL = origURL }()
+
+	// 1. 模拟正常网络 (返回 204 No Content)
+	tsNormal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer tsNormal.Close()
+
+	captivePortalURL = tsNormal.URL
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	detected, err := DetectCaptivePortal(ctx)
+	if err != nil {
+		t.Fatalf("DetectCaptivePortal failed on normal: %v", err)
+	}
+	if detected {
+		t.Fatalf("expected detected=false on 204 response")
+	}
+
+	// 2. 模拟强制门户拦截 (返回 302 重定向到认证页)
+	tsRedirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://login.wifi.portal/index.html", http.StatusFound)
+	}))
+	defer tsRedirect.Close()
+
+	captivePortalURL = tsRedirect.URL
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+
+	detected, err = DetectCaptivePortal(ctx2)
+	if err != nil {
+		t.Fatalf("DetectCaptivePortal failed on redirect: %v", err)
+	}
+	if !detected {
+		t.Fatalf("expected detected=true on 302 redirect")
+	}
+
+	// 3. 模拟强制门户拦截 (返回 200 OK 认证页)
+	tsHTML := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "<html><body>Please login to WiFi</body></html>")
+	}))
+	defer tsHTML.Close()
+
+	captivePortalURL = tsHTML.URL
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel3()
+
+	detected, err = DetectCaptivePortal(ctx3)
+	if err != nil {
+		t.Fatalf("DetectCaptivePortal failed on 200 HTML: %v", err)
+	}
+	if !detected {
+		t.Fatalf("expected detected=true on 200 OK response")
+	}
+}
+
+// 验收项：Engine 网络变动事件响应 (onNetworkChange)
+func TestEngineOnNetworkChange(t *testing.T) {
+	eng := NewEngine()
+
+	// 注册模拟会话池
+	resetCalled := atomic.Bool{}
+	eng.sessionPool = &mockSessionPool{
+		onReset: func() {
+			resetCalled.Store(true)
+		},
+	}
+
+	// 注册模拟活跃连接
+	mockConn := &mockCloser{}
+	eng.activeConns.Store(mockConn, struct{}{})
+
+	// 触发物理网络变动
+	eng.onNetworkChange("192.168.1.1", "eth0")
+
+	// 1. 验证存量连接已被关闭
+	if !mockConn.closed.Load() {
+		t.Fatalf("expected activeConns to be closed on network change")
+	}
+
+	// 2. 验证 sessionPool.Reset 已被调用
+	if !resetCalled.Load() {
+		t.Fatalf("expected sessionPool.Reset to be called on network change")
+	}
+
+	// 3. 验证物理 DNS 已被更新为新网关
+	if eng.dnsHandler.physicalDNS != "192.168.1.1:53" {
+		t.Fatalf("expected physical DNS updated to 192.168.1.1:53, got %s", eng.dnsHandler.physicalDNS)
+	}
+}
+
+type mockCloser struct {
+	closed atomic.Bool
+}
+
+func (m *mockCloser) Close() error {
+	m.closed.Store(true)
+	return nil
+}

@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -167,16 +169,38 @@ func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	return "", "", fmt.Errorf("no physical default gateway")
 }
 
-// DialPhysicalDirect 绑定 Linux 物理网卡直连
+// DialPhysicalDirect 绑定 Linux 物理网卡直连 (SO_BINDTODEVICE)
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
 	var dialer net.Dialer
 	dialer.Timeout = 8 * time.Second
+	if !isLoopbackHost(addr) {
+		_, ifName, err := PhysicalDefaultGateway()
+		if err == nil && ifName != "" && !strings.Contains(strings.ToLower(ifName), "aero") {
+			dialer.Control = func(netw, address string, c syscall.RawConn) error {
+				var opErr error
+				_ = c.Control(func(fd uintptr) {
+					opErr = unix.BindToDevice(int(fd), ifName)
+				})
+				return opErr
+			}
+		}
+	}
 	return dialer.DialContext(ctx, network, addr)
 }
 
-// ListenPhysicalPacket 监听物理网络包
+// ListenPhysicalPacket 监听物理网络包 (SO_BINDTODEVICE)
 func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, error) {
+	_, ifName, err := PhysicalDefaultGateway()
 	var lc net.ListenConfig
+	if err == nil && ifName != "" && !strings.Contains(strings.ToLower(ifName), "aero") {
+		lc.Control = func(netw, address string, c syscall.RawConn) error {
+			var opErr error
+			_ = c.Control(func(fd uintptr) {
+				opErr = unix.BindToDevice(int(fd), ifName)
+			})
+			return opErr
+		}
+	}
 	return lc.ListenPacket(ctx, network, ":0")
 }
 
