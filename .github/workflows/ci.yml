@@ -14,7 +14,7 @@ jobs:
   # Job 1: Linux — Proto + Edge Server + aero-panel + Linux Client CLI
   # ──────────────────────────────────────────────────────────────────────────
   build-server:
-    name: Linux Build & Test (Proto + Edge Server + Panel + Client CLI)
+    name: Linux Build & Test (Proto + Edge Server + Panel + Client)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -23,48 +23,38 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: 'stable'
           cache: false
 
-      - name: Vet & Test Protocol Proto
+      - name: Vet & Test Proto and Edge
         run: |
-          cd protocol/proto
-          go vet ./...
-          go test -race -shuffle=on -v ./...
-
-      - name: Vet & Test Protocol Server
-        run: |
-          cd protocol/server
-          go vet ./...
-          go test -race -shuffle=on -v ./...
+          go vet ./internal/proto ./internal/edge ./cmd/edge ./cmd/panel
+          go test -race -shuffle=on -v ./internal/proto ./internal/edge
 
       - name: Build Edge Server (linux/amd64 & linux/arm64)
         run: |
           mkdir -p dist/server
-          cd protocol/server/vps
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o ../../../dist/server/aerosys-server-linux-amd64 .
+            -o dist/server/aerosys-server-linux-amd64 ./cmd/edge
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o ../../../dist/server/aerosys-server-linux-arm64 .
+            -o dist/server/aerosys-server-linux-arm64 ./cmd/edge
 
       - name: Build Standalone VPS Panel (aerosys-panel)
         run: |
-          cd protocol/server/public/webui/cmd/panel
-          GOWORK=off GOOS=linux GOARCH=amd64 go build -v \
+          GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o ../../../../../../dist/server/aerosys-panel-linux-amd64 .
+            -o dist/server/aerosys-panel-linux-amd64 ./cmd/panel
 
       - name: Build Linux Client CLI (linux/amd64 & linux/arm64)
         run: |
-          cd protocol/client
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o ../../dist/server/aerosys-cli-linux-amd64 ./cli
+            -o dist/server/aerosys-cli-linux-amd64 ./cmd/client
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o ../../dist/server/aerosys-cli-linux-arm64 ./cli
+            -o dist/server/aerosys-cli-linux-arm64 ./cmd/client
 
       - name: Upload Server & Linux Client Artifacts
         uses: actions/upload-artifact@v4
@@ -73,10 +63,10 @@ jobs:
           path: dist/server/*
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 2: Windows — Client GUI + CLI + Watchdog Guard
+  # Job 2: Windows — Client GUI + Watchdog Guard
   # ──────────────────────────────────────────────────────────────────────────
   build-client-windows:
-    name: Windows Build & Test (Client GUI + CLI + Guard)
+    name: Windows Build & Test (Client GUI + Guard)
     runs-on: windows-latest
     steps:
       - name: Checkout Code
@@ -85,44 +75,31 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: 'stable'
           cache: false
 
-      - name: Vet & Test Protocol Client
+      - name: Vet & Test Client
         run: |
-          cd protocol/client
-          go vet ./...
-          go test -v -short -shuffle=on ./...
+          go vet ./internal/client ./cmd/client ./cmd/guard
+          go test -v -short -shuffle=on ./internal/client
 
-      - name: Build Client GUI (windows/amd64)
+      - name: Build Client (windows/amd64)
         run: |
-          cd protocol/client
-          go build -v -ldflags="-s -w -H windowsgui" -o aerosys-client-windows-amd64.exe ./win
-
-      - name: Build Client CLI (windows/amd64)
-        run: |
-          cd protocol/client
-          go build -v -ldflags="-s -w" -o aerosys-cli-windows-amd64.exe ./cli
-
-      - name: Build Watchdog Guard (windows/amd64)
-        run: |
-          cd protocol/client
-          go build -v -ldflags="-s -w" -o aerosys-guard-windows-amd64.exe ./win/guard
+          mkdir -p dist/client-windows
+          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-client-windows-amd64.exe ./cmd/client
+          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-guard-windows-amd64.exe ./cmd/guard
 
       - name: Upload Windows Client Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-client-windows
-          path: |
-            protocol/client/aerosys-client-windows-amd64.exe
-            protocol/client/aerosys-cli-windows-amd64.exe
-            protocol/client/aerosys-guard-windows-amd64.exe
+          path: dist/client-windows/*
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 3: macOS — Client GUI + CLI (arm64 & amd64)
+  # Job 3: macOS — Client (arm64 & amd64)
   # ──────────────────────────────────────────────────────────────────────────
   build-client-macos:
-    name: macOS Build & Test (Client GUI + CLI)
+    name: macOS Build & Test (Client)
     runs-on: macos-latest
     steps:
       - name: Checkout Code
@@ -131,89 +108,27 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: 'stable'
           cache: false
 
-      - name: Vet Protocol Client
+      - name: Vet Client
         run: |
-          cd protocol/client
-          go vet ./...
+          go vet ./internal/client ./cmd/client
 
-      - name: Build Client GUI (mac arm64 & amd64)
+      - name: Build Client (mac arm64 & amd64)
         run: |
-          cd protocol/client
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aerosys-client-mac-arm64 ./mac
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aerosys-client-mac-amd64 ./mac
-
-      - name: Build Client CLI (mac arm64 & amd64)
-        run: |
-          cd protocol/client
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o aerosys-cli-mac-arm64 ./cli
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o aerosys-cli-mac-amd64 ./cli
+          mkdir -p dist/client-macos
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-arm64 ./cmd/client
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-amd64 ./cmd/client
 
       - name: Upload macOS Client Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-client-macos
-          path: |
-            protocol/client/aerosys-client-mac-arm64
-            protocol/client/aerosys-client-mac-amd64
-            protocol/client/aerosys-cli-mac-arm64
-            protocol/client/aerosys-cli-mac-amd64
+          path: dist/client-macos/*
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 4: Mobile — Android & iOS Client CLI + Mobile SDK
-  # ──────────────────────────────────────────────────────────────────────────
-  build-client-mobile:
-    name: Mobile Build & Test (Android + iOS)
-    runs-on: macos-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          cache: false
-
-      - name: Build Android Client (arm64 CLI & Mobile Core)
-        run: |
-          cd protocol/client
-          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -v -ldflags="-s -w" -o aerosys-cli-android-arm64 ./cli
-          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -v ./mobile
-
-      - name: Build iOS Client (Mobile Core)
-        run: |
-          cd protocol/client
-          CGO_ENABLED=0 GOOS=ios GOARCH=arm64 go build -v ./mobile
-
-      - name: Build gomobile SDK Bindings (aerosys-android-sdk.aar & aerosys-ios-sdk.zip)
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
-          gomobile init
-          cd protocol/client
-          mkdir -p dist/mobile
-          gomobile bind -target=android -ldflags="-s -w" -o dist/mobile/aerosys-android-sdk.aar ./mobile || true
-          gomobile bind -target=ios -ldflags="-s -w" -o dist/mobile/AeroKit.xcframework ./mobile || true
-          if [ -d dist/mobile/AeroKit.xcframework ]; then
-            (cd dist/mobile && zip -r aerosys-ios-sdk.zip AeroKit.xcframework)
-          fi
-        continue-on-error: true
-
-      - name: Upload Mobile Deliverables
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-client-mobile
-          if-no-files-found: warn
-          path: |
-            protocol/client/aerosys-cli-android-arm64
-            protocol/client/dist/mobile/aerosys-android-sdk.aar
-            protocol/client/dist/mobile/aerosys-ios-sdk.zip
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # Job 5: Publish Multi-Platform Release (on main)
+  # Job 4: Publish Multi-Platform Release (on main)
   # ──────────────────────────────────────────────────────────────────────────
   publish-release:
     name: Publish Official Multi-Platform GitHub Release
@@ -222,7 +137,6 @@ jobs:
       - build-server
       - build-client-windows
       - build-client-macos
-      - build-client-mobile
     runs-on: ubuntu-latest
     steps:
       - name: Download All Build Artifacts

@@ -4,23 +4,27 @@ Next-generation, commercial-grade anti-censorship tunneling framework powered by
 
 ---
 
-## 架构组成 (Architecture)
+## 架构组成 (Unified Flat Architecture)
 
-- **`protocol/client/`**: 跨平台客户端核心，支持 **Windows** (Wintun + gVisor)、**macOS** (utun)、**Linux** (TUN/CLI)、**iOS** (`NEPacketTunnelProvider`) 与 **Android** (`VpnService`)。
-- **`protocol/server/`**: 边缘服务端 (`aero-edge`)，具备 100% 离线自治数据面、纯 Go AES-256-GCM 加密数据库 (`edge.db`)、毫秒级本地验权、伪装站自动回落与纯正 HTTP/3 监听。
-- **`protocol/proto/`**: 底层 Protobuf 消息契约与分帧定义。
-- **`api/`**: OpenAPI 3.1 REST API 与订阅契约规范。
+- **`cmd/client/`**: 跨平台客户端薄入口，内置嵌入式 Web UI 控制台 (`127.0.0.1:19877`)。
+- **`cmd/guard/`**: Windows 守卫守护进程，监控主进程 PID 并在退出时清理路由。
+- **`cmd/edge/`**: 边缘服务端 (`aero-edge`) 独立入口，毫秒级本地验权、短流 DNS 与单连接数据报分发。
+- **`cmd/panel/`**: 边缘管理面板 (`aero-panel`)，8090 端口轻量可视化运维控制台。
+- **`internal/client/`**: 客户端核心数据面，支持 Windows (Wintun + gVisor)、macOS (utun)、Linux (TUN)，内置两级 DNS 漏斗、APNIC 国内分流与 ICMP Type 3 Code 4 反压。
+- **`internal/edge/`**: 边缘服务端核心，支持连接级 Token 绑定、TCP/UDP 流控隔离与多租户配额。
+- **`internal/proto/`**: 底层 Protobuf 消息契约与纯二进制数据报定义。
+- **`deploy/`**: 边缘一键自动化部署脚本 (`edge-install.sh`) 与生产配置资产。
 
 ---
 
 ## 核心特性 (Key Features)
 
-1. **纯正空中协议**：基于原生 HTTP/3、QUIC 与 ECH 隐匿，彻底消灭明文 SNI 泄露与 TLS 握手特征。
-2. **APNIC 智能分流**：内置 APNIC 大陆 3,900 条聚合网段，二分查找耗时仅 10.48ns，国内服务 100% 物理网卡直连，打满本地带宽。
-3. **加密 DoH 与防污染**：RFC 8484 标准 DoH (`https://223.5.5.5/dns-query`) + 60s 内存 TTL 缓存，Fake-IP 双栈即时响应。
-4. **连接自愈韧性**：5 级指数退避自动重连 (150ms ~ 3s) 与真 0-RTT Session Ticket 握手复用，消灭瞬时网络抖动 502。
-5. **零系统环境破坏**：全量网络捕获收敛于 L3 TUN 与 L4 gVisor 用户态协议栈，严禁篡改 Windows 注册表与注入系统代理环境变量。
-6. **标准化 443 订阅**：严格遵循端口纯净契约，全站统一标准 443 HTTPS 域名分发。
+1. **纯正空中协议**：基于原生 HTTP/3、QUIC 与 ECH 隐匿，消灭明文 SNI 泄露与 TLS 握手特征。
+2. **两级 DNS 漏斗**：`.cn` 域名直连物理 DNS 剥离 AAAA；非 `.cn` 全量通过隧道短流由边缘节点解析，建连前 Fake-IP (198.18.0.0/15) 隔离。
+3. **APNIC 智能分流**：内置 APNIC 大陆 3,900+ 聚合网段二分查找，国内流量 100% 物理网卡直连。
+4. **MTU 自适应与 ICMP 反压**：初始 MTU 1224，栈入口 IPv4 DF 检测超限包并在栈内回写 ICMP Fragmentation Needed (Type 3 Code 4)；捕获 `DatagramTooLargeError` 动态同步网卡 MTU。
+5. **容量防雪崩流控**：TCP 业务流进入 `ConnLimiter.TryAcquire` 限额门禁；短流 DNS 与 UDP Context 豁免连接槽，单 Token 最多 64 个 UDP Context 并扣减带宽。
+6. **零系统环境破坏**：全量网络捕获收敛于 L3 TUN 与 L4 gVisor 用户态协议栈，严禁篡改系统代理与注册表。
 
 ---
 
@@ -28,47 +32,32 @@ Next-generation, commercial-grade anti-censorship tunneling framework powered by
 
 ### 1. 服务端部署 (Linux VPS)
 ```bash
-# 1. 克隆官方公开源并就地构建
-git clone --depth 1 https://github.com/jackybig999/aero.git /tmp/aero-git
-cd /tmp/aero-git/protocol/server/vps
-go build -v -o /usr/local/bin/aero-edge .
-chmod 755 /usr/local/bin/aero-edge
-rm -rf /tmp/aero-git
+# 1. 一键安装命令 (推荐)
+curl -fsSL https://raw.githubusercontent.com/jackybig999/aero/main/deploy/edge-install.sh | bash -s -- -d edge.your-domain.com
 
-# 2. 启动服务 (以 443 端口为例)
-/usr/local/bin/aero-edge -listen :443 -domain your-domain.com -token your-token -admin-key your-key -autocert your-domain.com -data-dir /var/lib/aero
+# 2. 或源码直接编译
+go build -v -ldflags="-s -w" -o aero-edge ./cmd/edge
+go build -v -ldflags="-s -w" -o aero-panel ./cmd/panel
 ```
 
 ### 2. 客户端构建 (Client Builds)
 
 #### Windows
 ```powershell
-# 编译图形化托盘客户端
-go build -ldflags "-s -w" -o dist/win/aero-client.exe ./protocol/client/win
-
-# 编译命令行客户端
-go build -ldflags "-s -w" -o dist/win/aero-cli.exe ./protocol/client/cli
-```
-
-#### macOS (Apple Silicon / Intel)
-```bash
-# 编译 Apple Silicon 原生命令行程序
-GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o dist/mac/aero-cli ./protocol/client/cli
-
-# 运行 (需 sudo 调起 utun 虚拟网卡)
-sudo ./dist/mac/aero-cli --sub https://your-domain.com/sub/superadmin
+go build -ldflags "-s -w" -o aero-client.exe ./cmd/client
+go build -ldflags "-s -w" -o aero-guard.exe ./cmd/guard
 ```
 
 #### Linux
 ```bash
-GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o dist/linux/aero-cli ./protocol/client/cli
-sudo ./dist/linux/aero-cli --sub https://your-domain.com/sub/superadmin
+GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o aero-client ./cmd/client
 ```
 
-#### Mobile (iOS / Android)
-移动端核心逻辑位于 `protocol/client/mobile`：
-- **Android**: `gomobile bind -target=android -androidapi=24 -o aero-mobile.aar ./protocol/client/mobile`
-- **iOS**: `gomobile bind -target=ios -o AeroMobile.xcframework ./protocol/client/mobile`
+#### macOS
+```bash
+GOOS=darwin GOARCH=arm64 go build -ldflags "-s -w" -o aero-client-arm64 ./cmd/client
+GOOS=darwin GOARCH=amd64 go build -ldflags "-s -w" -o aero-client-amd64 ./cmd/client
+```
 
 ---
 

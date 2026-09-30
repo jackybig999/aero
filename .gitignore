@@ -14,14 +14,12 @@ desktop.ini
 
 # Node.js & Web build
 node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 
 # Binaries & Executables
 *.exe
 *.exe~
 *.dll
+!internal/client/assets/wintun.dll
 *.so
 *.dylib
 
@@ -36,44 +34,29 @@ tmp/
 *.temp
 *.out
 *.test
-.host-ip-cache.json
-**/.host-ip-cache.json
-.last-sub-body
-**/.last-sub-body
-.last-sub-url
-**/.last-sub-url
-.saved-proxy.json
-**/.saved-proxy.json
-.runtime-port
-**/.runtime-port
+*.pprof
+coverage/
 
-# Environment & Local Secrets (preserve examples)
+# Environment & Local Secrets
 .env
 .env.*
-!.env.example
-!*.env.example
+*.key
+*.pem
+*.p12
+*secret*
+*credential*
+target/
+vendor/
 
-# Local Testing Binaries
-platform.exe
-**/platform.exe
-
-# Go Test Artifacts
-*.test
-__debug_bin*
-/dist/
-/build/dist/
-
-# SQLite WAL and SHM and DB files
+# Local databases and runtime state
+data/
 *.db
 *.db-shm
 *.db-wal
 
-# Private subsystems (Strictly excluded from public repo — root-anchored)
-/sub/
-/connect/
-AERO_OS_FRAMEWORK_SPEC.md
-plan.md
-
-# Embedded assets whitelist (Required for //go:embed)
-!protocol/client/win/wintun.dll
-!protocol/client/public/assets/wintun.dll
+# Private subsystems (Strictly excluded from public aero repository)
+/cmd/mid/
+/cmd/desk/
+/internal/mid/
+/internal/desk/
+/deploy/mid-install.sh

@@ -1,6 +1,0 @@
-/dist/
-*.log
-.host-ip-cache.json
-.last-sub-body
-.last-sub-url
-.saved-proxy.json
