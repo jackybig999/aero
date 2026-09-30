@@ -9,6 +9,7 @@ import (
 	"embed"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -28,6 +29,7 @@ func main() {
 	apiAddr := flag.String("api", "127.0.0.1:19877", "client control API and UI address")
 	subURL := flag.String("sub", "", "subscription URL or file")
 	mode := flag.String("mode", "tun", "operating mode: tun | socks")
+	headless := flag.Bool("headless", false, "run in headless mode without GUI window")
 	flag.Parse()
 
 	log.Printf("[CLIENT] initializing AERO client (api=%s, listen=%s, mode=%s)...", *apiAddr, *listenAddr, *mode)
@@ -143,17 +145,26 @@ func main() {
 		}
 	}()
 
-	// 优雅停机信号处理
+	shutdown := func() {
+		log.Println("[CLIENT] stopping engine and api server...")
+		_ = eng.Stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = apiServer.Shutdown(shutdownCtx)
+		log.Println("[CLIENT] AERO client shutdown complete.")
+	}
+
+	uiURL := fmt.Sprintf("http://%s/", *apiAddr)
+	if *headless {
+		runHeadless(shutdown)
+	} else {
+		runClientWindow(uiURL, shutdown)
+	}
+}
+
+func runHeadless(shutdown func()) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
-
-	log.Println("[CLIENT] received shutdown signal, stopping engine...")
-	_ = eng.Stop()
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = apiServer.Shutdown(shutdownCtx)
-
-	log.Println("[CLIENT] AERO client shutdown complete.")
+	shutdown()
 }
