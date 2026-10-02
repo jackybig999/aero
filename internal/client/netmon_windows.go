@@ -33,7 +33,7 @@ func (m *windowsNetworkMonitor) Start(onChange func(newGW, ifName string)) {
 	})
 
 	var handle windows.Handle
-	err := windows.NotifyIpInterfaceChange(windows.AF_UNSPEC, cb, unsafe.Pointer(nil), false, &handle)
+	err := windows.NotifyIpInterfaceChange(windows.AF_INET, cb, unsafe.Pointer(nil), false, &handle)
 	if err != nil {
 		log.Printf("[NETMON] Windows NotifyIpInterfaceChange failed: %v", err)
 		return

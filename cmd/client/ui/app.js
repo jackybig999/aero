@@ -154,6 +154,9 @@ async function refreshStatus() {
       if (n && n.rtt_ms) rtt = n.rtt_ms
     }
     if ($('stRtt')) $('stRtt').textContent = rtt ? rtt + ' ms' : on ? '…' : '—'
+    if ($('geoRuleCount') && st.geo_rule_count) {
+      $('geoRuleCount').textContent = st.geo_rule_count.toLocaleString() + ' 条 (已就绪)'
+    }
     if (st.sub_url && !$('subUrl').value) $('subUrl').value = st.sub_url
     if (st.probe_ok === true || st.probe_ok === false) {
       applyProbe({ ok: st.probe_ok, ms: st.probe_ms })
@@ -647,6 +650,36 @@ function init() {
     const f = e.target.files && e.target.files[0]
     e.target.value = ''
     onAlbumFile(f)
+  }
+
+  if ($('btnPing')) {
+    $('btnPing').onclick = async () => {
+      $('btnPing').disabled = true
+      $('btnPing').textContent = '⚡ 测速中'
+      try {
+        const res = await api('POST', '/api/v1/ping')
+        if (res && res.status === 'ok') {
+          if ($('stRtt')) $('stRtt').textContent = res.rtt_ms + ' ms'
+        }
+      } catch {}
+      $('btnPing').disabled = false
+      $('btnPing').textContent = '⚡ 测速'
+    }
+  }
+
+  if ($('btnSyncGeo')) {
+    $('btnSyncGeo').onclick = async () => {
+      $('btnSyncGeo').disabled = true
+      $('btnSyncGeo').textContent = '🔄 同步中'
+      try {
+        const res = await api('POST', '/api/v1/geodata/sync')
+        if (res && res.status === 'ok') {
+          if ($('geoRuleCount')) $('geoRuleCount').textContent = res.count.toLocaleString() + ' 条 (已同步)'
+        }
+      } catch {}
+      $('btnSyncGeo').disabled = false
+      $('btnSyncGeo').textContent = '🔄 同步'
+    }
   }
 
   setInterval(refreshStatus, 2000)

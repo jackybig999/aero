@@ -318,6 +318,87 @@ func (e *SplitEngine) ClearCache() {
 	e.cache = make(map[string]Strategy)
 }
 
+// ReloadRules 动态热加载直连分流规则库
+func (e *SplitEngine) ReloadRules(data []byte) (int, error) {
+	lines := strings.Split(string(data), "\n")
+	var newDomains []string
+	var newIPRanges []string
+
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(line); err == nil {
+			newIPRanges = append(newIPRanges, line)
+		} else if ip := net.ParseIP(line); ip != nil {
+			if ip.To4() != nil {
+				newIPRanges = append(newIPRanges, line+"/32")
+			} else {
+				newIPRanges = append(newIPRanges, line+"/128")
+			}
+		} else {
+			clean := strings.TrimPrefix(line, "domain:")
+			clean = strings.TrimPrefix(clean, "full:")
+			clean = strings.TrimSpace(clean)
+			if clean != "" {
+				newDomains = append(newDomains, clean)
+			}
+		}
+	}
+
+	newRule := Rule{
+		Name:           "China Direct (Dynamic)",
+		Strategy:       DIRECT,
+		DomainSuffixes: newDomains,
+		IPRanges:       newIPRanges,
+	}
+
+	e.mu.Lock()
+	newRule.parsedIPNets = make([]*net.IPNet, 0, len(newRule.IPRanges))
+	for _, cidr := range newRule.IPRanges {
+		if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
+			newRule.parsedIPNets = append(newRule.parsedIPNets, ipNet)
+		}
+	}
+
+	filtered := make([]Rule, 0, len(e.rules)+1)
+	for _, r := range e.rules {
+		if r.Name == "China Direct" || r.Name == "China Direct (Dynamic)" {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	filtered = append(filtered, newRule)
+	e.rules = filtered
+	e.mu.Unlock()
+
+	e.ClearCache()
+
+	return len(newDomains) + len(newIPRanges), nil
+}
+
+// TotalRules 统计 APNIC 范围与所有 rules 的域名与 IP 范围总和
+func (e *SplitEngine) TotalRules() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	total := 0
+	if e.chinaMatcher != nil {
+		total += e.chinaMatcher.TotalRanges()
+	}
+	for _, r := range e.rules {
+		total += len(r.DomainSuffixes)
+		total += len(r.DomainKeywords)
+		ipCount := len(r.parsedIPNets)
+		if ipCount == 0 && len(r.IPRanges) > 0 {
+			ipCount = len(r.IPRanges)
+		}
+		total += ipCount
+	}
+	return total
+}
+
 func (e *SplitEngine) loadBuiltinRules() {
 	e.rules = append(e.rules, Rule{
 		Name:           "AI Services",
@@ -380,7 +461,13 @@ func builtinChinaDomains() []string {
 		"bilibili.com", "hdslb.com", "zhihu.com", "weibo.com", "sina.com",
 		"sinaimg.cn", "sina.cn", "douban.com", "doubanio.com",
 		"xiaohongshu.com", "xhscdn.com", "gov.cn", "edu.cn", "org.cn",
-		"icbc.com.cn", "ccb.com", "boc.cn", "bankcomm.com", "cmbchina.com", "abchina.com",
+		"icbc.com.cn", "icbc.com", "abchina.com", "abchina.com.cn",
+		"boc.cn", "bankofchina.com", "ccb.com", "ccb.com.cn",
+		"bankcomm.com", "95559.com.cn", "cmbchina.com", "cmbwinglung.com",
+		"spdb.com.cn", "cmbc.com.cn", "cib.com.cn", "pingan.com", "pingan.com.cn",
+		"citicbank.com", "ecitic.com", "cebbank.com", "hxb.com.cn", "psbc.com",
+		"cgbchina.com.cn", "unionpay.com", "95516.com", "pbc.gov.cn",
+		"sse.com.cn", "szse.cn", "bse.cn", "chinaclear.cn",
 	}
 }
 

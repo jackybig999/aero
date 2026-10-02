@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,26 @@ type ServerConfig struct {
 	PinSPKI     []string `json:"pin_spki,omitempty" yaml:"pin_spki"`
 	PurityScore int      `json:"purityScore,omitempty"`
 	AIBlocked   bool     `json:"aiBlocked,omitempty"`
+	LineType    string   `json:"lineType,omitempty" yaml:"line_type"`
+	ISPAffinity string   `json:"ispAffinity,omitempty" yaml:"isp_affinity"`
+}
+
+// sortServersByISP 纯函数：使用 sort.SliceStable 优先将 ISPAffinity == isp 的节点排在前面
+func sortServersByISP(servers []ServerConfig, isp string) {
+	if len(servers) <= 1 || isp == "" {
+		return
+	}
+	ispUpper := strings.ToUpper(strings.TrimSpace(isp))
+	sort.SliceStable(servers, func(i, j int) bool {
+		affI := strings.ToUpper(strings.TrimSpace(servers[i].ISPAffinity))
+		affJ := strings.ToUpper(strings.TrimSpace(servers[j].ISPAffinity))
+		matchI := affI == ispUpper
+		matchJ := affJ == ispUpper
+		if matchI && !matchJ {
+			return true
+		}
+		return false
+	})
 }
 
 // Optimization 调度优化参数
@@ -243,7 +264,7 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 	req.Header.Set("User-Agent", "AeroClient/2.0")
 
 	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: nil,
 		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
 			return DialPhysicalDirect(c, network, addr)
 		},

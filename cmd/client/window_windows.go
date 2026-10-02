@@ -3,6 +3,7 @@
 package main
 
 import (
+	"embed"
 	"log"
 	"os"
 	"os/exec"
@@ -13,6 +14,9 @@ import (
 
 	"github.com/jchv/go-webview2"
 )
+
+//go:embed assets/icon_blue.ico assets/icon_green.ico assets/icon_yellow.ico
+var iconFS embed.FS
 
 const (
 	clientMutexName = "Local\\AERO-Client-Single-Instance-Lock"
@@ -39,12 +43,15 @@ const (
 
 	MF_STRING       = 0x00000000
 	MF_SEPARATOR    = 0x00000800
+	MF_GRAYED       = 0x00000001
 	TPM_RETURNCMD   = 0x0100
 	TPM_NONOTIFY    = 0x0080
 	TPM_RIGHTBUTTON = 0x0002
 
 	ID_TRAY_SHOW = 2001
 	ID_TRAY_EXIT = 2002
+	ID_MODE_TUN  = 2003
+	ID_MODE_SYS  = 2004
 )
 
 var (
@@ -54,16 +61,18 @@ var (
 	modShell32  = syscall.NewLazyDLL("shell32.dll")
 	modKernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	procShowWindow          = modUser32.NewProc("ShowWindow")
-	procSetForegroundWindow = modUser32.NewProc("SetForegroundWindow")
-	procSetWindowLongPtrW   = modUser32.NewProc("SetWindowLongPtrW")
-	procCallWindowProcW     = modUser32.NewProc("CallWindowProcW")
-	procCreatePopupMenu     = modUser32.NewProc("CreatePopupMenu")
-	procAppendMenuW         = modUser32.NewProc("AppendMenuW")
-	procTrackPopupMenu      = modUser32.NewProc("TrackPopupMenu")
-	procDestroyMenu         = modUser32.NewProc("DestroyMenu")
-	procGetCursorPos        = modUser32.NewProc("GetCursorPos")
-	procLoadIconW           = modUser32.NewProc("LoadIconW")
+	procShowWindow               = modUser32.NewProc("ShowWindow")
+	procSetForegroundWindow      = modUser32.NewProc("SetForegroundWindow")
+	procSetWindowLongPtrW        = modUser32.NewProc("SetWindowLongPtrW")
+	procCallWindowProcW          = modUser32.NewProc("CallWindowProcW")
+	procCreatePopupMenu          = modUser32.NewProc("CreatePopupMenu")
+	procAppendMenuW              = modUser32.NewProc("AppendMenuW")
+	procTrackPopupMenu           = modUser32.NewProc("TrackPopupMenu")
+	procDestroyMenu              = modUser32.NewProc("DestroyMenu")
+	procGetCursorPos             = modUser32.NewProc("GetCursorPos")
+	procLoadIconW                = modUser32.NewProc("LoadIconW")
+	procLoadImageW               = modUser32.NewProc("LoadImageW")
+	procCreateIconFromResourceEx = modUser32.NewProc("CreateIconFromResourceEx")
 
 	procShell_NotifyIconW = modShell32.NewProc("Shell_NotifyIconW")
 	procExtractIconW      = modShell32.NewProc("ExtractIconW")
@@ -72,6 +81,10 @@ var (
 	trayNID     notifyIconDataW
 	clientHWND  uintptr
 	clientWV    webview2.WebView
+
+	hIconBlue   uintptr
+	hIconGreen  uintptr
+	hIconYellow uintptr
 )
 
 type point struct {
@@ -152,7 +165,10 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		} else if lParam == WM_RBUTTONUP {
 			hMenu, _, _ := procCreatePopupMenu.Call()
 			if hMenu != 0 {
-				showStr, _ := syscall.UTF16PtrFromString("打开界面")
+				statusStr, _ := syscall.UTF16PtrFromString("AEROSYS · 系统托盘")
+				procAppendMenuW.Call(hMenu, uintptr(MF_STRING|MF_GRAYED), 0, uintptr(unsafe.Pointer(statusStr)))
+				procAppendMenuW.Call(hMenu, uintptr(MF_SEPARATOR), 0, 0)
+				showStr, _ := syscall.UTF16PtrFromString("打开主界面")
 				procAppendMenuW.Call(hMenu, uintptr(MF_STRING), uintptr(ID_TRAY_SHOW), uintptr(unsafe.Pointer(showStr)))
 				procAppendMenuW.Call(hMenu, uintptr(MF_SEPARATOR), 0, 0)
 				exitStr, _ := syscall.UTF16PtrFromString("退出客户端")
@@ -187,6 +203,58 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	return r
 }
 
+func loadEmbeddedIcon(filename string) uintptr {
+	data, err := iconFS.ReadFile(filename)
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+	r, _, _ := procCreateIconFromResourceEx.Call(
+		uintptr(unsafe.Pointer(&data[0])),
+		uintptr(len(data)),
+		1,          // fIcon = TRUE
+		0x00030000, // dwVersion
+		16, 16,     // 16x16 standard tray size
+		0,
+	)
+	if r != 0 {
+		return r
+	}
+	tmpPath := filepath.Join(os.TempDir(), "aero_"+filepath.Base(filename))
+	if err := os.WriteFile(tmpPath, data, 0644); err == nil {
+		pathPtr, _ := syscall.UTF16PtrFromString(tmpPath)
+		h, _, _ := procLoadImageW.Call(0, uintptr(unsafe.Pointer(pathPtr)), 1, 16, 16, 0x0010)
+		return h
+	}
+	return 0
+}
+
+func UpdateTrayIcon(mode string, connected bool) {
+	if clientHWND == 0 {
+		return
+	}
+	var targetIcon uintptr
+	var tip string
+
+	if !connected {
+		targetIcon = hIconBlue
+		tip = "AEROSYS · 就绪 (未连接)"
+	} else if mode == "tun" {
+		targetIcon = hIconGreen
+		tip = "AEROSYS · TUN 全局模式 (已连接)"
+	} else {
+		targetIcon = hIconYellow
+		tip = "AEROSYS · 系统代理模式 (已连接)"
+	}
+
+	if targetIcon != 0 {
+		trayNID.HIcon = targetIcon
+	}
+	tipText, _ := syscall.UTF16FromString(tip)
+	copy(trayNID.SzTip[:], tipText)
+
+	procShell_NotifyIconW.Call(uintptr(NIM_MODIFY), uintptr(unsafe.Pointer(&trayNID)))
+}
+
 func setupSystemTray(w webview2.WebView) {
 	clientWV = w
 	hwndPtr := w.Window()
@@ -195,12 +263,18 @@ func setupSystemTray(w webview2.WebView) {
 	}
 	clientHWND = uintptr(hwndPtr)
 
-	var hIcon uintptr
-	if exePath, err := os.Executable(); err == nil {
-		exePathPtr, _ := syscall.UTF16PtrFromString(exePath)
-		r, _, _ := procExtractIconW.Call(0, uintptr(unsafe.Pointer(exePathPtr)), 0)
-		if r > 1 {
-			hIcon = r
+	hIconBlue = loadEmbeddedIcon("assets/icon_blue.ico")
+	hIconGreen = loadEmbeddedIcon("assets/icon_green.ico")
+	hIconYellow = loadEmbeddedIcon("assets/icon_yellow.ico")
+
+	var hIcon uintptr = hIconBlue
+	if hIcon == 0 {
+		if exePath, err := os.Executable(); err == nil {
+			exePathPtr, _ := syscall.UTF16PtrFromString(exePath)
+			r, _, _ := procExtractIconW.Call(0, uintptr(unsafe.Pointer(exePathPtr)), 0)
+			if r > 1 {
+				hIcon = r
+			}
 		}
 	}
 	if hIcon == 0 {
@@ -215,7 +289,7 @@ func setupSystemTray(w webview2.WebView) {
 	trayNID.UCallbackMessage = WM_TRAY_MSG
 	trayNID.HIcon = hIcon
 
-	tipText, _ := syscall.UTF16FromString("AEROSYS 客户端")
+	tipText, _ := syscall.UTF16FromString("AEROSYS · 就绪 (未连接)")
 	copy(trayNID.SzTip[:], tipText)
 
 	procShell_NotifyIconW.Call(uintptr(NIM_ADD), uintptr(unsafe.Pointer(&trayNID)))

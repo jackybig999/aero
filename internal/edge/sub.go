@@ -14,9 +14,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,12 +40,14 @@ type SubDocument struct {
 
 // SubServer represents a single edge node entry in subscription
 type SubServer struct {
-	Name     string   `json:"name"`
-	Address  string   `json:"address"`
-	Token    string   `json:"token"`
-	SNI      string   `json:"sni"`
-	Protocol string   `json:"protocol"`
-	PinSPKI  []string `json:"pin_spki,omitempty"`
+	Name        string   `json:"name"`
+	Address     string   `json:"address"`
+	Token       string   `json:"token"`
+	SNI         string   `json:"sni"`
+	Protocol    string   `json:"protocol"`
+	PinSPKI     []string `json:"pin_spki,omitempty"`
+	LineType    string   `json:"line_type,omitempty"`
+	ISPAffinity string   `json:"isp_affinity,omitempty"`
 }
 
 // UserSub represents a user-specific subscription (e.g. /sub/username{6-char-code})
@@ -74,11 +78,13 @@ type SubMeta struct {
 
 // EnsureSubParams contains parameters for bootstrapping subscription
 type EnsureSubParams struct {
-	Name    string
-	Address string
-	Token   string
-	SNI     string
-	PinSPKI []string
+	Name        string
+	Address     string
+	Token       string
+	SNI         string
+	PinSPKI     []string
+	LineType    string
+	ISPAffinity string
 }
 
 // ==========================================
@@ -134,12 +140,14 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 	}
 
 	srv := SubServer{
-		Name:     p.Name,
-		Address:  p.Address,
-		Token:    p.Token,
-		SNI:      p.SNI,
-		Protocol: "quic",
-		PinSPKI:  p.PinSPKI,
+		Name:        p.Name,
+		Address:     p.Address,
+		Token:       p.Token,
+		SNI:         p.SNI,
+		Protocol:    "quic",
+		PinSPKI:     p.PinSPKI,
+		LineType:    p.LineType,
+		ISPAffinity: p.ISPAffinity,
 	}
 
 	if s.meta.Secret == "" {
@@ -423,7 +431,8 @@ func (h *SubHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // BootstrapSubscription ensures data directory, updates sub_meta.json, writes client-sub.json, and returns SubStore
-func BootstrapSubscription(dir, advertiseHost string, tlsPort int, token, sni string, cert *tls.Certificate) (*SubStore, string, error) {
+func BootstrapSubscription(cfg ServerConfig, cert *tls.Certificate) (*SubStore, string, error) {
+	dir := cfg.DataDir
 	if dir == "" {
 		dir = "./data"
 	}
@@ -436,14 +445,27 @@ func BootstrapSubscription(dir, advertiseHost string, tlsPort int, token, sni st
 		return nil, "", err
 	}
 
-	host := strings.TrimSpace(advertiseHost)
+	host := strings.TrimSpace(cfg.AdvertiseHost)
+	if host == "" {
+		host = cfg.Domain
+	}
 	if host == "" || host == "cdn-aero.com" || host == "localhost" {
 		host = "127.0.0.1"
 	}
-	if tlsPort <= 0 {
-		tlsPort = 443
+	tlsPort := 443
+	if cfg.Listen != "" {
+		if _, portStr, err := net.SplitHostPort(cfg.Listen); err == nil {
+			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+				tlsPort = p
+			}
+		}
 	}
 	addr := fmt.Sprintf("%s:%d", host, tlsPort)
+
+	sni := cfg.Domain
+	if sni == "" {
+		sni = "localhost"
+	}
 
 	var pins []string
 	if cert != nil {
@@ -453,11 +475,13 @@ func BootstrapSubscription(dir, advertiseHost string, tlsPort int, token, sni st
 	}
 
 	if err := store.Ensure(EnsureSubParams{
-		Name:    "default",
-		Address: addr,
-		Token:   token,
-		SNI:     sni,
-		PinSPKI: pins,
+		Name:        "default",
+		Address:     addr,
+		Token:       cfg.Token,
+		SNI:         sni,
+		PinSPKI:     pins,
+		LineType:    cfg.LineType,
+		ISPAffinity: cfg.ISPAffinity,
 	}); err != nil {
 		return nil, "", err
 	}

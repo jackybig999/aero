@@ -1,7 +1,7 @@
 # AERO 项目研发与执行准则 (PROJECT_RULES.md)
 
-> **Version**: 2.1.0-unified (Aligned with GLOBAL MASTER RULES v1.0.0 & newplan.md)  
-> **Last-Updated**: 2026-09-30  
+> **Version**: 2.2.0-hardened (Aligned with GLOBAL MASTER RULES v1.0.0 & Universal Pre-Flight Protocol)  
+> **Last-Updated**: 2026-10-02  
 > **Maintainer**: Jacky  
 > **Language-Stack**: Go 1.24+ (Solidified, per GLOBAL MASTER RULES §1.3)  
 > **Repository-Module**: `module github.com/aero-protocol/aero`  
@@ -116,3 +116,79 @@
 - 客户端与边缘节点支持完全独立发布，不依赖中台与工作台；
 - 边缘安装脚本（`deploy/edge-install.sh`）闭合 iptables 语法（补齐 `fi`）；
 - 所有二进制产物由标准 `go build` 原生编译生成。
+
+---
+
+## 第五部分：通用工程交付防错、Git 预检与仓库防御准则 (Universal Delivery & Anti-Error Protocol)
+
+> 本部分沉淀自本项目多轮严格工程审计与实战复盘，适用于 AERO 全仓及任何追求工业级高可靠交付的工程项目。所有开发人员与自动代理必须无条件遵循。
+
+### U1. 交付预检与 Git 索引对齐准则 (Pre-Flight Git Alignment Gate) `[CI/RELEASE]`
+* **根因警示**：本地工作区物理文件的存在极易造成“本地测试通过 = 可以发布”的虚假安全感。若新增源码、单元测试或 `//go:embed` 静态资产未纳入 Git 追踪（处于 `??` 状态），一旦推送到远端或由 CI/VPS 克隆构建，将立即引发严重的 `undefined symbol` 或 `pattern no matching files` 编译崩溃事故。
+* **执行红线 (MUST)**：
+  1. **零未跟踪红线 (Zero Untracked Files)**：
+     - 在任何代码提交（commit）、合并（PR）或推送（push）前，`git status --porcelain` 输出中未跟踪项（`??`）必须严格为 **0**；
+     - 严禁留存任何游离的核心源码、测试脚本或配置资产；新文件必须明确执行 `git add` 纳入版本追踪。
+  2. **删除显式暂存 (Explicit Deletion Staging)**：
+     - 工作区物理删除的文件必须显式通过 `git add -u` 或 `git rm` 纳入暂存区，严禁遗留 `Changes not staged for commit: deleted: ...` 悬空状态导致远端残余过时文件。
+  3. **暂存区对齐终审 (Staging Validation)**：
+     - 严禁盲目依赖 `git commit -a`（该命令无法追踪新增文件）；
+     - 提交前必须执行 `git diff --cached --stat` 逐一核验待提交清单，确保修改、新增、删除与交付目标 100% 吻合。
+  4. **干净克隆模拟验证 (Clean Clone Simulation)**：
+     - 在重大发布或里程碑交付前，必须在隔离临时目录中通过 `git clone` 模拟全新环境构建：`go build ./...` 与 `go test ./...`，证明仓库绝无依赖本地宿主机未追踪文件的隐式隐患。
+
+### U2. 物理资产卫生与轻量隔离模型 (Physical Hygiene & Strict 3-Path Model) `[CI]`
+* **根因警示**：大体积可执行文件、构建中间件与高分辨率设计源文件若随意堆放于代码根目录，不仅会导致仓库体积爆炸式膨胀（几 MB 源码膨胀至近百 MB），还会永久污染 Git 历史对象库，拖垮拉取与构建带宽。
+* **执行红线 (MUST)**：
+  1. **二进制产物绝对零入库 (No Binaries in Git Tree)**：
+     - 所有平台构建可执行文件（`*.exe`, `client`, `edge`, `*.dll`, `*.so`, `*.dylib`，除极少数强绑定的核心驱动白名单如 `wintun.dll` 外）严禁出现在 Git 树中；
+     - 本地 `go build` 产生的调试二进制必须在测试完成后即刻物理清理；生产发布二进制严格仅推送到 GitHub Release Assets。
+  2. **设计原始素材与运行时代码解耦 (Design Asset Decoupling)**：
+     - 高清设计切图、全尺寸图标套件（如包含 Mac `.icns`、iOS 1024、Android 多分辨率 mipmap 等）属于设计中间件，严禁直接堆放于业务代码根目录；
+     - 嵌入可执行文件的静态资源必须经过极端轻量化压缩（单图标 < 150KB，全静态集合 < 500KB），存放于专属 `assets/` 或 `ui/` 目录并明确声明 `//go:embed`。
+  3. **运行态数据与数据库全量忽略 (Runtime & DB Exclusion)**：
+     - 本地测试/开发生成的数据库文件（`*.db`, `*.db-shm`, `*.db-wal`）与运行时目录（`data/`, `tmp/`, `logs/`）必须 100% 纳入 `.gitignore`，杜绝任何运行时状态数据与敏感测试数据泄露入库。
+  4. **临时目录沙箱隔离与源码零污染铁律 (Tmp Sandbox & Zero-Pollution Mandate)**：
+     - 仓库根目录下的 `tmp/` 目录为全工程唯一合法的本地临时工作空间；
+     - **测试零污染**：所有本地测试、基准测试产生的文件、临时套接字、Mock 数据库必须强制重定向至 `tmp/` 目录完成（通过 `GOTMPDIR` 或 `t.TempDir()`），严禁在源码树、包目录或根目录下生成任何临时测试文件；
+     - **构建零污染**：本地开发、调试编译产生的所有临时可执行文件，必须显式重定向至 `tmp/` 输出（如 `go build -o tmp/client.exe ./cmd/client`），严禁直接裸输出至源码根目录；
+     - **缓存与运行时零污染**：开发态和调试态的临时缓存文件（如 `.last-sub-body`、动态规则临时文件、临时日志）一律强制限制在 `tmp/` 内部生成；
+     - **源码神圣不可侵犯**：源码目录与根目录除升级、维护、修复 bug 显式修改源码与必要工程配置文件外，严禁写入、衍生或残留任何垃圾文件，违者视为严重工程违规。
+
+### U3. 可逆操作与安全备份契约 (Non-Destructive Operations & Rollback Contract) `[OPS]`
+* **根因警示**：在环境整治、垃圾清理或重构瘦身时，直接使用不可逆的硬删除（如 `rm -rf` / `Remove-Item`）极其容易导致误删有用文件且无法自证与恢复。
+* **执行红线 (MUST)**：
+  1. **备份优先，严禁直接硬删除 (Archive Before Clean)**：
+     - 在清理工作区非源码文件或大体积垃圾时，必须将所有移出文件完整保存在受 `.gitignore` 保护的 `backup/` 目录中，同时同步至外部独立目录（如 `../backup`）作为灾备镜像。
+  2. **清单与脚本双闭环 (Manifest & Rollback Automation)**：
+     - 每次执行备份与清理必须生成清单文档（`BACKUP_MANIFEST.md`），详尽记录每个文件的原路径、大小、时间戳与清理原因；
+     - 必须配套提供开箱即用的自动化一键回滚脚本（如 `rollback.ps1` / `rollback.sh`），确保任何误清理均可在 3 秒内完全无损还原。
+  3. **依赖白名单前置排查 (Preservation Whitelist)**：
+     - 执行清理前必须对全仓代码进行静态扫描（检索 `//go:embed` 路径、驱动文件、配置文件等），凡被代码显式引用的文件绝对列入保护白名单，严禁过度清理。
+
+### U4. 高可靠网络与数据面对抗工程模式 (Advanced Data-Plane & Network Defense Patterns) `[ARCH]`
+* **架构模式萃取 (MUST)**：
+  1. **反 DPI 包长密码学动态抖动 (Anti-DPI Cryptographic Jitter)**：
+     - 传输层（QUIC/TLS）握手包长严禁硬编码固定数值（如固定 1350 会暴露极其明显的静态流量指纹）；
+     - 必须通过密码学安全随机源（`crypto/rand`）引入动态随机扰动（如在 `[1280, 1380]` 区间内离散分布），既打破 DPI 静态统计特征，又严格满足 RFC 9000 规范下限（≥ 1200）。
+  2. **WebRTC 两阶段原子状态机 (Two-Stage WebRTC Guard)**：
+     - 防止 UDP 打洞导致物理真实 IP 泄露，必须依托原子状态机（`atomic.Bool`）实现两阶段精准门控；
+     - **阶段一（未握手 / 切换中）**：网络栈直接静默丢弃发往 3478、19302、5349 端口的 UDP 报文；
+     - **阶段二（会话就绪）**：仅在底层 QUIC 物理会话预热成功后方可原子置为 `true` 放行；
+     - 发生网络跃点变动（Roaming/WiFi切移动网）或主动切换节点时，必须先将状态下线置 `false`，待新通道验证就绪后再原子激活。
+  3. **哨兵探测专用短路与零 DNS 消耗 (Sentinel Probe & Zero-DNS Short Circuit)**：
+     - 节点活跃与 RTT 探针必须基于控制短流专用保留域名（如 `probe.aero` / `ping.aero`）；
+     - 边缘节点接收到探针域名时，必须在协议分发层直接专用短路：**严禁发起上游公网 DNS 解析，严禁消耗用户单 Token QPS 限速令牌**，直接返回协议握手成功确认帧与固定回环 IP，实现端到端纯网络往返延迟的高频、零成本度量。
+  4. **配置与分流规则原子落地保障 (Atomic Configuration File Sync)**：
+     - 客户端或服务端在线同步分流规则（GeoData）、路由表或证书时，严禁使用直接覆写或预删除模式；
+     - 必须遵循**同目录原子写入链路**：`os.CreateTemp` -> `Sync()` -> `Close()` -> `os.Rename` 覆盖替换；若底层（如 Windows 文件独占锁）报错，必须走 `.bak` 备份并包含双向自动回滚防护，杜绝断电或崩溃产生半写文件。
+  5. **并发锁解耦与无睡眠可测性 (Fine-Grained Concurrency & Decoupled Reaping)**：
+     - 扫描和清理闲置网络连接（如 UDP 上下文回收）时，严禁在全局互斥锁或读写锁内执行阻塞的网络套接字关闭（`conn.Close()`）；
+     - 必须遵循“读锁快照收集待清理项 -> 释放锁 -> 锁外安全关闭连接”原则，套接字关闭自身必须通过 CAS（`CompareAndSwap`）保证幂等；
+     - 清理逻辑必须解耦为纯函数（如 `reapIdleContexts(maxIdle)`），严禁使用 `time.Sleep` 进行单元测试同步，保证单测在微秒级内确定性执行完毕。
+  6. **生命周期 Context 全链路穿透 (Context Lifecycle Penetration)**：
+     - 所有守护协程、监听器接收循环（如 `ServeListener`）、流中继（`relayTCP`）必须显式接受并穿透 `ctx context.Context`；
+     - 监听和阻塞操作必须与 `ctx.Done()` 绑定联动退出，杜绝孤儿协程挂死；入参若为 `nil` 必须防御性自动降级为 `context.Background()`。
+  7. **生产环境强证书阻断 (Production Zero Self-Signed Cert)**：
+     - 边缘节点生产模式严禁降级使用自签名 TLS 证书（防止中间人探测与审查嗅探）；自签证书逻辑仅允许在单元测试配置中显式声明开启（`AllowSelfSignedCertForTest: true`），生产启动若缺少合法证书必须硬拒绝启动。
+

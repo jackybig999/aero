@@ -52,3 +52,5 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 	var lc net.ListenConfig
 	return lc.ListenPacket(ctx, network, ":0")
 }
+
+func invalidateGatewayCache() {}

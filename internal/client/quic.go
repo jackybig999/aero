@@ -6,6 +6,7 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -228,6 +229,11 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 		cfg.TLSConfig = defaultTLSConfig(cfg.TLSServerName)
 	}
 
+	var randBuf [1]byte
+	_, _ = rand.Read(randBuf[:])
+	jitter := uint16(randBuf[0] % 101)   // 0 ~ 100 字节密码学随机扰动
+	initialSize := uint16(1280) + jitter // 1280 ~ 1380 动态包长，杜绝 DPI 静态特征识别
+
 	quicConfig := &quic.Config{
 		MaxIncomingStreams:      cfg.MaxStreams,
 		MaxIncomingUniStreams:   cfg.MaxStreams,
@@ -237,7 +243,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 		EnableDatagrams:         true,
 		DisablePathMTUDiscovery: false,
 		KeepAlivePeriod:         20 * time.Second,
-		InitialPacketSize:       1350,
+		InitialPacketSize:       initialSize,
 	}
 
 	var pconn net.PacketConn

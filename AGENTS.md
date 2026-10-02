@@ -18,3 +18,6 @@ All subagents and background tools working on this codebase must strictly follow
 9. **Quality Gate**: Must pass `gofmt`, `go vet ./...`, and race detector (`go test -race -shuffle=on ./...`).
 10. **Error Standards**: No implicit error discarding; explicit `_ = f()` with rationale comments only; safeGo wrapper with recover on background goroutines.
 11. **Native AERO Sub Only & Zero-Port URL Mandate**: Strict ban on third-party formats. Only `https://domain.com/sub/superadmin` and `https://domain.com/sub/username{六位随机码}` via standard 443 HTTPS.
+12. **Pre-Flight Git Alignment & Zero Untracked**: Before any commit/push, `git status --porcelain` must have 0 untracked files (`??` == 0) and 0 unstaged deletions. All new files and embeds must be staged.
+13. **Non-Destructive Cleanup & Rollback Contract**: No hard `rm -rf`. All cleanup must archive to gitignored `backup/` + external mirror, accompanied by `BACKUP_MANIFEST.md` and executable rollback script.
+14. **Dedicated Tmp Sandbox & Zero Source Pollution**: `D:\jacky\gemini\AIsysnew\tmp` is the sole authorized local sandbox for all tests, build artifacts (`-o tmp/...`), and runtime caches. Writing, dropping, or generating any temporary file in source directories is strictly prohibited.

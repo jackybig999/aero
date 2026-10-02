@@ -7,12 +7,19 @@ package client
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +41,15 @@ type AppState struct {
 	SubURL     string `json:"sub_url,omitempty"`
 	NodesCount int    `json:"nodes_count"`
 	Version    string `json:"version"`
+
+	Node         string `json:"node,omitempty"`
+	SNI          string `json:"sni,omitempty"`
+	ISP          string `json:"isp,omitempty"`
+	ISPName      string `json:"isp_name,omitempty"`
+	RttMs        int64  `json:"rtt_ms"`
+	ProbeOk      bool   `json:"probe_ok"`
+	ProbeMs      int64  `json:"probe_ms"`
+	GeoRuleCount int    `json:"geo_rule_count"`
 }
 
 // Engine 客户端核心引擎
@@ -54,6 +70,10 @@ type Engine struct {
 	listenAddr    string
 	mixedListener net.Listener
 
+	currentISP  string
+	savedSubURL string
+	geoDataURL  string
+
 	running     atomic.Bool
 	stopMixed   chan struct{}
 	rootCtx     context.Context
@@ -61,6 +81,7 @@ type Engine struct {
 	netMon      NetworkMonitor
 	activeConns sync.Map
 	killSwitch  atomic.Bool
+	sentinel    *nodeSentinel
 }
 
 // NewEngine 创建客户端引擎
@@ -75,7 +96,7 @@ func NewEngine() *Engine {
 		return tunnel.ResolveDNS(ctx, domain)
 	})
 
-	return &Engine{
+	eng := &Engine{
 		splitEngine:  split,
 		dnsHandler:   dns,
 		tunnelClient: tunnel,
@@ -85,6 +106,8 @@ func NewEngine() *Engine {
 		stopMixed:    make(chan struct{}),
 		netMon:       NewNetworkMonitor(),
 	}
+	eng.sentinel = newNodeSentinel(eng)
+	return eng
 }
 
 // SetNetworkMonitor 允许注入自定义网络监控器 (用于单元测试与调试)
@@ -133,7 +156,9 @@ func (e *Engine) Apply(applied *Applied) error {
 // LoadAndApplySubscription 从远程 URL 加载并应用订阅，挂载 singleflight 阻断重入
 func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
 	v, err, _ := subSingleFlight.Do(src, func() (any, error) {
-		sub, err := FetchSubscription(context.Background(), src, SubFetchOptions{})
+		ctx, cancel := context.WithTimeout(e.getContext(), 30*time.Second)
+		defer cancel()
+		sub, err := FetchSubscription(ctx, src, SubFetchOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -141,6 +166,19 @@ func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		ispRes := DetectISP(ctx, 500*time.Millisecond)
+		bestISP := "DEFAULT"
+		if ispRes != nil && ispRes.BestISP != "" {
+			bestISP = ispRes.BestISP
+		}
+		sortServersByISP(applied.Servers, bestISP)
+
+		e.mu.Lock()
+		e.currentISP = bestISP
+		e.savedSubURL = src
+		e.mu.Unlock()
+
 		if err := e.Apply(applied); err != nil {
 			return nil, err
 		}
@@ -261,19 +299,33 @@ func (e *Engine) Start() error {
 		return fmt.Errorf("start stack: %w", err)
 	}
 
-	// 2. 启动物理网络变动监控 (Netmon)
+	// 2. 初始化并启动节点健康哨兵 (Node Sentinel)
 	e.mu.Lock()
+	if e.sentinel == nil {
+		e.sentinel = newNodeSentinel(e)
+	}
+	sentinel := e.sentinel
 	if e.netMon == nil {
 		e.netMon = NewNetworkMonitor()
 	}
 	nm := e.netMon
 	e.mu.Unlock()
 
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[SENTINEL] panic recovered: %v", r)
+			}
+		}()
+		sentinel.run(e.rootCtx)
+	}()
+
+	// 3. 启动物理网络变动监控 (Netmon)
 	nm.Start(func(newGW, ifName string) {
 		e.onNetworkChange(newGW, ifName)
 	})
 
-	// 3. 启动本地 127.0.0.1:55555 混合代理监听器
+	// 4. 启动本地 127.0.0.1:55555 混合代理监听器
 	go e.startMixedProxy()
 
 	log.Printf("[ENGINE] data plane started successfully (TUN aero0, mixed proxy %s)", e.listenAddr)
@@ -283,12 +335,23 @@ func (e *Engine) Start() error {
 // onNetworkChange 响应底层物理网络切换事件
 // 规则：原子级刷新 ProtectHostRoute、清理存量悬挂连接、重置会话池、更新物理解析、异步预热 QUIC
 func (e *Engine) onNetworkChange(newGW, ifName string) {
+	invalidateGatewayCache()
 	log.Printf("[ENGINE] onNetworkChange triggered: newGW=%s, ifName=%s", newGW, ifName)
 
 	e.mu.RLock()
 	activeAddr := e.activeAddr
 	activeSNI := e.activeSNI
+	sentinel := e.sentinel
+	stackEng := e.stackEngine
 	e.mu.RUnlock()
+
+	if stackEng != nil {
+		stackEng.SetWebRTCActive(false)
+	}
+
+	if sentinel != nil {
+		sentinel.wakeup()
+	}
 
 	// 1. 刷新活跃节点保护路由
 	if activeAddr != "" {
@@ -304,13 +367,9 @@ func (e *Engine) onNetworkChange(newGW, ifName string) {
 	// 3. 重置 QUIC 会话池
 	e.sessionPool.Reset()
 
-	// 4. 更新物理 DNS
+	// 4. 更新物理 DNS (固定设为 223.5.5.5:53)
 	if e.dnsHandler != nil {
-		if newGW != "" && net.ParseIP(newGW) != nil {
-			e.dnsHandler.SetPhysicalDNS(newGW + ":53")
-		} else {
-			e.dnsHandler.SetPhysicalDNS("223.5.5.5:53")
-		}
+		e.dnsHandler.SetPhysicalDNS("223.5.5.5:53")
 	}
 
 	// 5. 异步预热新网络接口上的 QUIC 拨号
@@ -321,7 +380,11 @@ func (e *Engine) onNetworkChange(newGW, ifName string) {
 		cfg := DefaultTransportConfig(activeAddr, activeSNI)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = e.sessionPool.Get(ctx, cfg)
+		if _, err := e.sessionPool.Get(ctx, cfg); err == nil {
+			if stackEng != nil && e.running.Load() {
+				stackEng.SetWebRTCActive(true)
+			}
+		}
 	}()
 }
 
@@ -372,8 +435,13 @@ func (e *Engine) Stop() error {
 	}
 
 	if e.stackEngine != nil {
+		e.stackEngine.SetWebRTCActive(false)
 		e.stackEngine.Stop()
 		e.stackEngine = nil
+	}
+
+	if e.tunnelClient != nil {
+		e.tunnelClient.Close()
 	}
 
 	TeardownRoutes("aero0")
@@ -398,15 +466,243 @@ func (e *Engine) GetState() AppState {
 		nodesCount = len(e.appliedSub.Servers)
 	}
 
-	return AppState{
-		Connected:  e.running.Load(),
-		Mode:       e.mode,
-		Listen:     e.listenAddr,
-		ActiveNode: e.activeAddr,
-		ActiveSNI:  e.activeSNI,
-		NodesCount: nodesCount,
-		Version:    "aero/2.0",
+	var rttMs int64
+	var probeOk bool
+	if e.sentinel != nil {
+		d := e.sentinel.LastRTT()
+		if d > 0 {
+			rttMs = d.Milliseconds()
+			probeOk = true
+		}
 	}
+
+	geoCount := 0
+	if e.splitEngine != nil {
+		geoCount = e.splitEngine.TotalRules()
+	}
+
+	subURL := e.savedSubURL
+	isp := e.currentISP
+	if isp == "" {
+		isp = "DEFAULT"
+	}
+
+	return AppState{
+		Connected:    e.running.Load(),
+		Mode:         e.mode,
+		Listen:       e.listenAddr,
+		ActiveNode:   e.activeAddr,
+		ActiveSNI:    e.activeSNI,
+		SubURL:       subURL,
+		NodesCount:   nodesCount,
+		Version:      "aero/2.0",
+		Node:         e.activeAddr,
+		SNI:          e.activeSNI,
+		ISP:          isp,
+		ISPName:      ispToName(isp),
+		RttMs:        rttMs,
+		ProbeOk:      probeOk,
+		ProbeMs:      rttMs,
+		GeoRuleCount: geoCount,
+	}
+}
+
+func ispToName(isp string) string {
+	switch strings.ToUpper(isp) {
+	case "CT":
+		return "中国电信"
+	case "CU":
+		return "中国联通"
+	case "CM":
+		return "中国移动"
+	default:
+		return "默认"
+	}
+}
+
+// PingActiveNode 向当前活跃节点发送 probe.aero 控制短流，度量往返 RTT 并更新 sentinel.lastRTT
+func (e *Engine) PingActiveNode(ctx context.Context) (time.Duration, error) {
+	if e.tunnelClient == nil {
+		return 0, fmt.Errorf("tunnel client not initialized")
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+	}
+
+	start := time.Now()
+	if _, err := e.tunnelClient.ResolveDNS(ctx, "probe.aero"); err != nil {
+		return 0, fmt.Errorf("ping active node failed: %w", err)
+	}
+	rtt := time.Since(start)
+
+	e.mu.RLock()
+	sentinel := e.sentinel
+	e.mu.RUnlock()
+	if sentinel != nil {
+		sentinel.lastRTT.Store(rtt.Nanoseconds())
+	}
+
+	return rtt, nil
+}
+
+// SetGeoDataURL 设置分流地理数据同步源 URL (用于测试与自定义配置)
+func (e *Engine) SetGeoDataURL(u string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.geoDataURL = u
+}
+
+// SyncGeoData 从云端同步最新中国直连域名与网段规则库
+// 规则：必须使用 DialPhysicalDirect 构建 HTTP Transport 防止 TUN 路由环路死锁，比对 If-None-Match ETag，200 则原子写入 GetDataDir()/geodata_direct.txt 并调用 e.splitEngine.ReloadRules
+func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
+	e.mu.RLock()
+	targetURL := e.geoDataURL
+	subURL := e.savedSubURL
+	e.mu.RUnlock()
+
+	if targetURL == "" {
+		if subURL != "" {
+			if u, err := url.Parse(subURL); err == nil && u.Host != "" {
+				scheme := u.Scheme
+				if scheme == "" {
+					scheme = "https"
+				}
+				targetURL = fmt.Sprintf("%s://%s/api/v1/geodata/direct", scheme, u.Host)
+			}
+		}
+	}
+	if targetURL == "" {
+		targetURL = "https://rules.aero-protocol.com/geodata_direct.txt"
+	}
+
+	dataDir := GetDataDir()
+	filePath := filepath.Join(dataDir, "geodata_direct.txt")
+	etagPath := filepath.Join(dataDir, "geodata_direct.etag")
+
+	var currentETag string
+	if b, err := os.ReadFile(etagPath); err == nil {
+		currentETag = strings.TrimSpace(string(b))
+	} else if existing, err := os.ReadFile(filePath); err == nil && len(existing) > 0 {
+		sum := sha256.Sum256(existing)
+		currentETag = `"` + hex.EncodeToString(sum[:]) + `"`
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("create geodata request: %w", err)
+	}
+	req.Header.Set("User-Agent", "AeroClient/2.0")
+	if currentETag != "" {
+		req.Header.Set("If-None-Match", currentETag)
+	}
+
+	tr := &http.Transport{
+		Proxy: nil,
+		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
+			return DialPhysicalDirect(c, network, addr)
+		},
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   15 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, false, fmt.Errorf("sync geodata network error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		count := 0
+		if e.splitEngine != nil {
+			count = e.splitEngine.TotalRules()
+		}
+		return count, false, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, false, fmt.Errorf("sync geodata unexpected HTTP status: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, false, fmt.Errorf("read geodata body: %w", err)
+	}
+
+	// 原子写入 GetDataDir()/geodata_direct.txt
+	tmpFile, err := os.CreateTemp(dataDir, "geodata_direct.*.tmp")
+	if err != nil {
+		return 0, false, fmt.Errorf("create geodata temp file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+
+	var renameSuccess bool
+	defer func() {
+		if !renameSuccess {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmpFile.Write(body); err != nil {
+		_ = tmpFile.Close()
+		return 0, false, fmt.Errorf("write geodata temp file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return 0, false, fmt.Errorf("sync geodata temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return 0, false, fmt.Errorf("close geodata temp file: %w", err)
+	}
+
+	if err := os.Rename(tmpName, filePath); err == nil {
+		renameSuccess = true
+	} else {
+		bakPath := filePath + ".bak"
+		_ = os.Remove(bakPath)
+		if renBakErr := os.Rename(filePath, bakPath); renBakErr == nil {
+			if renTmpErr := os.Rename(tmpName, filePath); renTmpErr == nil {
+				renameSuccess = true
+				_ = os.Remove(bakPath)
+			} else {
+				_ = os.Rename(bakPath, filePath) // 立即回滚恢复原文件
+				return 0, false, fmt.Errorf("rename geodata fallback failed: %w", renTmpErr)
+			}
+		} else {
+			if werr := os.WriteFile(filePath, body, 0644); werr != nil {
+				return 0, false, fmt.Errorf("write geodata direct fallback: %w", werr)
+			}
+			renameSuccess = true
+		}
+	}
+
+	newETag := resp.Header.Get("ETag")
+	if newETag == "" {
+		sum := sha256.Sum256(body)
+		newETag = `"` + hex.EncodeToString(sum[:]) + `"`
+	}
+	_ = os.WriteFile(etagPath, []byte(newETag), 0644)
+
+	if e.splitEngine == nil {
+		return 0, true, fmt.Errorf("split engine not initialized")
+	}
+	count, err := e.splitEngine.ReloadRules(body)
+	if err != nil {
+		return 0, true, fmt.Errorf("reload rules failed: %w", err)
+	}
+
+	return count, true, nil
 }
 
 // SetMode 设置工作模式

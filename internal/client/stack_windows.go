@@ -293,6 +293,23 @@ func interfaceIndex(name string) string {
 	return ""
 }
 
+type cachedGateway struct {
+	gw      string
+	ifIndex string
+	updated time.Time
+}
+
+var (
+	gwCacheMu sync.RWMutex
+	lastGW    cachedGateway
+)
+
+func invalidateGatewayCache() {
+	gwCacheMu.Lock()
+	lastGW = cachedGateway{}
+	gwCacheMu.Unlock()
+}
+
 type ipv4Default struct {
 	gw      string
 	ifaceIP net.IP
@@ -301,6 +318,14 @@ type ipv4Default struct {
 
 // PhysicalDefaultGateway 获取物理默认网关与网卡索引
 func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
+	gwCacheMu.RLock()
+	if lastGW.gw != "" && time.Since(lastGW.updated) < 15*time.Second {
+		cachedGW, cachedIdx := lastGW.gw, lastGW.ifIndex
+		gwCacheMu.RUnlock()
+		return cachedGW, cachedIdx, nil
+	}
+	gwCacheMu.RUnlock()
+
 	prt := exec.Command("route", "print", "-4")
 	prt.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	out, e := prt.CombinedOutput()
@@ -342,6 +367,15 @@ func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	if !found {
 		return "", "", fmt.Errorf("no physical default gateway")
 	}
+
+	gwCacheMu.Lock()
+	lastGW = cachedGateway{
+		gw:      best.gw,
+		ifIndex: bestIdx,
+		updated: time.Now(),
+	}
+	gwCacheMu.Unlock()
+
 	return best.gw, bestIdx, nil
 }
 

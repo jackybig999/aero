@@ -127,31 +127,30 @@
         <p id="modeTip" class="muted">TUN 虚拟网卡驱动接管全局流量 (零改动系统注册表)</p>
       </section>
 
-      <!-- 状态指示条（紧凑精炼） -->
-      <section class="status-bar">
-        <div class="st-row">
-          <span class="st-label" data-i18n="network">网络</span>
-          <span id="stProbe" class="st-val">—</span>
+      <!-- 指标与规则条（高聚合精简） -->
+      <section class="metrics-ribbon">
+        <div class="metrics-row">
+          <div class="metric-item">
+            <span class="m-icon">🌐</span>
+            <span class="m-label" data-i18n="node">节点</span>
+            <b id="stNode" class="m-val">—</b>
+          </div>
+          <div class="metric-item">
+            <span class="m-icon">📶</span>
+            <span class="m-label" data-i18n="latency">延迟</span>
+            <b id="stRtt" class="m-val">—</b>
+            <button type="button" id="btnPing" class="badge-btn">⚡ 测速</button>
+          </div>
         </div>
-        <div class="st-row">
-          <span class="st-label" data-i18n="mode">接管</span>
-          <span id="stMode" class="st-val">纯本地 55555</span>
-        </div>
-        <div class="st-row">
-          <span class="st-label" data-i18n="node">节点</span>
-          <span id="stNode" class="st-val">—</span>
-        </div>
-        <div class="st-row">
-          <span class="st-label" data-i18n="sni">伪装通道</span>
-          <span id="stSNI" class="st-val">—</span>
-        </div>
-        <div class="st-row">
-          <span class="st-label" data-i18n="latency">延迟</span>
-          <span id="stRtt" class="st-val">—</span>
-        </div>
-        <div class="st-row">
-          <span class="st-label" data-i18n="local">本地口</span>
-          <span id="stListen" class="st-val">127.0.0.1:55555</span>
+        <div class="metrics-row geodata-row">
+          <div class="metric-item" style="width:100%;justify-content:space-between;">
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span class="m-icon">🛡️</span>
+              <span class="m-label">国内直连</span>
+              <span id="geoRuleCount" class="geo-badge">8,420 条 (已就绪)</span>
+            </div>
+            <button type="button" id="btnSyncGeo" class="badge-btn ghost">🔄 同步</button>
+          </div>
         </div>
       </section>
 

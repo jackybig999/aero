@@ -13,4 +13,4 @@ func newPlatformNetworkMonitor() NetworkMonitor {
 }
 
 func (m *stubNetworkMonitor) Start(onChange func(newGW, ifName string)) {}
-func (m *stubNetworkMonitor) Stop()                                   {}
+func (m *stubNetworkMonitor) Stop()                                     {}

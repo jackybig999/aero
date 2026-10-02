@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -125,8 +126,33 @@ func UnprotectHostRoute(hostIP string) {
 	_ = runMac("route", "-n", "delete", "-host", hostIP)
 }
 
+type cachedGateway struct {
+	gw      string
+	ifIndex string
+	updated time.Time
+}
+
+var (
+	gwCacheMu sync.RWMutex
+	lastGW    cachedGateway
+)
+
+func invalidateGatewayCache() {
+	gwCacheMu.Lock()
+	lastGW = cachedGateway{}
+	gwCacheMu.Unlock()
+}
+
 // PhysicalDefaultGateway 获取物理网关与网卡
 func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
+	gwCacheMu.RLock()
+	if lastGW.gw != "" && time.Since(lastGW.updated) < 15*time.Second {
+		cachedGW, cachedIdx := lastGW.gw, lastGW.ifIndex
+		gwCacheMu.RUnlock()
+		return cachedGW, cachedIdx, nil
+	}
+	gwCacheMu.RUnlock()
+
 	out, e := exec.Command("route", "-n", "get", "default").CombinedOutput()
 	if e != nil {
 		return "", "", e
@@ -146,6 +172,15 @@ func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	if gw == "" {
 		return "", "", fmt.Errorf("no physical default gateway")
 	}
+
+	gwCacheMu.Lock()
+	lastGW = cachedGateway{
+		gw:      gw,
+		ifIndex: ifIndex,
+		updated: time.Now(),
+	}
+	gwCacheMu.Unlock()
+
 	return gw, ifIndex, nil
 }
 

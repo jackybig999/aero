@@ -28,6 +28,8 @@ logs/
 **/logs/
 tmp/
 **/tmp/
+backup/
+**/backup/
 *.log
 **/*.log
 *.tmp

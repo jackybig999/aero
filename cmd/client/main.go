@@ -101,6 +101,8 @@ func main() {
 		if req.Mode != "" {
 			eng.SetMode(req.Mode)
 		}
+		st := eng.GetState()
+		UpdateTrayIcon(st.Mode, st.Connected)
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "mode": req.Mode})
 	})
 
@@ -111,6 +113,8 @@ func main() {
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": err.Error()})
 			return
 		}
+		st := eng.GetState()
+		UpdateTrayIcon(st.Mode, st.Connected)
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 	})
 
@@ -118,15 +122,61 @@ func main() {
 	mux.HandleFunc("/api/v1/disconnect", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = eng.Stop()
+		st := eng.GetState()
+		UpdateTrayIcon(st.Mode, st.Connected)
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 	})
 
-	// 7. 快速连通性探针
+	// 7. 快速连通性探针 (真实度量，消灭假数据)
 	mux.HandleFunc("/api/v1/probe", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		st := eng.GetState()
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok": true,
-			"ms": 35,
+			"ok": st.Connected && st.RttMs > 0,
+			"ms": st.RttMs,
+		})
+	})
+
+	// 8. 真实链路延迟二测探针
+	mux.HandleFunc("/api/v1/ping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		rtt, err := eng.PingActiveNode(ctx)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"rtt_ms": rtt.Milliseconds(),
+		})
+	})
+
+	// 9. GeoData 规则手动同步端点
+	mux.HandleFunc("/api/v1/geodata/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		count, updated, err := eng.SyncGeoData(ctx)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"updated": updated,
+			"count":   count,
 		})
 	})
 

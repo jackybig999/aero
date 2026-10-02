@@ -42,17 +42,18 @@ type TunDevice interface {
 
 // StackEngine 封装 gVisor 虚拟网络协议栈
 type StackEngine struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	device    TunDevice
-	gvEP      *channel.Endpoint
-	gvStack   *stack.Stack
-	dialer    *TunnelClient
-	dns       *DNSHandler
-	gatewayIP net.IP
-	wg         sync.WaitGroup
-	udpSess    sync.Map
-	killSwitch atomic.Bool
+	ctx                context.Context
+	cancel             context.CancelFunc
+	device             TunDevice
+	gvEP               *channel.Endpoint
+	gvStack            *stack.Stack
+	dialer             *TunnelClient
+	dns                *DNSHandler
+	gatewayIP          net.IP
+	wg                 sync.WaitGroup
+	udpSess            sync.Map
+	killSwitch         atomic.Bool
+	webrtcRelayEnabled atomic.Bool
 }
 
 // NewStackEngine 创建网络栈引擎
@@ -153,6 +154,16 @@ func (e *StackEngine) SetKillSwitch(active bool) {
 // KillSwitch 返回当前 Kill Switch 激活状态
 func (e *StackEngine) KillSwitch() bool {
 	return e.killSwitch.Load()
+}
+
+// SetWebRTCActive 设置 WebRTC 中继转发激活状态
+func (e *StackEngine) SetWebRTCActive(active bool) {
+	e.webrtcRelayEnabled.Store(active)
+}
+
+// WebRTCActive 返回 WebRTC 中继转发是否已激活
+func (e *StackEngine) WebRTCActive() bool {
+	return e.webrtcRelayEnabled.Load()
 }
 
 // pumpTunToStack 从虚拟网卡读包注入网络栈
@@ -275,6 +286,32 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 			}
 		}
 
+		var strat Strategy = PROXY
+		host, _, splitErr := net.SplitHostPort(target)
+		if splitErr != nil {
+			host = target
+		}
+		hostIP := net.ParseIP(host)
+		if hostIP == nil {
+			hostIP = localIP
+		}
+
+		if e.dialer != nil && e.dialer.splitEngine != nil {
+			strat = e.dialer.splitEngine.Match(host, hostIP)
+		}
+
+		if strat == DIRECT {
+			ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
+			remote, derr := DialPhysicalDirect(ctx, "tcp", target)
+			cancel()
+			if derr != nil {
+				return
+			}
+			defer remote.Close()
+			relayTraffic(local, remote)
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
 		remote, derr := e.dialer.DialTCP(ctx, target)
 		cancel()
@@ -303,12 +340,14 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 
-	// 1. WebRTC STUN 物理防泄露：阶段一静默丢弃 3478 / 19302 / 5349
+	// 1. WebRTC STUN 物理防泄露：阶段一未激活时静默丢弃 3478 / 19302 / 5349
 	if id.LocalPort == 3478 || id.LocalPort == 19302 || id.LocalPort == 5349 {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
+		if !e.webrtcRelayEnabled.Load() {
+			if r.Packet() != nil {
+				r.Packet().DecRef()
+			}
+			return true
 		}
-		return true
 	}
 
 	// 2. 拦截端口 53 DNS 查询：
@@ -420,13 +459,14 @@ func isPrivateOrLoopbackAddr(addr tcpip.Address) bool {
 	if ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
 		return true
 	}
-	if ip.IsPrivate() && !ip.To4().Equal(net.IPv4(10, 88, 0, 2)) {
-		if v4 := ip.To4(); v4 != nil && v4[0] == 10 && v4[1] == 88 {
+	v4 := ip.To4()
+	if v4 != nil {
+		if ip.IsPrivate() && !v4.Equal(net.IPv4(10, 88, 0, 2)) {
 			return true
 		}
-		return true
+		return false
 	}
-	return false
+	return ip.IsPrivate()
 }
 
 func isLoopbackHost(addr string) bool {

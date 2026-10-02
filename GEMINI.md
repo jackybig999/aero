@@ -21,3 +21,7 @@ This project strictly enforces the Two-Tier Engineering Rules defined in [PROJEC
 - **P6. Mobile Stub**: SetupRoutes returns fmt.Errorf("TUN not supported on this platform").
 - **P7. Single Branch main & Remote Deploy**: Only main branch. VPS installs pull directly from GitHub public repo (`jackybig999/aero`). Zero local binary uploads.
 - **P8. Native AERO Subscription Only**: Strictly `https://domain.com/sub/superadmin` and `https://domain.com/sub/username{六位随机码}` via standard 443 HTTPS. No non-standard ports.
+- **P9. Pre-Flight Git Alignment & Zero Untracked**: `git status --porcelain` untracked files must strictly be 0 (`??` == 0); all embed assets and new code staged; clean clone simulation mandatory before push.
+- **P10. Reversible Cleanup & Rollback**: No hard `rm -rf`. All cleanups archive to gitignored `backup/` with `BACKUP_MANIFEST.md` and executable `rollback.ps1`/`rollback.sh`.
+- **P11. Anti-DPI & Network Defense Patterns**: `crypto/rand` dynamic packet jitter [1280, 1380]; two-stage atomic WebRTC state machine; zero-DNS short circuit for probe.aero; atomic configuration file writes with `.bak` rollback; lock-free `close()` UDP context reaping.
+- **P12. Dedicated Tmp Sandbox & Zero Source Pollution**: All tests, temporary databases, test artifacts, build binaries (`-o tmp/...`), and caches are strictly confined to `D:\jacky\gemini\AIsysnew\tmp`. Absolute zero file generation in source trees.

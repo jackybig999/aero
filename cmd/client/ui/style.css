@@ -348,29 +348,69 @@ button.ghost:hover {
   background: #25334d;
 }
 
-/* 状态栏条目 */
-.status-bar {
+/* 指标高聚合条目 */
+.metrics-ribbon {
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 6px 10px;
+  padding: 8px 10px;
   margin-bottom: 6px;
-}
-.st-row {
-  display: grid;
-  grid-template-columns: 56px 1fr;
+  display: flex;
+  flex-direction: column;
   gap: 6px;
+}
+.metrics-row {
+  display: flex;
   align-items: center;
-  padding: 2px 0;
+  justify-content: space-between;
+  gap: 8px;
+}
+.metric-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-size: 11px;
 }
-.st-label { color: var(--muted); font-size: 10px; }
-.st-val {
+.m-icon { font-size: 12px; }
+.m-label { color: var(--muted); font-size: 10px; }
+.m-val {
   color: var(--text);
-  word-break: break-all;
+  font-size: 11px;
   font-family: ui-monospace, Consolas, monospace;
+}
+.badge-btn {
+  background: #1e3a8a;
+  color: #93c5fd;
+  border: 1px solid #2563eb;
+  border-radius: 4px;
+  padding: 1px 6px;
   font-size: 10px;
-  text-align: right;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.badge-btn:hover {
+  background: #2563eb;
+  color: #ffffff;
+}
+.badge-btn.ghost {
+  background: #172554;
+  border-color: #1d4ed8;
+  color: #60a5fa;
+}
+.geo-badge {
+  background: rgba(34, 197, 94, 0.15);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: ui-monospace, Consolas, monospace;
+}
+.geodata-row {
+  padding-top: 4px;
+  border-top: 1px dashed var(--line);
 }
 
 .msg {

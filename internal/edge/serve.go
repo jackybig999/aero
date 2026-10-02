@@ -29,20 +29,23 @@ import (
 
 // ServerConfig configures the AERO edge server
 type ServerConfig struct {
-	Listen        string `json:"listen"`         // e.g. ":443"
-	Domain        string `json:"domain"`         // public domain / SNI
-	Token         string `json:"token"`          // initial auth token (auto if empty)
-	CertFile      string `json:"cert_file"`      // TLS cert PEM
-	KeyFile       string `json:"key_file"`       // TLS key PEM
-	DataDir       string `json:"data_dir"`       // data dir for tokens.json / client-sub.json
-	AdminKey      string `json:"admin_key"`      // admin auth key
-	Profile       string `json:"profile"`        // tiny|small|medium
-	MaxConn       int    `json:"max_conn"`       // max tunnels global
-	MaxConnUser   int    `json:"max_conn_user"`  // max tunnels per user
-	RateIP        int    `json:"rate_ip"`        // new conns/s/IP
-	BWUser        int    `json:"bw_user"`        // bytes/s per token
-	AdvertiseHost string `json:"advertise_host"` // host in subscription
-	CoverName     string `json:"cover_name"`     // cover site title
+	Listen                     string `json:"listen"`         // e.g. ":443"
+	Domain                     string `json:"domain"`         // public domain / SNI
+	Token                      string `json:"token"`          // initial auth token (auto if empty)
+	CertFile                   string `json:"cert_file"`      // TLS cert PEM
+	KeyFile                    string `json:"key_file"`       // TLS key PEM
+	DataDir                    string `json:"data_dir"`       // data dir for tokens.json / client-sub.json
+	AdminKey                   string `json:"admin_key"`      // admin auth key
+	Profile                    string `json:"profile"`        // tiny|small|medium
+	MaxConn                    int    `json:"max_conn"`       // max tunnels global
+	MaxConnUser                int    `json:"max_conn_user"`  // max tunnels per user
+	RateIP                     int    `json:"rate_ip"`        // new conns/s/IP
+	BWUser                     int    `json:"bw_user"`        // bytes/s per token
+	AdvertiseHost              string `json:"advertise_host"` // host in subscription
+	CoverName                  string `json:"cover_name"`     // cover site title
+	LineType                   string `json:"line_type,omitempty"`
+	ISPAffinity                string `json:"isp_affinity,omitempty"`
+	AllowSelfSignedCertForTest bool   `json:"-"` // 仅允许单元测试显式开启，生产环境严禁自签
 }
 
 // Server is the unified edge server instance
@@ -58,6 +61,7 @@ type Server struct {
 	quicServer   *QUICServer
 	adminHandler *AdminHandler
 	subHandler   *SubHandler
+	geoHandler   *GeoDataHandler
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -122,6 +126,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		}
 		cert = &c
 	} else {
+		if !cfg.AllowSelfSignedCertForTest {
+			return nil, fmt.Errorf("production edge server strictly requires valid TLS certificate (--cert and --key); self-signed cert is prohibited to prevent active probing")
+		}
 		dom := cfg.Domain
 		if dom == "" {
 			dom = "localhost"
@@ -153,7 +160,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		sni = "localhost"
 	}
 
-	subStore, _, err := BootstrapSubscription(absDataDir, adv, tlsPort, tok, sni, cert)
+	cfg.Token = tok
+	cfg.AdvertiseHost = adv
+	cfg.Domain = sni
+	subStore, _, err := BootstrapSubscription(cfg, cert)
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap subscription: %w", err)
 	}
@@ -179,6 +189,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	adminHandler := NewAdminHandler(cfg.AdminKey, validator, tokenStore, subStore, connLimit, bwLimit, dialGuard)
 	subHandler := &SubHandler{Store: subStore}
 
+	// 7. GeoData Handler
+	geoHandler := NewGeoDataHandler(cfg.DataDir)
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	srv := &Server{
@@ -193,6 +206,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		quicServer:   quicServer,
 		adminHandler: adminHandler,
 		subHandler:   subHandler,
+		geoHandler:   geoHandler,
 		ctx:          ctx,
 		cancel:       cancel,
 		tlsCert:      cert,
@@ -207,7 +221,7 @@ func (s *Server) Start() error {
 	tlsCfg := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{*s.tlsCert},
-		NextProtos:   []string{"http/1.1"},
+		NextProtos:   []string{"h2", "http/1.1"},
 	}
 
 	// 1. TCP/TLS Listener
@@ -235,6 +249,10 @@ func (s *Server) Start() error {
 	}
 	s.quicListener = quicLn
 
+	if s.geoHandler != nil {
+		s.geoHandler.StartCronUpdate(s.ctx)
+	}
+
 	log.Printf("[EDGE] Server started on %s (TLS + QUIC)", s.cfg.Listen)
 	log.Printf("[EDGE] Subscriptions ready at /sub/%s (client-sub: %s/client-sub.json)", s.subStore.Secret(), s.subStore.Dir())
 	log.Printf("[EDGE] Tokens loaded from %s (count: %d)", s.tokenStore.Path(), s.tokenStore.v.Count())
@@ -244,6 +262,12 @@ func (s *Server) Start() error {
 
 // ServeHTTP routes HTTP requests to /admin, /sub, /health, or Cover page
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Server", "nginx/1.30.5")
+	w.Header().Set("Alt-Svc", `h3=":443"; ma=86400`)
+
+	if s.geoHandler != nil && s.geoHandler.TryServe(w, r) {
+		return
+	}
 	if s.adminHandler != nil && s.adminHandler.TryServe(w, r) {
 		return
 	}

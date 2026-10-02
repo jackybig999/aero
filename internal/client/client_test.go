@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/sagernet/gvisor/pkg/tcpip"
+	"github.com/sagernet/gvisor/pkg/tcpip/header"
 )
 
 // 验收项 7：换线与刷新幂等
@@ -69,9 +72,13 @@ func TestEngineSwitchActiveNodeIdempotent(t *testing.T) {
 
 type mockSessionPool struct {
 	onReset func()
+	onGet   func(ctx context.Context, cfg *TransportConfig) (*Client, error)
 }
 
 func (m *mockSessionPool) Get(ctx context.Context, cfg *TransportConfig) (*Client, error) {
+	if m.onGet != nil {
+		return m.onGet(ctx, cfg)
+	}
 	return nil, nil
 }
 
@@ -682,9 +689,52 @@ func TestEngineOnNetworkChange(t *testing.T) {
 		t.Fatalf("expected sessionPool.Reset to be called on network change")
 	}
 
-	// 3. 验证物理 DNS 已被更新为新网关
-	if eng.dnsHandler.physicalDNS != "192.168.1.1:53" {
-		t.Fatalf("expected physical DNS updated to 192.168.1.1:53, got %s", eng.dnsHandler.physicalDNS)
+	// 3. 验证物理 DNS 已固定设为 223.5.5.5:53
+	if eng.dnsHandler.physicalDNS != "223.5.5.5:53" {
+		t.Fatalf("expected physical DNS updated to 223.5.5.5:53, got %s", eng.dnsHandler.physicalDNS)
+	}
+}
+
+// 验收项：isPrivateOrLoopbackAddr 边界与 IPv6 防崩溃测试
+func TestIsPrivateOrLoopbackAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		ipStr    string
+		expected bool
+	}{
+		{"IPv4 Loopback", "127.0.0.1", true},
+		{"IPv4 Private Class A", "10.0.0.1", true},
+		{"IPv4 Private Class B", "172.16.0.1", true},
+		{"IPv4 Private Class C", "192.168.1.1", true},
+		{"IPv4 Fake-IP Gateway", "10.88.0.2", false}, // Fake-IP 绝不判定为私网，必须放行代理
+		{"IPv4 Public 1.1.1.1", "1.1.1.1", false},
+		{"IPv4 Public 8.8.8.8", "8.8.8.8", false},
+		{"IPv6 Loopback", "::1", true},
+		{"IPv6 ULA Private fc00", "fc00::1", true},
+		{"IPv6 ULA Private fd12", "fd12:3456:789a::1", true},
+		{"IPv6 Link Local fe80", "fe80::1", true},
+		{"IPv6 Public", "2001:4860:4860::8888", false},
+		{"IPv4 Unspecified", "0.0.0.0", true},
+		{"IPv6 Unspecified", "::", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed := net.ParseIP(tc.ipStr)
+			if parsed == nil {
+				t.Fatalf("failed to parse IP %s", tc.ipStr)
+			}
+			var addr tcpip.Address
+			if v4 := parsed.To4(); v4 != nil {
+				addr = tcpip.AddrFromSlice(v4)
+			} else {
+				addr = tcpip.AddrFromSlice(parsed.To16())
+			}
+			result := isPrivateOrLoopbackAddr(addr)
+			if result != tc.expected {
+				t.Errorf("isPrivateOrLoopbackAddr(%s) = %v; want %v", tc.ipStr, result, tc.expected)
+			}
+		})
 	}
 }
 
@@ -695,4 +745,302 @@ type mockCloser struct {
 func (m *mockCloser) Close() error {
 	m.closed.Store(true)
 	return nil
+}
+
+type mockTunDevice struct {
+	readCh chan []byte
+	closed atomic.Bool
+}
+
+func newMockTunDevice() *mockTunDevice {
+	return &mockTunDevice{
+		readCh: make(chan []byte, 100),
+	}
+}
+
+func (m *mockTunDevice) Read(b []byte) (int, error) {
+	pkt, ok := <-m.readCh
+	if !ok || m.closed.Load() {
+		return 0, io.EOF
+	}
+	copy(b, pkt)
+	return len(pkt), nil
+}
+
+func (m *mockTunDevice) Write(b []byte) (int, error) {
+	if m.closed.Load() {
+		return 0, io.EOF
+	}
+	return len(b), nil
+}
+
+func (m *mockTunDevice) Close() error {
+	if m.closed.Swap(true) {
+		return nil
+	}
+	close(m.readCh)
+	return nil
+}
+
+func (m *mockTunDevice) Name() string {
+	return "mocktun0"
+}
+
+func (m *mockTunDevice) injectPacket(pkt []byte) {
+	if !m.closed.Load() {
+		m.readCh <- pkt
+	}
+}
+
+func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) []byte {
+	totalLen := header.IPv4MinimumSize + header.UDPMinimumSize + len(payload)
+	b := make([]byte, totalLen)
+
+	ip := header.IPv4(b[:header.IPv4MinimumSize])
+	ip.Encode(&header.IPv4Fields{
+		TotalLength: uint16(totalLen),
+		TTL:         64,
+		Protocol:    uint8(header.UDPProtocolNumber),
+		SrcAddr:     tcpip.AddrFromSlice(srcIP.To4()),
+		DstAddr:     tcpip.AddrFromSlice(dstIP.To4()),
+	})
+	ip.SetChecksum(^ip.CalculateChecksum())
+
+	u := header.UDP(b[header.IPv4MinimumSize:])
+	u.Encode(&header.UDPFields{
+		SrcPort: srcPort,
+		DstPort: dstPort,
+		Length:  uint16(header.UDPMinimumSize + len(payload)),
+	})
+	copy(b[header.IPv4MinimumSize+header.UDPMinimumSize:], payload)
+	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, tcpip.AddrFromSlice(srcIP.To4()), tcpip.AddrFromSlice(dstIP.To4()), uint16(header.UDPMinimumSize+len(payload)))
+	u.SetChecksum(^u.CalculateChecksum(xsum))
+	return b
+}
+
+// 验收项：WebRTC 两阶段精准控制
+// 断言在 webrtcRelayEnabled 为 false 时，发往 3478/19302/5349 端口的包必须被拦截丢弃；
+// 在调用 SetWebRTCActive(true) 之后，验证 WebRTCActive() 状态并验证放行。
+func TestWebRTCTwoStageControl(t *testing.T) {
+	mockDev := newMockTunDevice()
+	defer mockDev.Close()
+
+	getCalls := atomic.Int32{}
+	pool := &mockSessionPool{
+		onGet: func(ctx context.Context, cfg *TransportConfig) (*Client, error) {
+			getCalls.Add(1)
+			return nil, errors.New("mock dial error")
+		},
+	}
+	split := NewSplitEngine()
+	dialer := NewTunnelClient(pool, split)
+	defer dialer.Close()
+
+	SetActiveEdge("192.0.2.1:443", "tok_test", "edge.example.com")
+	defer SetActiveEdge("", "", "")
+
+	stackEng := NewStackEngine(mockDev, dialer, nil)
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("stackEng.Start() failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	// 1. 验证默认状态：未激活 (阶段一防泄露)
+	if stackEng.WebRTCActive() {
+		t.Fatalf("expected WebRTCActive false by default")
+	}
+
+	srcIP := net.ParseIP("10.88.0.2")
+	dstIP := net.ParseIP("198.51.100.1") // 公网目标 IP
+
+	ports := []uint16{3478, 19302, 5349}
+	for i, port := range ports {
+		pkt := buildIPv4UDPPacket(srcIP, dstIP, uint16(40001+i), port, []byte("stun-ping-blocked"))
+		mockDev.injectPacket(pkt)
+	}
+
+	// 等待协议栈处理
+	time.Sleep(50 * time.Millisecond)
+
+	// 断言：由于未激活，发往 3478/19302/5349 端口的包必须被拦截丢弃，绝不上报或发起 RegisterUDPContext
+	if calls := getCalls.Load(); calls != 0 {
+		t.Fatalf("expected 0 getCalls when WebRTC inactive, got %d", calls)
+	}
+
+	// 2. 激活 WebRTC 阶段二 (建连成功放行)
+	stackEng.SetWebRTCActive(true)
+	if !stackEng.WebRTCActive() {
+		t.Fatalf("expected WebRTCActive true after SetWebRTCActive(true)")
+	}
+
+	// 依次向 3478, 19302, 5349 发送数据包，验证放行进入普通 UDP 业务转发
+	for i, port := range ports {
+		prevCalls := getCalls.Load()
+		pkt := buildIPv4UDPPacket(srcIP, dstIP, uint16(41001+i), port, []byte("stun-ping-allowed"))
+		mockDev.injectPacket(pkt)
+
+		// 轮询等待放行触发 dialer 注册
+		success := false
+		for attempt := 0; attempt < 50; attempt++ {
+			if getCalls.Load() > prevCalls {
+				success = true
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if !success {
+			t.Fatalf("expected port %d to be forwarded when WebRTC active, getCalls did not increment", port)
+		}
+	}
+
+	// 3. 再次关闭 WebRTC，验证重新拦截
+	stackEng.SetWebRTCActive(false)
+	if stackEng.WebRTCActive() {
+		t.Fatalf("expected WebRTCActive false after SetWebRTCActive(false)")
+	}
+
+	currentCalls := getCalls.Load()
+	for i, port := range ports {
+		pkt := buildIPv4UDPPacket(srcIP, dstIP, uint16(42001+i), port, []byte("stun-ping-blocked-again"))
+		mockDev.injectPacket(pkt)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if getCalls.Load() != currentCalls {
+		t.Fatalf("expected 0 additional calls after deactivation, got %d", getCalls.Load()-currentCalls)
+	}
+}
+
+// 验收项：多用户与多并发 WebRTC 状态生命周期
+// 验证多用户/多并发场景下 WebRTC 状态在网络切换、停止时的隔离性与正确性。
+func TestMultiUserWebRTCLifecycle(t *testing.T) {
+	const userCount = 6
+	users := make([]*Engine, userCount)
+	stackEngines := make([]*StackEngine, userCount)
+	pools := make([]*mockSessionPool, userCount)
+	devs := make([]*mockTunDevice, userCount)
+	stopped := make([]atomic.Bool, userCount)
+
+	for i := 0; i < userCount; i++ {
+		idx := i
+		dev := newMockTunDevice()
+		devs[i] = dev
+		p := &mockSessionPool{
+			onGet: func(ctx context.Context, cfg *TransportConfig) (*Client, error) {
+				if idx%2 == 0 {
+					return nil, nil // 偶数用户拨号成功
+				}
+				return nil, errors.New("simulated dial failure") // 奇数用户拨号失败
+			},
+		}
+		pools[i] = p
+
+		eng := NewEngine()
+		eng.sessionPool = p
+		eng.activeAddr = fmt.Sprintf("198.51.100.%d:443", 10+i)
+		eng.activeSNI = fmt.Sprintf("node%d.example.com", i)
+		eng.running.Store(true)
+
+		stk := NewStackEngine(dev, eng.tunnelClient, nil)
+		_ = stk.Start()
+		eng.stackEngine = stk
+		stackEngines[i] = stk
+		users[i] = eng
+	}
+
+	defer func() {
+		for i := 0; i < userCount; i++ {
+			if !stopped[i].Swap(true) && stackEngines[i] != nil {
+				stackEngines[i].Stop()
+			}
+		}
+	}()
+
+	// 1. 验证多用户初始状态隔离性
+	for i := 0; i < userCount; i++ {
+		if stackEngines[i].WebRTCActive() {
+			t.Fatalf("user %d WebRTCActive should be false initially", i)
+		}
+	}
+
+	// 仅激活 user 0 和 user 2
+	stackEngines[0].SetWebRTCActive(true)
+	stackEngines[2].SetWebRTCActive(true)
+
+	if !stackEngines[0].WebRTCActive() || !stackEngines[2].WebRTCActive() {
+		t.Fatalf("expected user 0 and 2 to be active")
+	}
+	for _, idx := range []int{1, 3, 4, 5} {
+		if stackEngines[idx].WebRTCActive() {
+			t.Fatalf("user %d should remain false (isolation violation)", idx)
+		}
+	}
+
+	// 2. 并发触发网络切换 (onNetworkChange)
+	var wg sync.WaitGroup
+	for i := 0; i < userCount; i++ {
+		u := users[i]
+		wg.Add(1)
+		go func(eng *Engine) {
+			defer wg.Done()
+			eng.onNetworkChange("10.0.0.1", "eth0")
+		}(u)
+	}
+	wg.Wait()
+
+	// 等待异步预热 goroutine 执行完成
+	// 偶数用户 (0, 2, 4) 的 pool.Get 成功且 running=true -> WebRTC 应激活为 true
+	// 奇数用户 (1, 3, 5) 的 pool.Get 失败 -> WebRTC 应保持 false
+	for _, idx := range []int{0, 2, 4} {
+		success := false
+		for attempt := 0; attempt < 100; attempt++ {
+			if stackEngines[idx].WebRTCActive() {
+				success = true
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if !success {
+			t.Fatalf("expected user %d WebRTCActive true after successful QUIC pre-warm", idx)
+		}
+	}
+
+	for _, idx := range []int{1, 3, 5} {
+		// 奇数用户拨号失败，WebRTC 严禁激活
+		time.Sleep(20 * time.Millisecond)
+		if stackEngines[idx].WebRTCActive() {
+			t.Fatalf("expected user %d WebRTCActive false when QUIC pre-warm failed", idx)
+		}
+	}
+
+	// 3. 并发压力测试：各用户并行高频网络切换与并发状态读取，验证竞争检测 (Data Race Free)
+	var stressWg sync.WaitGroup
+	for c := 0; c < userCount; c++ {
+		stressWg.Add(1)
+		go func(uid int) {
+			defer stressWg.Done()
+			targetUser := users[uid]
+			targetUser.onNetworkChange("172.16.0.1", "wlan0")
+			if stk := stackEngines[uid]; stk != nil {
+				_ = stk.WebRTCActive()
+			}
+		}(c)
+	}
+	stressWg.Wait()
+
+	// 4. 验证 Stop() 时的 WebRTC 关闭保证与正在预热时的竞争安全
+	// 停止 user 0 (偶数用户，其 WebRTC 预热成功后为 true)
+	for attempt := 0; attempt < 100; attempt++ {
+		if stackEngines[0].WebRTCActive() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !stackEngines[0].WebRTCActive() {
+		t.Fatalf("user 0 should have been active before Stop")
+	}
+	stopped[0].Store(true)
+	_ = users[0].Stop()
+	if stackEngines[0].WebRTCActive() {
+		t.Fatalf("expected user 0 WebRTCActive false after Stop()")
+	}
 }

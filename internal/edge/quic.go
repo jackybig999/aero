@@ -38,6 +38,7 @@ type DNSResolver struct {
 	group       singleflight.Group
 	rateMu      sync.Mutex
 	rateBuckets map[string]*rateTokenBucket // 50 QPS per token
+	lastCleanup time.Time
 	lookupFn    func(ctx context.Context, host string) ([]net.IP, error)
 }
 
@@ -68,6 +69,14 @@ func (r *DNSResolver) checkRateLimit(token string) bool {
 	defer r.rateMu.Unlock()
 
 	now := time.Now()
+	if len(r.rateBuckets) > 500 && now.Sub(r.lastCleanup) > time.Minute {
+		for k, v := range r.rateBuckets {
+			if now.Sub(v.lastTime) > 5*time.Minute {
+				delete(r.rateBuckets, k)
+			}
+		}
+		r.lastCleanup = now
+	}
 	b, ok := r.rateBuckets[token]
 	if !ok {
 		b = &rateTokenBucket{
@@ -131,7 +140,7 @@ func (r *DNSResolver) Resolve(token, host string) ([]byte, error) {
 			return nil, fmt.Errorf("cached negative resolution")
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 		defer cancel()
 
 		r.mu.RLock()
@@ -142,13 +151,24 @@ func (r *DNSResolver) Resolve(token, host string) ([]byte, error) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 
-		if lookupErr != nil || len(ips) == 0 {
-			// Negative cache: 30s
+		if lookupErr != nil {
+			negTTL := 30 * time.Second
+			var netErr net.Error
+			if errors.Is(lookupErr, context.DeadlineExceeded) || (errors.As(lookupErr, &netErr) && netErr.Timeout()) {
+				negTTL = 5 * time.Second
+			}
+			r.cache[host] = dnsCacheEntry{
+				ip:        nil,
+				expiresAt: time.Now().Add(negTTL),
+			}
+			return nil, lookupErr
+		}
+		if len(ips) == 0 {
 			r.cache[host] = dnsCacheEntry{
 				ip:        nil,
 				expiresAt: time.Now().Add(30 * time.Second),
 			}
-			return nil, lookupErr
+			return nil, fmt.Errorf("no ipv4 found for %s", host)
 		}
 
 		var selected net.IP
@@ -394,10 +414,13 @@ func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx conte
 	return ln, nil
 }
 
-// ServeListener accepts and handles connections from an existing quic.Listener
-func (s *QUICServer) ServeListener(ln *quic.Listener) error {
+// ServeListener accepts and handles connections from an existing quic.Listener with external context
+func (s *QUICServer) ServeListener(ctx context.Context, ln *quic.Listener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
-		conn, err := ln.Accept(context.Background())
+		conn, err := ln.Accept(ctx)
 		if err != nil {
 			return err
 		}
@@ -573,8 +596,13 @@ func (qc *quicConnState) handleTCPStream(stream *quic.Stream, token string, stre
 }
 
 func (qc *quicConnState) relayTCP(stream *quic.Stream, targetConn net.Conn, token string, streamID uint32) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(qc.conn.Context())
 	defer cancel()
+
+	stopAfter := context.AfterFunc(ctx, func() {
+		_ = targetConn.Close()
+	})
+	defer stopAfter()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -596,7 +624,9 @@ func (qc *quicConnState) relayTCP(stream *quic.Stream, targetConn net.Conn, toke
 			if qc.server.bandwidthLimiter != nil {
 				qc.server.bandwidthLimiter.Take(token, n)
 			}
-			frame := &proto.TcpFrame{StreamId: streamID, Payload: buf[:n], Sequence: seq}
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+			frame := &proto.TcpFrame{StreamId: streamID, Payload: payload, Sequence: seq}
 			if err := proto.TypedWriteMessage(stream, proto.MsgTypeTcpFrame, frame); err != nil {
 				return
 			}
@@ -815,6 +845,26 @@ func (qc *quicConnState) receiveDatagramLoop(ctx context.Context) {
 	}
 }
 
+// reapIdleContexts scans and closes UDP contexts idle for > maxIdle, returning closed count
+func (qc *quicConnState) reapIdleContexts(maxIdle time.Duration) int {
+	now := time.Now().UnixNano()
+	var toClose []*udpContext
+
+	qc.ctxMu.RLock()
+	for _, u := range qc.contexts {
+		last := u.lastActive.Load()
+		if time.Duration(now-last) > maxIdle {
+			toClose = append(toClose, u)
+		}
+	}
+	qc.ctxMu.RUnlock()
+
+	for _, u := range toClose {
+		u.close()
+	}
+	return len(toClose)
+}
+
 // startIdleReaper closes sockets that are idle for >= 45s and reclaims slots
 func (qc *quicConnState) startIdleReaper(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
@@ -825,21 +875,7 @@ func (qc *quicConnState) startIdleReaper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			now := time.Now().UnixNano()
-			var toClose []*udpContext
-
-			qc.ctxMu.RLock()
-			for _, u := range qc.contexts {
-				last := u.lastActive.Load()
-				if time.Duration(now-last) > 45*time.Second {
-					toClose = append(toClose, u)
-				}
-			}
-			qc.ctxMu.RUnlock()
-
-			for _, u := range toClose {
-				u.close()
-			}
+			qc.reapIdleContexts(45 * time.Second)
 		}
 	}
 }
@@ -849,16 +885,44 @@ func (s *QUICServer) handleDNSStream(stream *quic.Stream, token string, targetHo
 	defer stream.Close()
 
 	if targetHost == "" {
+		resp := &proto.ConnectResponse{Accepted: false, Message: "missing target host"}
+		_ = proto.WriteMessage(stream, resp)
+		return
+	}
+
+	if targetHost == "probe.aero" || targetHost == "ping.aero" {
+		resp := &proto.ConnectResponse{
+			Accepted:            true,
+			SessionId:           generateSessionID(),
+			HeartbeatInterval:   30,
+			RecommendedProtocol: "quic",
+		}
+		if err := proto.WriteMessage(stream, resp); err != nil {
+			return
+		}
+		_, _ = stream.Write([]byte{127, 0, 0, 1})
 		return
 	}
 
 	ip4, err := s.dnsResolver.Resolve(token, targetHost)
 	if err != nil || len(ip4) != 4 {
-		// Empty on failure/timeout
+		resp := &proto.ConnectResponse{Accepted: false, Message: "dns resolve failed"}
+		_ = proto.WriteMessage(stream, resp)
 		return
 	}
 
-	// 4-byte IPv4 payload on success
+	// 1. 先发送标准握手成功确认帧，满足客户端 aeroHandshake 协议期望
+	resp := &proto.ConnectResponse{
+		Accepted:            true,
+		SessionId:           generateSessionID(),
+		HeartbeatInterval:   30,
+		RecommendedProtocol: "quic",
+	}
+	if err := proto.WriteMessage(stream, resp); err != nil {
+		return
+	}
+
+	// 2. 紧随其后写入 4 字节真实 IPv4 数据
 	_, _ = stream.Write(ip4)
 }
 

@@ -31,6 +31,8 @@ type debounceWatcher struct {
 	stopCh          chan struct{}
 	doneCh          chan struct{}
 	running         bool
+	started         bool
+	closeOnce       sync.Once
 	debounce        time.Duration
 }
 
@@ -50,6 +52,7 @@ func (w *debounceWatcher) start(onChange func(newGW, ifName string)) {
 		return
 	}
 	w.running = true
+	w.started = true
 	w.onChange = onChange
 
 	// 初始指纹采样，防止启动阶段无意义自触发
@@ -70,13 +73,16 @@ func (w *debounceWatcher) trigger() {
 
 func (w *debounceWatcher) stop() {
 	w.mu.Lock()
-	if !w.running {
+	if !w.started {
 		w.mu.Unlock()
 		return
 	}
 	w.running = false
-	close(w.stopCh)
 	w.mu.Unlock()
+
+	w.closeOnce.Do(func() {
+		close(w.stopCh)
+	})
 
 	<-w.doneCh
 }

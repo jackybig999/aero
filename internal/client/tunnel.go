@@ -94,21 +94,28 @@ func isAITraffic(host string) bool {
 	return false
 }
 
-// classifyTarget 严格按 IP 报头与 AI 域名判定，彻底移除 IsGameTraffic
-func classifyTarget(raw string) streamTarget {
+// classifyTarget 严格按 IP 报头与 AI 规则判定，结合 splitEngine 激活多通道
+func (tc *TunnelClient) classifyTarget(raw string) streamTarget {
 	st := streamTarget{Raw: raw, StreamType: protocol.StreamType_GENERAL}
 	host, portStr, err := net.SplitHostPort(raw)
 	if err != nil {
 		st.Host = raw
-		return st
+		host = raw
+	} else {
+		st.Host = host
+		var port int
+		fmt.Sscanf(portStr, "%d", &port)
+		st.Port = uint32(port)
 	}
-	st.Host = host
-	var port int
-	fmt.Sscanf(portStr, "%d", &port)
-	st.Port = uint32(port)
 
 	if isAITraffic(host) {
 		st.StreamType = protocol.StreamType_AI
+	} else if tc != nil && tc.splitEngine != nil {
+		ip := net.ParseIP(host)
+		strat := tc.splitEngine.Match(host, ip)
+		if strat == AI {
+			st.StreamType = protocol.StreamType_AI
+		}
 	}
 	return st
 }
@@ -230,7 +237,7 @@ func (tc *TunnelClient) runDatagramReceiveLoop(ctx context.Context, client *Clie
 // DialTCP 拨号建立经由 AERO 隧道的 TCP 业务流连接
 // 规则：单流最多重试 1 次（不睡眠，使用 select 和 ctx.Done() 退避）；单流超时绝对不调用 GlobalSessionPool.Remove！
 func (tc *TunnelClient) DialTCP(ctx context.Context, target string) (net.Conn, error) {
-	st := classifyTarget(target)
+	st := tc.classifyTarget(target)
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
@@ -310,7 +317,11 @@ func (tc *TunnelClient) SendDatagram(contextID uint32, payload []byte) error {
 		return fmt.Errorf("no active edge")
 	}
 	cfg := DefaultTransportConfig(addr, sni)
-	client, err := tc.pool.Get(context.Background(), cfg)
+	poolCtx := tc.ctx
+	if poolCtx == nil {
+		poolCtx = context.Background()
+	}
+	client, err := tc.pool.Get(poolCtx, cfg)
 	if err != nil {
 		return err
 	}
@@ -342,7 +353,7 @@ func (tc *TunnelClient) ResolveDNS(ctx context.Context, domain string) (net.IP, 
 		StreamType: protocol.StreamType_CONTROL,
 	}
 
-	_ = stream.SetDeadline(time.Now().Add(1000 * time.Millisecond))
+	_ = stream.SetDeadline(time.Now().Add(2500 * time.Millisecond))
 	if _, err := aeroHandshake(stream, st, streamID); err != nil {
 		return nil, err
 	}

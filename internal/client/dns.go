@@ -312,7 +312,7 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 
 	// A 记录：优先尝试隧道内短流解析 (StreamType_CONTROL)
 	if h.tunnelResolver != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 		realIP, err := h.tunnelResolver(ctx, qnameLower)
 		cancel()
 		if err == nil && realIP != nil && realIP.To4() != nil {
@@ -339,7 +339,10 @@ func (h *DNSHandler) queryFastUDP(pkt []byte) []byte {
 		server = "223.5.5.5:53"
 	}
 
-	conn, err := net.DialTimeout("udp", server, 1200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+
+	conn, err := DialPhysicalDirect(ctx, "udp", server)
 	if err != nil {
 		return nil
 	}
