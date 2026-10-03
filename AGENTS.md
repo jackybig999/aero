@@ -5,7 +5,7 @@ All subagents and background tools working on this codebase must strictly follow
 1. **Go Only (Solidified)**: Production code must be standard Go 1.24+ single module (`github.com/aero-protocol/aero`) flat layout. Frontends are native HTML5/CSS/JS embedded in Go binaries without `node_modules` (gzip < 150KB, 0 runtime deps).
 2. **Frontend Zero-Trust**: Frontend holds no business facts, secrets, tokens, or pricing constants. All state is authoritatively computed and validated by the backend.
 3. **Directory Conventions & Flat 3-Tier Layout**: `cmd/<bin>/main.go` for thin entries, `internal/<pkg>/` for packages. Ban on vague container directories (`common/`, `utils/`, `core/`, `domain/`, `infra/`, `service/`).
-4. **Zero Cross-System Imports**: `internal/client`, `internal/edge`, `internal/mid`, `internal/desk` must NOT import each other in Go code! Shared boundaries are strictly limited to `internal/proto` (between client & edge), HTTP REST /admin/subs, subscription JSON aero/2.0, and local 127.0.0.1:19877.
+4. **Zero Cross-System Imports**: `internal/client`, `internal/edge`, `internal/mid`, `internal/desk` must NOT import each other in Go code! Shared boundaries are strictly limited to HTTP REST /admin/subs, subscription JSON aero/3.0, and local 127.0.0.1:19877.
 5. **Data-Plane Guardrails**:
    - Client initial MTU 1224; IPv4 DF check at gVisor entry: exceeding MTU with DF=1 generates ICMP Type 3 Code 4 (Next-MTU = currentMaxDatagramSize + 24) written back ONLY to local virtual NIC; DF=0 silent drop.
    - Dynamic MTU sync upon *quic.DatagramTooLargeError: decrease currentMaxDatagramSize and update virtual NIC MTU immediately.

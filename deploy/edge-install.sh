@@ -182,7 +182,9 @@ if [[ "$installed_ok" -eq 0 ]]; then
             echo "[bin] 目标主机缺少 go 编译器，正在自动安装..."
             apt-get update -y && apt-get install -y golang-go >/dev/null 2>&1 || yum install -y golang >/dev/null 2>&1 || true
         fi
-        if [[ -d "$TMP_SRC/cmd/edge" ]]; then
+        if [[ -d "$TMP_SRC/aeroprot/cmd/edge" ]]; then
+            (cd "$TMP_SRC" && go build -v -ldflags="-s -w" -o "$INSTALL_DIR/aerosys-server" ./aeroprot/cmd/edge)
+        elif [[ -d "$TMP_SRC/cmd/edge" ]]; then
             (cd "$TMP_SRC" && go build -v -ldflags="-s -w" -o "$INSTALL_DIR/aerosys-server" ./cmd/edge)
         elif [[ -d "$TMP_SRC/protocol/server/vps" ]]; then
             (cd "$TMP_SRC/protocol/server/vps" && go build -v -ldflags="-s -w" -o "$INSTALL_DIR/aerosys-server" .)

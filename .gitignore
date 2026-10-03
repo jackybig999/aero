@@ -19,7 +19,6 @@ node_modules/
 *.exe
 *.exe~
 *.dll
-!internal/client/assets/wintun.dll
 *.so
 *.dylib
 
@@ -52,13 +51,8 @@ vendor/
 
 # Local databases and runtime state
 data/
+**/data/
 *.db
 *.db-shm
 *.db-wal
 
-# Private subsystems (Strictly excluded from public aero repository)
-/cmd/mid/
-/cmd/desk/
-/internal/mid/
-/internal/desk/
-/deploy/mid-install.sh

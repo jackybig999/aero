@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AERO 用户控制台 - 原生极速订阅</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Auth Container (Login / Register) -->
+  <div class="auth-wrap" id="authWrap">
+    <div class="auth-box">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+        <div class="logo-badge">A</div>
+        <div>
+          <h2 style="font-size:16px;font-weight:700">AERO 协议中台</h2>
+          <p style="font-size:11px;color:var(--muted)">原生零信任边缘接入</p>
+        </div>
+      </div>
+
+      <!-- Login Form -->
+      <form id="loginForm" style="display:flex;flex-direction:column;gap:12px">
+        <h3 style="font-size:14px;font-weight:700;margin-top:4px">用户登录</h3>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户名</label>
+          <input type="text" id="loginUser" class="input-text" style="width:100%" placeholder="请输入用户名" required />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">登录密码</label>
+          <input type="password" id="loginPass" class="input-text" style="width:100%" placeholder="请输入密码" required />
+        </div>
+        <button type="submit" class="btn btn-primary" id="btnLogin" style="width:100%;margin-top:6px;justify-content:center">立即登录</button>
+        <p style="font-size:12px;color:var(--muted);text-align:center;margin-top:4px">
+          还没有账号？<a href="#" id="toRegister" style="color:var(--blue);text-decoration:none">立即注册</a>
+        </p>
+      </form>
+
+      <!-- Register Form -->
+      <form id="registerForm" style="display:none;flex-direction:column;gap:12px">
+        <h3 style="font-size:14px;font-weight:700;margin-top:4px">新用户注册</h3>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户名 (必填)</label>
+          <input type="text" id="regUser" class="input-text" style="width:100%" placeholder="3-32位字母/数字，用于专属订阅凭据" required minlength="3" maxlength="32" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">电子邮箱 (必填)</label>
+          <input type="email" id="regEmail" class="input-text" style="width:100%" placeholder="user@example.com (用于验证与找回)" required />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">设置密码 (至少8位字母+数字组合)</label>
+          <input type="password" id="regPass" class="input-text" style="width:100%" placeholder="至少8位，包含字母和数字" required minlength="8" />
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">确认密码 (必填)</label>
+          <input type="password" id="regPassConfirm" class="input-text" style="width:100%" placeholder="请再次输入相同密码" required minlength="8" />
+        </div>
+        <button type="submit" class="btn btn-primary" id="btnReg" style="width:100%;margin-top:6px;justify-content:center">完成注册</button>
+        <p style="font-size:12px;color:var(--muted);text-align:center;margin-top:4px">
+          已有账号？<a href="#" id="toLogin" style="color:var(--blue);text-decoration:none">返回登录</a>
+        </p>
+      </form>
+    </div>
+  </div>
+
+  <!-- App Layout -->
+  <div class="user-layout" id="appLayout" style="display:none">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo-badge" id="userBadge">A</div>
+        <div class="brand-text">
+          <h1>AERO 控制台</h1>
+          <span class="brand-sub" id="userName">用户</span>
+        </div>
+      </div>
+      <nav class="nav-menu">
+        <button class="menu-item active" data-tab="subs">
+          <span>🚀</span>
+          <span>我的专属订阅</span>
+        </button>
+        <button class="menu-item" data-tab="nodes">
+          <span>🌐</span>
+          <span>全球边缘节点</span>
+        </button>
+        <button class="menu-item" data-tab="plans">
+          <span>💳</span>
+          <span>套餐与订购</span>
+        </button>
+        <button class="menu-item" data-tab="orders">
+          <span>📋</span>
+          <span>账单记录</span>
+        </button>
+      </nav>
+      <div class="user-foot">
+        <button class="btn btn-danger" id="btnLogout" style="width:100%;justify-content:center">
+          退出登录
+        </button>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <div class="main-area">
+      <header class="topbar">
+        <div class="top-left">
+          <div class="page-title" id="pageTitle">我的专属订阅</div>
+        </div>
+        <div class="top-right">
+          <span class="tag tag-green">Zero-Trust Active</span>
+        </div>
+      </header>
+
+      <main class="content-pane">
+        <!-- Tab: Subscriptions -->
+        <div class="tab-content" id="tab-subs">
+          <div id="subList"></div>
+        </div>
+
+        <!-- Tab: Nodes -->
+        <div class="tab-content" id="tab-nodes" style="display:none">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>节点名称</th>
+                  <th>接入地域</th>
+                  <th>实时延迟</th>
+                  <th>接入带宽</th>
+                  <th>传输协议</th>
+                </tr>
+              </thead>
+              <tbody id="nodesTbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Tab: Plans -->
+        <div class="tab-content" id="tab-plans" style="display:none">
+          <div class="grid-cards" id="plansList"></div>
+        </div>
+
+        <!-- Tab: Orders -->
+        <div class="tab-content" id="tab-orders" style="display:none">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>订单编号</th>
+                  <th>订购套餐</th>
+                  <th>实付金额</th>
+                  <th>订单状态</th>
+                  <th>创建时间</th>
+                </tr>
+              </thead>
+              <tbody id="ordersTbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script src="user.js"></script>
+</body>
+</html>

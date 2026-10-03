@@ -11,10 +11,10 @@ permissions:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 1: Linux — Proto + Edge Server + aero-panel + Linux Client CLI
+  # Job 1: Linux — Edge Server + Linux Client CLI
   # ──────────────────────────────────────────────────────────────────────────
   build-server:
-    name: Linux Build & Test (Proto + Edge Server + Panel + Client)
+    name: Linux Build & Test (Edge Server + Client)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -26,35 +26,35 @@ jobs:
           go-version: 'stable'
           cache: false
 
-      - name: Vet & Test Proto and Edge
+      - name: Vet & Test Edge & Mid
         run: |
-          go vet ./internal/proto ./internal/edge ./cmd/edge ./cmd/panel
-          go test -race -shuffle=on -v ./internal/proto ./internal/edge
+          go vet ./aeroprot/internal/edge ./aeroprot/cmd/edge ./aerosub/internal/mid ./aerosub/cmd/mid
+          go test -race -shuffle=on -v ./aeroprot/internal/edge ./aerosub/internal/mid
 
       - name: Build Edge Server (linux/amd64 & linux/arm64)
         run: |
           mkdir -p dist/server
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-server-linux-amd64 ./cmd/edge
+            -o dist/server/aerosys-server-linux-amd64 ./aeroprot/cmd/edge
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-server-linux-arm64 ./cmd/edge
+            -o dist/server/aerosys-server-linux-arm64 ./aeroprot/cmd/edge
 
-      - name: Build Standalone VPS Panel (aerosys-panel)
+      - name: Build Midplatform Control Plane (linux/amd64)
         run: |
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-panel-linux-amd64 ./cmd/panel
+            -o dist/server/aerosys-mid-linux-amd64 ./aerosub/cmd/mid
 
       - name: Build Linux Client CLI (linux/amd64 & linux/arm64)
         run: |
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-cli-linux-amd64 ./cmd/client
+            -o dist/server/aerosys-cli-linux-amd64 ./aeroprot/cmd/client
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-cli-linux-arm64 ./cmd/client
+            -o dist/server/aerosys-cli-linux-arm64 ./aeroprot/cmd/client
 
       - name: Upload Server & Linux Client Artifacts
         uses: actions/upload-artifact@v4
@@ -63,10 +63,10 @@ jobs:
           path: dist/server/*
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 2: Windows — Client GUI + Watchdog Guard
+  # Job 2: Windows — Client GUI + Watchdog Guard + Desk
   # ──────────────────────────────────────────────────────────────────────────
   build-client-windows:
-    name: Windows Build & Test (Client GUI + Guard)
+    name: Windows Build & Test (Client GUI + Guard + Desk)
     runs-on: windows-latest
     steps:
       - name: Checkout Code
@@ -78,16 +78,20 @@ jobs:
           go-version: 'stable'
           cache: false
 
-      - name: Vet & Test Client
+      - name: Vet & Test Client & Desk
         run: |
-          go vet ./internal/client ./cmd/client ./cmd/guard
-          go test -v -short -shuffle=on ./internal/client
+          go vet ./aeroprot/internal/client ./aeroprot/cmd/client ./aeroprot/cmd/guard ./aeroos/internal/desk ./aeroos/cmd/desk
+          go test -v -short -shuffle=on ./aeroprot/internal/client ./aeroos/internal/desk
 
-      - name: Build Client (windows/amd64)
+      - name: Build Windows Client & Desk
         run: |
           mkdir -p dist/client-windows
-          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-client-windows-amd64.exe ./cmd/client
-          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-guard-windows-amd64.exe ./cmd/guard
+          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-client-windows-amd64.exe ./aeroprot/cmd/client
+          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-guard-windows-amd64.exe ./aeroprot/cmd/guard
+          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-desk-windows-amd64.exe ./aeroos/cmd/desk
+          curl.exe -fsSL "https://www.wintun.net/builds/wintun-0.14.1.zip" -o wintun.zip
+          tar.exe -xf wintun.zip
+          Copy-Item wintun/bin/amd64/wintun.dll dist/client-windows/wintun.dll
 
       - name: Upload Windows Client Artifacts
         uses: actions/upload-artifact@v4
@@ -96,10 +100,10 @@ jobs:
           path: dist/client-windows/*
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 3: macOS — Client (arm64 & amd64)
+  # Job 3: macOS — Client & Desk (arm64 & amd64)
   # ──────────────────────────────────────────────────────────────────────────
   build-client-macos:
-    name: macOS Build & Test (Client)
+    name: macOS Build & Test (Client & Desk)
     runs-on: macos-latest
     steps:
       - name: Checkout Code
@@ -111,15 +115,17 @@ jobs:
           go-version: 'stable'
           cache: false
 
-      - name: Vet Client
+      - name: Vet Client & Desk
         run: |
-          go vet ./internal/client ./cmd/client
+          go vet ./aeroprot/internal/client ./aeroprot/cmd/client ./aeroos/internal/desk ./aeroos/cmd/desk
 
       - name: Build Client (mac arm64 & amd64)
         run: |
           mkdir -p dist/client-macos
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-arm64 ./cmd/client
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-amd64 ./cmd/client
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-arm64 ./aeroprot/cmd/client
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-amd64 ./aeroprot/cmd/client
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-desk-mac-arm64 ./aeroos/cmd/desk
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-desk-mac-amd64 ./aeroos/cmd/desk
 
       - name: Upload macOS Client Artifacts
         uses: actions/upload-artifact@v4
