@@ -18,15 +18,17 @@ import (
 const DefaultMaxFakeIPSlots = 65535
 
 type lruNode struct {
-	host string
-	ip   uint32
-	prev *lruNode
-	next *lruNode
+	host       string
+	ip         uint32
+	prev       *lruNode
+	next       *lruNode
+	refCount   atomic.Int32
+	lastAccess atomic.Int64
 }
 
 // FakeIPTable Fake-IP ↔ 域名双向映射表，65535 槽位 LRU 自动淘汰
 type FakeIPTable struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	hostToNode map[string]*lruNode
 	ipToNode   map[uint32]*lruNode
 	head       *lruNode
@@ -105,13 +107,33 @@ func (t *FakeIPTable) removeNode(node *lruNode) {
 	}
 }
 
-func (t *FakeIPTable) removeTail() *lruNode {
-	if t.tail == nil {
-		return nil
+func (t *FakeIPTable) findEvictableNode() *lruNode {
+	curr := t.tail
+	count := 0
+	for curr != nil {
+		if curr.refCount.Load() == 0 {
+			t.removeNode(curr)
+			return curr
+		}
+		count++
+		if count >= 32 {
+			if t.maxSlots < 131072 {
+				t.maxSlots += 1024
+				if t.maxSlots > 131072 {
+					t.maxSlots = 131072
+				}
+			}
+			return nil
+		}
+		curr = curr.prev
 	}
-	tail := t.tail
-	t.removeNode(tail)
-	return tail
+	if t.maxSlots < 131072 {
+		t.maxSlots += 1024
+		if t.maxSlots > 131072 {
+			t.maxSlots = 131072
+		}
+	}
+	return nil
 }
 
 // Allocate 为域名分配或复用 Fake-IP
@@ -126,13 +148,14 @@ func (t *FakeIPTable) Allocate(host string) net.IP {
 
 	if node, ok := t.hostToNode[host]; ok {
 		t.moveToHead(node)
+		node.lastAccess.Store(time.Now().UnixNano())
 		ip := make(net.IP, 4)
 		binary.BigEndian.PutUint32(ip, node.ip)
 		return ip
 	}
 
 	if len(t.hostToNode) >= t.maxSlots {
-		if evicted := t.removeTail(); evicted != nil {
+		if evicted := t.findEvictableNode(); evicted != nil {
 			delete(t.hostToNode, evicted.host)
 			delete(t.ipToNode, evicted.ip)
 		}
@@ -152,16 +175,19 @@ func (t *FakeIPTable) Allocate(host string) net.IP {
 	}
 
 	if ipVal == 0 {
-		if evicted := t.removeTail(); evicted != nil {
+		if evicted := t.findEvictableNode(); evicted != nil {
 			ipVal = evicted.ip
 			delete(t.hostToNode, evicted.host)
 			delete(t.ipToNode, evicted.ip)
-		} else {
-			ipVal = t.baseIP + 2
 		}
 	}
 
+	if ipVal == 0 {
+		return nil
+	}
+
 	node := &lruNode{host: host, ip: ipVal}
+	node.lastAccess.Store(time.Now().UnixNano())
 	t.hostToNode[host] = node
 	t.ipToNode[ipVal] = node
 	t.addToHead(node)
@@ -169,6 +195,30 @@ func (t *FakeIPTable) Allocate(host string) net.IP {
 	ip := make(net.IP, 4)
 	binary.BigEndian.PutUint32(ip, ipVal)
 	return ip
+}
+
+// Acquire 线程安全地借出 Fake-IP 对应的主机名，并增加引用计数；返回对应主机名与释放函数
+func (t *FakeIPTable) Acquire(ip net.IP) (string, func()) {
+	if t == nil || ip == nil {
+		return "", func() {}
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return "", func() {}
+	}
+	ipVal := binary.BigEndian.Uint32(ip4)
+
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if node, ok := t.ipToNode[ipVal]; ok {
+		node.refCount.Add(1)
+		node.lastAccess.Store(time.Now().UnixNano())
+		return node.host, func() {
+			node.refCount.Add(-1)
+		}
+	}
+	return "", func() {}
 }
 
 // Lookup 根据 Fake-IP 反查原始真实域名
@@ -184,6 +234,7 @@ func (t *FakeIPTable) Lookup(ip net.IP) string {
 
 	if node, ok := t.ipToNode[ipVal]; ok {
 		t.moveToHead(node)
+		node.lastAccess.Store(time.Now().UnixNano())
 		return node.host
 	}
 	return ""

@@ -86,6 +86,95 @@ func SetInterfaceMTU(devName string, mtu int) error {
 	return runLinux("ip", "link", "set", "dev", devName, "mtu", fmt.Sprintf("%d", mtu))
 }
 
+// SetupLinuxDNS 配置 Linux DNS 零泄露保护：优先使用 systemd-resolved，降级原子备份 /etc/resolv.conf
+func SetupLinuxDNS(dev ...string) error {
+	devName := "aero0"
+	if len(dev) > 0 && dev[0] != "" {
+		devName = dev[0]
+	}
+
+	// a) 优先检测 systemd-resolved (resolvectl 或 systemd-resolve)
+	if _, err := exec.LookPath("resolvectl"); err == nil {
+		if err := runLinux("resolvectl", "dns", devName, "1.1.1.1", "8.8.8.8"); err == nil {
+			_ = runLinux("resolvectl", "domain", devName, "~.")
+			log.Printf("[TUN] Linux DNS configured via resolvectl on %s (1.1.1.1 8.8.8.8, domain ~.)", devName)
+			return nil
+		}
+	}
+	if _, err := exec.LookPath("systemd-resolve"); err == nil {
+		if err := runLinux("systemd-resolve", "-i", devName, "--set-dns=1.1.1.1", "--set-dns=8.8.8.8", "--set-domain=~."); err == nil {
+			log.Printf("[TUN] Linux DNS configured via systemd-resolve on %s", devName)
+			return nil
+		}
+	}
+
+	// b) 若不可用，将 /etc/resolv.conf 原子备份到 /etc/resolv.conf.aero.bak，写入 1.1.1.1
+	const (
+		resolvConf    = "/etc/resolv.conf"
+		resolvConfBak = "/etc/resolv.conf.aero.bak"
+		resolvConfTmp = "/etc/resolv.conf.aero.tmp"
+	)
+
+	if _, err := os.Stat(resolvConfBak); os.IsNotExist(err) {
+		orig, rerr := os.ReadFile(resolvConf)
+		if rerr != nil {
+			return fmt.Errorf("read %s: %w", resolvConf, rerr)
+		}
+		bakTmp := resolvConfBak + ".tmp"
+		if werr := os.WriteFile(bakTmp, orig, 0644); werr != nil {
+			return fmt.Errorf("write %s: %w", bakTmp, werr)
+		}
+		if renErr := os.Rename(bakTmp, resolvConfBak); renErr != nil {
+			_ = os.Remove(bakTmp)
+			return fmt.Errorf("rename to %s: %w", resolvConfBak, renErr)
+		}
+	}
+
+	newContent := []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+	if err := os.WriteFile(resolvConfTmp, newContent, 0644); err != nil {
+		return fmt.Errorf("write %s: %w", resolvConfTmp, err)
+	}
+	if err := os.Rename(resolvConfTmp, resolvConf); err != nil {
+		_ = os.Remove(resolvConfTmp)
+		return fmt.Errorf("replace %s: %w", resolvConf, err)
+	}
+
+	log.Printf("[TUN] Linux DNS configured via %s (backup at %s)", resolvConf, resolvConfBak)
+	return nil
+}
+
+// RestoreLinuxDNS 还原 Linux DNS 配置
+func RestoreLinuxDNS(dev ...string) error {
+	devName := "aero0"
+	if len(dev) > 0 && dev[0] != "" {
+		devName = dev[0]
+	}
+
+	var firstErr error
+
+	// 1. 若存在 /etc/resolv.conf.aero.bak，使用 os.Rename 还原
+	const (
+		resolvConf    = "/etc/resolv.conf"
+		resolvConfBak = "/etc/resolv.conf.aero.bak"
+	)
+	if _, err := os.Stat(resolvConfBak); err == nil {
+		if err := os.Rename(resolvConfBak, resolvConf); err != nil {
+			firstErr = fmt.Errorf("restore %s from %s: %w", resolvConf, resolvConfBak, err)
+		} else {
+			log.Printf("[TUN] Restored %s from %s", resolvConf, resolvConfBak)
+		}
+	}
+
+	// 2. 若使用 systemd-resolved，执行 revert
+	if _, err := exec.LookPath("resolvectl"); err == nil {
+		_ = runLinux("resolvectl", "revert", devName)
+	} else if _, err := exec.LookPath("systemd-resolve"); err == nil {
+		_ = runLinux("systemd-resolve", "--revert", "-i", devName)
+	}
+
+	return firstErr
+}
+
 // SetupRoutes 配置 Linux 路由
 func SetupRoutes(devName, ipv4 string) error {
 	if devName == "" {
@@ -107,6 +196,10 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runLinux("ip", "route", "replace", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "replace", "128.0.0.0/1", "dev", devName)
 
+	if err := SetupLinuxDNS(devName); err != nil {
+		log.Printf("[TUN] Linux DNS configuration warning: %v", err)
+	}
+
 	log.Printf("[TUN] Routes configured on %s (MTU=1224)", devName)
 	return nil
 }
@@ -115,6 +208,9 @@ func SetupRoutes(devName, ipv4 string) error {
 func TeardownRoutes(devName string) {
 	if devName == "" {
 		devName = "aero0"
+	}
+	if err := RestoreLinuxDNS(devName); err != nil {
+		log.Printf("[TUN] Linux DNS restore warning: %v", err)
 	}
 	_ = runLinux("ip", "route", "del", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "del", "128.0.0.0/1", "dev", devName)

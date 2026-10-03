@@ -22,6 +22,7 @@ var (
 	activeEdgeToken  atomic.Pointer[string]
 	activeEdgeSNI    atomic.Pointer[string]
 	activeEdgeIP     atomic.Pointer[net.IP]
+	activeEdgeECH    atomic.Pointer[[]byte]
 
 	inboundDatagramHandlers sync.Map // map[uint32]func(payload []byte)
 )
@@ -35,7 +36,7 @@ func init() {
 }
 
 // SetActiveEdge 设置当前激活节点的拨号信息
-func SetActiveEdge(addr, tok, sni string, ip net.IP) {
+func SetActiveEdge(addr, tok, sni string, ip net.IP, ech ...[]byte) {
 	activeEdgeAddr.Store(&addr)
 	activeEdgeToken.Store(&tok)
 	activeEdgeSNI.Store(&sni)
@@ -45,6 +46,20 @@ func SetActiveEdge(addr, tok, sni string, ip net.IP) {
 	} else {
 		activeEdgeIP.Store(nil)
 	}
+	if len(ech) > 0 && len(ech[0]) > 0 {
+		echCopy := append([]byte(nil), ech[0]...)
+		activeEdgeECH.Store(&echCopy)
+	} else {
+		activeEdgeECH.Store(nil)
+	}
+}
+
+func getActiveEdgeECH() []byte {
+	echP := activeEdgeECH.Load()
+	if echP != nil && *echP != nil {
+		return append([]byte(nil), (*echP)...)
+	}
+	return nil
 }
 
 func getActiveEdge() (string, string, string, net.IP) {
@@ -202,6 +217,9 @@ func (tc *TunnelClient) getActiveQUICClient(ctx context.Context) (*Client, error
 		return nil, fmt.Errorf("no active edge address configured")
 	}
 	cfg := DefaultTransportConfig(addr, sni)
+	if ech := getActiveEdgeECH(); len(ech) > 0 {
+		cfg.ECHConfigList = ech
+	}
 	if ip != nil {
 		port := 443
 		if _, portStr, err := net.SplitHostPort(addr); err == nil {
@@ -298,6 +316,9 @@ func (tc *TunnelClient) SendDatagram(contextID uint32, payload []byte) error {
 		return fmt.Errorf("no active edge")
 	}
 	cfg := DefaultTransportConfig(addr, sni)
+	if ech := getActiveEdgeECH(); len(ech) > 0 {
+		cfg.ECHConfigList = ech
+	}
 	if ip != nil {
 		port := 443
 		if _, portStr, err := net.SplitHostPort(addr); err == nil {

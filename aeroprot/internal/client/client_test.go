@@ -836,8 +836,7 @@ func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []
 		Length:  uint16(header.UDPMinimumSize + len(payload)),
 	})
 	copy(b[header.IPv4MinimumSize+header.UDPMinimumSize:], payload)
-	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, tcpip.AddrFromSlice(srcIP.To4()), tcpip.AddrFromSlice(dstIP.To4()), uint16(header.UDPMinimumSize+len(payload)))
-	u.SetChecksum(^u.CalculateChecksum(xsum))
+	u.SetChecksum(0)
 	return b
 }
 
@@ -1486,4 +1485,507 @@ func TestEngineStartSysproxyWithThirdPartyTUN(t *testing.T) {
 		t.Fatalf("sysproxy mode should never return ErrConflictingTUN, got %v", err)
 	}
 	_ = eng.Stop()
+}
+
+// ---------------------------------------------------------
+// AERO v1.0.3 WebRTC STUN & Fake-IP & 0-RTT & Captive Tests
+// ---------------------------------------------------------
+
+func TestDefaultTransportConfigEnable0RTTFalse(t *testing.T) {
+	cfg := DefaultTransportConfig("node.example.com:443", "node.example.com")
+	if cfg.Enable0RTT {
+		t.Fatalf("expected Enable0RTT to be false, got true")
+	}
+}
+
+func TestCaptivePortalUserAgentChrome133(t *testing.T) {
+	var receivedUA string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedUA = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	inMemDialer := newInMemHTTPDialer(handler)
+	origDialer := getPhysicalDialerHook()
+	defer SetPhysicalDialerHook(origDialer)
+	SetPhysicalDialerHook(inMemDialer)
+
+	oldURL := captivePortalURL
+	captivePortalURL = "http://connectivitycheck.gstatic.com/generate_204"
+	defer func() { captivePortalURL = oldURL }()
+
+	intercepted, err := DetectCaptivePortal(context.Background())
+	if err != nil {
+		t.Fatalf("DetectCaptivePortal failed: %v", err)
+	}
+	if intercepted {
+		t.Fatalf("expected intercepted to be false for 204")
+	}
+
+	expectedUA := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+	if receivedUA != expectedUA {
+		t.Fatalf("expected User-Agent %q, got %q", expectedUA, receivedUA)
+	}
+}
+
+func TestIsSTUNPacket(t *testing.T) {
+	// 短于 20 字节
+	if isSTUNPacket([]byte{0x00, 0x01, 0x00, 0x08}) {
+		t.Fatalf("short packet should not be STUN")
+	}
+
+	// 构造有效 STUN Binding Request (20 字节)
+	validSTUN := make([]byte, 20)
+	validSTUN[0] = 0x00                                    // 第一二位为 00
+	validSTUN[1] = 0x01                                    // Binding Request
+	binary.BigEndian.PutUint16(validSTUN[2:4], 0)          // Length = 0
+	binary.BigEndian.PutUint32(validSTUN[4:8], 0x2112A442) // Magic Cookie
+	copy(validSTUN[8:20], []byte("transact_id1"))          // Transaction ID
+
+	if !isSTUNPacket(validSTUN) {
+		t.Fatalf("valid STUN packet was not recognized")
+	}
+
+	// 第一二位不为 00 (0x80 -> 10)
+	invalidBits := make([]byte, 20)
+	copy(invalidBits, validSTUN)
+	invalidBits[0] = 0x80
+	if isSTUNPacket(invalidBits) {
+		t.Fatalf("invalid first 2 bits should not be STUN")
+	}
+
+	// Magic Cookie 不匹配
+	invalidCookie := make([]byte, 20)
+	copy(invalidCookie, validSTUN)
+	binary.BigEndian.PutUint32(invalidCookie[4:8], 0x12345678)
+	if isSTUNPacket(invalidCookie) {
+		t.Fatalf("invalid cookie should not be STUN")
+	}
+}
+
+func TestPrefixedUDPConn(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	firstData := []byte("hello-first-")
+	pconn := &prefixedUDPConn{
+		first: append([]byte(nil), firstData...),
+		Conn:  c1,
+	}
+
+	// 第一次 Read 读出前 6 字节
+	buf1 := make([]byte, 6)
+	n1, err := pconn.Read(buf1)
+	if err != nil || n1 != 6 || string(buf1) != "hello-" {
+		t.Fatalf("first partial read failed: n=%d, err=%v, data=%q", n1, err, string(buf1))
+	}
+
+	// 第二次 Read 读出剩余 6 字节
+	buf2 := make([]byte, 10)
+	n2, err := pconn.Read(buf2)
+	if err != nil || n2 != 6 || string(buf2[:n2]) != "first-" {
+		t.Fatalf("second partial read failed: n=%d, err=%v, data=%q", n2, err, string(buf2[:n2]))
+	}
+
+	// 此时 first 缓冲区耗尽，后续 Read 透传底层 Conn.Read
+	go func() {
+		_, _ = c2.Write([]byte("stream-data"))
+	}()
+
+	buf3 := make([]byte, 20)
+	n3, err := pconn.Read(buf3)
+	if err != nil || string(buf3[:n3]) != "stream-data" {
+		t.Fatalf("passthrough read failed: n=%d, err=%v, data=%q", n3, err, string(buf3[:n3]))
+	}
+}
+
+func TestFakeIPTableAcquireAndRelease(t *testing.T) {
+	table := NewFakeIPTable("198.18.0.0/15", 10)
+	ip := table.Allocate("example.com")
+	if ip == nil {
+		t.Fatalf("Allocate failed")
+	}
+
+	// 未分配的 IP Acquire 应返回空
+	nonExistent := net.ParseIP("198.18.254.254")
+	dom, rel := table.Acquire(nonExistent)
+	if dom != "" {
+		t.Fatalf("expected empty domain for non-existent IP, got %s", dom)
+	}
+	rel() // no-op
+
+	// 命中 Acquire
+	dom, release := table.Acquire(ip)
+	if dom != "example.com" {
+		t.Fatalf("expected example.com, got %s", dom)
+	}
+
+	// 检查 refCount
+	ipVal := binary.BigEndian.Uint32(ip.To4())
+	table.mu.RLock()
+	node := table.ipToNode[ipVal]
+	if node.refCount.Load() != 1 {
+		t.Fatalf("expected refCount=1, got %d", node.refCount.Load())
+	}
+	table.mu.RUnlock()
+
+	// 再次 Acquire
+	dom2, release2 := table.Acquire(ip)
+	if dom2 != "example.com" {
+		t.Fatalf("expected example.com, got %s", dom2)
+	}
+	if node.refCount.Load() != 2 {
+		t.Fatalf("expected refCount=2, got %d", node.refCount.Load())
+	}
+
+	// 释放一次
+	release()
+	if node.refCount.Load() != 1 {
+		t.Fatalf("expected refCount=1 after release, got %d", node.refCount.Load())
+	}
+
+	// 全部释放
+	release2()
+	if node.refCount.Load() != 0 {
+		t.Fatalf("expected refCount=0 after second release, got %d", node.refCount.Load())
+	}
+}
+
+func TestFakeIPTableEvictionRefGuardAndDynamicExpansion(t *testing.T) {
+	// 容量设为 2
+	table := NewFakeIPTable("198.18.0.0/15", 2)
+	ip1 := table.Allocate("node1.com")
+	ip2 := table.Allocate("node2.com")
+
+	// 借出 node1 和 node2
+	_, rel1 := table.Acquire(ip1)
+	defer rel1()
+	_, rel2 := table.Acquire(ip2)
+	defer rel2()
+
+	// 此时 node1 和 node2 的 refCount 均为 1。
+	// 分配 node3 时，由于所有借出中的节点 refCount > 0，绝不淘汰，触发扩容
+	ip3 := table.Allocate("node3.com")
+	if ip3 == nil {
+		t.Fatalf("Allocate node3 failed")
+	}
+
+	// 断言：table.maxSlots 扩容了 1024 槽位
+	if table.maxSlots != 1026 {
+		t.Fatalf("expected maxSlots=1026, got %d", table.maxSlots)
+	}
+
+	// node1 和 node2 依然存在且可查
+	if table.Lookup(ip1) != "node1.com" {
+		t.Fatalf("borrowed node1 was evicted!")
+	}
+	if table.Lookup(ip2) != "node2.com" {
+		t.Fatalf("borrowed node2 was evicted!")
+	}
+}
+
+func TestFakeIPTable32ConsecutiveBorrowedTriggersExpansion(t *testing.T) {
+	// 构造具有 35 个节点的表，容量为 35
+	table := NewFakeIPTable("198.18.0.0/15", 35)
+	var releases []func()
+	defer func() {
+		for _, r := range releases {
+			r()
+		}
+	}()
+
+	for i := 0; i < 35; i++ {
+		host := fmt.Sprintf("host%02d.com", i)
+		ip := table.Allocate(host)
+		_, rel := table.Acquire(ip)
+		releases = append(releases, rel)
+	}
+
+	// 连续 32 个借出节点导致遍历 32 个后停止并动态扩容
+	ipNew := table.Allocate("newhost.com")
+	if ipNew == nil {
+		t.Fatalf("Allocate newhost failed")
+	}
+
+	if table.maxSlots < 1059 { // 35 + 1024 = 1059
+		t.Fatalf("expected maxSlots >= 1059, got %d", table.maxSlots)
+	}
+}
+
+func TestStackDeepSTUNInterception(t *testing.T) {
+	mockDev := newMockTunDevice()
+	defer mockDev.Close()
+
+	getCalls := atomic.Int32{}
+	pool := &mockSessionPool{
+		onGet: func(ctx context.Context, cfg *TransportConfig) (*Client, error) {
+			getCalls.Add(1)
+			return nil, errors.New("mock dial error")
+		},
+	}
+	split := NewSplitEngine()
+	dialer := NewTunnelClient(pool, split)
+	defer dialer.Close()
+
+	SetActiveEdge("192.0.2.1:443", "tok_test", "edge.example.com", net.ParseIP("192.0.2.1"))
+	defer SetActiveEdge("", "", "", nil)
+
+	stackEng := NewStackEngine(mockDev, dialer, nil)
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("stackEng.Start() failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	// 默认 WebRTC 未激活
+	srcIP := net.ParseIP("10.88.0.2")
+	dstIP := net.ParseIP("198.51.100.55") // 非 Fake-IP 外部目标
+
+	// 构造发往非标准端口 12345 的 STUN 数据报
+	stunPktPayload := make([]byte, 20)
+	binary.BigEndian.PutUint16(stunPktPayload[0:2], 0x0001)     // STUN binding req
+	binary.BigEndian.PutUint32(stunPktPayload[4:8], 0x2112A442) // Magic Cookie
+	copy(stunPktPayload[8:20], []byte("deep_stun_tx"))
+
+	pkt := buildIPv4UDPPacket(srcIP, dstIP, 41234, 12345, stunPktPayload)
+	mockDev.injectPacket(pkt)
+
+	// 等待协议栈处理与 40ms 超时判定
+	time.Sleep(100 * time.Millisecond)
+
+	// 断言：深度拦截生效，绝不上报或外拨
+	if calls := getCalls.Load(); calls != 0 {
+		t.Fatalf("expected 0 getCalls for deep STUN packet, got %d", calls)
+	}
+}
+
+func TestStackOrphanFakeIPCircuitBreaking(t *testing.T) {
+	mockDev := newMockTunDevice()
+	defer mockDev.Close()
+
+	getCalls := atomic.Int32{}
+	pool := &mockSessionPool{
+		onGet: func(ctx context.Context, cfg *TransportConfig) (*Client, error) {
+			getCalls.Add(1)
+			return nil, errors.New("mock dial error")
+		},
+	}
+	split := NewSplitEngine()
+	dialer := NewTunnelClient(pool, split)
+	defer dialer.Close()
+
+	SetActiveEdge("192.0.2.1:443", "tok_test", "edge.example.com", net.ParseIP("192.0.2.1"))
+	defer SetActiveEdge("", "", "", nil)
+
+	dnsHandler := NewDNSHandler(split)
+	stackEng := NewStackEngine(mockDev, dialer, dnsHandler)
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("stackEng.Start() failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	srcIP := net.ParseIP("10.88.0.2")
+	// 198.18.99.99 属于 Fake-IP 网段，但未在 dnsHandler.fakeIP 中登记（孤儿 Fake-IP）
+	orphanFakeIP := net.ParseIP("198.18.99.99")
+
+	// 1. 发送 UDP 数据报到孤儿 Fake-IP
+	udpPkt := buildIPv4UDPPacket(srcIP, orphanFakeIP, 51234, 8080, []byte("udp-test"))
+	mockDev.injectPacket(udpPkt)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// 断言：UDP 孤儿 Fake-IP 被熔断丢弃，绝不上报或发起外拨
+	if calls := getCalls.Load(); calls != 0 {
+		t.Fatalf("expected 0 getCalls for orphan Fake-IP UDP, got %d", calls)
+	}
+
+	// 2. 发送 TCP SYN 到孤儿 Fake-IP
+	tcpPkt := buildIPv4TCPPacket(srcIP, orphanFakeIP, 51235, 8080, header.TCPFlagSyn, nil, 1000)
+	mockDev.injectPacket(tcpPkt)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// 断言：TCP 孤儿 Fake-IP 被直接 Complete(true) 熔断，绝不上报或发起外拨
+	if calls := getCalls.Load(); calls != 0 {
+		t.Fatalf("expected 0 getCalls for orphan Fake-IP TCP, got %d", calls)
+	}
+}
+
+func buildIPv4TCPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, flags header.TCPFlags, payload []byte, seq uint32) []byte {
+	totalLen := header.IPv4MinimumSize + header.TCPMinimumSize + len(payload)
+	b := make([]byte, totalLen)
+
+	ip := header.IPv4(b[:header.IPv4MinimumSize])
+	ip.Encode(&header.IPv4Fields{
+		TotalLength: uint16(totalLen),
+		TTL:         64,
+		Protocol:    uint8(header.TCPProtocolNumber),
+		SrcAddr:     tcpip.AddrFromSlice(srcIP.To4()),
+		DstAddr:     tcpip.AddrFromSlice(dstIP.To4()),
+	})
+	ip.SetChecksum(^ip.CalculateChecksum())
+
+	t := header.TCP(b[header.IPv4MinimumSize:])
+	t.Encode(&header.TCPFields{
+		SrcPort:    srcPort,
+		DstPort:    dstPort,
+		SeqNum:     seq,
+		AckNum:     0,
+		DataOffset: header.TCPMinimumSize,
+		Flags:      flags,
+		WindowSize: 65535,
+	})
+	copy(b[header.IPv4MinimumSize+header.TCPMinimumSize:], payload)
+
+	xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, tcpip.AddrFromSlice(srcIP.To4()), tcpip.AddrFromSlice(dstIP.To4()), uint16(header.TCPMinimumSize+len(payload)))
+	t.SetChecksum(^t.CalculateChecksum(xsum))
+	return b
+}
+
+func TestStackDeepNonSTUNLosslessReplay(t *testing.T) {
+	mockDev := newMockTunDevice()
+	defer mockDev.Close()
+
+	receivedData := make(chan []byte, 1)
+	origDialer := getPhysicalDialerHook()
+	defer SetPhysicalDialerHook(origDialer)
+	SetPhysicalDialerHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		cliConn, srvConn := net.Pipe()
+		go func() {
+			defer srvConn.Close()
+			buf := make([]byte, 1024)
+			_ = srvConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			n, err := srvConn.Read(buf)
+			if err == nil && n > 0 {
+				receivedData <- append([]byte(nil), buf[:n]...)
+			}
+		}()
+		return cliConn, nil
+	})
+
+	split := NewSplitEngine()
+	// 设置 223.5.5.5 为 DIRECT 规则
+	split.AddRule(Rule{
+		Strategy: DIRECT,
+		IPRanges: []string{"223.5.5.5/32"},
+	})
+
+	dialer := NewTunnelClient(nil, split)
+	defer dialer.Close()
+
+	stackEng := NewStackEngine(mockDev, dialer, nil)
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("stackEng.Start() failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	// 构造非 STUN 数据包发往非标准端口 12345
+	srcIP := net.ParseIP("10.88.0.2")
+	dstIP := net.ParseIP("223.5.5.5")
+	testPayload := []byte("non-stun-test-payload-12345")
+
+	pkt := buildIPv4UDPPacket(srcIP, dstIP, 41234, 12345, testPayload)
+	mockDev.injectPacket(pkt)
+
+	select {
+	case data := <-receivedData:
+		if string(data) != string(testPayload) {
+			t.Fatalf("expected payload %q, got %q", string(testPayload), string(data))
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timeout waiting for non-STUN UDP packet lossless replay")
+	}
+}
+
+func TestStackValidFakeIPAcquireLifecycle(t *testing.T) {
+	mockDev := newMockTunDevice()
+	defer mockDev.Close()
+
+	split := NewSplitEngine()
+	split.AddRule(Rule{
+		Strategy:       DIRECT,
+		DomainSuffixes: []string{"example.com"},
+	})
+
+	var dialTarget string
+	var dialMu sync.Mutex
+	connDone := make(chan struct{})
+
+	origDialer := getPhysicalDialerHook()
+	defer SetPhysicalDialerHook(origDialer)
+	SetPhysicalDialerHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialMu.Lock()
+		dialTarget = addr
+		dialMu.Unlock()
+		cliConn, srvConn := net.Pipe()
+		go func() {
+			<-connDone
+			srvConn.Close()
+		}()
+		return cliConn, nil
+	})
+
+	dnsHandler := NewDNSHandler(split)
+	fakeIPTable := NewFakeIPTable("198.18.0.0/15", 10)
+	dnsHandler.SetFakeIP(fakeIPTable)
+
+	fakeIP := fakeIPTable.Allocate("example.com")
+	if fakeIP == nil {
+		t.Fatalf("Allocate fakeIP failed")
+	}
+
+	dialer := NewTunnelClient(nil, split)
+	defer dialer.Close()
+
+	stackEng := NewStackEngine(mockDev, dialer, dnsHandler)
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("stackEng.Start() failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	srcIP := net.ParseIP("10.88.0.2")
+	udpPkt := buildIPv4UDPPacket(srcIP, fakeIP, 51236, 8080, []byte("udp-fakeip-lifecycle"))
+	mockDev.injectPacket(udpPkt)
+
+	// 等待拨号触发
+	for i := 0; i < 50; i++ {
+		dialMu.Lock()
+		target := dialTarget
+		dialMu.Unlock()
+		if target != "" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	dialMu.Lock()
+	target := dialTarget
+	dialMu.Unlock()
+	if target != "example.com:8080" {
+		t.Fatalf("expected dialTarget example.com:8080, got %q", target)
+	}
+
+	// 此时连接活跃，refCount 应为 1
+	ipVal := binary.BigEndian.Uint32(fakeIP.To4())
+	fakeIPTable.mu.RLock()
+	node := fakeIPTable.ipToNode[ipVal]
+	refBefore := node.refCount.Load()
+	fakeIPTable.mu.RUnlock()
+
+	if refBefore != 1 {
+		t.Fatalf("expected refCount=1 during active connection, got %d", refBefore)
+	}
+
+	// 释放远端连接
+	close(connDone)
+	time.Sleep(50 * time.Millisecond)
+
+	// 连接关闭后，refCount 应释放为 0
+	fakeIPTable.mu.RLock()
+	refAfter := node.refCount.Load()
+	fakeIPTable.mu.RUnlock()
+
+	if refAfter != 0 {
+		t.Fatalf("expected refCount=0 after connection closed, got %d", refAfter)
+	}
 }

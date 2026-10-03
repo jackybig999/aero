@@ -8,6 +8,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -77,6 +78,143 @@ func SetInterfaceMTU(devName string, mtu int) error {
 	return runMac("ifconfig", devName, "mtu", fmt.Sprintf("%d", mtu))
 }
 
+type darwinDNSBackup struct {
+	Service string   `json:"service"`
+	Servers []string `json:"servers"`
+}
+
+func darwinDNSBackupPath() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("aero_dns_bak_%d.json", os.Getpid()))
+}
+
+// getActiveDarwinService 通过 route -n get default 查找网卡 (如 en0)，再通过 networksetup -listnetworkserviceorder 查找对应服务名 (如 Wi-Fi)
+func getActiveDarwinService() (string, error) {
+	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("route get default: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	var iface string
+	for _, l := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(l)
+		if len(fields) >= 2 && fields[0] == "interface:" {
+			iface = fields[1]
+			break
+		}
+	}
+	if iface == "" {
+		return "", fmt.Errorf("default interface not found")
+	}
+
+	orderOut, err := exec.Command("networksetup", "-listnetworkserviceorder").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("networksetup -listnetworkserviceorder: %w (%s)", err, strings.TrimSpace(string(orderOut)))
+	}
+
+	lines := strings.Split(string(orderOut), "\n")
+	var currentSvc string
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "(") && strings.Contains(trimmed, ")") && !strings.Contains(trimmed, "Hardware Port:") {
+			idx := strings.Index(trimmed, ")")
+			currentSvc = strings.TrimSpace(trimmed[idx+1:])
+			currentSvc = strings.TrimSpace(strings.TrimPrefix(currentSvc, "*"))
+		} else if strings.Contains(trimmed, "Device:") && currentSvc != "" {
+			parts := strings.Split(trimmed, ",")
+			for _, p := range parts {
+				p = strings.TrimSpace(strings.TrimSuffix(p, ")"))
+				if strings.HasPrefix(p, "Device:") {
+					dev := strings.TrimSpace(strings.TrimPrefix(p, "Device:"))
+					if dev == iface {
+						return currentSvc, nil
+					}
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("network service not found for interface %s", iface)
+}
+
+// SetupDarwinDNS 备份原始 DNS 配置并设置为 1.1.1.1 8.8.8.8
+func SetupDarwinDNS() error {
+	svc, err := getActiveDarwinService()
+	if err != nil {
+		return fmt.Errorf("get active darwin service: %w", err)
+	}
+
+	bakPath := darwinDNSBackupPath()
+	if _, statErr := os.Stat(bakPath); os.IsNotExist(statErr) {
+		out, err := exec.Command("networksetup", "-getdnsservers", svc).CombinedOutput()
+		var origServers []string
+		if err == nil {
+			text := strings.TrimSpace(string(out))
+			if !strings.Contains(text, "There aren't any DNS Servers set") {
+				for _, line := range strings.Split(text, "\n") {
+					line = strings.TrimSpace(line)
+					if line != "" && net.ParseIP(line) != nil {
+						origServers = append(origServers, line)
+					}
+				}
+			}
+		}
+
+		bak := darwinDNSBackup{
+			Service: svc,
+			Servers: origServers,
+		}
+		data, jerr := json.Marshal(bak)
+		if jerr != nil {
+			return fmt.Errorf("marshal dns backup: %w", jerr)
+		}
+		if err := os.WriteFile(bakPath, data, 0600); err != nil {
+			return fmt.Errorf("write dns backup file: %w", err)
+		}
+	}
+
+	if err := runMac("networksetup", "-setdnsservers", svc, "1.1.1.1", "8.8.8.8"); err != nil {
+		return fmt.Errorf("set darwin dns servers: %w", err)
+	}
+	log.Printf("[TUN] Darwin DNS set to 1.1.1.1 8.8.8.8 on service %s", svc)
+	return nil
+}
+
+// RestoreDarwinDNS 读取持久化备份文件还原 DNS 设置，成功后删除备份文件
+func RestoreDarwinDNS() error {
+	bakPath := darwinDNSBackupPath()
+	data, err := os.ReadFile(bakPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read dns backup file: %w", err)
+	}
+
+	var bak darwinDNSBackup
+	if err := json.Unmarshal(data, &bak); err != nil {
+		return fmt.Errorf("unmarshal dns backup: %w", err)
+	}
+
+	if bak.Service == "" {
+		_ = os.Remove(bakPath)
+		return fmt.Errorf("empty service name in dns backup")
+	}
+
+	if len(bak.Servers) == 0 {
+		if err := runMac("networksetup", "-setdnsservers", bak.Service, "Empty"); err != nil {
+			return fmt.Errorf("restore empty darwin dns: %w", err)
+		}
+	} else {
+		args := append([]string{"-setdnsservers", bak.Service}, bak.Servers...)
+		if err := runMac("networksetup", args...); err != nil {
+			return fmt.Errorf("restore darwin dns servers: %w", err)
+		}
+	}
+
+	_ = os.Remove(bakPath)
+	log.Printf("[TUN] Darwin DNS restored on service %s", bak.Service)
+	return nil
+}
+
 // SetupRoutes 配置 macOS 路由
 func SetupRoutes(devName, ipv4 string) error {
 	if devName == "" {
@@ -97,6 +235,10 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runMac("route", "add", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "add", "-net", "128.0.0.0/1", "-interface", devName)
 
+	if err := SetupDarwinDNS(); err != nil {
+		log.Printf("[TUN] Darwin DNS configuration warning: %v", err)
+	}
+
 	log.Printf("[TUN] Routes configured on %s (MTU=1224)", devName)
 	return nil
 }
@@ -105,6 +247,9 @@ func SetupRoutes(devName, ipv4 string) error {
 func TeardownRoutes(devName string) {
 	if devName == "" {
 		return
+	}
+	if err := RestoreDarwinDNS(); err != nil {
+		log.Printf("[TUN] Darwin DNS restore warning: %v", err)
 	}
 	_ = runMac("route", "delete", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "delete", "-net", "128.0.0.0/1", "-interface", devName)

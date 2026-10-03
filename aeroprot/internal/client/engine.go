@@ -209,6 +209,18 @@ func (e *Engine) Apply(applied *Applied) error {
 	primary := applied.Servers[0]
 	if e.activeAddr == primary.Address {
 		// host:port 严格一致，短路返回，绝对不调用 Reset()！
+		var ech []byte
+		if applied.ECHConfigs != nil {
+			if c, ok := applied.ECHConfigs[primary.Address]; ok && len(c) > 0 {
+				ech = c
+			}
+		}
+		_, _, _, curIP := getActiveEdge()
+		if len(ech) > 0 {
+			SetActiveEdge(primary.Address, primary.Token, primary.SNI, curIP, ech)
+		} else {
+			SetActiveEdge(primary.Address, primary.Token, primary.SNI, curIP)
+		}
 		return nil
 	}
 
@@ -384,7 +396,17 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	e.activeAddr = addr
 	e.activeToken = tok
 	e.activeSNI = sni
-	SetActiveEdge(addr, tok, sni, newIP)
+	var ech []byte
+	if e.appliedSub != nil && e.appliedSub.ECHConfigs != nil {
+		if c, ok := e.appliedSub.ECHConfigs[addr]; ok && len(c) > 0 {
+			ech = c
+		}
+	}
+	if len(ech) > 0 {
+		SetActiveEdge(addr, tok, sni, newIP, ech)
+	} else {
+		SetActiveEdge(addr, tok, sni, newIP)
+	}
 
 	if e.dnsHandler != nil && newHost != "" && newIP != nil {
 		e.dnsHandler.SetEdge(newHost, newIP)
@@ -482,7 +504,17 @@ func (e *Engine) Start() error {
 	if mode == "tun" {
 		_ = ProtectHostRoute(ip.String())
 	}
-	SetActiveEdge(activeAddr, activeToken, activeSNI, ip)
+	var ech []byte
+	if e.appliedSub != nil && e.appliedSub.ECHConfigs != nil {
+		if c, ok := e.appliedSub.ECHConfigs[activeAddr]; ok && len(c) > 0 {
+			ech = c
+		}
+	}
+	if len(ech) > 0 {
+		SetActiveEdge(activeAddr, activeToken, activeSNI, ip, ech)
+	} else {
+		SetActiveEdge(activeAddr, activeToken, activeSNI, ip)
+	}
 	if e.dnsHandler != nil {
 		e.dnsHandler.SetEdge(host, ip)
 	}
@@ -500,6 +532,9 @@ func (e *Engine) Start() error {
 	defer probeCancel()
 
 	cfg := DefaultTransportConfig(activeAddr, activeSNI)
+	if len(ech) > 0 {
+		cfg.ECHConfigList = ech
+	}
 	cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
 	cfg.ConnectTimeout = 8 * time.Second
 	e.mu.RLock()

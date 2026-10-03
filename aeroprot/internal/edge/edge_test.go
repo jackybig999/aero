@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -507,8 +508,25 @@ func TestServerCoverAndHealth(t *testing.T) {
 		t.Fatalf("expected Alt-Svc 'h3=\":443\"; ma=86400', got %q", recHz.Header().Get("Alt-Svc"))
 	}
 
-	// 2. Health endpoint test (管理面 JSON)
+	// 2. Health endpoint test (管理面 JSON，脱敏鉴权：未鉴权 404，带密钥 200)
+	reqHUnauth := httptest.NewRequest(http.MethodGet, "/health", nil)
+	recHUnauth := httptest.NewRecorder()
+	srv.ServeHTTP(recHUnauth, reqHUnauth)
+	if recHUnauth.Code != http.StatusNotFound {
+		t.Fatalf("unauthenticated health expected 404, got %d", recHUnauth.Code)
+	}
+
+	// 2a. With query parameter admin_key
+	reqHQuery := httptest.NewRequest(http.MethodGet, "/health?admin_key=adminkey", nil)
+	recHQuery := httptest.NewRecorder()
+	srv.ServeHTTP(recHQuery, reqHQuery)
+	if recHQuery.Code != http.StatusOK {
+		t.Fatalf("query authenticated health expected 200, got %d", recHQuery.Code)
+	}
+
+	// 2b. With header Aero-Admin-Key
 	reqH := httptest.NewRequest(http.MethodGet, "/health", nil)
+	reqH.Header.Set("Aero-Admin-Key", "adminkey")
 	recH := httptest.NewRecorder()
 	srv.ServeHTTP(recH, reqH)
 	if recH.Code != http.StatusOK {
@@ -1900,5 +1918,254 @@ func TestHTTP3Healthz(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("expected 'ok', got %q", string(body))
+	}
+}
+
+// ==========================================
+// 10. Tests for v1.0.3 Security & Resource Management
+// ==========================================
+
+func TestAuthFailureJail(t *testing.T) {
+	jail := NewAuthFailureJail()
+	defer jail.Close()
+
+	ip := "198.51.100.10"
+	if jail.IsBanned(ip) {
+		t.Fatalf("expected IP %s not to be banned initially", ip)
+	}
+
+	// 1-4 failures should not ban
+	for i := 1; i <= 4; i++ {
+		banned := jail.RecordFailure(ip)
+		if banned {
+			t.Fatalf("expected failure %d not to trigger ban", i)
+		}
+		if jail.IsBanned(ip) {
+			t.Fatalf("expected IP not to be banned after %d failures", i)
+		}
+	}
+
+	// 5th failure triggers 15 minute ban
+	banned := jail.RecordFailure(ip)
+	if !banned {
+		t.Fatalf("expected 5th failure to trigger ban")
+	}
+	if !jail.IsBanned(ip) {
+		t.Fatalf("expected IP to be banned after 5 failures")
+	}
+
+	// Another failure while banned still returns banned
+	if !jail.RecordFailure(ip) {
+		t.Fatalf("expected failure while banned to return true")
+	}
+
+	// Other IP is unaffected
+	otherIP := "198.51.100.20"
+	if jail.IsBanned(otherIP) {
+		t.Fatalf("expected unrecorded IP not to be banned")
+	}
+
+	// Test window expiration reset
+	windowIP := "198.51.100.30"
+	jail.mu.Lock()
+	jail.records[windowIP] = &jailEntry{
+		failures:   4,
+		firstFail:  time.Now().Add(-2 * time.Minute), // expired window (>1m)
+		lastActive: time.Now().Add(-2 * time.Minute),
+	}
+	jail.mu.Unlock()
+
+	// Recording a failure after expired window resets count to 1
+	banned = jail.RecordFailure(windowIP)
+	if banned {
+		t.Fatalf("expected expired window failure not to trigger ban")
+	}
+	jail.mu.Lock()
+	if jail.records[windowIP].failures != 1 {
+		t.Fatalf("expected failure count reset to 1, got %d", jail.records[windowIP].failures)
+	}
+	jail.mu.Unlock()
+
+	// Test cleanup logic
+	cleanIP := "198.51.100.40"
+	jail.mu.Lock()
+	jail.records[cleanIP] = &jailEntry{
+		failures:   1,
+		banUntil:   time.Now().Add(-1 * time.Minute),
+		lastActive: time.Now().Add(-15 * time.Minute), // > 10m inactive
+	}
+	jail.mu.Unlock()
+
+	// Simulate cleanup sweep manually
+	jail.mu.Lock()
+	now := time.Now()
+	for k, entry := range jail.records {
+		if now.After(entry.banUntil) && now.Sub(entry.lastActive) > 10*time.Minute {
+			delete(jail.records, k)
+		}
+	}
+	_, found := jail.records[cleanIP]
+	jail.mu.Unlock()
+	if found {
+		t.Fatalf("expected stale entry %s to be cleaned up", cleanIP)
+	}
+}
+
+func TestIPPoolAvailable(t *testing.T) {
+	pool, err := NewIPPool("10.88.0.0/16")
+	if err != nil {
+		t.Fatalf("NewIPPool failed: %v", err)
+	}
+
+	if !pool.Available() {
+		t.Fatalf("expected freshly created pool to be available")
+	}
+
+	// Simulate pool exhaustion
+	pool.mu.Lock()
+	pool.maxHost = 2
+	pool.used[pool.baseIP] = struct{}{}
+	candAddr, _ := netip.ParseAddr("10.88.0.2")
+	pool.used[candAddr] = struct{}{}
+	pool.mu.Unlock()
+
+	if pool.Available() {
+		t.Fatalf("expected exhausted pool not to be available")
+	}
+
+	// Release an address and check availability
+	pool.Release(netip.PrefixFrom(candAddr, 32))
+	if !pool.Available() {
+		t.Fatalf("expected pool to be available after release")
+	}
+}
+
+func TestQUICServerAuthJailIntegration(t *testing.T) {
+	v := NewValidator()
+	v.AddToken("valid_token", "user", 24*time.Hour)
+	qs := NewQUICServer(v, nil, nil, nil, nil)
+	defer qs.Close()
+
+	remoteAddr := "203.0.113.88:12345"
+
+	// 5 unauthorized requests should ban the IP
+	for i := 1; i <= 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/.well-known/masque/ip/*/*/", nil)
+		req.RemoteAddr = remoteAddr
+		req.Header.Set("Authorization", "Bearer invalid_token")
+		rec := httptest.NewRecorder()
+
+		token, ok := qs.authRequest(rec, req)
+		if ok || token != "" {
+			t.Fatalf("expected authRequest to fail with invalid token")
+		}
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("request %d expected 401, got %d", i, rec.Code)
+		}
+	}
+
+	// 6th request from banned IP should receive 429 Too Many Requests with Retry-After: 900
+	reqBanned := httptest.NewRequest(http.MethodGet, "/.well-known/masque/ip/*/*/", nil)
+	reqBanned.RemoteAddr = remoteAddr
+	reqBanned.Header.Set("Authorization", "Bearer invalid_token")
+	recBanned := httptest.NewRecorder()
+
+	token, ok := qs.authRequest(recBanned, reqBanned)
+	if ok || token != "" {
+		t.Fatalf("expected authRequest to fail for banned IP")
+	}
+	if recBanned.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests, got %d", recBanned.Code)
+	}
+	if retryAfter := recBanned.Header().Get("Retry-After"); retryAfter != "900" {
+		t.Fatalf("expected Retry-After 900, got %q", retryAfter)
+	}
+}
+
+func TestServeConnectIPPoolExhausted(t *testing.T) {
+	v := NewValidator()
+	v.AddToken("valid_token", "user", 24*time.Hour)
+	qs := NewQUICServer(v, nil, nil, nil, nil)
+	defer qs.Close()
+
+	// Exhaust the IP pool
+	qs.ipPool.mu.Lock()
+	qs.ipPool.maxHost = 0
+	qs.ipPool.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodConnect, "https://example.com/.well-known/masque/ip/*/*/", nil)
+	req.Proto = "connect-ip"
+	req.Host = "example.com"
+	req.Header.Set("Capsule-Protocol", "?1")
+	req.RemoteAddr = "203.0.113.99:54321"
+	req.Header.Set("Authorization", "Bearer valid_token")
+	rec := httptest.NewRecorder()
+
+	qs.serveConnectIP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable, got %d", rec.Code)
+	}
+	expectedStatus := "aero; error=address_pool_exhausted; details=\"IP pool exhausted\""
+	if rec.Header().Get("Proxy-Status") != expectedStatus {
+		t.Fatalf("expected Proxy-Status %q, got %q", expectedStatus, rec.Header().Get("Proxy-Status"))
+	}
+}
+
+func TestGenerateTokenEntropy(t *testing.T) {
+	tokens := make(map[string]struct{})
+	for i := 0; i < 100; i++ {
+		tok, err := GenerateToken()
+		if err != nil {
+			t.Fatalf("GenerateToken failed: %v", err)
+		}
+		if !strings.HasPrefix(tok, "aero_") {
+			t.Fatalf("expected token prefix 'aero_', got %s", tok)
+		}
+		// aero_ (5 chars) + 32 bytes hex (64 chars) = 69 chars
+		if len(tok) != 69 {
+			t.Fatalf("expected token length 69 (256-bit entropy), got %d (%s)", len(tok), tok)
+		}
+		if _, exists := tokens[tok]; exists {
+			t.Fatalf("duplicate token generated: %s", tok)
+		}
+		tokens[tok] = struct{}{}
+	}
+}
+
+func TestServerConfigAndSubServerECH(t *testing.T) {
+	cfg := ServerConfig{
+		Domain: "edge.example.com",
+		ECH:    "AERO_ECH_CONFIG_HEX_BASE64",
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal ServerConfig failed: %v", err)
+	}
+
+	var parsed ServerConfig
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("unmarshal ServerConfig failed: %v", err)
+	}
+	if parsed.ECH != "AERO_ECH_CONFIG_HEX_BASE64" {
+		t.Fatalf("expected ECH 'AERO_ECH_CONFIG_HEX_BASE64', got %q", parsed.ECH)
+	}
+
+	sub := SubServer{
+		Name: "node-1",
+		Host: "edge.example.com",
+		ECH:  "AERO_ECH_NODE_CONFIG",
+	}
+	subData, err := json.Marshal(sub)
+	if err != nil {
+		t.Fatalf("marshal SubServer failed: %v", err)
+	}
+	var parsedSub SubServer
+	if err := json.Unmarshal(subData, &parsedSub); err != nil {
+		t.Fatalf("unmarshal SubServer failed: %v", err)
+	}
+	if parsedSub.ECH != "AERO_ECH_NODE_CONFIG" {
+		t.Fatalf("expected SubServer ECH 'AERO_ECH_NODE_CONFIG', got %q", parsedSub.ECH)
 	}
 }

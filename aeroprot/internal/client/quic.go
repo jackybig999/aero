@@ -213,7 +213,7 @@ func DefaultTransportConfig(addr, sni string) *TransportConfig {
 	return &TransportConfig{
 		Address:        addr,
 		TLSServerName:  sni,
-		Enable0RTT:     true,
+		Enable0RTT:     false,
 		MaxStreams:     100,
 		IdleTimeout:    90 * time.Second,
 		ConnectTimeout: 10 * time.Second,

@@ -49,6 +49,7 @@ type SubServer struct {
 	PinSPKI     []string `json:"pin_spki,omitempty"`
 	LineType    string   `json:"line_type,omitempty"`
 	ISPAffinity string   `json:"isp_affinity,omitempty"`
+	ECH         string   `json:"ech,omitempty" yaml:"ech"`
 }
 
 // UserSub represents a user-specific subscription (e.g. /sub/username{6-char-code})
@@ -87,6 +88,7 @@ type EnsureSubParams struct {
 	PinSPKI     []string
 	LineType    string
 	ISPAffinity string
+	ECH         string
 }
 
 // ==========================================
@@ -161,6 +163,7 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 		PinSPKI:     p.PinSPKI,
 		LineType:    p.LineType,
 		ISPAffinity: p.ISPAffinity,
+		ECH:         p.ECH,
 	}
 
 	if s.meta.Secret == "" {
@@ -495,6 +498,7 @@ func BootstrapSubscription(cfg ServerConfig, cert *tls.Certificate) (*SubStore, 
 		PinSPKI:     pins,
 		LineType:    cfg.LineType,
 		ISPAffinity: cfg.ISPAffinity,
+		ECH:         cfg.ECH,
 	}); err != nil {
 		return nil, "", err
 	}

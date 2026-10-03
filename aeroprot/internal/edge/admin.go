@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	Version  = "1.0.2"
+	Version  = "1.0.3"
 	Protocol = "aero/3.0"
 	APILevel = 3
 )
@@ -176,12 +176,16 @@ func (h *AdminHandler) handleAddToken(w http.ResponseWriter, r *http.Request) {
 	} else {
 		tok = req.Token
 		if tok == "" {
-			tok = GenerateToken()
+			tok, err = GenerateToken()
 		}
-		h.validator.AddToken(tok, req.Label, ttl)
+		if err == nil {
+			h.validator.AddToken(tok, req.Label, ttl)
+		}
 	}
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "token": tok, "label": req.Label})

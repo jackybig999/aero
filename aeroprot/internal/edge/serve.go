@@ -10,6 +10,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -59,7 +60,8 @@ type ServerConfig struct {
 	AllowSelfSignedCertForTest bool                          `json:"-"`                        // 仅允许单元测试显式开启，生产环境严禁自签
 	Role                       string                        `json:"role,omitempty"`           // single|ingress|egress, default single
 	HopCredential              string                        `json:"hop_credential,omitempty"` // hop credential for multi-hop (strictly distinct from user token)
-	EncryptedClientHelloKeys   []tls.EncryptedClientHelloKey `json:"-"`                        // ECH server keys (never serialised)
+	ECH                        string                        `json:"ech,omitempty" yaml:"ech"`
+	EncryptedClientHelloKeys   []tls.EncryptedClientHelloKey `json:"-"` // ECH server keys (never serialised)
 }
 
 // Server is the unified edge server instance
@@ -140,7 +142,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		if list := tokenStore.List(); len(list) > 0 {
 			tok = list[0].Token
 		} else {
-			tok = GenerateToken()
+			var err error
+			tok, err = GenerateToken()
+			if err != nil {
+				return nil, fmt.Errorf("bootstrap token: %w", err)
+			}
 		}
 	}
 	if err := tokenStore.Ensure(tok, "default", 365*24*time.Hour); err != nil {
@@ -353,6 +359,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/health" {
+		reqKey := r.Header.Get("Aero-Admin-Key")
+		if reqKey == "" {
+			reqKey = r.URL.Query().Get("admin_key")
+		}
+		if s.cfg.AdminKey == "" || subtle.ConstantTimeCompare([]byte(reqKey), []byte(s.cfg.AdminKey)) != 1 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		writeJSON(w, map[string]any{
 			"status":     "ok",
 			"version":    Version,
@@ -387,6 +401,9 @@ func (s *Server) serveCover(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Close() {
 	if s.cancel != nil {
 		s.cancel()
+	}
+	if s.quicServer != nil {
+		s.quicServer.Close()
 	}
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

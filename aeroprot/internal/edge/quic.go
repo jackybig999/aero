@@ -279,6 +279,16 @@ func (p *IPPool) Release(prefix netip.Prefix) {
 	delete(p.used, prefix.Addr())
 }
 
+// Available checks if there is any available IP address in the pool.
+func (p *IPPool) Available() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return uint32(len(p.used)) < p.maxHost
+}
+
 // ==========================================
 // 3. Connection Token Tracker
 // ==========================================
@@ -346,6 +356,7 @@ type QUICServer struct {
 	dnsResolver      *DNSResolver
 	connTracker      *ConnTracker
 	ipPool           *IPPool
+	authJail         *AuthFailureJail
 	masqueProxy      *masque.Proxy
 	connectIPProxy   *connectip.Proxy
 	h3Server         *http3.Server
@@ -377,6 +388,7 @@ func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		dnsResolver:      NewDNSResolver(),
 		connTracker:      NewConnTracker(),
 		ipPool:           ipPool,
+		authJail:         NewAuthFailureJail(),
 		masqueProxy:      &masque.Proxy{},
 		connectIPProxy:   &connectip.Proxy{},
 		tokenUDPCtx:      make(map[string]int),
@@ -390,6 +402,18 @@ func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		},
 	}
 	return qs
+}
+
+// AuthJail returns the internal AuthFailureJail
+func (s *QUICServer) AuthJail() *AuthFailureJail {
+	return s.authJail
+}
+
+// Close closes the QUICServer and its background components
+func (s *QUICServer) Close() {
+	if s.authJail != nil {
+		s.authJail.Close()
+	}
 }
 
 // SetHandler sets the HTTP handler for HTTP/3 requests.
@@ -618,8 +642,18 @@ func (s *QUICServer) ServeDefault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
+	remoteIP := ClientIP(r)
+	if s.authJail != nil && s.authJail.IsBanned(remoteIP) {
+		w.Header().Set("Retry-After", "900")
+		w.WriteHeader(http.StatusTooManyRequests)
+		return "", false
+	}
+
 	authHdr := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHdr, "Bearer ") {
+		if s.authJail != nil {
+			s.authJail.RecordFailure(remoteIP)
+		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
 		w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -631,6 +665,9 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 	if qc != nil && s.connTracker != nil {
 		if bound, ok := s.connTracker.Get(qc); ok {
 			if token != bound || !s.validator.Validate(token) {
+				if s.authJail != nil {
+					s.authJail.RecordFailure(remoteIP)
+				}
 				w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
 				w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
 				w.WriteHeader(http.StatusUnauthorized)
@@ -642,6 +679,9 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 		tsStr := r.Header.Get("Aero-Timestamp")
 		nonceHex := r.Header.Get("Aero-Nonce")
 		if tsStr == "" || nonceHex == "" {
+			if s.authJail != nil {
+				s.authJail.RecordFailure(remoteIP)
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
 			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="missing timestamp or nonce on first request"`)
 			w.WriteHeader(http.StatusUnauthorized)
@@ -650,6 +690,9 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 		ts, err1 := strconv.ParseUint(tsStr, 10, 64)
 		nonceBytes, err2 := hex.DecodeString(nonceHex)
 		if err1 != nil || err2 != nil || len(nonceBytes) != 32 || !s.validator.ValidateFull(token, ts, nonceBytes) {
+			if s.authJail != nil {
+				s.authJail.RecordFailure(remoteIP)
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
 			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="invalid timestamp, nonce or signature"`)
 			w.WriteHeader(http.StatusUnauthorized)
@@ -666,6 +709,9 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 			ts, err1 := strconv.ParseUint(tsStr, 10, 64)
 			nonceBytes, err2 := hex.DecodeString(nonceHex)
 			if err1 != nil || err2 != nil || len(nonceBytes) != 32 || !s.validator.ValidateFull(token, ts, nonceBytes) {
+				if s.authJail != nil {
+					s.authJail.RecordFailure(remoteIP)
+				}
 				w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
 				w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
 				w.WriteHeader(http.StatusUnauthorized)
@@ -674,6 +720,9 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 			return token, true
 		}
 		if !s.validator.Validate(token) {
+			if s.authJail != nil {
+				s.authJail.RecordFailure(remoteIP)
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
 			w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -861,6 +910,12 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	proxyReq, err := connectip.ParseProxyRequest(r, tmpl)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if s.ipPool != nil && !s.ipPool.Available() {
+		w.Header().Set("Proxy-Status", "aero; error=address_pool_exhausted; details=\"IP pool exhausted\"")
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 

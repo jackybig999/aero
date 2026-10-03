@@ -42,6 +42,7 @@ type ServerConfig struct {
 	AIBlocked   bool     `json:"aiBlocked,omitempty"`
 	LineType    string   `json:"lineType,omitempty" yaml:"line_type"`
 	ISPAffinity string   `json:"ispAffinity,omitempty" yaml:"isp_affinity"`
+	ECH         string   `json:"ech,omitempty" yaml:"ech"`
 }
 
 // sortServersByISP 纯函数：使用 sort.SliceStable 优先将 ISPAffinity == isp 的节点排在前面
@@ -115,6 +116,7 @@ type Applied struct {
 	Tokens        map[string]string
 	SNIs          map[string]string
 	Servers       []ServerConfig
+	ECHConfigs    map[string][]byte
 }
 
 // ApplySubscription 将订阅转为拨号参数
@@ -126,8 +128,9 @@ func ApplySubscription(s *Subscription) (*Applied, error) {
 		return nil, fmt.Errorf("subscription expired")
 	}
 	out := &Applied{
-		Tokens: make(map[string]string),
-		SNIs:   make(map[string]string),
+		Tokens:     make(map[string]string),
+		SNIs:       make(map[string]string),
+		ECHConfigs: make(map[string][]byte),
 	}
 	var addrs []string
 	var validServers []ServerConfig
@@ -154,6 +157,14 @@ func ApplySubscription(s *Subscription) (*Applied, error) {
 		out.Tokens[addr] = srv.Token
 		if srv.SNI != "" {
 			out.SNIs[addr] = srv.SNI
+		}
+		if srv.ECH != "" {
+			trimmed := strings.TrimSpace(srv.ECH)
+			if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil && len(decoded) > 0 {
+				out.ECHConfigs[addr] = decoded
+			} else if decoded, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil && len(decoded) > 0 {
+				out.ECHConfigs[addr] = decoded
+			}
 		}
 		for _, p := range srv.PinSPKI {
 			p = strings.TrimSpace(p)

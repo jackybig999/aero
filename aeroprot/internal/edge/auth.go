@@ -177,13 +177,13 @@ func (v *Validator) ListTokens() []TokenInfo {
 	return list
 }
 
-// GenerateToken generates random 16-byte hex token prefixed with aero_
-func GenerateToken() string {
-	b := make([]byte, 16)
+// GenerateToken generates random 32-byte (256-bit entropy) hex token prefixed with aero_
+func GenerateToken() (string, error) {
+	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("aero_%d", time.Now().UnixNano())
+		return "", fmt.Errorf("read crypto random bytes: %w", err)
 	}
-	return fmt.Sprintf("aero_%x", b)
+	return fmt.Sprintf("aero_%x", b), nil
 }
 
 // ==========================================
@@ -316,7 +316,11 @@ func (s *TokenStore) Add(token, label string, ttl time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if token == "" {
-		token = GenerateToken()
+		var err error
+		token, err = GenerateToken()
+		if err != nil {
+			return err
+		}
 	}
 	if ttl <= 0 {
 		ttl = 365 * 24 * time.Hour
@@ -331,7 +335,11 @@ func (s *TokenStore) Add(token, label string, ttl time.Duration) error {
 // AddReturn adds a new token and returns the token string
 func (s *TokenStore) AddReturn(token, label string, ttl time.Duration) (string, error) {
 	if token == "" {
-		token = GenerateToken()
+		var err error
+		token, err = GenerateToken()
+		if err != nil {
+			return "", err
+		}
 	}
 	if err := s.Add(token, label, ttl); err != nil {
 		return "", err

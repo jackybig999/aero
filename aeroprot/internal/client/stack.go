@@ -252,6 +252,31 @@ func (e *StackEngine) pumpStackToTun() {
 	}
 }
 
+// isSTUNPacket 检查载荷是否为 WebRTC STUN 协议报文 (RFC 5389/8489)
+func isSTUNPacket(payload []byte) bool {
+	return len(payload) >= 20 &&
+		(payload[0]&0xC0 == 0) &&
+		binary.BigEndian.Uint32(payload[4:8]) == 0x2112A442
+}
+
+// prefixedUDPConn 包装带有首包缓存的 UDP 连接，用于实现首包无损回放
+type prefixedUDPConn struct {
+	first []byte
+	net.Conn
+}
+
+func (c *prefixedUDPConn) Read(b []byte) (int, error) {
+	if len(c.first) > 0 {
+		n := copy(b, c.first)
+		c.first = c.first[n:]
+		if len(c.first) == 0 {
+			c.first = nil
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
 func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 	if e.killSwitch.Load() {
 		r.Complete(true)
@@ -267,6 +292,20 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
+
+		target := dst
+		localIP := net.ParseIP(id.LocalAddress.String())
+		if localIP != nil && e.dns != nil && e.dns.fakeIP != nil && e.dns.fakeIP.Contains(localIP) {
+			domain, release := e.dns.fakeIP.Acquire(localIP)
+			if domain == "" {
+				log.Printf("[STACK] orphan fake-ip rejected for TCP: %s", localIP)
+				r.Complete(true)
+				return
+			}
+			defer release()
+			target = net.JoinHostPort(domain, strconv.Itoa(int(id.LocalPort)))
+		}
+
 		wq := waiter.Queue{}
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
@@ -277,14 +316,6 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 
 		local := gonet.NewTCPConn(&wq, ep)
 		defer local.Close()
-
-		target := dst
-		localIP := net.ParseIP(id.LocalAddress.String())
-		if localIP != nil && e.dns != nil && e.dns.fakeIP != nil && e.dns.fakeIP.Contains(localIP) {
-			if domain := e.dns.fakeIP.Lookup(localIP); domain != "" {
-				target = net.JoinHostPort(domain, strconv.Itoa(int(id.LocalPort)))
-			}
-		}
 
 		var strat Strategy = PROXY
 		host, _, splitErr := net.SplitHostPort(target)
@@ -386,6 +417,15 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 
+	wq := waiter.Queue{}
+	ep, err := r.CreateEndpoint(&wq)
+	if err != nil {
+		if r.Packet() != nil {
+			r.Packet().DecRef()
+		}
+		return true
+	}
+
 	pkt := r.Packet()
 	e.wg.Add(1)
 	go func() {
@@ -395,21 +435,38 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 			defer pkt.DecRef()
 		}
 
-		wq := waiter.Queue{}
-		ep, err := r.CreateEndpoint(&wq)
-		if err != nil {
-			return
-		}
 		local := gonet.NewUDPConn(&wq, ep)
 		defer local.Close()
+
+		var activeLocal net.Conn = local
+		if !e.webrtcRelayEnabled.Load() && id.LocalPort != 3478 && id.LocalPort != 19302 && id.LocalPort != 5349 {
+			peekBuf := make([]byte, 65535)
+			_ = local.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
+			n, err := local.Read(peekBuf)
+			_ = local.SetReadDeadline(time.Time{})
+			if err == nil && n > 0 {
+				if isSTUNPacket(peekBuf[:n]) {
+					log.Printf("[STACK] blocked deep WebRTC STUN packet to %s", dst)
+					return
+				}
+				activeLocal = &prefixedUDPConn{
+					first: append([]byte(nil), peekBuf[:n]...),
+					Conn:  local,
+				}
+			}
+		}
 
 		targetHost := id.LocalAddress.String()
 		targetPort := uint32(id.LocalPort)
 		localIP := net.ParseIP(targetHost)
 		if localIP != nil && e.dns != nil && e.dns.fakeIP != nil && e.dns.fakeIP.Contains(localIP) {
-			if domain := e.dns.fakeIP.Lookup(localIP); domain != "" {
-				targetHost = domain
+			domain, release := e.dns.fakeIP.Acquire(localIP)
+			if domain == "" {
+				log.Printf("[STACK] orphan fake-ip rejected for UDP: %s", localIP)
+				return
 			}
+			defer release()
+			targetHost = domain
 		}
 
 		target := fmt.Sprintf("%s:%d", targetHost, targetPort)
@@ -428,7 +485,7 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 				return
 			}
 			defer remote.Close()
-			relayTraffic(local, remote)
+			relayTraffic(activeLocal, remote)
 			return
 		}
 
@@ -440,7 +497,7 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 				return
 			}
 			defer remote.Close()
-			relayTraffic(local, remote)
+			relayTraffic(activeLocal, remote)
 			return
 		}
 
@@ -454,15 +511,15 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 
 		// 注册入站回包分发
 		RegisterInboundDatagramHandler(contextID, func(payload []byte) {
-			_, _ = local.Write(payload)
+			_, _ = activeLocal.Write(payload)
 		})
 		defer UnregisterInboundDatagramHandler(contextID)
 
 		// 出站读循环向远端发送数据报
 		buf := make([]byte, 65535)
 		for {
-			_ = local.SetReadDeadline(time.Now().Add(45 * time.Second))
-			n, err := local.Read(buf)
+			_ = activeLocal.SetReadDeadline(time.Now().Add(45 * time.Second))
+			n, err := activeLocal.Read(buf)
 			if err != nil {
 				return
 			}
