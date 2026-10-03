@@ -18,6 +18,66 @@ let autoProbeTimer = null;
 let cfReady = false;
 
 // ------------------------------------------------------------------------------
+// Screen-Centered Modal Dialogs (Zero Top-Banner Popups)
+// ------------------------------------------------------------------------------
+let alertResolve = null;
+function modalAlert(msg, title = '系统提示') {
+  return new Promise((resolve) => {
+    alertResolve = resolve;
+    const modal = $('centerAlertModal');
+    const titleEl = $('centerAlertTitleText');
+    const bodyEl = $('centerAlertBody');
+    if (!modal) {
+      return resolve();
+    }
+    if (titleEl) titleEl.textContent = title;
+    if (bodyEl) bodyEl.textContent = String(msg || '');
+    modal.classList.add('active');
+  });
+}
+
+function closeAlertModal() {
+  const modal = $('centerAlertModal');
+  if (modal) modal.classList.remove('active');
+  if (alertResolve) {
+    const fn = alertResolve;
+    alertResolve = null;
+    fn();
+  }
+}
+
+let confirmResolve = null;
+function modalConfirm(msg, title = '操作确认') {
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+    const modal = $('centerConfirmModal');
+    const titleEl = $('centerConfirmTitleText');
+    const bodyEl = $('centerConfirmBody');
+    if (!modal) {
+      return resolve(false);
+    }
+    if (titleEl) titleEl.textContent = title;
+    if (bodyEl) bodyEl.textContent = String(msg || '');
+    modal.classList.add('active');
+  });
+}
+
+function resolveConfirm(result) {
+  const modal = $('centerConfirmModal');
+  if (modal) modal.classList.remove('active');
+  if (confirmResolve) {
+    const fn = confirmResolve;
+    confirmResolve = null;
+    fn(result);
+  }
+}
+
+// Override native alert so zero top-banner browser prompts appear!
+window.alert = function(msg) {
+  modalAlert(msg);
+};
+
+// ------------------------------------------------------------------------------
 // Service Metadata & Classification (Matching Yesterday's Final Architecture)
 // ------------------------------------------------------------------------------
 const SVC_META = {
@@ -422,8 +482,14 @@ function initEvents() {
   $('btnOpenAddPlan')?.addEventListener('click', () => openAddPlanModal());
   $('btnClosePlanModal')?.addEventListener('click', () => $('planModal').classList.remove('active'));
   $('btnCancelPlanModal')?.addEventListener('click', () => $('planModal').classList.remove('active'));
-  $('btnSavePlanModal')?.addEventListener('click', savePlanModal);
   $('btnRefreshSubs')?.addEventListener('click', () => loadSubsTable());
+
+  // Centered Alert & Confirm Modals
+  $('btnCenterAlertOk')?.addEventListener('click', closeAlertModal);
+  $('btnCenterAlertClose')?.addEventListener('click', closeAlertModal);
+  $('btnCenterConfirmOk')?.addEventListener('click', () => resolveConfirm(true));
+  $('btnCenterConfirmCancel')?.addEventListener('click', () => resolveConfirm(false));
+  $('btnCenterConfirmClose')?.addEventListener('click', () => resolveConfirm(false));
 }
 
 // ------------------------------------------------------------------------------
@@ -801,7 +867,7 @@ async function submitRenew() {
 }
 
 window.delUser = async (id) => {
-  if (!confirm(`确认彻底删除用户 #${id}？`)) return;
+  if (!await modalConfirm(`确认彻底删除用户 #${id}？`, '删除用户')) return;
   try {
     await apiCall(`/users/${id}/`, { method: 'DELETE' });
     alert('删除成功');
@@ -1227,7 +1293,7 @@ async function saveEditPass() {
 }
 
 window.delVPS = async (id) => {
-  if (!confirm(`警告：确认彻底删除 VPS #${id}？将联动清理节点与关联订阅！`)) return;
+  if (!await modalConfirm(`警告：确认彻底删除 VPS #${id}？将联动清理节点与关联订阅！`, '删除 VPS')) return;
   try {
     await apiCall(`/vps/${id}/`, { method: 'DELETE' });
     alert('已删除');
@@ -1459,6 +1525,46 @@ function openAeroTaskDrawer(taskId, action = 'task') {
   $('aeroTaskModalTitle').innerHTML = `<span>🚀 调度流水线详情 #${taskId}</span> <span class="tag tag-blue" id="aeroTaskModalStatusTag">RUNNING</span>`;
   const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : `${action.toUpperCase()} Edge`);
   $('aeroTaskModalSub').textContent = `任务 #${taskId} · ${actName}`;
+
+  // 抽屉面板内嵌警示/说明提示框（彻底替代弹窗确认）
+  const noticeBox = $('aeroTaskNoticeBox');
+  if (noticeBox) {
+    if (action === 'uninstall') {
+      noticeBox.style.display = 'block';
+      noticeBox.style.background = 'rgba(239, 68, 68, 0.12)';
+      noticeBox.style.border = '1px solid rgba(239, 68, 68, 0.35)';
+      noticeBox.style.color = '#fca5a5';
+      noticeBox.innerHTML = `
+        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px">
+          <span>⚠️</span> 危险操作执行警告：
+        </div>
+        <div style="font-size:12px;line-height:1.6">
+          1. 停止并禁用远端 <code>aero-edge.service</code><br/>
+          2. 终结运行中的 aero-edge 进程并释放端口<br/>
+          3. 清理 <code>/usr/local/bin/aero-edge</code> 及配置文件<br/>
+          4. 联动彻底从中台节点池中注销该节点并恢复网络规则
+        </div>
+      `;
+    } else if (action === 'install') {
+      noticeBox.style.display = 'block';
+      noticeBox.style.background = 'rgba(59, 130, 246, 0.12)';
+      noticeBox.style.border = '1px solid rgba(59, 130, 246, 0.35)';
+      noticeBox.style.color = '#93c5fd';
+      noticeBox.innerHTML = `
+        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px">
+          <span>🚀</span> 官方源极速流水线：
+        </div>
+        <div style="font-size:12px;line-height:1.6">
+          1. 自动比对远端版本（若已是最新版本则智能跳过重复构建）<br/>
+          2. 若非最新版则彻底清理旧版并从官方公开源拉取新版<br/>
+          3. 自动适配宿主机环境，配置 UDP 2083 透明重定向与证书
+        </div>
+      `;
+    } else {
+      noticeBox.style.display = 'none';
+    }
+  }
+
   $('aeroTaskDrawerModal').classList.add('active');
   $('aeroTaskProgressBar').style.width = '10%';
   $('aeroTaskProgressPercent').textContent = '10%';
@@ -1581,7 +1687,7 @@ async function loadAeroTasks() {
 
 window.delAeroToken = async (tok) => {
   if (!currentAeroVpsId) return;
-  if (!confirm(`确认删除 Token [${tok}]？`)) return;
+  if (!await modalConfirm(`确认删除 Token [${tok}]？`, '删除凭证')) return;
   try {
     await apiCall(`/aero/vps/${currentAeroVpsId}/tokens/?token=${encodeURIComponent(tok)}`, { method: 'DELETE' });
     loadAeroTokens(currentAeroVpsId);
@@ -1603,35 +1709,15 @@ function initAeroEvents() {
   });
   $('btnAeroRestart')?.addEventListener('click', () => deployAero('restart'));
 
-  // 安装 / 升级 独立弹窗
+  // 安装 / 升级 直接拉起调度流水线抽屉 (无冗余弹窗)
   $('btnAeroInstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
-    const targetName = v ? `${v.name} (${v.domain || v.ip}:${v.ssh_port || 22})` : `VPS #${currentAeroVpsId}`;
-    $('installModalVpsName').value = targetName;
-    $('installModalPort').value = '443';
-    $('aeroInstallModal').classList.add('active');
-  });
-  $('btnCancelInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
-  $('btnCloseInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
-  $('btnConfirmInstallModal')?.addEventListener('click', () => {
-    $('aeroInstallModal').classList.remove('active');
-    const port = parseInt($('installModalPort').value.trim(), 10) || 443;
-    deployAero('install', port);
+    deployAero('install', 443);
   });
 
-  // 深度卸载 独立弹窗
+  // 深度卸载 直接拉起调度流水线抽屉并在面板内展示危险警告 (无冗余弹窗)
   $('btnAeroUninstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
-    const targetName = v ? `${v.name} (${v.domain || v.ip})` : `VPS #${currentAeroVpsId}`;
-    $('uninstallModalVpsName').value = targetName;
-    $('aeroUninstallModal').classList.add('active');
-  });
-  $('btnCancelUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
-  $('btnCloseUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
-  $('btnConfirmUninstallModal')?.addEventListener('click', () => {
-    $('aeroUninstallModal').classList.remove('active');
     deployAero('uninstall');
   });
   
@@ -1788,7 +1874,7 @@ window.nodeHeartbeat = async (id) => {
 };
 
 window.delNode = async (id) => {
-  if (!confirm(`确认彻底删除节点 #${id}？将同时终止远端服务并清理节点记录！`)) return;
+  if (!await modalConfirm(`确认彻底删除节点 #${id}？将同时终止远端服务并清理节点记录！`, '删除节点')) return;
   try {
     await apiCall(`/nodes/${id}/`, { method: 'DELETE' });
     alert('节点及远端服务已彻底删除清理');
@@ -1801,7 +1887,7 @@ window.delNode = async (id) => {
 };
 
 async function cleanOrphanNodes() {
-  if (!confirm('确认批量清理所有失联无归属节点？')) return;
+  if (!await modalConfirm('确认批量清理所有失联无归属节点？', '清理失联节点')) return;
   try {
     const validIds = cachedVpsList.map(v => v.id);
     await apiCall('/nodes/orphan/', {
@@ -1913,7 +1999,7 @@ function renderLedger() {
 }
 
 async function doBatchSettle() {
-  if (!confirm('确认执行一键批量归集与自动结算？')) return;
+  if (!await modalConfirm('确认执行一键批量归集与自动结算？', '批量结算')) return;
   try {
     const res = await apiCall('/ledger/settle/batch/', {
       method: 'POST',
@@ -2096,7 +2182,7 @@ async function renewSub(subID) {
 }
 
 async function deleteSub(subID) {
-  if (!confirm(`确认永久删除订阅 ${subID}？客户端拉取将立即返回 404 并清空本地连接！`)) return;
+  if (!await modalConfirm(`确认永久删除订阅 ${subID}？客户端拉取将立即返回 404 并清空本地连接！`, '删除订阅')) return;
   try {
     await apiCall(`/subscriptions/${subID}/`, { method: 'DELETE' });
     loadSubsTable();

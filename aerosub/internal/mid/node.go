@@ -1678,18 +1678,14 @@ func (h *VPSHandler) VerifyDomain(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 422, errResp(1002, "invalid vps id"))
 		return
 	}
-	v, err := h.svc.Get(id)
-	if err != nil {
-		writeJSON(w, 404, errResp(1001, "not found"))
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	if err := h.svc.VerifyOrSyncDomain(ctx, v.Domain, v.IP); err != nil {
+	res, err := h.svc.VerifyDomain(ctx, id)
+	if err != nil {
 		writeJSON(w, 400, errResp(1004, err.Error()))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"code": 0, "message": "domain verified"})
+	writeJSON(w, 200, map[string]any{"code": 0, "data": res})
 }
 
 func (h *VPSHandler) CFStatus(w http.ResponseWriter, r *http.Request) {

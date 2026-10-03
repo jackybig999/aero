@@ -370,9 +370,49 @@ echo "disk_used=$DU"
 	return met, nil
 }
 
+var (
+	cfCIDROnce   sync.Once
+	cfCIDRBlocks []*net.IPNet
+)
+
+func initCloudflareCIDRs() {
+	cfCIDROnce.Do(func() {
+		cidrs := []string{
+			"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+			"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+			"197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+			"104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+		}
+		for _, c := range cidrs {
+			if _, block, err := net.ParseCIDR(c); err == nil {
+				cfCIDRBlocks = append(cfCIDRBlocks, block)
+			}
+		}
+	})
+}
+
+func isCloudflareIP(ipStr string) bool {
+	initCloudflareCIDRs()
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return false
+	}
+	for _, block := range cfCIDRBlocks {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveDomainAuthoritative resolves a domain name using authoritative public DoH
-// (AliDNS with Cloudflare fallback) to prevent pollution from local Clash/VPN Fake-IPs (198.18.0.0/15).
+// and direct public DNS (223.5.5.5) to prevent pollution from local Clash/VPN Fake-IPs (198.18.0.0/15).
 func resolveDomainAuthoritative(ctx context.Context, domain string) ([]string, error) {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return nil, fmt.Errorf("domain required")
+	}
+
 	client := &http.Client{Timeout: 3 * time.Second}
 
 	// 1. Primary: AliDNS DoH JSON API
@@ -405,7 +445,28 @@ func resolveDomainAuthoritative(ctx context.Context, domain string) ([]string, e
 		}
 	}
 
-	// 2. Secondary fallback: Cloudflare DoH JSON API
+	// 2. Direct Public DNS Resolver (223.5.5.5:53) to bypass local Windows/Clash Fake-IP intercept
+	directResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 2 * time.Second}
+			return d.DialContext(ctx, "udp", "223.5.5.5:53")
+		},
+	}
+	if ips, err := directResolver.LookupHost(ctx, domain); err == nil && len(ips) > 0 {
+		var clean []string
+		for _, ip := range ips {
+			ipStr := strings.TrimSpace(ip)
+			if !strings.HasPrefix(ipStr, "198.18.") && !strings.HasPrefix(ipStr, "198.19.") {
+				clean = append(clean, ipStr)
+			}
+		}
+		if len(clean) > 0 {
+			return clean, nil
+		}
+	}
+
+	// 3. Cloudflare DoH JSON API
 	uCF := "https://1.1.1.1/dns-query?name=" + url.QueryEscape(domain) + "&type=A"
 	if req, err := http.NewRequestWithContext(ctx, "GET", uCF, nil); err == nil {
 		req.Header.Set("Accept", "application/dns-json")
@@ -435,7 +496,7 @@ func resolveDomainAuthoritative(ctx context.Context, domain string) ([]string, e
 		}
 	}
 
-	// 3. Fallback: OS resolver, explicitly filtering out 198.18.0.0/15 fake IPs
+	// 4. Fallback: OS resolver, explicitly filtering out 198.18.0.0/15 fake IPs
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", domain)
 	if err != nil {
 		return nil, err
@@ -448,7 +509,7 @@ func resolveDomainAuthoritative(ctx context.Context, domain string) ([]string, e
 		}
 	}
 	if len(cleanIPs) == 0 {
-		return nil, fmt.Errorf("no clean public IP found for %s (filtered out synthetic/fake IPs)", domain)
+		return nil, fmt.Errorf("未找到有效公网 IP (已过滤虚拟/Fake-IP)")
 	}
 	return cleanIPs, nil
 }
@@ -477,20 +538,16 @@ func (s *VPSService) VerifyDomain(ctx context.Context, id uint64) (map[string]an
 			if ipStr == vps.IP {
 				matched = true
 			}
-			if strings.HasPrefix(ipStr, "104.16.") || strings.HasPrefix(ipStr, "104.17.") ||
-				strings.HasPrefix(ipStr, "104.18.") || strings.HasPrefix(ipStr, "104.19.") ||
-				strings.HasPrefix(ipStr, "104.20.") || strings.HasPrefix(ipStr, "104.21.") ||
-				strings.HasPrefix(ipStr, "172.64.") || strings.HasPrefix(ipStr, "172.65.") ||
-				strings.HasPrefix(ipStr, "172.66.") || strings.HasPrefix(ipStr, "172.67.") {
+			if isCloudflareIP(ipStr) {
 				isCF = true
 			}
 		}
 	}
 
-	statusText := "公网 DNS 已与 VPS IP 匹配 (DNS 直连)"
+	statusText := "公网 DNS 已与 VPS IP 匹配 (灰云直连)"
 	if !matched {
 		if isCF {
-			statusText = "域名已通过 Cloudflare 解析 (CF 灰云防护)"
+			statusText = "域名已开启 Cloudflare 橙云代理 (需切换为灰云直连)"
 		} else if len(resolvedIPs) == 0 {
 			statusText = "域名尚未解析到任何公网 IP"
 		} else {
@@ -1786,40 +1843,74 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 	globalTaskManager.AppendLog(taskID, "[SSH 连通] 安全终端连接建立成功，目标系统环境正常。")
 	globalTaskManager.SetStep(taskID, "ssh_connect", "success", "已连通", 40, "拉取官方源")
 
-	// 步骤 3：由目标 VPS 直接从 GitHub 官方源拉取并部署核心组件（严禁中台本地私拷）
-	globalTaskManager.SetStep(taskID, "binary_deploy", "running", "从官方源拉取组件...", 45, "远端拉取")
+	// 步骤 3：版本前置检测与按需拉取部署
+	globalTaskManager.SetStep(taskID, "binary_deploy", "running", "检测远端版本并部署...", 45, "版本检测")
 
-	_, _ = runSSH(client, "mkdir -p /usr/local/bin /var/lib/aero /var/lib/aero/tls /etc/aero /var/log /tmp", 10*time.Second)
-
-	token := os.Getenv("AERO_GITHUB_TOKEN")
-	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
+	targetVer := strings.TrimSpace(src.ReleaseTag)
+	if targetVer == "" || targetVer == "main" {
+		targetVer = "1.0.0"
 	}
-	var downloadCmd string
-	if src.SourceType == "github" && src.DownloadURL != "" {
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方 Release 拉取] 目标 VPS 正在从 GitHub 官方发布包拉取: %s...", src.DownloadURL))
-		if token != "" {
-			downloadCmd = fmt.Sprintf("curl -fsSL -H %q -H %q -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge",
-				"Authorization: Bearer "+token, "Accept: application/octet-stream", src.DownloadURL)
-		} else {
-			downloadCmd = fmt.Sprintf("curl -fsSL -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge", src.DownloadURL)
-		}
+	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
+
+	verCheckScript := `set +e
+if [ -x /usr/local/bin/aero-edge ]; then
+  echo "INSTALLED=yes"
+  VER=$(/usr/local/bin/aero-edge -version 2>/dev/null | awk '{print $2}')
+  echo "REMOTE_VER=$VER"
+else
+  echo "INSTALLED=no"
+  echo "REMOTE_VER="
+fi
+`
+	verOut, _ := runSSH(client, verCheckScript, 8*time.Second)
+	verKV := parseKV(verOut)
+	remoteInstalled := verKV["INSTALLED"] == "yes"
+	remoteVer := strings.TrimPrefix(strings.TrimSpace(verKV["REMOTE_VER"]), "v")
+
+	if remoteInstalled && remoteVer != "" && remoteVer == cleanTargetVer {
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[版本检测 提示] 目标 VPS 当前已安装最新版本 (aero-edge v%s)，无需重复拉取构建！", remoteVer))
+		globalTaskManager.SetStep(taskID, "binary_deploy", "success", fmt.Sprintf("已是最新版 (v%s)", remoteVer), 65, "配置服务")
 	} else {
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方公开源同步] 目标 VPS 正在从 GitHub 官方公开源（%s:main）拉取源码并构建核心组件...", src.Repo))
-		downloadCmd = fmt.Sprintf("rm -rf /tmp/aero-git && git clone --depth 1 https://github.com/%s.git /tmp/aero-git && (command -v go >/dev/null || (apt-get update -y && apt-get install -y golang-go 2>/dev/null || yum install -y golang 2>/dev/null)) && cd /tmp/aero-git && go build -v -ldflags=\"-s -w\" -o /usr/local/bin/aero-edge ./aeroprot/cmd/edge && chmod 755 /usr/local/bin/aero-edge && rm -rf /tmp/aero-git", src.Repo)
-	}
+		if remoteInstalled {
+			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[版本升级 清理] 远端版本 (v%s) 与最新目标版本 (v%s) 不一致，正在清理旧版组件...", remoteVer, cleanTargetVer))
+			cleanOldCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; pkill -9 -f aero-edge 2>/dev/null || true; rm -f /usr/local/bin/aero-edge; rm -rf /tmp/aero-git /tmp/aero-*"
+			_, _ = runSSH(client, cleanOldCmd, 15*time.Second)
+		} else {
+			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[全新部署] 目标 VPS 尚未安装核心组件，开始拉取官方最新版本 (v%s)...", cleanTargetVer))
+		}
 
-	out, err := runSSH(client, downloadCmd, 180*time.Second)
-	if err != nil {
-		errMsg := fmt.Sprintf("从官方源拉取并安装失败: %v (输出: %s)", err, strings.TrimSpace(out))
-		globalTaskManager.AppendLog(taskID, "[拉取 错误] "+errMsg)
-		globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "官方源拉取失败")
-		globalTaskManager.Finish(taskID, "failed", errMsg)
-		return
-	}
+		_, _ = runSSH(client, "mkdir -p /usr/local/bin /var/lib/aero /var/lib/aero/tls /etc/aero /var/log /tmp", 10*time.Second)
 
-	globalTaskManager.AppendLog(taskID, "[部署 成功] 已成功从官方源置入 /usr/local/bin/aero-edge (0755)。")
-	globalTaskManager.SetStep(taskID, "binary_deploy", "success", "拉取部署完成", 65, "配置服务")
+		token := os.Getenv("AERO_GITHUB_TOKEN")
+		if token == "" {
+			token = os.Getenv("GITHUB_TOKEN")
+		}
+		var downloadCmd string
+		if src.SourceType == "github" && src.DownloadURL != "" {
+			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方 Release 拉取] 目标 VPS 正在从 GitHub 官方发布包拉取: %s...", src.DownloadURL))
+			if token != "" {
+				downloadCmd = fmt.Sprintf("curl -fsSL -H %q -H %q -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge",
+					"Authorization: Bearer "+token, "Accept: application/octet-stream", src.DownloadURL)
+			} else {
+				downloadCmd = fmt.Sprintf("curl -fsSL -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge", src.DownloadURL)
+			}
+		} else {
+			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方公开源同步] 目标 VPS 正在从 GitHub 官方公开源（%s:main）拉取源码并构建核心组件...", src.Repo))
+			downloadCmd = fmt.Sprintf("rm -rf /tmp/aero-git && git clone --depth 1 https://github.com/%s.git /tmp/aero-git && (command -v go >/dev/null || (apt-get update -y && apt-get install -y golang-go 2>/dev/null || yum install -y golang 2>/dev/null)) && cd /tmp/aero-git && go build -v -ldflags=\"-s -w\" -o /usr/local/bin/aero-edge ./aeroprot/cmd/edge && chmod 755 /usr/local/bin/aero-edge && rm -rf /tmp/aero-git", src.Repo)
+		}
+
+		out, err := runSSH(client, downloadCmd, 180*time.Second)
+		if err != nil {
+			errMsg := fmt.Sprintf("从官方源拉取并安装失败: %v (输出: %s)", err, strings.TrimSpace(out))
+			globalTaskManager.AppendLog(taskID, "[拉取 错误] "+errMsg)
+			globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "官方源拉取失败")
+			globalTaskManager.Finish(taskID, "failed", errMsg)
+			return
+		}
+
+		globalTaskManager.AppendLog(taskID, "[部署 成功] 已成功从官方源置入最新 /usr/local/bin/aero-edge (0755)。")
+		globalTaskManager.SetStep(taskID, "binary_deploy", "success", "拉取部署完成", 65, "配置服务")
+	}
 
 	// 步骤 4：配置 systemd 服务与运行环境
 	globalTaskManager.SetStep(taskID, "service_config", "running", "写入服务配置...", 70, "配置服务")
@@ -1955,6 +2046,77 @@ WantedBy=multi-user.target
 	}
 
 	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[配置 成功] /etc/systemd/system/aero-edge.service 及运行环境写入完毕 (端口: %d)。", targetPort))
+
+	// === 全陌生环境自适应网络与 UDP/TCP 2083 透明重定向保障 ===
+	redirScript := `set +e
+REDIR_ACTIVE="no"
+REDIR_METHOD="none"
+
+# 1. 检查 2083 端口占用状况 (杜绝破坏第三方业务)
+OCC_2083=$(ss -lntup 2>/dev/null | grep -E ':(2083)\b' | head -1)
+if [ -n "$OCC_2083" ] && ! echo "$OCC_2083" | grep -qE "aero|nft|iptables"; then
+  echo "OCCUPIED_2083=yes"
+else
+  # 2. 首选 nftables
+  if command -v nft >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y nftables >/dev/null 2>&1) || (yum install -y nftables >/dev/null 2>&1); then
+    if nft add table inet aero_nat 2>/dev/null; then
+      nft 'add chain inet aero_nat prerouting { type nat hook prerouting priority dstnat; }' 2>/dev/null || true
+      nft add rule inet aero_nat prerouting udp dport 2083 redirect to :443 2>/dev/null || true
+      nft add rule inet aero_nat prerouting tcp dport 2083 redirect to :443 2>/dev/null || true
+      nft add rule inet aero_nat prerouting udp dport 2087 redirect to :443 2>/dev/null || true
+      nft add rule inet aero_nat prerouting tcp dport 2087 redirect to :443 2>/dev/null || true
+      nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+      systemctl enable nftables 2>/dev/null || true
+      systemctl restart nftables 2>/dev/null || true
+      REDIR_ACTIVE="yes"
+      REDIR_METHOD="nftables"
+    fi
+  fi
+
+  # 3. 若 nftables 不可用，回退至 iptables
+  if [ "$REDIR_ACTIVE" != "yes" ]; then
+    if iptables -t nat -L -n >/dev/null 2>&1; then
+      iptables -t nat -C PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
+      iptables -t nat -C PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
+      iptables -t nat -C PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
+      iptables -t nat -C PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
+      which iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
+      REDIR_ACTIVE="yes"
+      REDIR_METHOD="iptables"
+    fi
+  fi
+
+  # 4. 全环境防火墙放行 (UFW / Firewalld)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 443/tcp 2>/dev/null || true
+    ufw allow 443/udp 2>/dev/null || true
+    ufw allow 2083/tcp 2>/dev/null || true
+    ufw allow 2083/udp 2>/dev/null || true
+    ufw allow 2087/tcp 2>/dev/null || true
+    ufw allow 2087/udp 2>/dev/null || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+    firewall-cmd --add-port=443/tcp --add-port=443/udp --add-port=2083/tcp --add-port=2083/udp --add-port=2087/tcp --add-port=2087/udp --permanent 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+  fi
+fi
+
+echo "REDIR_ACTIVE=$REDIR_ACTIVE"
+echo "REDIR_METHOD=$REDIR_METHOD"
+`
+	redirOut, _ := runSSH(client, redirScript, 15*time.Second)
+	redirKV := parseKV(redirOut)
+	redirActive := redirKV["REDIR_ACTIVE"] == "yes"
+	redirMethod := redirKV["REDIR_METHOD"]
+
+	dataPlanePort := targetPort
+	if targetPort == 443 && redirActive {
+		dataPlanePort = 2083
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[网络防护 自适应] 通过 %s 成功配置 UDP/TCP 2083->443 透明重定向（成功规避移动等运营商 UDP 443 封锁）！", redirMethod))
+	} else if !redirActive {
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[网络探测 提示] 宿主机环境保持原生 %d 端口监听（未启用 2083 重定向）。", targetPort))
+	}
+
 	globalTaskManager.SetStep(taskID, "service_config", "success", "配置就绪", 85, "验收服务")
 
 	// 步骤 5：启动服务与健康验收
@@ -1969,6 +2131,28 @@ WantedBy=multi-user.target
 	isActive := strings.Contains(checkOut, "active")
 	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[验收 结果] 运行状态: %s (端口 %d 检测: %v)", strings.TrimSpace(strings.Split(checkOut, "\n")[0]), targetPort, strings.Contains(checkOut, fmt.Sprint(targetPort))))
 
+	// 同步生成目标 VPS 的 sub_meta.json 与 client-sub.json，数据面指定 dataPlanePort
+	edgeSubSetupScript := fmt.Sprintf(`cat << 'EOF' > /var/lib/aero/sub_meta.json
+{
+  "secret": "%s",
+  "servers": [
+    {
+      "name": "%s",
+      "host": "%s",
+      "address": "%s:%d",
+      "token": "%s",
+      "sni": "%s",
+      "protocol": "connect-ip",
+      "line_type": "quic",
+      "isp_affinity": "cmcc"
+    }
+  ],
+  "user_subs": {}
+}
+EOF
+`, subSec, cred.Name, host, host, dataPlanePort, tok, host)
+	_, _ = runSSH(client, edgeSubSetupScript, 10*time.Second)
+
 	// 更新中台 Endpoint 资产状态：443 零端口纯净输出，备用端口带端口
 	var subUrl string
 	if targetPort == 443 {
@@ -1980,7 +2164,7 @@ WantedBy=multi-user.target
 		VPSID:     vpsID,
 		Name:      cred.Name,
 		Host:      host,
-		Port:      targetPort,
+		Port:      dataPlanePort,
 		SubSecret: subSec,
 		AdminKey:  adminKey,
 		HasAdmin:  true,
@@ -2001,6 +2185,7 @@ WantedBy=multi-user.target
 			if n.VPSID == vpsID || (cred.IP != "" && n.IP == cred.IP) {
 				n.Status = true
 				n.Region = geo
+				n.Port = int32(dataPlanePort)
 				n.UpdatedAt = time.Now()
 				found = true
 				break
@@ -2008,7 +2193,7 @@ WantedBy=multi-user.target
 		}
 		svc.nodeSvc.mu.Unlock()
 		if !found {
-			_, _ = svc.nodeSvc.CreateNode(cred.Name, geo, host, "aero-quic", 443, 500, false, 100, vpsID)
+			_, _ = svc.nodeSvc.CreateNode(cred.Name, geo, host, "aero-quic", int32(dataPlanePort), 500, false, 100, vpsID)
 		}
 	}
 
@@ -2055,14 +2240,31 @@ func RunUninstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
 	globalTaskManager.AppendLog(taskID, "[停止] 正在执行 systemctl stop & disable aero-edge 并终结进程...")
 	stopCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; pkill -9 -f aero-edge 2>/dev/null || true; pkill -9 -f '/usr/local/bin/aero' 2>/dev/null || true"
 	_, _ = runSSH(client, stopCmd, 15*time.Second)
-	globalTaskManager.SetStep(taskID, "stop_service", "success", "服务已停止并终结", 65, "清理文件")
+	globalTaskManager.SetStep(taskID, "stop_service", "success", "服务已停止并终结", 65, "清理文件与网络规则")
 
-	// 步骤 3：清理文件与环境
-	globalTaskManager.SetStep(taskID, "clean_files", "running", "深度清理核心文件与配置...", 80, "清理文件")
-	globalTaskManager.AppendLog(taskID, "[清理] 正在清理 /usr/local/bin/aero-edge、systemd 单元及运行配置...")
-	cleanCmd := "rm -rf /usr/local/bin/aero-edge /usr/local/bin/aero /etc/systemd/system/aero-edge.service /etc/systemd/system/aero.service /etc/aero /var/lib/aero/tls /var/lib/aero/certs /var/lib/aero/edge.conf; systemctl daemon-reload"
+	// 步骤 3：清理文件与环境（同时清理 nftables 与 iptables 重定向规则，恢复宿主机初始状态）
+	globalTaskManager.SetStep(taskID, "clean_files", "running", "深度清理核心文件、配置与网络规则...", 80, "清理文件与网络规则")
+	globalTaskManager.AppendLog(taskID, "[清理] 正在清理 /usr/local/bin/aero-edge、systemd 单元、运行配置及 NAT 重定向规则...")
+	cleanCmd := `set +e
+rm -rf /usr/local/bin/aero-edge /usr/local/bin/aero /etc/systemd/system/aero-edge.service /etc/systemd/system/aero.service /etc/aero /var/lib/aero/tls /var/lib/aero/certs /var/lib/aero/edge.conf
+systemctl daemon-reload 2>/dev/null || true
+
+# 清理 nftables 重定向规则
+if command -v nft >/dev/null 2>&1; then
+  nft delete table inet aero_nat 2>/dev/null || true
+  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+fi
+
+# 清理 iptables 重定向规则
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -D PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
+  iptables -t nat -D PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
+  iptables -t nat -D PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
+  iptables -t nat -D PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
+fi
+`
 	_, _ = runSSH(client, cleanCmd, 15*time.Second)
-	globalTaskManager.SetStep(taskID, "clean_files", "success", "文件清理完毕", 90, "卸载验收")
+	globalTaskManager.SetStep(taskID, "clean_files", "success", "文件与网络规则清理完毕", 90, "卸载验收")
 
 	// 步骤 4：卸载验收与中台状态联动 (卸载即从中台节点池彻底清理删除)
 	if svc.eps != nil {

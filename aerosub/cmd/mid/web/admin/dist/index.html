@@ -820,6 +820,8 @@
         <button class="btn btn-sm" id="btnCloseAeroTaskDrawer">✕ 关闭</button>
       </div>
 
+      <div id="aeroTaskNoticeBox" style="display:none;padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:12px;line-height:1.5"></div>
+
       <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted)">
         <span id="aeroTaskProgressStage">阶段：正在初始化...</span>
         <span id="aeroTaskProgressPercent" style="font-weight:700;color:var(--blue)">0%</span>
@@ -939,6 +941,41 @@
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
         <button class="btn btn-sm" id="btnCloseUninstallModal">取消</button>
         <button class="btn btn-danger btn-sm" id="btnConfirmUninstallModal">确认彻底卸载</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全局居中弹窗：Alert 提示框 -->
+  <div class="modal-backdrop" id="centerAlertModal" style="z-index:9999">
+    <div class="modal-content" style="max-width:440px;width:90%;box-shadow:0 20px 48px rgba(0,0,0,0.8);border:1px solid rgba(59,130,246,0.3)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid var(--line);padding-bottom:10px">
+        <h3 style="font-size:14px;font-weight:700;display:flex;align-items:center;gap:6px">
+          <span>🔔</span>
+          <span id="centerAlertTitleText">系统提示</span>
+        </h3>
+        <button class="btn btn-sm" id="btnCenterAlertClose">✕</button>
+      </div>
+      <div id="centerAlertBody" style="font-size:13px;line-height:1.6;color:var(--text);white-space:pre-wrap;padding:8px 0 16px;max-height:300px;overflow-y:auto"></div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;border-top:1px solid var(--line);padding-top:10px">
+        <button class="btn btn-blue btn-sm" id="btnCenterAlertOk" style="min-width:70px;justify-content:center">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全局居中弹窗：Confirm 确认框 -->
+  <div class="modal-backdrop" id="centerConfirmModal" style="z-index:9999">
+    <div class="modal-content" style="max-width:440px;width:90%;box-shadow:0 20px 48px rgba(0,0,0,0.8);border:1px solid rgba(239,68,68,0.3)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid var(--line);padding-bottom:10px">
+        <h3 style="font-size:14px;font-weight:700;color:var(--red);display:flex;align-items:center;gap:6px">
+          <span>⚠️</span>
+          <span id="centerConfirmTitleText">危险操作确认</span>
+        </h3>
+        <button class="btn btn-sm" id="btnCenterConfirmClose">✕</button>
+      </div>
+      <div id="centerConfirmBody" style="font-size:13px;line-height:1.6;color:var(--text);white-space:pre-wrap;padding:8px 0 16px;max-height:300px;overflow-y:auto"></div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;border-top:1px solid var(--line);padding-top:10px">
+        <button class="btn btn-sm" id="btnCenterConfirmCancel">取消</button>
+        <button class="btn btn-danger btn-sm" id="btnCenterConfirmOk" style="min-width:70px;justify-content:center">确认执行</button>
       </div>
     </div>
   </div>

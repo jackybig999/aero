@@ -80,6 +80,8 @@
         localStorage.setItem(USER_KEY, JSON.stringify(u));
         const el = document.getElementById('userName');
         if (el) el.textContent = u.username;
+        const topEl = document.getElementById('topUserName');
+        if (topEl) topEl.textContent = u.username;
         const b = document.getElementById('userBadge');
         if (b) b.textContent = u.username[0].toUpperCase();
       }
@@ -89,8 +91,11 @@
   function showApp() {
     document.getElementById('authWrap').style.display = 'none';
     document.getElementById('appLayout').style.display = 'flex';
-    document.getElementById('userName').textContent = (currentUser && currentUser.username) || '用户';
-    document.getElementById('userBadge').textContent = ((currentUser && currentUser.username) || 'U')[0].toUpperCase();
+    const uname = (currentUser && currentUser.username) || '用户';
+    document.getElementById('userName').textContent = uname;
+    const topEl = document.getElementById('topUserName');
+    if (topEl) topEl.textContent = uname;
+    document.getElementById('userBadge').textContent = uname[0].toUpperCase();
     fetchUserFromDb();
     switchTab(activeTab);
   }

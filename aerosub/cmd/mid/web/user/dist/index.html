@@ -97,11 +97,6 @@
           <span class="collapse-text">收起导航</span>
         </button>
       </div>
-      <div class="user-foot">
-        <button class="btn btn-danger" id="btnLogout" style="width:100%;justify-content:center">
-          退出登录
-        </button>
-      </div>
     </aside>
 
     <!-- Main Content -->
@@ -110,7 +105,12 @@
         <div class="top-left">
           <div class="page-title" id="pageTitle">我的专属订阅</div>
         </div>
-        <div class="top-right">
+        <div class="top-right" style="display:flex;align-items:center;gap:10px">
+          <span class="user-chip" id="topUserChip" style="background:var(--card-active);border:1px solid rgba(59,130,246,0.4);padding:5px 14px;border-radius:20px;font-size:14px;font-weight:700;color:#38bdf8;display:inline-flex;align-items:center;gap:6px">
+            <span>👤</span>
+            <span id="topUserName">用户</span>
+          </span>
+          <button class="btn btn-sm btn-danger" id="btnLogout">退出登录</button>
         </div>
       </header>
 

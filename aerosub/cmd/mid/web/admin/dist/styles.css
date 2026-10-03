@@ -165,12 +165,16 @@ body {
 }
 
 .user-chip {
-  background: var(--card);
-  border: 1px solid var(--line);
-  padding: 4px 10px;
+  background: var(--card-active);
+  border: 1px solid rgba(59, 130, 246, 0.4);
+  padding: 5px 14px;
   border-radius: 20px;
-  font-size: 11px;
-  color: var(--muted);
+  font-size: 14px;
+  font-weight: 700;
+  color: #38bdf8;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .content-pane {
