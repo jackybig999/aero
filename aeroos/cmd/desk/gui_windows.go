@@ -248,7 +248,16 @@ func setupSystemTray(w webview2.WebView) {
 	}
 }
 
+func initDPIAwareness() {
+	proc := modUser32.NewProc("SetProcessDpiAwarenessContext")
+	if proc.Find() == nil {
+		// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+		_, _, _ = proc.Call(^uintptr(3))
+	}
+}
+
 func runDesktopWindow(deps *desk.IPCDependencies, netDaemon *desk.ClientDaemon) {
+	initDPIAwareness()
 	wvData := filepath.Join(os.TempDir(), "aero-os-wv-"+strconv.Itoa(os.Getpid()))
 	_ = os.MkdirAll(wvData, 0700)
 	defer os.RemoveAll(wvData)

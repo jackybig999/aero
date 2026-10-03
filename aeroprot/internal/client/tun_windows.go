@@ -8,11 +8,14 @@ package client
 
 import (
 	"context"
+	_ "embed"
 	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +27,108 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wintun"
 )
+
+//go:embed wintun.dll
+var embeddedWintunDLL []byte
+
+func ensureWintunDLL() error {
+	exe, err := os.Executable()
+	if err == nil {
+		exeDir := filepath.Dir(exe)
+		target := filepath.Join(exeDir, "wintun.dll")
+		if _, err := os.Stat(target); err == nil {
+			return nil
+		}
+		if len(embeddedWintunDLL) > 0 {
+			if werr := os.WriteFile(target, embeddedWintunDLL, 0755); werr == nil {
+				log.Printf("[TUN] auto-extracted wintun.dll to %s", target)
+				return nil
+			}
+		}
+	}
+
+	sys32 := filepath.Join(os.Getenv("SystemRoot"), "System32", "wintun.dll")
+	if _, err := os.Stat(sys32); err == nil {
+		return nil
+	}
+
+	if _, err := os.Stat("wintun.dll"); err == nil {
+		return nil
+	}
+	if len(embeddedWintunDLL) > 0 {
+		if err := os.WriteFile("wintun.dll", embeddedWintunDLL, 0755); err == nil {
+			log.Printf("[TUN] auto-extracted wintun.dll to current directory")
+			return nil
+		}
+	}
+	return nil
+}
+
+var (
+	guardOnce sync.Once
+	guardMu   sync.Mutex
+	guardPID  int
+)
+
+func startCrashGuard() {
+	guardOnce.Do(startCrashGuardOnce)
+}
+
+func startCrashGuardOnce() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(exe)
+	candidates := []string{
+		filepath.Join(dir, "aeroprot-guard.exe"),
+		filepath.Join(dir, "aerosys-guard-windows-amd64.exe"),
+		filepath.Join(dir, "guard.exe"),
+		filepath.Join(dir, "aero-guard.exe"),
+	}
+	var guardPath string
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			guardPath = c
+			break
+		}
+	}
+	if guardPath == "" {
+		return
+	}
+	cmd := exec.Command(guardPath, "-pid", strconv.Itoa(os.Getpid()))
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow: true,
+		CreationFlags: windows.DETACHED_PROCESS |
+			windows.CREATE_NEW_PROCESS_GROUP |
+			windows.CREATE_NO_WINDOW,
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("[GUARD] failed to start watchdog: %v", err)
+		return
+	}
+	guardMu.Lock()
+	guardPID = cmd.Process.Pid
+	guardMu.Unlock()
+	log.Printf("[GUARD] watchdog started (%s, pid=%d) monitoring client pid=%d", filepath.Base(guardPath), cmd.Process.Pid, os.Getpid())
+	_ = cmd.Process.Release()
+}
+
+func stopCrashGuard() {
+	guardMu.Lock()
+	pid := guardPID
+	guardPID = 0
+	guardMu.Unlock()
+	if pid <= 0 {
+		return
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return
+	}
+	_ = p.Kill()
+	log.Printf("[GUARD] stopped watchdog pid=%d", pid)
+}
 
 const errorNoMoreItems = syscall.Errno(259)
 
@@ -39,6 +144,7 @@ type windowsDevice struct {
 
 // OpenTunDevice 打开或创建 Windows Wintun 虚拟网卡（初始 MTU 1224）
 func OpenTunDevice(name string, mtu int) (TunDevice, error) {
+	_ = ensureWintunDLL()
 	if mtu <= 0 {
 		mtu = 1224
 	}
@@ -54,6 +160,7 @@ func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 				d := &windowsDevice{name: name, mtu: mtu, adapter: adapter, session: session}
 				d.sessionOK.Store(true)
 				log.Printf("[TUN] Reusing existing Windows adapter: %s (MTU=%d)", name, mtu)
+				startCrashGuard()
 				return d, nil
 			}
 			_ = adapter.Close()
@@ -72,6 +179,7 @@ func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 			if s, serr := a.StartSession(0x800000); serr == nil {
 				d := &windowsDevice{name: name, mtu: mtu, adapter: a, session: s}
 				d.sessionOK.Store(true)
+				startCrashGuard()
 				return d, nil
 			}
 			_ = a.Close()
@@ -90,6 +198,7 @@ func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 	d := &windowsDevice{name: name, mtu: mtu, adapter: adapter, session: session}
 	d.sessionOK.Store(true)
 	log.Printf("[TUN] Windows adapter created: %s (MTU=%d)", name, mtu)
+	startCrashGuard()
 	return d, nil
 }
 
@@ -158,6 +267,7 @@ func (d *windowsDevice) Write(p []byte) (int, error) {
 }
 
 func (d *windowsDevice) Close() error {
+	stopCrashGuard()
 	if !d.closed.CompareAndSwap(false, true) {
 		return nil
 	}

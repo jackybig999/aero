@@ -314,12 +314,39 @@ func main() {
 		log.Println("[CLIENT] AERO client shutdown complete.")
 	}
 
-	uiURL := fmt.Sprintf("http://%s/", *apiAddr)
+	htmlUI := getClientHTMLUI(uiFS)
 	if *headless {
 		runHeadless(shutdown)
 	} else {
-		runClientWindow(uiURL, shutdown)
+		runClientWindow(htmlUI, mux, shutdown)
 	}
+}
+
+func getClientHTMLUI(uiFS fs.FS) string {
+	indexBytes, err := fs.ReadFile(uiFS, "index.html")
+	if err != nil {
+		return "<html><body><h3>Failed to load UI</h3></body></html>"
+	}
+	html := string(indexBytes)
+
+	if cssBytes, err := fs.ReadFile(uiFS, "style.css"); err == nil {
+		cssTag := fmt.Sprintf("<style>\n%s\n</style>", string(cssBytes))
+		html = strings.Replace(html, `<link rel="stylesheet" href="style.css" />`, cssTag, 1)
+	}
+	if jsqrBytes, err := fs.ReadFile(uiFS, "jsqr.js"); err == nil {
+		tag := fmt.Sprintf("<script>\n%s\n</script>", string(jsqrBytes))
+		html = strings.Replace(html, `<script src="jsqr.js"></script>`, tag, 1)
+	}
+	if i18nBytes, err := fs.ReadFile(uiFS, "i18n.js"); err == nil {
+		tag := fmt.Sprintf("<script>\n%s\n</script>", string(i18nBytes))
+		html = strings.Replace(html, `<script src="i18n.js"></script>`, tag, 1)
+	}
+	if appBytes, err := fs.ReadFile(uiFS, "app.js"); err == nil {
+		tag := fmt.Sprintf("<script>\n%s\n</script>", string(appBytes))
+		html = strings.Replace(html, `<script src="app.js"></script>`, tag, 1)
+	}
+
+	return html
 }
 
 func runHeadless(shutdown func()) {

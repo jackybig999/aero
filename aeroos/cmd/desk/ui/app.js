@@ -2045,7 +2045,4 @@ function escapeHtml(str) {
             document.addEventListener('DOMContentLoaded', init);
         } else {
             init();
-        }
-    
-</body>
-</html>
+        }

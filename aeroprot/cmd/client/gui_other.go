@@ -4,10 +4,11 @@ package main
 
 import (
 	"log"
+	"net/http"
 )
 
-func runClientWindow(uiURL string, shutdown func()) {
-	log.Printf("[CLIENT] Native GUI window is only supported on Windows. Running in headless mode. Access Web UI at: %s", uiURL)
+func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
+	log.Println("[CLIENT] Native GUI window is only supported on Windows. Running in headless mode.")
 	runHeadless(shutdown)
 }
 

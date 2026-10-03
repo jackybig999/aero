@@ -36,25 +36,25 @@ jobs:
           mkdir -p dist/server
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-server-linux-amd64 ./aeroprot/cmd/edge
+            -o dist/server/aeroprot-edge-linux-amd64 ./aeroprot/cmd/edge
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-server-linux-arm64 ./aeroprot/cmd/edge
+            -o dist/server/aeroprot-edge-linux-arm64 ./aeroprot/cmd/edge
 
       - name: Build Midplatform Control Plane (linux/amd64)
         run: |
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-mid-linux-amd64 ./aerosub/cmd/mid
+            -o dist/server/aerosub-mid-linux-amd64 ./aerosub/cmd/mid
 
       - name: Build Linux Client CLI (linux/amd64 & linux/arm64)
         run: |
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-cli-linux-amd64 ./aeroprot/cmd/client
+            -o dist/server/aeroprot-cli-linux-amd64 ./aeroprot/cmd/client
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aerosys-cli-linux-arm64 ./aeroprot/cmd/client
+            -o dist/server/aeroprot-cli-linux-arm64 ./aeroprot/cmd/client
 
       - name: Upload Server & Linux Client Artifacts
         uses: actions/upload-artifact@v4
@@ -86,12 +86,14 @@ jobs:
       - name: Build Windows Client & Desk
         run: |
           mkdir -p dist/client-windows
-          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-client-windows-amd64.exe ./aeroprot/cmd/client
-          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-guard-windows-amd64.exe ./aeroprot/cmd/guard
-          go build -v -ldflags="-s -w" -o dist/client-windows/aerosys-desk-windows-amd64.exe ./aeroos/cmd/desk
+          mkdir -p dist/aeroprot-win-bundle
+          go build -v -ldflags="-s -w" -o dist/aeroprot-win-bundle/aeroprot-client.exe ./aeroprot/cmd/client
+          go build -v -ldflags="-s -w" -o dist/aeroprot-win-bundle/aeroprot-guard.exe ./aeroprot/cmd/guard
           curl.exe -fsSL "https://www.wintun.net/builds/wintun-0.14.1.zip" -o wintun.zip
           tar.exe -xf wintun.zip
-          Copy-Item wintun/bin/amd64/wintun.dll dist/client-windows/wintun.dll
+          Copy-Item wintun/bin/amd64/wintun.dll dist/aeroprot-win-bundle/wintun.dll
+          Compress-Archive -Path dist/aeroprot-win-bundle/* -DestinationPath dist/client-windows/aeroprot-client-windows-amd64.zip
+          go build -v -ldflags="-s -w" -o dist/client-windows/aeroos-desk-windows-amd64.exe ./aeroos/cmd/desk
 
       - name: Upload Windows Client Artifacts
         uses: actions/upload-artifact@v4
@@ -122,10 +124,10 @@ jobs:
       - name: Build Client (mac arm64 & amd64)
         run: |
           mkdir -p dist/client-macos
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-arm64 ./aeroprot/cmd/client
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-client-mac-amd64 ./aeroprot/cmd/client
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-desk-mac-arm64 ./aeroos/cmd/desk
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aerosys-desk-mac-amd64 ./aeroos/cmd/desk
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot-client-darwin-arm64 ./aeroprot/cmd/client
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot-client-darwin-amd64 ./aeroprot/cmd/client
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroos-desk-darwin-arm64 ./aeroos/cmd/desk
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroos-desk-darwin-amd64 ./aeroos/cmd/desk
 
       - name: Upload macOS Client Artifacts
         uses: actions/upload-artifact@v4

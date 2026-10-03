@@ -19,6 +19,7 @@ node_modules/
 *.exe
 *.exe~
 *.dll
+!aeroprot/internal/client/wintun.dll
 *.so
 *.dylib
 

@@ -105,6 +105,14 @@ function applyProbe(p) {
 }
 
 async function api(method, path, body) {
+  if (typeof window.goClientAPI === 'function') {
+    try {
+      const resStr = await window.goClientAPI(method, path, body != null ? JSON.stringify(body) : '')
+      return JSON.parse(resStr || '{}')
+    } catch (e) {
+      console.error('IPC bridge error:', e)
+    }
+  }
   const slow = path.indexOf('/connect') >= 0 || path.indexOf('/disconnect') >= 0 || path.indexOf('/mode') >= 0
   const opt = { method, headers: {}, signal: AbortSignal.timeout(slow ? 10000 : 5000) }
   if (body != null) {

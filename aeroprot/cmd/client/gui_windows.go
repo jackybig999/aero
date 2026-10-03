@@ -6,10 +6,12 @@ import (
 	"embed"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -359,7 +361,7 @@ func setupSystemTray(w webview2.WebView) {
 	}
 }
 
-func runClientWindow(uiURL string, shutdown func()) {
+func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 	hideOwnConsole()
 	if !ensureSingleInstance() {
 		return
@@ -384,15 +386,26 @@ func runClientWindow(uiURL string, shutdown func()) {
 	})
 
 	if w == nil {
-		log.Printf("[UI] WebView2 not available, opening default browser at %s", uiURL)
-		_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", uiURL).Start()
+		log.Printf("[UI] WebView2 not available, running headless")
 		runHeadless(shutdown)
 		return
 	}
 	defer w.Destroy()
 
 	w.SetSize(390, 580, webview2.HintNone)
-	w.Navigate(uiURL)
+
+	// 绑定内存级原生 IPC 通道，彻底切断对 127.0.0.1 网络端口依赖
+	w.Bind("goClientAPI", func(method, path, bodyStr string) (string, error) {
+		req := httptest.NewRequest(method, path, strings.NewReader(bodyStr))
+		if bodyStr != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Body.String(), nil
+	})
+
+	w.SetHtml(htmlUI)
 
 	setupSystemTray(w)
 
