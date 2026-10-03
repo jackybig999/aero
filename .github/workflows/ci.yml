@@ -160,11 +160,30 @@ jobs:
           find release-assets/ -type f -exec cp -f {} release-dist/ \;
           ls -lh release-dist/
 
+      - name: Prune Stale Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Auditing GitHub Release v1.0.0 Assets ==="
+          EXISTING_ASSETS=$(gh api repos/${{ github.repository }}/releases/tags/v1.0.0 --jq '.assets[] | "\(.id) \(.name)"' 2>/dev/null || true)
+          if [ -n "$EXISTING_ASSETS" ]; then
+            while read -r asset_id asset_name; do
+              if [ -n "$asset_id" ] && [ -n "$asset_name" ]; then
+                if [ ! -f "release-dist/$asset_name" ]; then
+                  echo "[PRUNE] Removing obsolete release asset: $asset_name (id: $asset_id)"
+                  gh api --method DELETE "repos/${{ github.repository }}/releases/assets/$asset_id" || true
+                else
+                  echo "[KEEP] Current valid release asset: $asset_name"
+                fi
+              fi
+            done <<< "$EXISTING_ASSETS"
+          fi
+
       - name: Publish All Multi-Platform Assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.0
-          name: "AEROSYS v1.0.0 Official Release"
+          name: "AERO v1.0.0 Official Release"
           draft: false
           prerelease: false
           make_latest: true

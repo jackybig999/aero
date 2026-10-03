@@ -142,7 +142,7 @@ func ensureSingleInstance() bool {
 }
 
 func restoreExistingWindow() {
-	title, _ := syscall.UTF16PtrFromString("AEROSYS")
+	title, _ := syscall.UTF16PtrFromString("AERO")
 	hwnd, _, _ := modUser32.NewProc("FindWindowW").Call(0, uintptr(unsafe.Pointer(title)))
 	if hwnd != 0 {
 		procShowWindow.Call(hwnd, uintptr(SW_SHOW))
@@ -202,7 +202,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		} else if lParam == WM_RBUTTONUP {
 			hMenu, _, _ := procCreatePopupMenu.Call()
 			if hMenu != 0 {
-				statusStr, _ := syscall.UTF16PtrFromString("AEROSYS · 系统托盘")
+				statusStr, _ := syscall.UTF16PtrFromString("AERO · 系统托盘")
 				procAppendMenuW.Call(hMenu, uintptr(MF_STRING|MF_GRAYED), 0, uintptr(unsafe.Pointer(statusStr)))
 				procAppendMenuW.Call(hMenu, uintptr(MF_SEPARATOR), 0, 0)
 				showStr, _ := syscall.UTF16PtrFromString("打开主界面")
@@ -277,13 +277,13 @@ func UpdateTrayIcon(mode string, connected bool) {
 
 	if !connected {
 		targetIcon = hIconBlue
-		tip = "AEROSYS · 就绪 (未连接)"
+		tip = "AERO · 就绪 (未连接)"
 	} else if mode == "tun" {
 		targetIcon = hIconGreen
-		tip = "AEROSYS · TUN 全局模式 (已连接)"
+		tip = "AERO · TUN 全局模式 (已连接)"
 	} else {
 		targetIcon = hIconYellow
-		tip = "AEROSYS · 系统代理模式 (已连接)"
+		tip = "AERO · 系统代理模式 (已连接)"
 	}
 
 	if targetIcon != 0 {
@@ -343,7 +343,7 @@ func setupSystemTray(w webview2.WebView) {
 	trayNID.UCallbackMessage = WM_TRAY_MSG
 	trayNID.HIcon = hIcon
 
-	tipText, _ := syscall.UTF16FromString("AEROSYS · 就绪 (未连接)")
+	tipText, _ := syscall.UTF16FromString("AERO · 就绪 (未连接)")
 	copy(trayNID.SzTip[:], tipText)
 
 	procShell_NotifyIconW.Call(uintptr(NIM_ADD), uintptr(unsafe.Pointer(&trayNID)))
@@ -378,7 +378,7 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 		AutoFocus: true,
 		DataPath:  wvData,
 		WindowOptions: webview2.WindowOptions{
-			Title:  "AEROSYS",
+			Title:  "AERO",
 			Width:  390,
 			Height: 580,
 			Center: true,

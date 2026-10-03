@@ -1439,7 +1439,7 @@ func queryGitHubRelease(repo string) SourceStatus {
 	if dlURL == "" {
 		for _, a := range gh.Assets {
 			lower := strings.ToLower(a.Name)
-			if lower == "aero-edge" || lower == "aerosys-server" {
+			if lower == "aero-edge" || lower == "aeroprot-edge" || lower == "aerosys-server" {
 				dlURL = a.BrowserDownloadURL
 				break
 			}

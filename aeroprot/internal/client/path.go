@@ -18,16 +18,27 @@ func GetDataDir() string {
 		appdata := os.Getenv("APPDATA")
 		if appdata == "" {
 			home, _ := os.UserHomeDir()
-			dir = filepath.Join(home, "AppData", "Roaming", "AEROSYS")
-		} else {
-			dir = filepath.Join(appdata, "AEROSYS")
+			appdata = filepath.Join(home, "AppData", "Roaming")
+		}
+		dir = filepath.Join(appdata, "AERO")
+		oldDir := filepath.Join(appdata, "AEROSYS")
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			if _, errOld := os.Stat(oldDir); errOld == nil {
+				_ = os.Rename(oldDir, dir)
+			}
 		}
 	case "darwin":
 		home, _ := os.UserHomeDir()
 		if home == "" {
 			home = os.Getenv("HOME")
 		}
-		dir = filepath.Join(home, "Library", "Application Support", "AEROSYS")
+		dir = filepath.Join(home, "Library", "Application Support", "AERO")
+		oldDir := filepath.Join(home, "Library", "Application Support", "AEROSYS")
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			if _, errOld := os.Stat(oldDir); errOld == nil {
+				_ = os.Rename(oldDir, dir)
+			}
+		}
 	case "android":
 		dir = os.Getenv("AERO_DATA_DIR")
 		if dir == "" {
