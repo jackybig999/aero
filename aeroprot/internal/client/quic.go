@@ -215,7 +215,7 @@ func DefaultTransportConfig(addr, sni string) *TransportConfig {
 		TLSServerName:  sni,
 		Enable0RTT:     true,
 		MaxStreams:     100,
-		IdleTimeout:    45 * time.Second,
+		IdleTimeout:    90 * time.Second,
 		ConnectTimeout: 10 * time.Second,
 	}
 }
@@ -252,15 +252,19 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 	}
 
 	quicConfig := &quic.Config{
-		MaxIncomingStreams:      cfg.MaxStreams,
-		MaxIncomingUniStreams:   cfg.MaxStreams,
-		HandshakeIdleTimeout:    cfg.ConnectTimeout,
-		MaxIdleTimeout:          cfg.IdleTimeout,
-		Allow0RTT:               cfg.Enable0RTT,
-		EnableDatagrams:         true,
-		DisablePathMTUDiscovery: false,
-		KeepAlivePeriod:         20 * time.Second,
-		InitialPacketSize:       0,
+		MaxIncomingStreams:             cfg.MaxStreams,
+		MaxIncomingUniStreams:          cfg.MaxStreams,
+		HandshakeIdleTimeout:           cfg.ConnectTimeout,
+		MaxIdleTimeout:                 cfg.IdleTimeout,
+		Allow0RTT:                      cfg.Enable0RTT,
+		EnableDatagrams:                true,
+		DisablePathMTUDiscovery:        false,
+		KeepAlivePeriod:                10 * time.Second,
+		InitialStreamReceiveWindow:     16 * 1024 * 1024,
+		MaxStreamReceiveWindow:         32 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 32 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
+		InitialPacketSize:              0,
 	}
 
 	factory := cfg.PacketConnFactory
@@ -453,11 +457,10 @@ func (p *SessionPool) Get(ctx context.Context, cfg *TransportConfig) (*Client, e
 	p.mu.Lock()
 	c, ok := p.clients[cfg.Address]
 	if ok && c != nil && c.conn != nil && c.conn.Context().Err() == nil {
-		last := c.lastActive.Load()
-		if last > 0 && time.Since(time.UnixMilli(last)) <= 45*time.Second {
-			p.mu.Unlock()
-			return c, nil
-		}
+		p.mu.Unlock()
+		return c, nil
+	}
+	if ok && c != nil {
 		_ = c.Close()
 		delete(p.clients, cfg.Address)
 	}

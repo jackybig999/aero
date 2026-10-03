@@ -459,13 +459,13 @@ func DefaultQUICConfig() *quic.Config {
 		Allow0RTT:                      false,
 		MaxIncomingStreams:             1000,
 		MaxIncomingUniStreams:          1000,
-		MaxIdleTimeout:                 30 * time.Second,
+		MaxIdleTimeout:                 90 * time.Second,
 		EnableDatagrams:                true,
 		InitialStreamReceiveWindow:     16 * 1024 * 1024,  // 16 MB single stream window (Rule L6)
 		MaxStreamReceiveWindow:         32 * 1024 * 1024,  // 32 MB
 		InitialConnectionReceiveWindow: 64 * 1024 * 1024,  // 64 MB
 		MaxConnectionReceiveWindow:     128 * 1024 * 1024, // 128 MB connection window (Rule L6)
-		KeepAlivePeriod:                12 * time.Second,  // 12s KeepAlive
+		KeepAlivePeriod:                10 * time.Second,  // 10s KeepAlive (beats domestic NAT timeout)
 	}
 }
 

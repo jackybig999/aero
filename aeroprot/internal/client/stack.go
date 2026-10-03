@@ -73,7 +73,7 @@ func NewStackEngine(dev TunDevice, dialer *TunnelClient, dnsHandler *DNSHandler)
 // 规则：Channel MTU >= 1280 (设为 1420 保证内部 buffer 充裕)
 func (e *StackEngine) Start() error {
 	mtu := uint32(1420)
-	ep := channel.New(512, mtu, "")
+	ep := channel.New(4096, mtu, "")
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,

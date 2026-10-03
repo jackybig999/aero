@@ -52,7 +52,13 @@ func NewSession(client *Client, token, addr, sni string) (*Session, error) {
 		EnableDatagrams: true,
 		TLSClientConfig: client.config.TLSConfig,
 		QUICConfig: &quic.Config{
-			EnableDatagrams: true,
+			EnableDatagrams:                true,
+			KeepAlivePeriod:                10 * time.Second,
+			MaxIdleTimeout:                 90 * time.Second,
+			InitialStreamReceiveWindow:     16 * 1024 * 1024,
+			MaxStreamReceiveWindow:         32 * 1024 * 1024,
+			InitialConnectionReceiveWindow: 32 * 1024 * 1024,
+			MaxConnectionReceiveWindow:     64 * 1024 * 1024,
 		},
 	}
 

@@ -634,11 +634,11 @@ func TestQUICConfigHardening(t *testing.T) {
 	if cfg.Allow0RTT {
 		t.Fatal("expected Allow0RTT to be false")
 	}
-	if cfg.MaxIdleTimeout != 30*time.Second {
-		t.Fatalf("expected MaxIdleTimeout 30s, got %v", cfg.MaxIdleTimeout)
+	if cfg.MaxIdleTimeout != 90*time.Second {
+		t.Fatalf("expected MaxIdleTimeout 90s, got %v", cfg.MaxIdleTimeout)
 	}
-	if cfg.KeepAlivePeriod != 12*time.Second {
-		t.Fatalf("expected KeepAlivePeriod 12s, got %v", cfg.KeepAlivePeriod)
+	if cfg.KeepAlivePeriod != 10*time.Second {
+		t.Fatalf("expected KeepAlivePeriod 10s, got %v", cfg.KeepAlivePeriod)
 	}
 	if !cfg.EnableDatagrams {
 		t.Fatal("expected EnableDatagrams to be true")

@@ -29,7 +29,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.0.1"
+VERSION="1.0.2"
 REPO="jackybig999/aero"
 
 usage() {
@@ -336,18 +336,26 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 SERVICE
 
-# --- firewall: open PRIMARY_PORT & 80 ---
-echo "[firewall] 放行业务端口 TCP ${PRIMARY_PORT} 与 ACME TCP 80"
+# --- firewall: open PRIMARY_PORT (TCP+UDP), 80, and secondary ports 2083/2087/8443 ---
+echo "[firewall] 放行业务端口 TCP/UDP ${PRIMARY_PORT} 与 ACME TCP 80，及备用端口 2083,2087,8443"
 if command -v ufw >/dev/null 2>&1; then
     ufw allow "${PRIMARY_PORT}/tcp" 2>/dev/null || true
+    ufw allow "${PRIMARY_PORT}/udp" 2>/dev/null || true
     ufw allow 80/tcp 2>/dev/null || true
+    ufw allow 2083/udp 2>/dev/null || true
+    ufw allow 2087/udp 2>/dev/null || true
+    ufw allow 8443/udp 2>/dev/null || true
 fi
 if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp -m multiport --dports 2083,2087,8443 -j ACCEPT 2>/dev/null || true
+    # 备用端口内核级重定向到主端口（防 UDP 443 针对性 QoS 丢包与封锁）
+    iptables -t nat -A PREROUTING -p udp -m multiport --dports 2083,2087,8443 -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
 fi
-# --- sysctl: 固化 BBRv3、FQ 队列与 128MB TCP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
-echo "[sysctl] 优化 BBR 拥塞控制与 128MB TCP 缓冲区"
+# --- sysctl: 固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
+echo "[sysctl] 优化 BBR 拥塞控制与 128MB TCP/UDP 缓冲区"
 cat > /etc/sysctl.d/99-aero-bbr.conf << 'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -355,6 +363,8 @@ net.core.rmem_max = 134217728
 net.core.wmem_max = 134217728
 net.ipv4.tcp_rmem = 4096 87380 134217728
 net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 net.ipv4.tcp_mtu_probing = 1
 net.core.netdev_max_backlog = 10000
 EOF

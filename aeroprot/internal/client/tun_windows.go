@@ -337,22 +337,28 @@ func SetupRoutes(devName, ipv4 string) error {
 	addSplitDefault("0.0.0.0", "128.0.0.0")
 	addSplitDefault("128.0.0.0", "128.0.0.0")
 
-	log.Printf("[TUN] Routes configured on %s via %s if=%s (MTU=1224)", devName, tunIP, idx)
+	// 3. 为虚拟网卡绑定纯净 DNS，使系统将 DNS 流量送入虚拟网卡，被 gVisor 端口 53 拦截处理
+	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=static", "address=1.1.1.1", "validate=no")
+	_ = runCmd("netsh", "interface", "ip", "add", "dnsservers", "name="+devName, "address=8.8.8.8", "index=2", "validate=no")
+
+	log.Printf("[TUN] Routes and DNS configured on %s via %s if=%s (MTU=1224)", devName, tunIP, idx)
 	return nil
 }
 
-// TeardownRoutes 清理 Windows 路由（严格限定在 aero0 接口上，绝对不误删宿主机或其他 VPN 路由）
+// TeardownRoutes 清理 Windows 路由与 DNS（严格限定在 aero0 接口上，绝对不误删宿主机或其他 VPN 路由）
 func TeardownRoutes(devName string) {
 	if devName == "" {
 		devName = "aero0"
 	}
+	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
-	log.Printf("[TUN] Routes removed for %s", devName)
+	log.Printf("[TUN] Routes and DNS removed for %s", devName)
 }
 
-// CleanAero0StaleRoutes 仅删除归属于 aero0 接口的 0.0.0.0/1 和 128.0.0.0/1，碰不到任何其他网卡
+// CleanAero0StaleRoutes 仅删除归属于 aero0 接口的 0.0.0.0/1 和 128.0.0.0/1 及 DNS，碰不到任何其他网卡
 func CleanAero0StaleRoutes() {
+	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name=aero0", "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", "aero0")
 }
