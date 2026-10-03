@@ -35,10 +35,15 @@ import (
 var embeddedWebFS embed.FS
 
 func main() {
+	hostFlag := flag.String("host", "0.0.0.0", "middle platform listen host")
 	portFlag := flag.String("port", "18080", "middle platform listen port")
 	dataDirFlag := flag.String("data", "", "data directory path")
 	flag.Parse()
 
+	host := *hostFlag
+	if h := os.Getenv("HOST"); h != "" {
+		host = h
+	}
 	port := *portFlag
 	if p := os.Getenv("PORT"); p != "" {
 		port = p
@@ -279,8 +284,9 @@ func main() {
 	fmt.Printf("  User Sub:       /sub/<user_slug>\n")
 	fmt.Printf("=======================================================\n\n")
 
+	listenAddr := net.JoinHostPort(host, port)
 	server := &http.Server{
-		Addr:         ":" + port,
+		Addr:         listenAddr,
 		Handler:      chain,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
