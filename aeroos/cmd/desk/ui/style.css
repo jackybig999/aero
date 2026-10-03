@@ -17,6 +17,12 @@
   --radius-sm: 6px;
   --radius-md: 10px;
   --radius-lg: 14px;
+  --glass-bg: #090e18;
+  --glass-card: #141b2d;
+  --glass-card-hover: #1a233a;
+  --glass-border: #2a3548;
+  --glass-inner-shadow: none;
+  --glass-elevation: 0 4px 16px rgba(0,0,0,0.3);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -26,8 +32,11 @@ html, body {
   width: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: -apple-system, "Segoe UI", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
   font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
   user-select: none;
   overflow: hidden;
 }
@@ -301,23 +310,24 @@ html, body {
 
 /* ─── Network Center Panel (Client Visual Match) ────────────────────────── */
 .net-container {
-  max-width: 680px;
+  max-width: 420px;
   margin: 0 auto;
   width: 100%;
 }
 
 .power-wrap {
-  display: grid;
-  place-items: center;
-  padding: 20px 0 16px;
-  gap: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0 10px;
+  gap: 6px;
 }
 
 .power {
-  width: 110px;
-  height: 110px;
+  width: 76px;
+  height: 76px;
   border-radius: 50%;
-  border: 3px solid #3d4a63;
+  border: 2.5px solid #3d4a63;
   background: radial-gradient(circle at 50% 42%, #1a2336, #0a0f18 72%);
   color: #dbe7ff;
   cursor: pointer;
@@ -327,33 +337,128 @@ html, body {
   transition: all 0.25s ease;
 }
 
+.power:hover {
+  border-color: #60a5fa;
+  transform: scale(1.03);
+}
+
 .power.on {
   border-color: var(--green);
   color: #fff;
-  box-shadow: 0 0 28px rgba(34, 197, 94, 0.35), inset 0 0 0 1px #166534;
+  box-shadow: 0 0 20px rgba(34, 197, 94, 0.35), inset 0 0 0 1px #166534;
 }
 
 .power.wait {
-  border-color: var(--amber);
-  color: var(--amber);
+  border-color: #fbbf24;
+  color: #fde68a;
   animation: pulse 1.1s ease-in-out infinite;
 }
 
 @keyframes pulse { 50% { opacity: 0.65; } }
 
 .pill {
-  font-size: 12px;
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
   font-weight: 700;
-  padding: 4px 14px;
-  border-radius: 20px;
-  background: #1e293b;
-  color: var(--muted);
 }
 
-.pill.on {
-  background: rgba(34, 197, 94, 0.2);
-  color: var(--green);
-  border: 1px solid var(--green);
+.pill.off { background: #1f2937; color: var(--muted); }
+.pill.on { background: #14532d; color: #86efac; border: 1px solid #22c55e; }
+.pill.wait { background: #422006; color: #fcd34d; }
+.pill.err { background: #450a0a; color: #fca5a5; }
+
+.desktop-badge-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid #1d4ed8;
+  background: #10203a;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+.desktop-badge-btn span:first-child { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.desktop-badge-btn b { flex: 1; font-size: 12px; font-weight: 700; color: #93c5fd; }
+.desktop-badge-btn .copy {
+  font-size: 10px;
+  font-weight: 700;
+  color: #60a5fa;
+}
+
+.mode-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.mode-radio {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: #0a0f18;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text);
+  transition: all 0.2s;
+}
+
+.mode-radio.selected {
+  border-color: var(--blue);
+  background: #10203a;
+  color: #93c5fd;
+  font-weight: 700;
+}
+
+.metrics-ribbon {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+}
+
+.metrics-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.geodata-row {
+  border-top: 1px solid var(--line);
+  padding-top: 4px;
+  margin-top: 2px;
+}
+
+.metric-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.m-icon { font-size: 11px; }
+.m-label { color: var(--muted); }
+.m-val { font-weight: 700; }
+.geo-badge {
+  font-size: 10px;
+  font-weight: 700;
+  color: #86efac;
+  background: #14532d;
+  padding: 1px 6px;
+  border-radius: 4px;
 }
 
 .status-grid {
@@ -402,8 +507,47 @@ html, body {
 }
 
 .mode-radio.selected {
-  border-color: var(--blue);
-  background: var(--card-active);
+  border-color: var(--blue) !important;
+  background: var(--card-active) !important;
+}
+
+.desktop-badge-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #1d4ed8;
+  background: #10203a;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s ease;
+}
+
+.desktop-badge-btn:hover {
+  background: #172a4d;
+  border-color: #3b82f6;
+}
+
+.desktop-badge-btn span:first-child {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.desktop-badge-btn b {
+  flex: 1;
+  font-size: 13px;
+  font-weight: 700;
+  color: #93c5fd;
+}
+
+.desktop-badge-btn .copy {
+  font-size: 11px;
+  font-weight: 700;
+  color: #60a5fa;
 }
 
 /* ─── Browser Sandboxes & Kernels (Segmented) ──────────────────────────── */
@@ -559,8 +703,7 @@ html, body {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.65);
-  backdrop-filter: blur(4px);
+  background: rgba(0,0,0,0.75);
   display: none;
   place-items: center;
   z-index: 99;
@@ -581,12 +724,11 @@ html, body {
 
 
 /* ─── 100% Full Fingerprint Browser & Kernel Component Styles ─── */
-    <style>
 
 
-        /* 苹果 macOS 原生旗舰级液态毛玻璃与弥散流动底板 */
+        /* 苹果 macOS 原生旗舰级液态毛玻璃与弥散流动底�?*/
 
-        /* Windows 平台原生紧凑型设计 */
+        /* Windows 平台原生紧凑型设�?*/
         body.platform-windows {
             font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
             font-size: 12px;
@@ -612,8 +754,6 @@ html, body {
         .sidebar {
             width: var(--sidebar-width);
             background: var(--glass-bg);
-            backdrop-filter: blur(32px) saturate(200%);
-            -webkit-backdrop-filter: blur(32px) saturate(200%);
             border-right: 1px solid var(--glass-border);
             display: flex;
             flex-direction: column;
@@ -624,7 +764,7 @@ html, body {
             position: relative;
         }
 
-        /* 侧边栏折叠状态 */
+        /* 侧边栏折叠状�?*/
         .sidebar.collapsed {
             width: 56px !important;
             padding: 14px 6px !important;
@@ -668,7 +808,7 @@ html, body {
             display: none !important;
         }
 
-        /* 侧边栏折叠/展开切换按钮 */
+        /* 侧边栏折�?展开切换按钮 */
         .sidebar-toggle-btn {
             background: rgba(255, 255, 255, 0.08);
             border: 1px solid var(--glass-border);
@@ -744,7 +884,7 @@ html, body {
             flex: 1;
         }
 
-        /* 自定义 macOS 极简悬浮滚动条 */
+        /* 自定�?macOS 极简悬浮滚动�?*/
         ::-webkit-scrollbar {
             width: 6px;
             height: 6px;
@@ -794,11 +934,9 @@ html, body {
             box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 4px 16px rgba(99, 102, 241, 0.45);
         }
 
-        /* 侧边栏底部用户信息面板 */
+        /* 侧边栏底部用户信息面�?*/
         .user-panel {
             background: rgba(255, 255, 255, 0.035);
-            backdrop-filter: blur(16px);
-            -webkit-backdrop-filter: blur(16px);
             border: 1px solid var(--glass-border);
             box-shadow: var(--glass-inner-shadow);
             border-radius: 10px;
@@ -847,11 +985,9 @@ html, body {
             min-width: 0;
         }
 
-        /* 顶部网络状态感知条 - macOS 液态毛玻璃微质感 */
+        /* 顶部网络状态感知条 - macOS 液态毛玻璃微质�?*/
         .top-banner {
             background: var(--glass-bg);
-            backdrop-filter: blur(32px) saturate(210%);
-            -webkit-backdrop-filter: blur(32px) saturate(210%);
             border: 1px solid var(--glass-border);
             box-shadow: var(--glass-inner-shadow), 0 8px 24px -6px rgba(0, 0, 0, 0.4);
             border-radius: 12px;
@@ -886,8 +1022,6 @@ html, body {
         /* 现代化通用操作与搜索过滤工具栏 - 液态毛玻璃悬浮卡片 */
         .toolbar-panel {
             background: var(--glass-card);
-            backdrop-filter: blur(28px) saturate(190%);
-            -webkit-backdrop-filter: blur(28px) saturate(190%);
             border: 1px solid var(--glass-border);
             box-shadow: var(--glass-inner-shadow), 0 6px 20px -6px rgba(0, 0, 0, 0.35);
             border-radius: 12px;
@@ -951,8 +1085,6 @@ html, body {
         }
         .btn-outline {
             background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
             border: 1px solid var(--glass-border);
             box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
             color: var(--text-main);
@@ -988,11 +1120,9 @@ html, body {
             box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), 0 6px 18px rgba(245, 158, 11, 0.5);
         }
 
-        /* 苹果半透拟物输入框与选择框 */
+        /* 苹果半透拟物输入框与选择�?*/
         .form-input, .form-select {
             background: rgba(16, 20, 32, 0.72);
-            backdrop-filter: blur(16px);
-            -webkit-backdrop-filter: blur(16px);
             border: 1px solid var(--glass-border);
             box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45);
             color: var(--text-main);
@@ -1013,13 +1143,11 @@ html, body {
             box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.28), inset 0 1px 2px rgba(0, 0, 0, 0.3);
         }
 
-        /* 专业紧凑数据表格 (Table View) - 悬浮液态卡片包裹 */
+        /* 专业紧凑数据表格 (Table View) - 悬浮液态卡片包�?*/
         .table-responsive {
             width: 100%;
             overflow-x: auto;
             background: var(--glass-card);
-            backdrop-filter: blur(28px) saturate(190%);
-            -webkit-backdrop-filter: blur(28px) saturate(190%);
             border: 1px solid var(--glass-border);
             box-shadow: var(--glass-inner-shadow), var(--glass-elevation);
             border-radius: 12px;
@@ -1082,7 +1210,7 @@ html, body {
             box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
         }
 
-        /* 卡片视图 (Card Grid) - macOS 悬浮小组件体验 */
+        /* 卡片视图 (Card Grid) - macOS 悬浮小组件体�?*/
         .card-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
@@ -1090,8 +1218,6 @@ html, body {
         }
         .profile-card {
             background: var(--glass-card);
-            backdrop-filter: blur(24px) saturate(180%);
-            -webkit-backdrop-filter: blur(24px) saturate(180%);
             border: 1px solid var(--glass-border);
             box-shadow: var(--glass-inner-shadow), 0 8px 24px -6px rgba(0, 0, 0, 0.38);
             border-radius: 12px;
@@ -1136,8 +1262,6 @@ html, body {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(5, 7, 13, 0.72);
-            backdrop-filter: blur(24px);
-            -webkit-backdrop-filter: blur(24px);
             display: none;
             justify-content: center;
             align-items: center;
@@ -1146,8 +1270,6 @@ html, body {
         }
         .modal {
             background: rgba(18, 22, 34, 0.88);
-            backdrop-filter: blur(48px) saturate(210%);
-            -webkit-backdrop-filter: blur(48px) saturate(210%);
             border: 1px solid rgba(255, 255, 255, 0.16);
             border-radius: 16px;
             width: 760px;
@@ -1253,7 +1375,7 @@ html, body {
             cursor: pointer;
         }
 
-        /* 通用用户注册与登录弹窗专属样式 */
+        /* 通用用户注册与登录弹窗专属样�?*/
         .auth-modal {
             width: 440px;
             border-radius: 16px;
@@ -1279,7 +1401,7 @@ html, body {
             background: rgba(99, 102, 241, 0.08);
         }
 
-        /* 呼吸灯动画 */
+        /* 呼吸灯动�?*/
         .pulse-dot {
             width: 7px;
             height: 7px;

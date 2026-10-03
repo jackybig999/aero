@@ -138,12 +138,40 @@ window.addEventListener('DOMContentLoaded', () => {
   initEvents();
 });
 
+function updateTopUser() {
+  let name = '';
+  try {
+    const raw = localStorage.getItem(USER_KEY);
+    if (raw) {
+      const obj = JSON.parse(raw);
+      name = obj.username || (obj.user && obj.user.username);
+    }
+  } catch {}
+  if (!name) name = localStorage.getItem('last_admin_username') || 'admin';
+  const el = $('topUser');
+  if (el) el.textContent = name;
+}
+
+async function fetchCurrentUserFromDb() {
+  try {
+    const res = await apiCall('/auth/me/');
+    if (res && res.username) {
+      localStorage.setItem('last_admin_username', res.username);
+      localStorage.setItem(USER_KEY, JSON.stringify(res));
+      const el = $('topUser');
+      if (el) el.textContent = res.username;
+    }
+  } catch (_) {}
+}
+
 function checkAuth() {
   const token = localStorage.getItem(TOKEN_KEY);
   if (!token) {
     showLogin(true);
   } else {
     showLogin(false);
+    updateTopUser();
+    fetchCurrentUserFromDb();
     loadCurrentTab();
   }
 }
@@ -175,14 +203,14 @@ function switchTab(tabId) {
   loadCurrentTab();
 }
 
-function loadCurrentTab() {
-  if (currentTab === 'dashboard') loadDashboard();
-  else if (currentTab === 'users') loadUsers();
-  else if (currentTab === 'vps') loadVPS();
-  else if (currentTab === 'aero') loadAERO();
-  else if (currentTab === 'nodes') loadNodes();
-  else if (currentTab === 'ledger') loadLedger();
-  else if (currentTab === 'subs') loadSubs();
+async function loadCurrentTab() {
+  if (currentTab === 'dashboard') return await loadDashboard();
+  else if (currentTab === 'users') return await loadUsers();
+  else if (currentTab === 'vps') return await loadVPS();
+  else if (currentTab === 'aero') return await loadAERO();
+  else if (currentTab === 'nodes') return await loadNodes();
+  else if (currentTab === 'ledger') return await loadLedger();
+  else if (currentTab === 'subs') return await loadSubs();
 }
 
 // ------------------------------------------------------------------------------
@@ -204,8 +232,10 @@ function initEvents() {
       if (token && typeof token === 'string') {
         localStorage.setItem(TOKEN_KEY, token);
         localStorage.setItem(USER_KEY, JSON.stringify(res));
+        localStorage.setItem('last_admin_username', u);
       }
       showLogin(false);
+      updateTopUser();
       loadCurrentTab();
     } catch (e) {
       errP.textContent = `登录失败: ${e.message}`;
@@ -227,8 +257,43 @@ function initEvents() {
     });
   });
 
-  // Top Refresh
-  $('btnTopRefresh')?.addEventListener('click', () => loadCurrentTab());
+  // Sidebar Collapse Toggle
+  $('btnToggleSidebar')?.addEventListener('click', () => {
+    const sb = document.querySelector('.sidebar');
+    if (!sb) return;
+    sb.classList.toggle('collapsed');
+    const isCollapsed = sb.classList.contains('collapsed');
+    const icon = $('collapseIcon');
+    if (icon) icon.textContent = isCollapsed ? '▶' : '◀';
+    localStorage.setItem('admin_sidebar_collapsed', isCollapsed ? '1' : '0');
+  });
+
+  // Restore Sidebar Collapse State
+  if (localStorage.getItem('admin_sidebar_collapsed') === '1') {
+    document.querySelector('.sidebar')?.classList.add('collapsed');
+    const icon = $('collapseIcon');
+    if (icon) icon.textContent = '▶';
+  }
+
+  // Top Refresh with visual loading state
+  $('btnTopRefresh')?.addEventListener('click', async () => {
+    const btn = $('btnTopRefresh');
+    if (!btn || btn.disabled) return;
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '🔄 刷新中...';
+    try {
+      await Promise.allSettled([
+        loadCurrentTab(),
+        fetchCurrentUserFromDb()
+      ]);
+    } finally {
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }, 400);
+    }
+  });
 
   // Dashboard Svc Groups Toggle All
   $('btnToggleAllSvcGroups')?.addEventListener('click', () => toggleAllSvcGroups());
@@ -1100,7 +1165,9 @@ window.probeVPS = async (id) => {
 window.verifyDomainVPS = async (id) => {
   try {
     const res = await apiCall(`/vps/${id}/verify-domain/`, { method: 'POST' });
-    alert(`复核完成: ${res.status || 'DNS OK'} · 对应 IP: ${res.resolved_ip || '—'}`);
+    const ipStr = (res.resolved_ips && res.resolved_ips.length > 0) ? res.resolved_ips.join(', ') : '无有效公网解析';
+    const tag = res.matched ? '✅ 匹配成功' : (res.is_cf_proxy ? '☁️ Cloudflare 代理' : '⚠️ 不匹配');
+    alert(`【DNS 复核完成 · ${tag}】\n\n判定状态: ${res.status_text || '正常'}\n公网解析 IP: ${ipStr}\nVPS 节点 IP: ${res.vps_ip || '—'}`);
     loadVPS();
   } catch (e) {
     alert(`复核失败: ${e.message}`);
@@ -1366,11 +1433,6 @@ async function loadAeroTokens(vpsId) {
 
 async function deployAero(action, customPort = 0) {
   if (!currentAeroVpsId) return alert('请先选择目标 VPS 主机！');
-  if (action === 'uninstall') {
-    if (!confirm('警告：确认彻底卸载目标 VPS 上的 AERO Edge 服务？\n卸载将联动彻底从中台节点池中删除该节点，保证数据绝对同步！')) {
-      return;
-    }
-  }
   try {
     const payload = { vps_id: Number(currentAeroVpsId) };
     if (action === 'install' && customPort > 0) {
@@ -1395,7 +1457,8 @@ async function deployAero(action, customPort = 0) {
 function openAeroTaskDrawer(taskId, action = 'task') {
   activeAeroTaskId = taskId;
   $('aeroTaskModalTitle').innerHTML = `<span>🚀 调度流水线详情 #${taskId}</span> <span class="tag tag-blue" id="aeroTaskModalStatusTag">RUNNING</span>`;
-  $('aeroTaskModalSub').textContent = `任务 #${taskId} · ${action.toUpperCase()} Edge`;
+  const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : `${action.toUpperCase()} Edge`);
+  $('aeroTaskModalSub').textContent = `任务 #${taskId} · ${actName}`;
   $('aeroTaskDrawerModal').classList.add('active');
   $('aeroTaskProgressBar').style.width = '10%';
   $('aeroTaskProgressPercent').textContent = '10%';
@@ -1414,9 +1477,48 @@ async function pollAeroTask(taskId) {
     const percent = Math.min(100, Math.max(10, task.progress || 10));
     $('aeroTaskProgressBar').style.width = `${percent}%`;
     $('aeroTaskProgressPercent').textContent = `${percent}%`;
-    $('aeroTaskProgressStage').textContent = `阶段: ${task.stage || task.action || '执行中'}`;
+    $('aeroTaskProgressStage').textContent = `阶段: ${task.stage || task.action || task.kind || '执行中'}`;
     $('aeroTaskModalStatusTag').textContent = (task.status || 'RUNNING').toUpperCase();
     $('aeroTaskModalStatusTag').className = `tag ${task.status === 'success' ? 'tag-green' : (task.status === 'failed' ? 'tag-red' : 'tag-blue')}`;
+
+    // 动态渲染任务各步骤状态，彻底消除步骤冻结在“等待中”
+    if (task.steps && task.steps.length > 0) {
+      const stepper = $('aeroTaskStepper');
+      if (stepper) {
+        stepper.innerHTML = task.steps.map((s, idx) => {
+          let tagClass = 'tag-blue';
+          let tagText = '等待中';
+          let icon = '⚪';
+          if (s.status === 'running') {
+            tagClass = 'tag-blue';
+            tagText = '执行中...';
+            icon = '🔄';
+          } else if (s.status === 'success') {
+            tagClass = 'tag-green';
+            tagText = '已完成';
+            icon = '✅';
+          } else if (s.status === 'failed') {
+            tagClass = 'tag-red';
+            tagText = '失败';
+            icon = '❌';
+          } else if (s.status === 'skipped') {
+            tagClass = 'tag-amber';
+            tagText = '已跳过';
+            icon = '⏭️';
+          }
+          return `
+            <div class="step-item" style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:12px;border:1px solid var(--line)">
+              <div style="display:flex;align-items:center;gap:8px">
+                <span>${icon}</span>
+                <span style="font-weight:600">${idx + 1}. ${escapeHtml(s.title || s.key)}</span>
+                ${s.detail ? `<span style="color:var(--muted);font-size:11px">(${escapeHtml(s.detail)})</span>` : ''}
+              </div>
+              <span class="tag ${tagClass}">${tagText}</span>
+            </div>
+          `;
+        }).join('');
+      }
+    }
 
     if (task.logs && task.logs.length) {
       $('aeroTaskLogBox').textContent = task.logs.join('\n');
@@ -1450,21 +1552,30 @@ async function loadAeroTasks() {
       return;
     }
     wrap.style.display = 'block';
-    tbody.innerHTML = items.slice(0, 5).map(t => `
-      <tr>
-        <td>#${t.id}</td>
-        <td><span class="tag tag-blue">${escapeHtml(t.action)}</span></td>
-        <td>#${t.vps_id}</td>
-        <td>
-          <div style="background:var(--line);border-radius:2px;height:4px;width:100%;overflow:hidden">
-            <div style="width:${t.progress || 0}%;height:100%;background:var(--blue)"></div>
-          </div>
-        </td>
-        <td>${escapeHtml(t.stage || '—')}</td>
-        <td><span class="tag ${t.status === 'success' ? 'tag-green' : (t.status === 'failed' ? 'tag-red' : 'tag-amber')}">${t.status}</span></td>
-        <td><button class="btn btn-sm" onclick="openAeroTaskDrawer(${t.id}, '${escapeHtml(t.action)}')">查看</button></td>
-      </tr>
-    `).join('');
+    tbody.innerHTML = items.slice(0, 5).map(t => {
+      const actKey = String(t.kind || t.action || 'install').toLowerCase();
+      let tagHtml = '<span class="tag tag-blue">安装 / 升级</span>';
+      if (actKey.includes('uninstall') || actKey.includes('卸载')) {
+        tagHtml = '<span class="tag tag-red">深度卸载</span>';
+      } else if (actKey.includes('restart') || actKey.includes('重启')) {
+        tagHtml = '<span class="tag tag-amber">服务重启</span>';
+      }
+      return `
+        <tr>
+          <td>#${t.id}</td>
+          <td>${tagHtml}</td>
+          <td>#${t.vps_id}</td>
+          <td>
+            <div style="background:var(--line);border-radius:2px;height:4px;width:100%;overflow:hidden">
+              <div style="width:${t.progress || 0}%;height:100%;background:var(--blue)"></div>
+            </div>
+          </td>
+          <td>${escapeHtml(t.stage || '—')}</td>
+          <td><span class="tag ${t.status === 'success' ? 'tag-green' : (t.status === 'failed' ? 'tag-red' : 'tag-blue')}">${t.status}</span></td>
+          <td><button class="btn btn-sm" onclick="openAeroTaskDrawer(${t.id}, '${escapeHtml(actKey)}')">查看</button></td>
+        </tr>
+      `;
+    }).join('');
   } catch (_) {}
 }
 
@@ -1491,14 +1602,38 @@ function initAeroEvents() {
     if (currentAeroVpsId) loadAeroDiagnose(currentAeroVpsId);
   });
   $('btnAeroRestart')?.addEventListener('click', () => deployAero('restart'));
+
+  // 安装 / 升级 独立弹窗
   $('btnAeroInstall')?.addEventListener('click', () => {
-    if (!currentAeroVpsId) return alert('请先选择目标 VPS 主机！');
-    const portStr = prompt('请输入 AERO Edge 部署监听端口\n(默认 443 为标准 HTTPS 端口；若遇第三方占用将自动轮试候选 HTTPS 端口):', '443');
-    if (portStr === null) return;
-    const port = parseInt(portStr.trim(), 10) || 443;
+    if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
+    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
+    const targetName = v ? `${v.name} (${v.domain || v.ip}:${v.ssh_port || 22})` : `VPS #${currentAeroVpsId}`;
+    $('installModalVpsName').value = targetName;
+    $('installModalPort').value = '443';
+    $('aeroInstallModal').classList.add('active');
+  });
+  $('btnCancelInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
+  $('btnCloseInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
+  $('btnConfirmInstallModal')?.addEventListener('click', () => {
+    $('aeroInstallModal').classList.remove('active');
+    const port = parseInt($('installModalPort').value.trim(), 10) || 443;
     deployAero('install', port);
   });
-  $('btnAeroUninstall')?.addEventListener('click', () => deployAero('uninstall'));
+
+  // 深度卸载 独立弹窗
+  $('btnAeroUninstall')?.addEventListener('click', () => {
+    if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
+    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
+    const targetName = v ? `${v.name} (${v.domain || v.ip})` : `VPS #${currentAeroVpsId}`;
+    $('uninstallModalVpsName').value = targetName;
+    $('aeroUninstallModal').classList.add('active');
+  });
+  $('btnCancelUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
+  $('btnCloseUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
+  $('btnConfirmUninstallModal')?.addEventListener('click', () => {
+    $('aeroUninstallModal').classList.remove('active');
+    deployAero('uninstall');
+  });
   
   $('btnCloseAeroTaskDrawer')?.addEventListener('click', () => {
     $('aeroTaskDrawerModal').classList.remove('active');

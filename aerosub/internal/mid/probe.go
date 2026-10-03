@@ -22,6 +22,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -369,6 +370,89 @@ echo "disk_used=$DU"
 	return met, nil
 }
 
+// resolveDomainAuthoritative resolves a domain name using authoritative public DoH
+// (AliDNS with Cloudflare fallback) to prevent pollution from local Clash/VPN Fake-IPs (198.18.0.0/15).
+func resolveDomainAuthoritative(ctx context.Context, domain string) ([]string, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	// 1. Primary: AliDNS DoH JSON API
+	uAli := "https://dns.alidns.com/resolve?name=" + url.QueryEscape(domain) + "&type=A"
+	if req, err := http.NewRequestWithContext(ctx, "GET", uAli, nil); err == nil {
+		req.Header.Set("Accept", "application/json")
+		if resp, err := client.Do(req); err == nil {
+			defer resp.Body.Close()
+			var aliResp struct {
+				Status int `json:"Status"`
+				Answer []struct {
+					Type int    `json:"type"`
+					Data string `json:"data"`
+				} `json:"Answer"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&aliResp); err == nil && len(aliResp.Answer) > 0 {
+				var ips []string
+				for _, ans := range aliResp.Answer {
+					if ans.Type == 1 { // A record
+						ip := strings.TrimSpace(ans.Data)
+						if !strings.HasPrefix(ip, "198.18.") && !strings.HasPrefix(ip, "198.19.") {
+							ips = append(ips, ip)
+						}
+					}
+				}
+				if len(ips) > 0 {
+					return ips, nil
+				}
+			}
+		}
+	}
+
+	// 2. Secondary fallback: Cloudflare DoH JSON API
+	uCF := "https://1.1.1.1/dns-query?name=" + url.QueryEscape(domain) + "&type=A"
+	if req, err := http.NewRequestWithContext(ctx, "GET", uCF, nil); err == nil {
+		req.Header.Set("Accept", "application/dns-json")
+		if resp, err := client.Do(req); err == nil {
+			defer resp.Body.Close()
+			var cfResp struct {
+				Status int `json:"Status"`
+				Answer []struct {
+					Type int    `json:"type"`
+					Data string `json:"data"`
+				} `json:"Answer"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&cfResp); err == nil && len(cfResp.Answer) > 0 {
+				var ips []string
+				for _, ans := range cfResp.Answer {
+					if ans.Type == 1 {
+						ip := strings.TrimSpace(ans.Data)
+						if !strings.HasPrefix(ip, "198.18.") && !strings.HasPrefix(ip, "198.19.") {
+							ips = append(ips, ip)
+						}
+					}
+				}
+				if len(ips) > 0 {
+					return ips, nil
+				}
+			}
+		}
+	}
+
+	// 3. Fallback: OS resolver, explicitly filtering out 198.18.0.0/15 fake IPs
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", domain)
+	if err != nil {
+		return nil, err
+	}
+	var cleanIPs []string
+	for _, ip := range ips {
+		ipStr := ip.String()
+		if !strings.HasPrefix(ipStr, "198.18.") && !strings.HasPrefix(ipStr, "198.19.") {
+			cleanIPs = append(cleanIPs, ipStr)
+		}
+	}
+	if len(cleanIPs) == 0 {
+		return nil, fmt.Errorf("no clean public IP found for %s (filtered out synthetic/fake IPs)", domain)
+	}
+	return cleanIPs, nil
+}
+
 // VerifyDomain checks if VPS domain resolves to its registered IP.
 func (s *VPSService) VerifyDomain(ctx context.Context, id uint64) (map[string]any, error) {
 	vps, err := s.store.Get(id)
@@ -384,12 +468,11 @@ func (s *VPSService) VerifyDomain(ctx context.Context, id uint64) (map[string]an
 	}
 
 	var resolvedIPs []string
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", domain)
+	ips, err := resolveDomainAuthoritative(ctx, domain)
 	matched := false
 	isCF := false
 	if err == nil {
-		for _, ip := range ips {
-			ipStr := ip.String()
+		for _, ipStr := range ips {
 			resolvedIPs = append(resolvedIPs, ipStr)
 			if ipStr == vps.IP {
 				matched = true
@@ -646,18 +729,36 @@ func probeEdgeAdminAPI(ctx context.Context, host, ip string, port int, adminKey 
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&st); err == nil && st.OK {
 				issuer := st.CertIssuer
+				daysLeft := st.CertDaysLeft
+				notAfter := st.CertNotAfter
+				certOK := daysLeft > 0
+
+				// 优先从真实 TLS 对端证书 (PeerCertificates) 中提取精准有效期与签发机构
+				if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+					leaf := resp.TLS.PeerCertificates[0]
+					realDays := int(time.Until(leaf.NotAfter).Hours() / 24)
+					if realDays >= 0 {
+						daysLeft = realDays
+						certOK = true
+					}
+					if leaf.Issuer.CommonName != "" {
+						issuer = leaf.Issuer.CommonName
+					} else if len(leaf.Issuer.Organization) > 0 {
+						issuer = leaf.Issuer.Organization[0]
+					}
+					notAfter = leaf.NotAfter.Format("2006-01-02 15:04:05")
+				}
+
 				if issuer == "" {
 					issuer = "Let's Encrypt / ACME"
 				}
-				daysLeft := st.CertDaysLeft
-				certOK := daysLeft >= 0
 
 				certMap := map[string]any{
 					"mode":       "acme-online",
 					"ok":         certOK,
 					"domain":     host,
 					"issuer":     issuer,
-					"not_after":  st.CertNotAfter,
+					"not_after":  notAfter,
 					"days_left":  daysLeft,
 					"file_count": 1,
 					"dir":        "在线直连 (AERO Edge 守护进程)",

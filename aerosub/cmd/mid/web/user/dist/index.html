@@ -69,8 +69,8 @@
       <div class="brand">
         <div class="logo-badge" id="userBadge">A</div>
         <div class="brand-text">
-          <h1>AERO 控制台</h1>
-          <span class="brand-sub" id="userName">用户</span>
+          <h1>AERO 用户系统</h1>
+          <span class="brand-sub" id="userName" style="font-size:18px;font-weight:700;color:var(--text);display:block;margin-top:4px">用户</span>
         </div>
       </div>
       <nav class="nav-menu">
@@ -91,6 +91,12 @@
           <span>账单记录</span>
         </button>
       </nav>
+      <div class="sidebar-collapse-wrap" style="padding:10px 0;border-top:1px solid var(--line);display:flex;justify-content:center">
+        <button class="btn btn-sm btn-ghost" id="btnToggleSidebar" title="折叠 / 展开侧边栏" style="width:100%;font-size:12px;gap:6px;display:flex;align-items:center;justify-content:center">
+          <span id="collapseIcon">◀</span>
+          <span class="collapse-text">收起导航</span>
+        </button>
+      </div>
       <div class="user-foot">
         <button class="btn btn-danger" id="btnLogout" style="width:100%;justify-content:center">
           退出登录
@@ -105,7 +111,6 @@
           <div class="page-title" id="pageTitle">我的专属订阅</div>
         </div>
         <div class="top-right">
-          <span class="tag tag-green">Zero-Trust Active</span>
         </div>
       </header>
 

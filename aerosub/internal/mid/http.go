@@ -148,6 +148,9 @@ func isUserOpenAPI(method, path string) bool {
 	if strings.HasPrefix(path, "/api/v1/user/subscription") {
 		return true
 	}
+	if method == http.MethodGet && path == "/api/v1/auth/me/" {
+		return true
+	}
 	if method == http.MethodGet && strings.HasPrefix(path, "/api/v1/users/") && strings.HasSuffix(path, "/traffic/") {
 		return true
 	}

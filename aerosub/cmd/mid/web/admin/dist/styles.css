@@ -46,6 +46,33 @@ body {
   display: flex;
   flex-direction: column;
   padding: 14px 10px;
+  transition: width 0.2s ease, min-width 0.2s ease, padding 0.2s ease;
+}
+
+.sidebar.collapsed {
+  width: 60px;
+  min-width: 60px;
+  padding: 14px 6px;
+}
+
+.sidebar.collapsed .brand-text,
+.sidebar.collapsed .menu-item span:not(.menu-icon),
+.sidebar.collapsed .collapse-text {
+  display: none !important;
+}
+
+.sidebar.collapsed .brand {
+  justify-content: center;
+  padding: 4px 0 16px;
+}
+
+.sidebar.collapsed .menu-item {
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.sidebar.collapsed .sidebar-collapse-wrap button {
+  justify-content: center !important;
 }
 
 .brand {

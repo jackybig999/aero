@@ -1501,12 +1501,12 @@ func (s *VPSService) VerifyOrSyncDomain(ctx context.Context, domain, ip string) 
 	if domain == "localhost" || domain == "127.0.0.1" {
 		return nil
 	}
-	ips, err := net.LookupIP(domain)
+	ips, err := resolveDomainAuthoritative(ctx, domain)
 	if err != nil {
-		return fmt.Errorf("域名 %s 尚未在公网解析，请添加 A 记录指向 %s", domain, ip)
+		return fmt.Errorf("域名 %s 尚未在公网解析，请添加 A 记录指向 %s: %w", domain, ip, err)
 	}
 	for _, resolved := range ips {
-		if resolved.String() == ip {
+		if resolved == ip {
 			return nil
 		}
 	}

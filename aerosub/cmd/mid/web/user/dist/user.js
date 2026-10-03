@@ -71,11 +71,27 @@
     document.getElementById('registerForm').style.display = mode === 'register' ? 'flex' : 'none';
   }
 
+  async function fetchUserFromDb() {
+    try {
+      const res = await apiRequest('/auth/me/');
+      const u = res.data || res;
+      if (u && u.username) {
+        currentUser = u;
+        localStorage.setItem(USER_KEY, JSON.stringify(u));
+        const el = document.getElementById('userName');
+        if (el) el.textContent = u.username;
+        const b = document.getElementById('userBadge');
+        if (b) b.textContent = u.username[0].toUpperCase();
+      }
+    } catch (_) {}
+  }
+
   function showApp() {
     document.getElementById('authWrap').style.display = 'none';
     document.getElementById('appLayout').style.display = 'flex';
-    document.getElementById('userName').textContent = currentUser.username || '用户';
-    document.getElementById('userBadge').textContent = (currentUser.username || 'U')[0].toUpperCase();
+    document.getElementById('userName').textContent = (currentUser && currentUser.username) || '用户';
+    document.getElementById('userBadge').textContent = ((currentUser && currentUser.username) || 'U')[0].toUpperCase();
+    fetchUserFromDb();
     switchTab(activeTab);
   }
 
@@ -178,6 +194,22 @@
         if (tab) switchTab(tab);
       });
     });
+
+    document.getElementById('btnToggleSidebar')?.addEventListener('click', () => {
+      const sb = document.querySelector('.sidebar');
+      if (!sb) return;
+      sb.classList.toggle('collapsed');
+      const isCollapsed = sb.classList.contains('collapsed');
+      const icon = document.getElementById('collapseIcon');
+      if (icon) icon.textContent = isCollapsed ? '▶' : '◀';
+      localStorage.setItem('user_sidebar_collapsed', isCollapsed ? '1' : '0');
+    });
+
+    if (localStorage.getItem('user_sidebar_collapsed') === '1') {
+      document.querySelector('.sidebar')?.classList.add('collapsed');
+      const icon = document.getElementById('collapseIcon');
+      if (icon) icon.textContent = '▶';
+    }
   }
 
   function switchTab(tab) {

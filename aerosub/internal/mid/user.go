@@ -1457,6 +1457,7 @@ func (h *UserHandler) SetSubBuilder(sb *SubBuilder) {
 
 func (h *UserHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/login/", h.Login)
+	mux.HandleFunc("GET /api/v1/auth/me/", h.GetMe)
 	mux.HandleFunc("GET /api/v1/user/subscription/", h.GetMySubscription)
 	mux.HandleFunc("POST /api/v1/users/", h.CreateUser)
 	mux.HandleFunc("GET /api/v1/users/", h.ListUsers)
@@ -1545,6 +1546,23 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"code": 0,
 		"data": loginData,
+	})
+}
+
+func (h *UserHandler) GetMe(w http.ResponseWriter, r *http.Request) {
+	uid, ok := r.Context().Value(CtxUserID).(uint64)
+	if !ok || uid == 0 {
+		writeJSON(w, http.StatusUnauthorized, errResp(1003, "unauthorized"))
+		return
+	}
+	u, err := h.svc.GetUser(uid)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, errResp(1001, "user not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"code": 0,
+		"data": u.Sanitize(),
 	})
 }
 
