@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-const (
-	Version  = "3.0.0"
+var (
+	Version  = "1.0.1"
 	Protocol = "aero/3.0"
 	APILevel = 3
 )

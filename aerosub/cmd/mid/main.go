@@ -280,8 +280,8 @@ func main() {
 	fmt.Printf("  AERO VPS Middle Platform -> :%s\n", port)
 	fmt.Printf("  Data directory: %s\n", dataDir)
 	fmt.Printf("  Health:         /health\n")
-	fmt.Printf("  Admin Sub:      /sub/superadmin\n")
-	fmt.Printf("  User Sub:       /sub/<user_slug>\n")
+	fmt.Printf("  Native Domain Sub:  https://<domain>/sub/superadmin\n")
+	fmt.Printf("  User Domain Sub:    https://<domain>/sub/<user_slug>\n")
 	fmt.Printf("=======================================================\n\n")
 
 	listenAddr := net.JoinHostPort(host, port)

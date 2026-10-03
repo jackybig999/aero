@@ -1848,7 +1848,11 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 
 	targetVer := strings.TrimSpace(src.ReleaseTag)
 	if targetVer == "" || targetVer == "main" {
-		targetVer = "1.0.0"
+		if verBytes, err := os.ReadFile("VERSION"); err == nil && len(strings.TrimSpace(string(verBytes))) > 0 {
+			targetVer = strings.TrimSpace(string(verBytes))
+		} else {
+			targetVer = "1.0.1"
+		}
 	}
 	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
 

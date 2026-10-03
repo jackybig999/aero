@@ -160,12 +160,19 @@ jobs:
           find release-assets/ -type f -exec cp -f {} release-dist/ \;
           ls -lh release-dist/
 
+      - name: Resolve Release Tag and Version
+        run: |
+          VER=$(cat VERSION 2>/dev/null || echo "1.0.1")
+          VER=$(echo "$VER" | tr -d '[:space:]' | sed 's/^v//')
+          echo "RELEASE_VER=$VER" >> $GITHUB_ENV
+          echo "RELEASE_TAG=v$VER" >> $GITHUB_ENV
+
       - name: Prune Stale Release Assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== Auditing GitHub Release v1.0.0 Assets ==="
-          EXISTING_ASSETS=$(gh api repos/${{ github.repository }}/releases/tags/v1.0.0 --jq '.assets[] | "\(.id) \(.name)"' 2>/dev/null || true)
+          echo "=== Auditing GitHub Release $RELEASE_TAG Assets ==="
+          EXISTING_ASSETS=$(gh api repos/${{ github.repository }}/releases/tags/$RELEASE_TAG --jq '.assets[] | "\(.id) \(.name)"' 2>/dev/null || true)
           if [ -n "$EXISTING_ASSETS" ]; then
             while read -r asset_id asset_name; do
               if [ -n "$asset_id" ] && [ -n "$asset_name" ]; then
@@ -182,11 +189,12 @@ jobs:
       - name: Publish All Multi-Platform Assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: "AERO v1.0.0 Official Release"
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "AERO ${{ env.RELEASE_TAG }} Official Release"
           draft: false
           prerelease: false
           make_latest: true
           files: release-dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
