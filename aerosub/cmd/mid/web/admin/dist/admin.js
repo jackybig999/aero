@@ -382,6 +382,10 @@ function initEvents() {
   $('btnSaveUser')?.addEventListener('click', saveUser);
   $('btnRefreshUsers')?.addEventListener('click', () => loadUsers());
 
+  // Admin Multi-Sub Modal
+  $('btnCloseAdminMultiSubModal')?.addEventListener('click', () => $('adminMultiSubModal')?.classList.remove('active'));
+  $('btnConfirmAdminMultiSubModal')?.addEventListener('click', () => $('adminMultiSubModal')?.classList.remove('active'));
+
   // Broadcast Subs
   $('btnBroadcastSubs')?.addEventListener('click', broadcastAllSubs);
 
@@ -633,7 +637,11 @@ async function loadUsers() {
 }
 
 function renderUsers() {
-  const staff = cachedUserList.filter(u => u.is_staff);
+  const staff = cachedUserList.filter(u => u.is_staff).sort((a, b) => {
+    if (a.username === 'superadmin' || a.id === 1) return -1;
+    if (b.username === 'superadmin' || b.id === 1) return 1;
+    return a.id - b.id;
+  });
   const sub = cachedUserList.filter(u => !u.is_staff);
 
   $('btnTabStaff').textContent = `管理员 (${staff.length})`;
@@ -657,41 +665,72 @@ function renderUsers() {
         ? `<span class="tag tag-red">已过期 (${fmtDate(u.expire_at).slice(0, 10)})</span>`
         : `<span class="tag tag-green">${u.expire_at ? fmtDate(u.expire_at).slice(0, 10) : '长期有效'}</span>`);
 
-    let subUrl = '';
-    if (u.is_staff) {
-      const slug = u.sub_slug || 'superadmin';
-      subUrl = subURL(slug);
-    } else if (u.sub_slug) {
-      subUrl = subURL(u.sub_slug);
-    }
-
     let subColHtml = '';
-    if (u.is_staff) {
-      const slug = u.sub_slug || 'superadmin';
-      subUrl = subURL(slug);
-      const activeNodes = (cachedNodeList && cachedNodeList.filter(n => n.status)) || [];
-      const liveCount = activeNodes.length;
+    const isSuperAdmin = u.username === 'superadmin' || u.id === 1;
 
-      if (liveCount === 0) {
+    if (u.is_staff) {
+      if (!isSuperAdmin) {
         subColHtml = `
           <td>
-            <div style="display:flex;align-items:center;gap:6px">
-              <input type="text" class="input-text" value="" placeholder="暂无可用节点 (0 个节点)" readonly style="font-size:11px;width:240px;height:24px;padding:2px 6px;color:var(--text-muted);background:rgba(255,255,255,0.02)" />
-              <button class="btn btn-sm btn-blue" disabled style="opacity:0.5;cursor:not-allowed">复制</button>
-              <span class="tag tag-red" style="white-space:nowrap">⚠️ 暂无可用节点 (0 个)</span>
-            </div>
+            <span class="tag tag-muted" style="font-size:11px;color:var(--muted)">共享 superadmin 管理订阅</span>
           </td>
         `;
       } else {
-        subColHtml = `
-          <td>
-            <div style="display:flex;align-items:center;gap:6px">
-              <input type="text" class="input-text" value="${subUrl}" readonly style="font-size:11px;width:240px;height:24px;padding:2px 6px;" />
-              <button class="btn btn-sm btn-blue" onclick="copySubUrl('${subUrl}', '${escapeHtml(u.username)}')">复制</button>
-              <span class="tag tag-amber" style="white-space:nowrap">实时管理订阅 · 已就绪 ${liveCount} 个节点</span>
-            </div>
-          </td>
-        `;
+        const onlineVpsList = (cachedVpsList && cachedVpsList.filter(v => (v.status === 'online' || v.status === true || v.status === 1) && (v.domain || v.ip))) || [];
+        const liveCount = onlineVpsList.length;
+
+        if (liveCount === 0) {
+          const anyVps = (cachedVpsList && cachedVpsList.filter(v => v.domain || v.ip)) || [];
+          if (anyVps.length === 0) {
+            subColHtml = `
+              <td>
+                <span class="tag tag-amber" style="font-size:11px">⚠️ 暂无就绪节点</span>
+              </td>
+            `;
+          } else if (anyVps.length === 1) {
+            const subUrl = `https://${anyVps[0].domain || anyVps[0].ip}/sub/superadmin`;
+            subColHtml = `
+              <td>
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span class="mono" style="font-size:11px;color:var(--text);font-weight:600">${subUrl}</span>
+                  <button class="btn btn-sm btn-blue" onclick="copySubUrl('${subUrl}', 'superadmin')">复制</button>
+                  <span class="tag tag-green" style="white-space:nowrap;font-size:10px">全协议无限制</span>
+                </div>
+              </td>
+            `;
+          } else {
+            subColHtml = `
+              <td>
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span class="tag tag-green" style="font-size:11px">已就绪 ${anyVps.length} 个节点</span>
+                  <button class="btn btn-sm btn-blue" onclick="openAdminMultiSubModal()">详细订阅</button>
+                  <span class="tag tag-amber" style="white-space:nowrap;font-size:10px">全协议无限制</span>
+                </div>
+              </td>
+            `;
+          }
+        } else if (liveCount === 1) {
+          const subUrl = `https://${onlineVpsList[0].domain || onlineVpsList[0].ip}/sub/superadmin`;
+          subColHtml = `
+            <td>
+              <div style="display:flex;align-items:center;gap:6px">
+                <span class="mono" style="font-size:11px;color:var(--text);font-weight:600">${subUrl}</span>
+                <button class="btn btn-sm btn-blue" onclick="copySubUrl('${subUrl}', 'superadmin')">复制</button>
+                <span class="tag tag-green" style="white-space:nowrap;font-size:10px">全协议无限制</span>
+              </div>
+            </td>
+          `;
+        } else {
+          subColHtml = `
+            <td>
+              <div style="display:flex;align-items:center;gap:6px">
+                <span class="tag tag-green" style="font-size:11px">已就绪 ${liveCount} 个节点</span>
+                <button class="btn btn-sm btn-blue" onclick="openAdminMultiSubModal()">详细订阅</button>
+                <span class="tag tag-amber" style="white-space:nowrap;font-size:10px">全协议无限制</span>
+              </div>
+            </td>
+          `;
+        }
       }
     } else if (u.subscriptions && u.subscriptions.length > 0) {
       const subItems = u.subscriptions.map((s, idx) => {
@@ -721,7 +760,7 @@ function renderUsers() {
         </td>
       `;
     } else if (u.sub_slug && u.plan_name && u.expire_at && new Date(u.expire_at).getTime() > Date.now()) {
-      subUrl = subURL(u.sub_slug);
+      const subUrl = subURL(u.sub_slug);
       subColHtml = `
         <td>
           <div style="display:flex;align-items:center;gap:6px">
@@ -754,7 +793,7 @@ function renderUsers() {
       <td>
         ${!u.is_staff ? `<button class="btn btn-sm" style="color:var(--green);border-color:var(--green)" onclick="openRenewModal(${u.id}, '${escapeHtml(u.username)}')">续费</button>` : ''}
         <button class="btn btn-sm" onclick="editUser(${u.id})">编辑</button>
-        <button class="btn btn-sm btn-danger" onclick="delUser(${u.id})">删除</button>
+        ${!isSuperAdmin ? `<button class="btn btn-sm btn-danger" onclick="delUser(${u.id})">删除</button>` : `<button class="btn btn-sm" disabled style="opacity:0.35;cursor:not-allowed" title="内置超级管理员禁止删除">内置</button>`}
       </td>
     `;
     tbody.appendChild(tr);
@@ -875,6 +914,41 @@ window.delUser = async (id) => {
   } catch (e) {
     alert(`删除失败: ${e.message}`);
   }
+};
+
+window.openAdminMultiSubModal = () => {
+  const modal = $('adminMultiSubModal');
+  const listEl = $('adminMultiSubList');
+  if (!modal || !listEl) return;
+
+  const onlineVpsList = (cachedVpsList && cachedVpsList.filter(v => (v.status === 'online' || v.status === true || v.status === 1) && (v.domain || v.ip))) || [];
+  const displayList = onlineVpsList.length ? onlineVpsList : ((cachedVpsList && cachedVpsList.filter(v => v.domain || v.ip)) || []);
+
+  if (displayList.length === 0) {
+    listEl.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">暂无就绪节点</div>';
+  } else {
+    listEl.innerHTML = displayList.map((v, idx) => {
+      const host = v.domain || v.ip;
+      const subUrl = `https://${host}/sub/superadmin`;
+      const name = v.name || `节点 ${idx + 1}`;
+      const isOnline = v.status === 'online' || v.status === true || v.status === 1;
+      return `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--line);border-radius:6px">
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
+              <span class="tag ${isOnline ? 'tag-green' : 'tag-amber'}" style="font-size:10px">${isOnline ? '在线' : '就绪'}</span>
+              <span style="font-weight:600;font-size:12px">${escapeHtml(name)}</span>
+              <span style="font-size:11px;color:var(--muted)">(${escapeHtml(host)})</span>
+            </div>
+            <div class="mono" style="font-size:11px;color:var(--accent);word-break:break-all">${escapeHtml(subUrl)}</div>
+          </div>
+          <button class="btn btn-sm btn-blue" style="white-space:nowrap" onclick="copySubUrl('${subUrl}', '${escapeHtml(name)}')">复制订阅</button>
+        </div>
+      `;
+    }).join('');
+  }
+
+  modal.classList.add('active');
 };
 
 async function broadcastAllSubs() {
@@ -1426,9 +1500,28 @@ async function loadAeroDiagnose(vpsId) {
     const svcActive = diag.service && diag.service.active;
     $('aeroKpiService').innerHTML = `<span class="tag ${svcActive ? 'tag-green' : 'tag-red'}">${svcActive ? 'RUNNING' : 'STOPPED'}</span>`;
 
-    // 2. Port 443
+    // 2. Port 443 / Listening Port
     const p443 = diag.ports && diag.ports.find(p => p.port === 443 && p.listen);
-    $('aeroKpiPort443').innerHTML = `<span class="tag ${p443 ? 'tag-green' : 'tag-amber'}">${p443 ? '443 监听' : '未监听'}</span>`;
+    const anyListen = diag.ports && diag.ports.find(p => p.listen);
+    const portTitleEl = $('aeroKpiPortTitle');
+    const portEl = $('aeroKpiPort443');
+    const portSubEl = $('aeroKpiPortSub');
+    if (p443) {
+      if (portTitleEl) portTitleEl.textContent = '443 协议监听';
+      if (portEl) portEl.innerHTML = '<span class="tag tag-green">已监听</span>';
+      if (portSubEl) portSubEl.style.display = 'none';
+    } else if (anyListen) {
+      if (portTitleEl) portTitleEl.textContent = `${anyListen.port} 协议监听`;
+      if (portEl) portEl.innerHTML = '<span class="tag tag-green">已监听</span>';
+      if (portSubEl) {
+        portSubEl.style.display = 'block';
+        portSubEl.textContent = `端口转发: ${anyListen.port} (详见下方)`;
+      }
+    } else {
+      if (portTitleEl) portTitleEl.textContent = '443 协议监听';
+      if (portEl) portEl.innerHTML = '<span class="tag tag-amber">未监听</span>';
+      if (portSubEl) portSubEl.style.display = 'none';
+    }
 
     // 3. Cert
     const cert = diag.cert || {};
@@ -1475,12 +1568,13 @@ async function loadAeroDiagnose(vpsId) {
     }
 
     // 8. Sub Box
-    const subUrl = subURL('superadmin');
+    const vpsHost = diag.domain || diag.ip || getPrimaryVpsDomain();
+    const subUrl = `https://${vpsHost}/sub/superadmin`;
     $('aeroSubUrlBox').textContent = subUrl;
     $('aeroSubSecretStatus').textContent = sub.secret_set === 'yes' ? '已配置就绪' : '未配置';
     $('aeroSubLocalStatus').innerHTML = `<span class="tag ${sub.local_ok ? 'tag-green' : 'tag-amber'}">${sub.local_ok ? 'OK' : 'FAIL'}</span>`;
     $('aeroSubPublicStatus').innerHTML = `<span class="tag ${sub.public_ok ? 'tag-green' : 'tag-amber'}">${sub.public_ok ? 'OK (直连畅通)' : '不可达'}</span>`;
-    $('aeroSubPreview').textContent = `https://${diag.domain || 'domain'}/sub/superadmin`;
+    $('aeroSubPreview').textContent = subUrl;
 
     // 9. Load Tokens
     await loadAeroTokens(vpsId);

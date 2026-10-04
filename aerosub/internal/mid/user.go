@@ -1425,6 +1425,12 @@ func (s *UserService) Store() UserStore {
 }
 
 func (s *UserService) DeleteUser(id uint64) error {
+	u, err := s.store.GetUser(id)
+	if err == nil && u != nil {
+		if u.Username == "superadmin" || id == 1 {
+			return fmt.Errorf("内置超级管理员禁止删除")
+		}
+	}
 	return s.store.DeleteUser(id)
 }
 
@@ -1683,7 +1689,10 @@ func (h *UserHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 
 func (h *UserHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseUint(r.PathValue("id"), 10, 64)
-	_ = h.svc.DeleteUser(id)
+	if err := h.svc.DeleteUser(id); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": 1002, "message": err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "message": "success"})
 }
 

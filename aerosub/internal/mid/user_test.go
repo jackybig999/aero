@@ -259,3 +259,42 @@ func TestSQLiteSingleWriterPool(t *testing.T) {
 		t.Fatalf("expected SQLiteLedgerStore MaxOpenConnections == 1, got %d", ledgerStore.db.Stats().MaxOpenConnections)
 	}
 }
+
+// 6. 验证内置超级管理员 superadmin 与 ID=1 禁止删除保护
+func TestSuperadminProtection(t *testing.T) {
+	uDB := NewMemoryUserStore()
+	svc := NewUserService(uDB, "test-hmac-secret-superadmin")
+
+	// 创建 superadmin
+	superAdmin, err := svc.Register(CreateUserParams{
+		Username:   "superadmin",
+		Password:   "InitialPassword123!",
+		Email:      "superadmin@example.com",
+		PlanMonths: 1,
+		IsStaff:    true,
+	})
+	if err != nil {
+		t.Fatalf("Register superadmin failed: %v", err)
+	}
+
+	// 尝试删除 superadmin
+	if err := svc.DeleteUser(superAdmin.ID); err == nil {
+		t.Fatalf("expected error when deleting superadmin, got nil")
+	}
+
+	// 创建普通用户并验证可以正常删除
+	normalUser, err := svc.Register(CreateUserParams{
+		Username:   "normaluser",
+		Password:   "NormalPassword123!",
+		Email:      "normal@example.com",
+		PlanMonths: 1,
+	})
+	if err != nil {
+		t.Fatalf("Register normal user failed: %v", err)
+	}
+
+	if err := svc.DeleteUser(normalUser.ID); err != nil {
+		t.Fatalf("failed to delete normal user: %v", err)
+	}
+}
+
