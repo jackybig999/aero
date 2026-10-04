@@ -20,7 +20,14 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/aero-protocol/aero/aeroprot/internal/client"
+)
+
+var (
+	connectLimiter = rate.NewLimiter(rate.Every(time.Second), 1)          // 1 RPS
+	probeLimiter   = rate.NewLimiter(rate.Every(200*time.Millisecond), 5) // 5 RPS
 )
 
 //go:embed ui/*
@@ -96,6 +103,10 @@ func main() {
 	// 4. 切换工作模式 (前置探测防冲撞、严格模式校验、故障原子恢复)
 	mux.HandleFunc("/api/v1/mode", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if !connectLimiter.Allow() {
+			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
@@ -200,6 +211,10 @@ func main() {
 	// 5. 启动隧道连接
 	mux.HandleFunc("/api/v1/connect", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if !connectLimiter.Allow() {
+			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
 		if err := eng.Start(); err != nil {
 			var conflictErr *client.ErrConflictingTUN
 			if errors.As(err, &conflictErr) {
@@ -231,6 +246,10 @@ func main() {
 	// 6. 断开隧道连接
 	mux.HandleFunc("/api/v1/disconnect", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if !connectLimiter.Allow() {
+			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
 		_ = eng.Stop()
 		st := eng.GetState()
 		UpdateTrayIcon(st.Mode, st.Connected)
@@ -240,6 +259,10 @@ func main() {
 	// 7. 快速连通性探针 (真实度量，消灭假数据)
 	mux.HandleFunc("/api/v1/probe", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if !probeLimiter.Allow() {
+			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
 		st := eng.GetState()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok": st.Connected && st.RttMs > 0,
@@ -250,6 +273,10 @@ func main() {
 	// 8. 真实链路延迟二测探针
 	mux.HandleFunc("/api/v1/ping", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if !probeLimiter.Allow() {
+			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
@@ -290,7 +317,65 @@ func main() {
 		})
 	})
 
-	// 8. 嵌入 Web 前端静态资源
+	// 10. 供应商线路节点列表
+	mux.HandleFunc("/api/v1/nodes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		nodes := eng.GetNodes()
+		if nodes == nil {
+			nodes = []client.NodeInfo{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"nodes":  nodes,
+		})
+	})
+
+	// 11. 供应商线路并发测速
+	mux.HandleFunc("/api/v1/nodes/probe", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !probeLimiter.Allow() {
+			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		nodes := eng.ProbeAllNodes(ctx)
+		if nodes == nil {
+			nodes = []client.NodeInfo{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"nodes":  nodes,
+		})
+	})
+
+	// 12. 切换激活节点 (无感热切线)
+	mux.HandleFunc("/api/v1/nodes/select", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Address string `json:"address"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": "invalid address"})
+			return
+		}
+		if err := eng.SwitchActiveNode(req.Address); err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		st := eng.GetState()
+		UpdateTrayIcon(st.Mode, st.Connected)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ok",
+			"active": req.Address,
+		})
+	})
+
+	// 13. 嵌入 Web 前端静态资源
 	mux.Handle("/", http.FileServer(http.FS(uiFS)))
 
 	apiServer := &http.Server{

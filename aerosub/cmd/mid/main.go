@@ -17,7 +17,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -49,12 +51,6 @@ func main() {
 		port = p
 	}
 
-	hmacSecret := os.Getenv("HMAC_SECRET")
-	if hmacSecret == "" {
-		hmacSecret = "dev-secret-change-me"
-		log.Printf("[SECURITY NOTICE] Using default HMAC secret. Set HMAC_SECRET in production!")
-	}
-
 	dataDir := *dataDirFlag
 	if dataDir == "" {
 		dataDir = os.Getenv("DATA_DIR")
@@ -73,6 +69,25 @@ func main() {
 	}
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		log.Fatalf("failed to init data dir: %v", err)
+	}
+
+	hmacSecret := os.Getenv("HMAC_SECRET")
+	if hmacSecret == "" {
+		keyPath := filepath.Join(dataDir, "hmac.key")
+		if b, err := os.ReadFile(keyPath); err == nil && len(strings.TrimSpace(string(b))) >= 32 {
+			hmacSecret = strings.TrimSpace(string(b))
+			log.Printf("[SECURITY] Loaded persistent HMAC secret from %s", keyPath)
+		} else {
+			raw := make([]byte, 32)
+			if _, err := rand.Read(raw); err != nil {
+				log.Fatalf("[FATAL] failed to generate CSPRNG HMAC secret: %v", err)
+			}
+			hmacSecret = hex.EncodeToString(raw)
+			if err := os.WriteFile(keyPath, []byte(hmacSecret), 0o600); err != nil {
+				log.Fatalf("[FATAL] failed to persist HMAC secret: %v", err)
+			}
+			log.Printf("[SECURITY] Generated new 256-bit persistent HMAC secret at %s", keyPath)
+		}
 	}
 
 	// 1. Double-Entry Financial Ledger & Settlement Database (aeropay.db)

@@ -361,6 +361,9 @@ type QUICServer struct {
 	connectIPProxy   *connectip.Proxy
 	h3Server         *http3.Server
 
+	udpTempl *uritemplate.Template
+	ipTempl  *uritemplate.Template
+
 	handlerMu sync.RWMutex
 	handler   http.Handler
 
@@ -393,6 +396,8 @@ func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		connectIPProxy:   &connectip.Proxy{},
 		tokenUDPCtx:      make(map[string]int),
 		maxGlobalUDP:     DefaultMaxGlobalUDP,
+		udpTempl:         uritemplate.MustNew("https://placeholder/.well-known/masque/udp/{target_host}/{target_port}/"),
+		ipTempl:          uritemplate.MustNew("https://placeholder/.well-known/masque/ip/*/*/"),
 	}
 	qs.h3Server = &http3.Server{
 		Handler:         qs,
@@ -705,26 +710,23 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 	if s.validator != nil {
 		tsStr := r.Header.Get("Aero-Timestamp")
 		nonceHex := r.Header.Get("Aero-Nonce")
-		if tsStr != "" && nonceHex != "" {
-			ts, err1 := strconv.ParseUint(tsStr, 10, 64)
-			nonceBytes, err2 := hex.DecodeString(nonceHex)
-			if err1 != nil || err2 != nil || len(nonceBytes) != 32 || !s.validator.ValidateFull(token, ts, nonceBytes) {
-				if s.authJail != nil {
-					s.authJail.RecordFailure(remoteIP)
-				}
-				w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-				w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
-				w.WriteHeader(http.StatusUnauthorized)
-				return "", false
-			}
-			return token, true
-		}
-		if !s.validator.Validate(token) {
+		if tsStr == "" || nonceHex == "" {
 			if s.authJail != nil {
 				s.authJail.RecordFailure(remoteIP)
 			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-			w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
+			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="missing timestamp or nonce on fallback"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return "", false
+		}
+		ts, err1 := strconv.ParseUint(tsStr, 10, 64)
+		nonceBytes, err2 := hex.DecodeString(nonceHex)
+		if err1 != nil || err2 != nil || len(nonceBytes) != 32 || !s.validator.ValidateFull(token, ts, nonceBytes) {
+			if s.authJail != nil {
+				s.authJail.RecordFailure(remoteIP)
+			}
+			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
+			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="invalid timestamp, nonce or signature"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return "", false
 		}
@@ -840,8 +842,13 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpl := uritemplate.MustNew("https://" + r.Host + "/.well-known/masque/udp/{target_host}/{target_port}/")
-	proxyReq, err := masque.ParseProxyRequest(r, tmpl)
+	origHost := r.Host
+	r.Host = "placeholder"
+	proxyReq, err := masque.ParseProxyRequest(r, s.udpTempl)
+	r.Host = origHost
+	if proxyReq != nil {
+		proxyReq.Host = origHost
+	}
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -906,30 +913,34 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpl := uritemplate.MustNew("https://" + r.Host + "/.well-known/masque/ip/*/*/")
-	proxyReq, err := connectip.ParseProxyRequest(r, tmpl)
+	origHost := r.Host
+	r.Host = "placeholder"
+	proxyReq, err := connectip.ParseProxyRequest(r, s.ipTempl)
+	r.Host = origHost
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	if s.ipPool != nil && !s.ipPool.Available() {
+	if s.ipPool == nil {
+		w.Header().Set("Proxy-Status", `aero; error=address_pool_exhausted; details="IP pool not configured"`)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	assignedPrefix, err := s.ipPool.Allocate()
+	if err != nil {
 		w.Header().Set("Proxy-Status", "aero; error=address_pool_exhausted; details=\"IP pool exhausted\"")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+	defer s.ipPool.Release(assignedPrefix)
 
 	conn, err := s.connectIPProxy.Proxy(w, proxyReq)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-
-	assignedPrefix, err := s.ipPool.Allocate()
-	if err != nil {
-		return
-	}
-	defer s.ipPool.Release(assignedPrefix)
 
 	if err := conn.AssignAddresses([]netip.Prefix{assignedPrefix}); err != nil {
 		return

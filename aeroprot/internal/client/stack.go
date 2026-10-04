@@ -222,8 +222,10 @@ func (e *StackEngine) pumpTunToStack() {
 			proto = header.IPv6ProtocolNumber
 		}
 
+		v := buffer.NewViewSize(n)
+		copy(v.AsSlice(), raw)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(append([]byte(nil), raw...)),
+			Payload: buffer.MakeWithView(v),
 		})
 		e.gvEP.InjectInbound(proto, pkt)
 		pkt.DecRef()
@@ -442,9 +444,11 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		if !e.webrtcRelayEnabled.Load() && id.LocalPort != 3478 && id.LocalPort != 19302 && id.LocalPort != 5349 {
 			peekBuf := make([]byte, 65535)
 			_ = local.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
-			n, err := local.Read(peekBuf)
+			n, _ := local.Read(peekBuf)
 			_ = local.SetReadDeadline(time.Time{})
-			if err == nil && n > 0 {
+
+			// V-06: 只要读到数据 (n > 0)，无论是否存在 timeout 错误，均完整处理
+			if n > 0 {
 				if isSTUNPacket(peekBuf[:n]) {
 					log.Printf("[STACK] blocked deep WebRTC STUN packet to %s", dst)
 					return

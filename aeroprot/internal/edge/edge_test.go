@@ -2099,6 +2099,8 @@ func TestServeConnectIPPoolExhausted(t *testing.T) {
 	req.Header.Set("Capsule-Protocol", "?1")
 	req.RemoteAddr = "203.0.113.99:54321"
 	req.Header.Set("Authorization", "Bearer valid_token")
+	req.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	req.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
 	rec := httptest.NewRecorder()
 
 	qs.serveConnectIP(rec, req)
@@ -2167,5 +2169,111 @@ func TestServerConfigAndSubServerECH(t *testing.T) {
 	}
 	if parsedSub.ECH != "AERO_ECH_NODE_CONFIG" {
 		t.Fatalf("expected SubServer ECH 'AERO_ECH_NODE_CONFIG', got %q", parsedSub.ECH)
+	}
+}
+
+func TestAuthValidateConstantTime(t *testing.T) {
+	v := NewValidator()
+	v.AddToken("tok_valid", "user1", 1*time.Hour)
+	v.AddToken("tok_expired", "user2", -1*time.Minute)
+
+	if !v.Validate("tok_valid") {
+		t.Fatal("expected tok_valid to be valid")
+	}
+	if v.Validate("tok_expired") {
+		t.Fatal("expected tok_expired to be invalid")
+	}
+	if v.Validate("tok_nonexistent") {
+		t.Fatal("expected tok_nonexistent to be invalid")
+	}
+	if v.Validate("") {
+		t.Fatal("expected empty token to be invalid")
+	}
+}
+
+func TestAuthFailureJailRWMutexConcurrency(t *testing.T) {
+	jail := NewAuthFailureJail()
+	defer jail.Close()
+
+	var wg sync.WaitGroup
+	ip := "192.0.2.100"
+
+	// 20 concurrent readers
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := 0; k < 100; k++ {
+				_ = jail.IsBanned(ip)
+			}
+		}()
+	}
+
+	// 5 concurrent writers
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := 0; k < 20; k++ {
+				jail.RecordFailure(ip)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if !jail.IsBanned(ip) {
+		t.Fatal("expected IP to be banned after recorded failures")
+	}
+}
+
+func TestAuthRequestEnforcesValidateFull(t *testing.T) {
+	v := NewValidator()
+	tok := "auth_test_tok"
+	v.AddToken(tok, "user", 1*time.Hour)
+	qs := NewQUICServer(v, nil, nil, nil, nil)
+	defer qs.Close()
+
+	// 1. Missing timestamp & nonce -> 401
+	req1 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req1.Header.Set("Authorization", "Bearer "+tok)
+	rec1 := httptest.NewRecorder()
+	tokRet1, ok1 := qs.authRequest(rec1, req1)
+	if ok1 || tokRet1 != "" || rec1.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on missing timestamp/nonce, got code=%d ok=%v", rec1.Code, ok1)
+	}
+
+	// 2. Invalid timestamp/nonce -> 401
+	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Aero-Timestamp", "not-a-number")
+	req2.Header.Set("Aero-Nonce", "0102")
+	rec2 := httptest.NewRecorder()
+	tokRet2, ok2 := qs.authRequest(rec2, req2)
+	if ok2 || tokRet2 != "" || rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on invalid timestamp/nonce, got code=%d ok=%v", rec2.Code, ok2)
+	}
+
+	// 3. Valid timestamp & nonce -> 200 / success
+	req3 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req3.Header.Set("Authorization", "Bearer "+tok)
+	req3.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	req3.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+	rec3 := httptest.NewRecorder()
+	tokRet3, ok3 := qs.authRequest(rec3, req3)
+	if !ok3 || tokRet3 != tok {
+		t.Fatalf("expected auth success, got ok=%v tok=%s", ok3, tokRet3)
+	}
+}
+
+func TestPrecompiledTemplatesInitialized(t *testing.T) {
+	qs := NewQUICServer(nil, nil, nil, nil, nil)
+	defer qs.Close()
+
+	if qs.udpTempl == nil {
+		t.Fatal("expected udpTempl to be initialized")
+	}
+	if qs.ipTempl == nil {
+		t.Fatal("expected ipTempl to be initialized")
 	}
 }

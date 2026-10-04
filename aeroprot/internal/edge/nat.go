@@ -177,8 +177,10 @@ func (r *UserSpaceNATRouter) pumpInbound() {
 			proto = header.IPv6ProtocolNumber
 		}
 
+		v := buffer.NewViewSize(n)
+		copy(v.AsSlice(), raw)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(append([]byte(nil), raw...)),
+			Payload: buffer.MakeWithView(v),
 		})
 		r.gvEP.InjectInbound(proto, pkt)
 		pkt.DecRef()

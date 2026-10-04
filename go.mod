@@ -12,6 +12,7 @@ require (
 	golang.org/x/crypto v0.56.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/time v0.7.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
 	modernc.org/sqlite v1.59.0
 )
@@ -28,7 +29,6 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/time v0.7.0 // indirect
 	modernc.org/libc v1.76.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect

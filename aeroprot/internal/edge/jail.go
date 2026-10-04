@@ -18,7 +18,7 @@ type jailEntry struct {
 
 // AuthFailureJail tracks failed authentications and bans abusing IPs.
 type AuthFailureJail struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	records map[string]*jailEntry
 	stopCh  chan struct{}
 }
@@ -82,8 +82,8 @@ func (j *AuthFailureJail) IsBanned(ip string) bool {
 	if ip == "" {
 		return false
 	}
-	j.mu.Lock()
-	defer j.mu.Unlock()
+	j.mu.RLock()
+	defer j.mu.RUnlock()
 
 	entry, ok := j.records[ip]
 	if !ok {

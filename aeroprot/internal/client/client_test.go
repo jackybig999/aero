@@ -1989,3 +1989,130 @@ func TestStackValidFakeIPAcquireLifecycle(t *testing.T) {
 		t.Fatalf("expected refCount=0 after connection closed, got %d", refAfter)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// 阶段二与三测试：NodeInfo 状态测试与 ProbeAllNodes 并发测速测试
+// -----------------------------------------------------------------------------
+
+func TestNodeInfoState(t *testing.T) {
+	eng := NewEngine()
+
+	// 1. 未应用订阅时，GetNodes 返回 nil
+	if nodes := eng.GetNodes(); nodes != nil {
+		t.Fatalf("expected nil nodes when no sub applied, got %v", nodes)
+	}
+
+	applied := &Applied{
+		Servers: []ServerConfig{
+			{Name: "HK-01", Address: "192.0.2.1:443", Token: "tok_1", SNI: "hk.example.com", LineType: "专线"},
+			{Name: "JP-02", Address: "192.0.2.2:443", Token: "tok_2", SNI: "jp.example.com", LineType: "BGP"},
+			{Address: "192.0.2.3:443", Token: "tok_3", SNI: "us.example.com", LineType: "直连"},
+		},
+		Tokens: map[string]string{
+			"192.0.2.1:443": "tok_1",
+			"192.0.2.2:443": "tok_2",
+			"192.0.2.3:443": "tok_3",
+		},
+		SNIs: map[string]string{
+			"192.0.2.1:443": "hk.example.com",
+			"192.0.2.2:443": "jp.example.com",
+			"192.0.2.3:443": "us.example.com",
+		},
+	}
+
+	// 2. 应用订阅，默认主节点激活
+	if err := eng.Apply(applied); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	nodes := eng.GetNodes()
+	if len(nodes) != 3 {
+		t.Fatalf("expected 3 nodes, got %d", len(nodes))
+	}
+
+	// 第一个节点 HK-01 应为 Active
+	if !nodes[0].Active || nodes[0].Address != "192.0.2.1:443" || nodes[0].Name != "HK-01" {
+		t.Fatalf("expected node[0] active with name HK-01, got %+v", nodes[0])
+	}
+	if nodes[1].Active || nodes[2].Active {
+		t.Fatalf("expected non-primary nodes inactive, got node[1]=%v, node[2]=%v", nodes[1].Active, nodes[2].Active)
+	}
+	// 第三个节点无 Name，但有 LineType，名字应为 "直连 (192.0.2.3:443)"
+	if nodes[2].Name != "直连 (192.0.2.3:443)" {
+		t.Fatalf("expected formatted name for node[2], got %q", nodes[2].Name)
+	}
+
+	// 3. 切换激活节点测试
+	if err := eng.SwitchActiveNode("192.0.2.2:443"); err != nil {
+		t.Fatalf("SwitchActiveNode failed: %v", err)
+	}
+
+	nodesAfter := eng.GetNodes()
+	if nodesAfter[0].Active {
+		t.Fatalf("expected node[0] inactive after switch")
+	}
+	if !nodesAfter[1].Active {
+		t.Fatalf("expected node[1] active after switch")
+	}
+}
+
+func TestProbeAllNodes(t *testing.T) {
+	eng := NewEngine()
+
+	// 1. 无订阅时，ProbeAllNodes 返回 nil
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if res := eng.ProbeAllNodes(ctx); res != nil {
+		t.Fatalf("expected nil when no sub applied, got %v", res)
+	}
+
+	// 2. 应用含有多个服务器的订阅
+	applied := &Applied{
+		Servers: []ServerConfig{
+			{Name: "Mock-1", Address: "127.0.0.1:54321", Token: "tok_1", SNI: "m1.example.com"},
+			{Name: "Mock-2", Address: "127.0.0.1:54322", Token: "tok_2", SNI: "m2.example.com"},
+			{Name: "Mock-3", Address: "127.0.0.1:54323", Token: "tok_3", SNI: "m3.example.com"},
+			{Name: "Mock-4", Address: "127.0.0.1:54324", Token: "tok_4", SNI: "m4.example.com"},
+		},
+		Tokens: map[string]string{
+			"127.0.0.1:54321": "tok_1",
+			"127.0.0.1:54322": "tok_2",
+			"127.0.0.1:54323": "tok_3",
+			"127.0.0.1:54324": "tok_4",
+		},
+		SNIs: map[string]string{
+			"127.0.0.1:54321": "m1.example.com",
+			"127.0.0.1:54322": "m2.example.com",
+			"127.0.0.1:54323": "m3.example.com",
+			"127.0.0.1:54324": "m4.example.com",
+		},
+	}
+	if err := eng.Apply(applied); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// 3. 短超时探针探测并发与无锁快照
+	probeCtx, pCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer pCancel()
+
+	results := eng.ProbeAllNodes(probeCtx)
+	if len(results) != 4 {
+		t.Fatalf("expected 4 probe results, got %d", len(results))
+	}
+
+	for i, r := range results {
+		if r.Address != applied.Servers[i].Address {
+			t.Errorf("result %d address mismatch: got %s, want %s", i, r.Address, applied.Servers[i].Address)
+		}
+		if r.LastProbeAt == "" {
+			t.Errorf("result %d LastProbeAt should not be empty", i)
+		}
+		// 目标端口未开放，探针应优雅降级为 Reachable == false, LatencyMs == -1
+		if r.Reachable {
+			t.Errorf("expected unreachable for closed port, got reachable: %+v", r)
+		}
+		if r.LatencyMs != -1 {
+			t.Errorf("expected -1 latency for unreachable node, got %d", r.LatencyMs)
+		}
+	}
+}

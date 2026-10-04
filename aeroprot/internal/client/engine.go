@@ -989,12 +989,13 @@ func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
 			return DialPhysicalDirect(c, network, addr)
 		},
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion: tls.VersionTLS13,
 		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          10,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	client := &http.Client{
@@ -1478,4 +1479,167 @@ func (e *Engine) handleSocks5UDPAssociate(tcpConn net.Conn, clientHost string, c
 
 		_, _ = entry.remote.Write(payload)
 	}
+}
+
+// NodeInfo 表示供应商线路节点的运行与探测状态
+type NodeInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Address     string `json:"address"`
+	SNI         string `json:"sni"`
+	LineType    string `json:"line_type,omitempty"`
+	Active      bool   `json:"active"`
+	Reachable   bool   `json:"reachable"`
+	LatencyMs   int64  `json:"latency_ms"`
+	LastProbeAt string `json:"last_probe_at,omitempty"`
+}
+
+// GetNodes 提取当前节点状态快照
+func (e *Engine) GetNodes() []NodeInfo {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.appliedSub == nil || len(e.appliedSub.Servers) == 0 {
+		return nil
+	}
+	res := make([]NodeInfo, 0, len(e.appliedSub.Servers))
+	for _, s := range e.appliedSub.Servers {
+		name := s.Address
+		if s.Name != "" {
+			name = s.Name
+		} else if s.LineType != "" {
+			name = fmt.Sprintf("%s (%s)", s.LineType, s.Address)
+		}
+		info := NodeInfo{
+			ID:        s.Address,
+			Name:      name,
+			Address:   s.Address,
+			SNI:       s.SNI,
+			LineType:  s.LineType,
+			Active:    s.Address == e.activeAddr,
+			Reachable: true,
+			LatencyMs: -1,
+		}
+		res = append(res, info)
+	}
+	return res
+}
+
+// ProbeAllNodes 缺陷 D 规范：在 e.mu.RLock() 下取快照 -> 立即释放读锁 -> 8路并发无锁探测
+func (e *Engine) ProbeAllNodes(ctx context.Context) []NodeInfo {
+	e.mu.RLock()
+	var servers []ServerConfig
+	var echConfigs map[string][]byte
+	if e.appliedSub != nil {
+		servers = append(servers, e.appliedSub.Servers...)
+		if e.appliedSub.ECHConfigs != nil {
+			echConfigs = make(map[string][]byte, len(e.appliedSub.ECHConfigs))
+			for k, v := range e.appliedSub.ECHConfigs {
+				echConfigs[k] = v
+			}
+		}
+	}
+	activeAddr := e.activeAddr
+	e.mu.RUnlock() // 立即释放读锁，严禁持锁进行网络探测
+
+	if len(servers) == 0 {
+		return nil
+	}
+
+	type probeResult struct {
+		idx       int
+		reachable bool
+		rttMs     int64
+	}
+
+	results := make([]NodeInfo, len(servers))
+	for i, s := range servers {
+		name := s.Address
+		if s.Name != "" {
+			name = s.Name
+		} else if s.LineType != "" {
+			name = fmt.Sprintf("%s (%s)", s.LineType, s.Address)
+		}
+		results[i] = NodeInfo{
+			ID:        s.Address,
+			Name:      name,
+			Address:   s.Address,
+			SNI:       s.SNI,
+			LineType:  s.LineType,
+			Active:    s.Address == activeAddr,
+			Reachable: false,
+			LatencyMs: -1,
+		}
+	}
+
+	jobs := make(chan int, len(servers))
+	resChan := make(chan probeResult, len(servers))
+
+	workers := 8
+	if len(servers) < workers {
+		workers = len(servers)
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				srv := servers[idx]
+				host, portStr, err := net.SplitHostPort(srv.Address)
+				if err != nil {
+					host = srv.Address
+					portStr = "443"
+				}
+				port := 443
+				if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
+					port = p
+				}
+				ip, rerr := resolvePhysicalIPv4(host)
+				if rerr != nil || ip == nil {
+					resChan <- probeResult{idx: idx, reachable: false, rttMs: -1}
+					continue
+				}
+
+				cfg := DefaultTransportConfig(srv.Address, srv.SNI)
+				cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
+				cfg.ConnectTimeout = 2500 * time.Millisecond
+				if echConfigs != nil {
+					if c, ok := echConfigs[srv.Address]; ok && len(c) > 0 {
+						cfg.ECHConfigList = c
+					}
+				}
+
+				probeCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+				start := time.Now()
+				cl, dialErr := Dial(probeCtx, cfg)
+				cancel()
+
+				if dialErr != nil {
+					resChan <- probeResult{idx: idx, reachable: false, rttMs: -1}
+					continue
+				}
+				rtt := time.Since(start).Milliseconds()
+				_ = cl.Close() // 测完立即关闭，绝不入池
+
+				resChan <- probeResult{idx: idx, reachable: true, rttMs: rtt}
+			}
+		}()
+	}
+
+	for i := range servers {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	close(resChan)
+
+	nowStr := time.Now().Format("15:04:05")
+	for r := range resChan {
+		results[r.idx].Reachable = r.reachable
+		results[r.idx].LatencyMs = r.rttMs
+		results[r.idx].LastProbeAt = nowStr
+	}
+
+	return results
 }

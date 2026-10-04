@@ -6,6 +6,105 @@
     <meta name="theme-color" content="#0c111c" />
     <title>AERO</title>
     <link rel="stylesheet" href="style.css" />
+    <style>
+      .nodes-card { margin-top: 10px; }
+      .node-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: #0a0f18;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 10px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+      .node-item:hover {
+        border-color: var(--blue);
+        background: #0f172a;
+      }
+      .node-item.active {
+        border-color: var(--blue);
+        background: #132238;
+      }
+      .node-info-col {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .node-name-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .node-name {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 220px;
+      }
+      .node-addr {
+        font-size: 10px;
+        color: var(--muted);
+        font-family: monospace;
+      }
+      .node-badge-wrap {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .badge-connected {
+        font-size: 10px;
+        font-weight: 700;
+        color: var(--blue);
+        background: rgba(59, 130, 246, 0.15);
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(59, 130, 246, 0.3);
+      }
+      .latency-badge {
+        font-size: 10px;
+        font-weight: 700;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-family: monospace;
+      }
+      .lat-green {
+        background: rgba(34, 197, 94, 0.15);
+        color: #22c55e;
+        border: 1px solid rgba(34, 197, 94, 0.3);
+      }
+      .lat-yellow {
+        background: rgba(234, 179, 8, 0.15);
+        color: #eab308;
+        border: 1px solid rgba(234, 179, 8, 0.3);
+      }
+      .lat-red {
+        background: rgba(239, 68, 68, 0.15);
+        color: #ef4444;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+      }
+      .lat-gray {
+        background: rgba(139, 155, 180, 0.15);
+        color: var(--muted);
+        border: 1px solid rgba(139, 155, 180, 0.3);
+      }
+      @keyframes pulse-ring {
+        0% { transform: scale(1); opacity: 1; }
+        50% { transform: scale(1.03); opacity: 0.75; }
+        100% { transform: scale(1); opacity: 1; }
+      }
+      .probing-pulse {
+        animation: pulse-ring 1s infinite ease-in-out;
+        pointer-events: none;
+        opacity: 0.85;
+      }
+    </style>
   </head>
   <body>
     <div class="app">
@@ -151,6 +250,20 @@
             </div>
             <button type="button" id="btnSyncGeo" class="badge-btn ghost">🔄 同步</button>
           </div>
+        </div>
+      </section>
+
+      <!-- 供应商线路看板：展示所有节点、实时测速、点击切线 -->
+      <section class="card nodes-card" id="nodesCard">
+        <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-weight:700;">供应商线路</span>
+            <span id="nodesCountBadge" class="tag-sm tag-blue" style="font-size:10px;">0 节点</span>
+          </div>
+          <button type="button" id="btnProbeAllNodes" class="badge-btn" style="cursor:pointer;padding:4px 8px;font-size:11px;font-weight:600;">⚡ 测速全部线路</button>
+        </div>
+        <div id="nodesList" class="nodes-list" style="margin-top:8px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto;padding-right:2px;">
+          <div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">暂无线路数据，请先载入订阅</div>
         </div>
       </section>
 

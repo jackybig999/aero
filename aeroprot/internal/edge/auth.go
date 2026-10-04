@@ -70,11 +70,9 @@ func (v *Validator) Validate(token string) bool {
 		return false
 	}
 
-	if time.Now().After(info.ExpiresAt) {
-		return false
-	}
-
-	return subtle.ConstantTimeCompare([]byte(token), []byte(info.Token)) == 1
+	match := subtle.ConstantTimeCompare([]byte(token), []byte(info.Token)) == 1
+	valid := time.Now().Before(info.ExpiresAt)
+	return match && valid
 }
 
 // ValidateWithTimestamp validates token + timestamp (anti-replay, tolerance ±5 minutes)

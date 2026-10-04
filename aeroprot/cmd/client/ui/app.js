@@ -171,6 +171,19 @@ async function refreshStatus() {
       applyProbe({ ok: st.probe_ok, ms: st.probe_ms })
     }
     if (!on && !busy) applyProbe(null)
+    if (st.node && currentNodes.length > 0) {
+      let changed = false
+      currentNodes.forEach((n) => {
+        const shouldBeActive = (n.address === st.node)
+        if (n.active !== shouldBeActive) {
+          n.active = shouldBeActive
+          changed = true
+        }
+      })
+      if (changed) renderNodes(currentNodes)
+    } else if (currentNodes.length === 0 && st.connected) {
+      fetchNodes()
+    }
   } catch {
     if (!busy) setState('off', t('ready'))
   }
@@ -200,6 +213,7 @@ async function ensureImported(strict = false) {
     } catch {}
     const imp = await api('POST', '/api/v1/import', { sub })
     if (imp && (imp.status === 'error' || imp.error)) throw new Error(imp.error || 'import')
+    fetchNodes()
   } finally {
     isImporting = false
   }
@@ -231,6 +245,7 @@ async function onConnect() {
     // 1. 导入订阅并解析服务器与 Token
     const imp = await api('POST', '/api/v1/import', { sub })
     if (imp && (imp.status === 'error' || imp.error)) throw new Error(imp.error || 'import')
+    fetchNodes()
     
     // 2. 设定工作模式
     const mode = selectedMode()
@@ -576,6 +591,154 @@ function doClientLogout() {
   msg('已退出账号登录')
 }
 
+let currentNodes = []
+let isProbingNodes = false
+
+function getLatencyClass(lat, reachable, probed) {
+  if (!probed) return 'lat-gray'
+  if (!reachable || lat < 0) return 'lat-gray'
+  if (lat < 100) return 'lat-green'
+  if (lat <= 200) return 'lat-yellow'
+  return 'lat-red'
+}
+
+function renderNodes(nodes) {
+  const container = $('nodesList')
+  const badge = $('nodesCountBadge')
+  if (!container) return
+  if (!nodes || nodes.length === 0) {
+    container.innerHTML = '<div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">暂无线路数据，请先载入订阅</div>'
+    if (badge) badge.textContent = '0 节点'
+    return
+  }
+  if (badge) badge.textContent = nodes.length + ' 节点'
+  container.innerHTML = ''
+
+  nodes.forEach((n) => {
+    const item = document.createElement('div')
+    item.className = 'node-item' + (n.active ? ' active' : '')
+    item.setAttribute('data-addr', n.address)
+
+    const infoCol = document.createElement('div')
+    infoCol.className = 'node-info-col'
+
+    const nameRow = document.createElement('div')
+    nameRow.className = 'node-name-row'
+
+    const nameSpan = document.createElement('span')
+    nameSpan.className = 'node-name'
+    nameSpan.textContent = n.name || n.address
+    nameRow.appendChild(nameSpan)
+
+    if (n.line_type) {
+      const typeTag = document.createElement('span')
+      typeTag.className = 'tag-sm tag-blue'
+      typeTag.style.fontSize = '9px'
+      typeTag.style.padding = '1px 4px'
+      typeTag.textContent = n.line_type
+      nameRow.appendChild(typeTag)
+    }
+    infoCol.appendChild(nameRow)
+
+    const addrSpan = document.createElement('span')
+    addrSpan.className = 'node-addr'
+    addrSpan.textContent = n.address
+    infoCol.appendChild(addrSpan)
+
+    item.appendChild(infoCol)
+
+    const badgeWrap = document.createElement('div')
+    badgeWrap.className = 'node-badge-wrap'
+
+    if (n.active) {
+      const activeTag = document.createElement('span')
+      activeTag.className = 'badge-connected'
+      activeTag.textContent = '已连接'
+      badgeWrap.appendChild(activeTag)
+    }
+
+    const latBadge = document.createElement('span')
+    const probed = !!n.last_probe_at
+    latBadge.className = 'latency-badge ' + getLatencyClass(n.latency_ms, n.reachable, probed)
+    if (!probed) {
+      latBadge.textContent = '—'
+    } else if (!n.reachable || n.latency_ms < 0) {
+      latBadge.textContent = '超时'
+    } else {
+      latBadge.textContent = n.latency_ms + 'ms'
+    }
+    badgeWrap.appendChild(latBadge)
+
+    item.appendChild(badgeWrap)
+
+    item.onclick = async () => {
+      if (n.active) return
+      await selectNode(n.address)
+    }
+
+    container.appendChild(item)
+  })
+}
+
+async function selectNode(addr) {
+  try {
+    msg('正在切换节点至 ' + addr + '...', 'info')
+    const res = await api('POST', '/api/v1/nodes/select', { address: addr })
+    if (res && res.status === 'ok') {
+      msg('已平滑切换至节点: ' + addr, 'ok')
+      await fetchNodes()
+      await refreshStatus()
+    } else {
+      msg('切换节点失败: ' + (res.error || '未知错误'), 'err')
+    }
+  } catch (e) {
+    msg('切换节点请求异常: ' + (e.message || String(e)), 'err')
+  }
+}
+
+async function fetchNodes() {
+  try {
+    const res = await api('GET', '/api/v1/nodes')
+    if (res && res.status === 'ok' && Array.isArray(res.nodes)) {
+      currentNodes = res.nodes
+      renderNodes(currentNodes)
+    }
+  } catch {}
+}
+
+async function probeAllNodes() {
+  if (isProbingNodes) return
+  isProbingNodes = true
+  const btn = $('btnProbeAllNodes')
+  if (btn) {
+    btn.classList.add('probing-pulse')
+    btn.disabled = true
+    btn.textContent = '⚡ 测速中...'
+  }
+  msg('正在并发测速全部线路...', 'info')
+  try {
+    const res = await api('POST', '/api/v1/nodes/probe')
+    if (res && res.status === 'ok' && Array.isArray(res.nodes)) {
+      currentNodes = res.nodes
+      renderNodes(currentNodes)
+      msg('全部线路测速完成', 'ok')
+    } else if (res && res.code === 'RATE_LIMITED') {
+      msg('测速请求过于频繁，请稍候再试', 'err')
+    } else {
+      msg('测速返回异常: ' + (res.error || '未知错误'), 'err')
+    }
+  } catch (e) {
+    msg('测速执行失败: ' + (e.message || String(e)), 'err')
+  } finally {
+    if (btn) {
+      btn.classList.remove('probing-pulse')
+      btn.disabled = false
+      btn.textContent = '⚡ 测速全部线路'
+    }
+    isProbingNodes = false
+  }
+}
+
 function init() {
   try {
     lang = localStorage.getItem(LANG_KEY) || 'zh-CN'
@@ -793,9 +956,14 @@ function init() {
     }
   }
 
+  if ($('btnProbeAllNodes')) {
+    $('btnProbeAllNodes').onclick = probeAllNodes
+  }
+
+  fetchNodes()
   setInterval(refreshStatus, 2000)
   refreshStatus()
-  ensureImported(false).catch(() => {})
+  ensureImported(false).then(() => fetchNodes()).catch(() => {})
 }
 
 init()
