@@ -1508,7 +1508,7 @@ async function deployAero(action, customPort = 0) {
       method: 'POST',
       body: JSON.stringify(payload)
     });
-    const taskId = res.task_id || (res.data && res.data.task_id);
+    const taskId = res.id || res.task_id || (res.data && (res.data.id || res.data.task_id));
     if (taskId) {
       openAeroTaskDrawer(taskId, action);
     } else {
@@ -1709,15 +1709,35 @@ function initAeroEvents() {
   });
   $('btnAeroRestart')?.addEventListener('click', () => deployAero('restart'));
 
-  // 安装 / 升级 直接拉起调度流水线抽屉 (无冗余弹窗)
+  // 安装 / 升级 独立弹窗面板
   $('btnAeroInstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    deployAero('install', 443);
+    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
+    const targetName = v ? `${v.name} (${v.domain || v.ip}:${v.ssh_port || 22})` : `VPS #${currentAeroVpsId}`;
+    $('installModalVpsName').value = targetName;
+    $('installModalPort').value = '443';
+    $('aeroInstallModal').classList.add('active');
+  });
+  $('btnCancelInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
+  $('btnCloseInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
+  $('btnConfirmInstallModal')?.addEventListener('click', () => {
+    $('aeroInstallModal').classList.remove('active');
+    const port = parseInt($('installModalPort').value.trim(), 10) || 443;
+    deployAero('install', port);
   });
 
-  // 深度卸载 直接拉起调度流水线抽屉并在面板内展示危险警告 (无冗余弹窗)
+  // 深度卸载 独立弹窗面板
   $('btnAeroUninstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
+    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
+    const targetName = v ? `${v.name} (${v.domain || v.ip})` : `VPS #${currentAeroVpsId}`;
+    $('uninstallModalVpsName').value = targetName;
+    $('aeroUninstallModal').classList.add('active');
+  });
+  $('btnCancelUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
+  $('btnCloseUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
+  $('btnConfirmUninstallModal')?.addEventListener('click', () => {
+    $('aeroUninstallModal').classList.remove('active');
     deployAero('uninstall');
   });
   

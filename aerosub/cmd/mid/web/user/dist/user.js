@@ -92,7 +92,8 @@
     document.getElementById('authWrap').style.display = 'none';
     document.getElementById('appLayout').style.display = 'flex';
     const uname = (currentUser && currentUser.username) || '用户';
-    document.getElementById('userName').textContent = uname;
+    const uEl = document.getElementById('userName');
+    if (uEl) uEl.textContent = uname;
     const topEl = document.getElementById('topUserName');
     if (topEl) topEl.textContent = uname;
     document.getElementById('userBadge').textContent = uname[0].toUpperCase();
