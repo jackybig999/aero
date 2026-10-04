@@ -9,7 +9,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -153,5 +155,173 @@ func TestUDPUnavailableFallback_NoTUN_Port55555Listening(t *testing.T) {
 	_ = eng.Stop()
 	if eng.mixedListener != nil {
 		t.Fatal("mixed listener must be closed after Stop()")
+	}
+}
+
+// TestPhase8Gate_MobilePipelineTeardown (Phase 8 Gate)
+// 验证移动端控制器管道双向流转与优雅退出
+func TestPhase8Gate_MobilePipelineTeardown(t *testing.T) {
+	tunSide, testTun := net.Pipe()
+	ipSide, testIP := net.Pipe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctrl := StartMobileTunnel(ctx, tunSide, ipSide)
+
+	// 1. 验证数据双向流转成功
+	tunPacket := []byte{0x45, 0x00, 0x00, 0x20, 0x01, 0x02, 0x03, 0x04, 0x10, 0x20, 0x30, 0x40}
+	ipPacket := []byte{0x45, 0x00, 0x00, 0x20, 0x05, 0x06, 0x07, 0x08, 0x50, 0x60, 0x70, 0x80}
+
+	errCh := make(chan error, 2)
+	go func() {
+		buf := make([]byte, 1024)
+		n, err := testIP.Read(buf)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if !bytes.Equal(buf[:n], tunPacket) {
+			errCh <- fmt.Errorf("tun->ip packet mismatch: got %x, want %x", buf[:n], tunPacket)
+			return
+		}
+		errCh <- nil
+	}()
+
+	if _, err := testTun.Write(tunPacket); err != nil {
+		t.Fatalf("write to testTun failed: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("tun->ip verification failed: %v", err)
+	}
+
+	go func() {
+		buf := make([]byte, 1024)
+		n, err := testTun.Read(buf)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if !bytes.Equal(buf[:n], ipPacket) {
+			errCh <- fmt.Errorf("ip->tun packet mismatch: got %x, want %x", buf[:n], ipPacket)
+			return
+		}
+		errCh <- nil
+	}()
+
+	if _, err := testIP.Write(ipPacket); err != nil {
+		t.Fatalf("write to testIP failed: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("ip->tun verification failed: %v", err)
+	}
+
+	// 2. 调用 Stop()，验证在 200ms 内 done 通道关闭
+	stopStart := time.Now()
+	stopErr := ctrl.Stop()
+	elapsed := time.Since(stopStart)
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("Stop() took %v, exceeded 200ms budget", elapsed)
+	}
+	if stopErr != nil {
+		t.Fatalf("Stop() returned unexpected error: %v", stopErr)
+	}
+
+	select {
+	case <-ctrl.done:
+	default:
+		t.Fatalf("ctrl.done channel not closed after Stop()")
+	}
+
+	// 3. 验证双端句柄安全释放 (底层已关闭，写入报错)
+	_, tunErr := testTun.Write([]byte{0x01})
+	if tunErr == nil {
+		t.Fatalf("expected write to testTun to fail after Stop(), got nil")
+	}
+	_, ipErr := testIP.Write([]byte{0x01})
+	if ipErr == nil {
+		t.Fatalf("expected write to testIP to fail after Stop(), got nil")
+	}
+	_ = testTun.Close()
+	_ = testIP.Close()
+
+	// 4. 验证零协程泄露 (CopyTunnel goroutines fully reaped)
+	for i := 0; i < 20; i++ {
+		time.Sleep(5 * time.Millisecond)
+		buf := make([]byte, 65536)
+		n := runtime.Stack(buf, true)
+		stackStr := string(buf[:n])
+		if !strings.Contains(stackStr, "CopyTunnel.func") && !strings.Contains(stackStr, "StartMobileTunnel.func") {
+			break
+		}
+		if i == 19 {
+			t.Fatalf("goroutine leak detected in CopyTunnel:\n%s", stackStr)
+		}
+	}
+}
+
+// TestFinalGate_MobileBufPool 验证 1500 字节缓冲池正常流转与快速释放及移动端运行时压制
+func TestFinalGate_MobileBufPool(t *testing.T) {
+	// 1. 验证移动端运行时压制函数可无错误执行
+	InitMobileRuntime()
+
+	// 2. 验证缓冲池获取到的对象为 1500 字节切片
+	bufPtr := mobileBufPool.Get().(*[]byte)
+	if bufPtr == nil {
+		t.Fatalf("expected non-nil buffer pointer from mobileBufPool")
+	}
+	if len(*bufPtr) != 1500 {
+		t.Fatalf("expected buffer length 1500, got %d", len(*bufPtr))
+	}
+	// 归还缓冲池
+	mobileBufPool.Put(bufPtr)
+
+	// 3. 验证通过 CopyTunnel 正常传输完整 1500 字节 MTU 数据包
+	tunSide, testTun := net.Pipe()
+	defer testTun.Close()
+	ipSide, testIP := net.Pipe()
+	defer testIP.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- CopyTunnel(ctx, tunSide, ipSide)
+	}()
+
+	packet1500 := make([]byte, 1500)
+	packet1500[0] = 0x45 // IPv4
+	packet1500[1499] = 0xFF
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		recvBuf := make([]byte, 2000)
+		n, err := testIP.Read(recvBuf)
+		if err != nil {
+			t.Errorf("read from testIP failed: %v", err)
+			return
+		}
+		if n != 1500 || !bytes.Equal(recvBuf[:n], packet1500) {
+			t.Errorf("packet mismatch: got %d bytes, want 1500", n)
+		}
+	}()
+
+	if _, err := testTun.Write(packet1500); err != nil {
+		t.Fatalf("write to testTun failed: %v", err)
+	}
+	wg.Wait()
+
+	// 优雅关闭并释放
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected CopyTunnel exit error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("CopyTunnel did not exit in time")
 	}
 }

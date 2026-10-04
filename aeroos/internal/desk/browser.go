@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 // KernelVersionInfo 内核版本元数据
@@ -468,12 +470,20 @@ func LaunchChrome(chromePath, dataDir string, profileID int64, proxyCfg *ProxyCo
 		"--disable-features=AudioServiceOutOfProcess,OptimizationHints,MediaRouter",
 	}
 
+	var fpScript string
 	if fpCfg != nil {
 		if fpCfg.ScreenWidth > 0 && fpCfg.ScreenHeight > 0 {
 			args = append(args, fmt.Sprintf("--window-size=%d,%d", fpCfg.ScreenWidth, fpCfg.ScreenHeight))
 		}
 		if fpCfg.UserAgent != "" {
 			args = append(args, fmt.Sprintf("--user-agent=%s", fpCfg.UserAgent))
+		}
+
+		// 方案双轨保障 (a): 自动生成内嵌扩展并通过 --load-extension 挂载注入，最早时机抹除真实指纹
+		fpScript = BuildFingerprintScript(fpCfg)
+		extDir := filepath.Join(profileUserData, "aero_fp_ext")
+		if err := BuildChromeFingerprintExtension(extDir, fpScript); err == nil {
+			args = append(args, fmt.Sprintf("--load-extension=%s", extDir))
 		}
 	}
 
@@ -517,6 +527,20 @@ func LaunchChrome(chromePath, dataDir string, profileID int64, proxyCfg *ProxyCo
 	activeInstancesMu.Lock()
 	activeInstances[profileID] = inst
 	activeInstancesMu.Unlock()
+
+	// 方案双轨保障 (b): 若 CDP 端口就绪，调用 CDP 方法 Page.addScriptToEvaluateOnNewDocument 注册注入
+	if fpScript != "" {
+		go func() {
+			if err := inst.CheckCDPReady(4 * time.Second); err == nil {
+				for retry := 0; retry < 3; retry++ {
+					if err := RegisterCDPFingerprintScript(inst.CDPPort, fpScript); err == nil {
+						break
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+			}
+		}()
+	}
 
 	go func() {
 		_ = cmd.Wait()
@@ -680,6 +704,18 @@ func GenerateFirefoxPrefs(proxyCfg *ProxyConfig, fpCfg *FingerprintConfig, mario
 
 	sb.WriteString("user_pref(\"marionette.enabled\", true);\n")
 	sb.WriteString(fmt.Sprintf("user_pref(\"marionette.port\", %d);\n", marionettePort))
+	sb.WriteString("user_pref(\"xpinstall.signatures.required\", false);\n")
+	sb.WriteString("user_pref(\"extensions.autoDisableScopes\", 0);\n")
+	sb.WriteString("user_pref(\"extensions.enabledScopes\", 15);\n")
+
+	if fpCfg != nil {
+		if fpCfg.Platform != "" {
+			sb.WriteString(fmt.Sprintf("user_pref(\"general.platform.override\", \"%s\");\n", fpCfg.Platform))
+		}
+		if fpCfg.HardwareConcurrency > 0 {
+			sb.WriteString(fmt.Sprintf("user_pref(\"dom.maxHardwareConcurrency\", %d);\n", fpCfg.HardwareConcurrency))
+		}
+	}
 
 	if proxyCfg != nil && proxyCfg.Enabled && proxyCfg.Host != "" {
 		sb.WriteString("user_pref(\"network.proxy.type\", 1);\n")
@@ -763,8 +799,16 @@ func LaunchFirefox(firefoxPath, dataDir string, profileID int64, proxyCfg *Proxy
 	}
 
 	prefsJsPath := filepath.Join(profileDir, "prefs.js")
-	if _, err := os.Stat(prefsJsPath); os.IsNotExist(err) {
-		_ = os.WriteFile(prefsJsPath, []byte(prefsContent), 0644)
+	if err := os.WriteFile(prefsJsPath, []byte(prefsContent), 0644); err != nil {
+		return nil, fmt.Errorf("挂载 prefs.js 失败: %w", err)
+	}
+
+	// 动态注入 Firefox 指纹对抗扩展
+	if fpCfg != nil {
+		extDir := filepath.Join(profileDir, "extensions")
+		_ = os.MkdirAll(extDir, 0755)
+		fpScript := BuildFingerprintScript(fpCfg)
+		_, _ = BuildFirefoxFingerprintExtension(extDir, fpScript)
 	}
 
 	args := []string{
@@ -860,13 +904,142 @@ func (f *FirefoxInstance) Stop() error {
 	return nil
 }
 
-// BuildFirefoxFingerprintExtension 动态生成 Firefox 注入扩展 (.xpi)
+// BuildChromeFingerprintExtension 动态生成 Chrome 内嵌扩展目录 (manifest v3, run_at: document_start, all_frames: true, match_about_blank: true)
+func BuildChromeFingerprintExtension(targetDir string, jsCode string) error {
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return err
+	}
+
+	manifest := `{
+  "manifest_version": 3,
+  "name": "AERO Fingerprint Shield",
+  "version": "1.0.0",
+  "description": "Native embedded fingerprint defense extension",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true,
+      "world": "MAIN"
+    }
+  ]
+}`
+
+	if err := os.WriteFile(filepath.Join(targetDir, "manifest.json"), []byte(manifest), 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "content.js"), []byte(jsCode), 0644); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RegisterCDPFingerprintScript 通过 CDP 接口调用 Page.addScriptToEvaluateOnNewDocument 注入指纹对抗代码
+func RegisterCDPFingerprintScript(cdpPort int, script string) error {
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json", cdpPort))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var targets []struct {
+		Type                 string `json:"type"`
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
+		return err
+	}
+
+	var lastErr error
+	injected := false
+	for _, target := range targets {
+		if (target.Type == "page" || target.Type == "other") && target.WebSocketDebuggerURL != "" {
+			if err := sendCDPAddScript(target.WebSocketDebuggerURL, script); err != nil {
+				lastErr = err
+			} else {
+				injected = true
+			}
+		}
+	}
+	if !injected && lastErr != nil {
+		return lastErr
+	}
+	return nil
+}
+
+func sendCDPAddScript(wsURL, script string) error {
+	ws, err := websocket.Dial(wsURL, "", "http://127.0.0.1")
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+
+	enableReq := map[string]interface{}{
+		"id":     1,
+		"method": "Page.enable",
+	}
+	if err := json.NewEncoder(ws).Encode(enableReq); err != nil {
+		return err
+	}
+
+	_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var dummy map[string]interface{}
+	_ = json.NewDecoder(ws).Decode(&dummy)
+
+	addScriptReq := map[string]interface{}{
+		"id":     2,
+		"method": "Page.addScriptToEvaluateOnNewDocument",
+		"params": map[string]interface{}{
+			"source": script,
+		},
+	}
+	if err := json.NewEncoder(ws).Encode(addScriptReq); err != nil {
+		return err
+	}
+
+	_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_ = json.NewDecoder(ws).Decode(&dummy)
+
+	return nil
+}
+
+// BuildFirefoxFingerprintExtension 动态生成 Firefox 注入扩展 (.xpi 及解压扩展目录)
 func BuildFirefoxFingerprintExtension(targetDir string, jsCode string) (string, error) {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return "", err
 	}
 	xpiPath := filepath.Join(targetDir, "fingerprint_hook.xpi")
 
+	manifest := `{
+  "manifest_version": 2,
+  "name": "AERO Fingerprint Shield",
+  "version": "1.0",
+  "applications": {
+    "gecko": {
+      "id": "fingerprint_hook@aero.local"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ]
+}`
+
+	// 1. 生成解压形式的扩展目录 (Firefox 支持直接读取扩展文件夹)
+	unpackedDir := filepath.Join(targetDir, "fingerprint_hook@aero.local")
+	_ = os.MkdirAll(unpackedDir, 0755)
+	_ = os.WriteFile(filepath.Join(unpackedDir, "manifest.json"), []byte(manifest), 0644)
+	_ = os.WriteFile(filepath.Join(unpackedDir, "content.js"), []byte(jsCode), 0644)
+
+	// 2. 打包为 .xpi 标准 Zip 包
 	out, err := os.Create(xpiPath)
 	if err != nil {
 		return "", err
@@ -876,19 +1049,6 @@ func BuildFirefoxFingerprintExtension(targetDir string, jsCode string) (string, 
 	w := zip.NewWriter(out)
 	defer w.Close()
 
-	manifest := `{
-  "manifest_version": 2,
-  "name": "Fingerprint Defense",
-  "version": "1.0",
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_start",
-      "all_frames": true
-    }
-  ]
-}`
 	f, err := w.Create("manifest.json")
 	if err != nil {
 		return "", err

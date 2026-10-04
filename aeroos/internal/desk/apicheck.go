@@ -64,8 +64,15 @@ func (v *APIVault) initDefaults() {
 func (v *APIVault) getAllLocked() []*APIProviderConfig {
 	res := make([]*APIProviderConfig, 0, len(v.providers))
 	order := []string{"openai", "anthropic", "gemini", "deepseek", "openrouter", "groq"}
+	seen := make(map[string]bool)
 	for _, id := range order {
 		if p, ok := v.providers[id]; ok {
+			res = append(res, p)
+			seen[id] = true
+		}
+	}
+	for id, p := range v.providers {
+		if !seen[id] {
 			res = append(res, p)
 		}
 	}
@@ -86,6 +93,15 @@ func (v *APIVault) SaveKey(id, key, baseURL string) {
 		p.APIKey = key
 		if baseURL != "" {
 			p.BaseURL = baseURL
+		}
+		v.saveLocked()
+	} else {
+		v.providers[id] = &APIProviderConfig{
+			ID:      id,
+			Name:    id,
+			APIKey:  key,
+			BaseURL: baseURL,
+			Status:  "untested",
 		}
 		v.saveLocked()
 	}
@@ -139,16 +155,19 @@ func (v *APIVault) saveLocked() {
 type Tester struct {
 	vault     *APIVault
 	proxyAddr string
+	client    *http.Client
 }
 
 func NewTester(vault *APIVault, proxyAddr string) *Tester {
-	if proxyAddr == "" {
-		proxyAddr = "127.0.0.1:55555"
-	}
 	return &Tester{
 		vault:     vault,
 		proxyAddr: proxyAddr,
 	}
+}
+
+// SetHTTPClient sets a custom HTTP client (useful for in-memory testing)
+func (t *Tester) SetHTTPClient(client *http.Client) {
+	t.client = client
 }
 
 func (t *Tester) TestProvider(id string) (string, int64, error) {
@@ -170,28 +189,44 @@ func (t *Tester) TestProvider(id string) (string, int64, error) {
 		return "untested", 0, fmt.Errorf("未配置 API Key")
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		DialContext: (&net.Dialer{
-			Timeout: 5 * time.Second,
-		}).DialContext,
-	}
-
-	if t.proxyAddr != "" {
-		if proxyURL, err := url.Parse("http://" + t.proxyAddr); err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
+	var client *http.Client
+	if t.client != nil {
+		client = t.client
+	} else {
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: (&net.Dialer{
+				Timeout: 5 * time.Second,
+			}).DialContext,
 		}
-	}
 
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   8 * time.Second,
+		if t.proxyAddr != "" {
+			if proxyURL, err := url.Parse("http://" + t.proxyAddr); err == nil {
+				transport.Proxy = http.ProxyURL(proxyURL)
+			}
+		}
+
+		client = &http.Client{
+			Transport: transport,
+			Timeout:   8 * time.Second,
+		}
 	}
 
 	start := time.Now()
 	testURL := target.BaseURL
 	if testURL == "" {
 		testURL = target.DefaultURL
+	}
+
+	if id == "gemini" && target.APIKey != "" {
+		if parsedURL, err := url.Parse(testURL); err == nil {
+			q := parsedURL.Query()
+			if q.Get("key") == "" {
+				q.Set("key", target.APIKey)
+				parsedURL.RawQuery = q.Encode()
+				testURL = parsedURL.String()
+			}
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -207,7 +242,7 @@ func (t *Tester) TestProvider(id string) (string, int64, error) {
 		req.Header.Set("x-api-key", target.APIKey)
 		req.Header.Set("anthropic-version", "2023-06-01")
 	} else if id == "gemini" {
-		// query params or key
+		req.Header.Set("x-goog-api-key", target.APIKey)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+target.APIKey)
 	}
@@ -215,16 +250,18 @@ func (t *Tester) TestProvider(id string) (string, int64, error) {
 	resp, err := client.Do(req)
 	latency := time.Since(start).Milliseconds()
 
-	status := "valid"
+	status := "error"
 	if err != nil {
 		status = "error"
 		GlobalLogger.Log("WARN", "APIMATRIX", fmt.Sprintf("[%s] 连通性测试异常 (%dms): %v", target.Name, latency, err))
 	} else {
 		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+			status = "valid"
+		} else if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			status = "invalid"
 		} else {
-			status = "valid"
+			status = "error"
 		}
 		GlobalLogger.Log("INFO", "APIMATRIX", fmt.Sprintf("[%s] 连通性检测完成: status=%s, code=%d, 时延=%dms", target.Name, status, resp.StatusCode, latency))
 	}

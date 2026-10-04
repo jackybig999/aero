@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +55,7 @@ type StackEngine struct {
 	udpSess            sync.Map
 	killSwitch         atomic.Bool
 	webrtcRelayEnabled atomic.Bool
+	icmpOutboundHook   func(pkt []byte)
 }
 
 // NewStackEngine 创建网络栈引擎
@@ -96,8 +98,8 @@ func (e *StackEngine) Start() error {
 	_ = s.SetPromiscuousMode(gvisorNICID, true)
 	_ = s.SetSpoofing(gvisorNICID, true)
 	s.SetRouteTable([]tcpip.Route{
-		{Destination: header.IPv4EmptySubnet, NIC: gvisorNICID},
-		{Destination: header.IPv6EmptySubnet, NIC: gvisorNICID},
+		{Destination: header.IPv4EmptySubnet, NIC: gvisorNICID, MTU: 1340},
+		{Destination: header.IPv6EmptySubnet, NIC: gvisorNICID, MTU: 1340},
 	})
 
 	protoAddr := tcpip.ProtocolAddress{
@@ -166,6 +168,11 @@ func (e *StackEngine) WebRTCActive() bool {
 	return e.webrtcRelayEnabled.Load()
 }
 
+// SetICMPOutboundHookForTest sets custom ICMP outbound hook for testing
+func (e *StackEngine) SetICMPOutboundHookForTest(hook func(pkt []byte)) {
+	e.icmpOutboundHook = hook
+}
+
 // pumpTunToStack 从虚拟网卡读包注入网络栈
 // 规则：在栈入口读取 IPv4 头 DF 标志：
 // 若 len(packet) > currentMaxDatagramSize + 24：
@@ -202,7 +209,10 @@ func (e *StackEngine) pumpTunToStack() {
 
 		// 检查 IPv4 数据报
 		if raw[0]>>4 == 4 {
-			curMax := GetCurrentMaxDatagramSize() + 24 // 初始 1200 + 24 = 1224
+			curMax := 1360
+			if dyn := GetCurrentMaxDatagramSize() + 24; dyn > 0 && dyn < curMax {
+				curMax = dyn
+			}
 			if n > curMax {
 				// 读取 DF (Don't Fragment) 标志：byte 6 bit 6 (0x40)
 				df := (raw[6] & 0x40) != 0
@@ -214,6 +224,16 @@ func (e *StackEngine) pumpTunToStack() {
 				}
 				// 无论是否回送 ICMP，超限包本身都绝不进入网络栈
 				continue
+			}
+
+			if raw[9] == 1 && n >= 28 {
+				dstIP := net.IP(raw[16:20])
+				if !dstIP.Equal(net.IPv4(10, 88, 0, 2)) && !dstIP.Equal(e.gatewayIP) {
+					if e.icmpOutboundHook != nil {
+						e.icmpOutboundHook(raw)
+						continue
+					}
+				}
 			}
 		}
 
@@ -314,6 +334,7 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 			r.Complete(true)
 			return
 		}
+		_ = ep.SetSockOptInt(tcpip.MaxSegOption, 1320)
 		r.Complete(false)
 
 		local := gonet.NewTCPConn(&wq, ep)
@@ -594,12 +615,43 @@ func getPhysicalDialerHook() func(ctx context.Context, network, addr string) (ne
 	return physicalDialerHook
 }
 
+func isUDPConn(c net.Conn) bool {
+	if c == nil {
+		return false
+	}
+	if la := c.LocalAddr(); la != nil && strings.HasPrefix(strings.ToLower(la.Network()), "udp") {
+		return true
+	}
+	if ra := c.RemoteAddr(); ra != nil && strings.HasPrefix(strings.ToLower(ra.Network()), "udp") {
+		return true
+	}
+	return false
+}
+
 func relayTraffic(a, b net.Conn) {
+	isUDP := isUDPConn(a) || isUDPConn(b)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	pipe := func(dst, src net.Conn) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		if isUDP {
+			buf := make([]byte, 65535)
+			for {
+				_ = src.SetReadDeadline(time.Now().Add(45 * time.Second))
+				n, err := src.Read(buf)
+				if n > 0 {
+					_ = src.SetReadDeadline(time.Now().Add(45 * time.Second))
+					if _, werr := dst.Write(buf[:n]); werr != nil {
+						break
+					}
+				}
+				if err != nil {
+					break
+				}
+			}
+		} else {
+			_, _ = io.Copy(dst, src)
+		}
 		_ = dst.SetDeadline(time.Now())
 	}
 	go pipe(a, b)

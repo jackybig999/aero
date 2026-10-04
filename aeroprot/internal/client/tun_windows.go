@@ -142,11 +142,11 @@ type windowsDevice struct {
 	writeMu   sync.Mutex
 }
 
-// OpenTunDevice 打开或创建 Windows Wintun 虚拟网卡（初始 MTU 1224）
+// OpenTunDevice 打开或创建 Windows Wintun 虚拟网卡（初始 MTU 1360）
 func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 	_ = ensureWintunDLL()
 	if mtu <= 0 {
-		mtu = 1224
+		mtu = 1360
 	}
 	var adapter *wintun.Adapter
 	var session wintun.Session
@@ -293,7 +293,7 @@ func SetInterfaceMTU(devName string, mtu int) error {
 }
 
 // SetupRoutes 配置 Windows 路由与网卡参数
-// 规则：初始 MTU 设为 1224；物理删除 fd88::2、IPv6 mtu=1380、::/1、8000::/1；物理删除 netsh advfirewall
+// 规则：初始 MTU 设为 1360；配置 IPv6 黑洞路由（::/1 与 8000::/1 绑定 devName）；配置 NRPT 策略解析至 TUN DNS
 func SetupRoutes(devName, ipv4 string) error {
 	if devName == "" {
 		devName = "aero0"
@@ -315,8 +315,8 @@ func SetupRoutes(devName, ipv4 string) error {
 
 	idx := interfaceIndex(devName)
 
-	// 1. 设置初始虚拟网卡 MTU 为 1224 (1200 + 24)
-	_ = SetInterfaceMTU(devName, 1224)
+	// 1. 设置初始虚拟网卡 MTU 为 1360
+	_ = SetInterfaceMTU(devName, 1360)
 
 	// 注册动态 MTU 回调
 	RegisterVirtualNICMTUSetter(func(mtu int) error {
@@ -337,11 +337,21 @@ func SetupRoutes(devName, ipv4 string) error {
 	addSplitDefault("0.0.0.0", "128.0.0.0")
 	addSplitDefault("128.0.0.0", "128.0.0.0")
 
-	// 3. 为虚拟网卡绑定纯净 DNS，使系统将 DNS 流量送入虚拟网卡，被 gVisor 端口 53 拦截处理
+	// 3. IPv6 黑洞路由：在 TUN 网卡上添加 ::/1 和 8000::/1（仅绑定 devName）
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", devName)
+	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "::/1", devName)
+	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "8000::/1", devName)
+
+	// 4. 为虚拟网卡绑定纯净 DNS，使系统将 DNS 流量送入虚拟网卡，被 gVisor 端口 53 拦截处理
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=static", "address=1.1.1.1", "validate=no")
 	_ = runCmd("netsh", "interface", "ip", "add", "dnsservers", "name="+devName, "address=8.8.8.8", "index=2", "validate=no")
 
-	log.Printf("[TUN] Routes and DNS configured on %s via %s if=%s (MTU=1224)", devName, tunIP, idx)
+	// 5. NRPT 策略配置：配置所有域名（Namespace "."）指向 TUN 网卡 DNS（tunIP），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！
+	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s' -Comment 'AERO_%s'", tunIP, devName))
+
+	log.Printf("[TUN] Routes and DNS configured on %s via %s if=%s (MTU=1360)", devName, tunIP, idx)
 	return nil
 }
 
@@ -350,6 +360,10 @@ func TeardownRoutes(devName string) {
 	if devName == "" {
 		devName = "aero0"
 	}
+	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		fmt.Sprintf("Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_%s' } | Remove-DnsClientNrptRule -Force", devName))
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", devName)
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
@@ -358,6 +372,10 @@ func TeardownRoutes(devName string) {
 
 // CleanAero0StaleRoutes 仅删除归属于 aero0 接口的 0.0.0.0/1 和 128.0.0.0/1 及 DNS，碰不到任何其他网卡
 func CleanAero0StaleRoutes() {
+	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_aero0' } | Remove-DnsClientNrptRule -Force")
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", "aero0")
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", "aero0")
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name=aero0", "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", "aero0")
@@ -669,6 +687,24 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 	return lc.ListenPacket(ctx, network, ":0")
 }
 
+var (
+	cmdExecutorMu sync.RWMutex
+	cmdExecutor   func(name string, args ...string) error
+)
+
+// SetCmdExecutorForTest sets the command execution hook for unit testing and returns a restore function.
+func SetCmdExecutorForTest(f func(name string, args ...string) error) func() {
+	cmdExecutorMu.Lock()
+	orig := cmdExecutor
+	cmdExecutor = f
+	cmdExecutorMu.Unlock()
+	return func() {
+		cmdExecutorMu.Lock()
+		cmdExecutor = orig
+		cmdExecutorMu.Unlock()
+	}
+}
+
 func runCmd(name string, args ...string) error {
 	clean := make([]string, 0, len(args))
 	for _, a := range args {
@@ -676,6 +712,14 @@ func runCmd(name string, args ...string) error {
 			clean = append(clean, a)
 		}
 	}
+
+	cmdExecutorMu.RLock()
+	execFn := cmdExecutor
+	cmdExecutorMu.RUnlock()
+	if execFn != nil {
+		return execFn(name, clean...)
+	}
+
 	cmd := exec.Command(name, clean...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	if out, err := cmd.CombinedOutput(); err != nil {

@@ -348,14 +348,8 @@ func NewRateLimiter(maxConnsPerIPPerSec int) *RateLimiter {
 	}
 }
 
-// ClientIP extracts IP from HTTP request
+// ClientIP extracts IP from HTTP request using physical RemoteAddr
 func ClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if ip := strings.TrimSpace(parts[0]); ip != "" {
-			return ip
-		}
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

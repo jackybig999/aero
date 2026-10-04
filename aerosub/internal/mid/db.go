@@ -50,6 +50,7 @@ func NewAeroDB(dbPath string, payDB *AeroPayDB) (*AeroDB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open aero db: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 
 	schema := `
 	CREATE TABLE IF NOT EXISTS user (
@@ -743,6 +744,128 @@ func (a *AeroDB) GetSubscriptionBySlug(slug string) (*Subscription, error) {
 	row := a.db.QueryRow(`SELECT sub_id, user_id, user_uuid, sub_slug, sub_token, sub_ticket_seed, plan_id, plan_name, assigned_nodes_json, limit_bytes, used_bytes, expire_at, switch_status, status, created_at, updated_at 
 		FROM subscription WHERE sub_slug = ?`, slug)
 	return a.scanSubscription(row)
+}
+
+// GetSubscriptionByToken fetches a subscription by its sub_token.
+func (a *AeroDB) GetSubscriptionByToken(token string) (*Subscription, error) {
+	row := a.db.QueryRow(`SELECT sub_id, user_id, user_uuid, sub_slug, sub_token, sub_ticket_seed, plan_id, plan_name, assigned_nodes_json, limit_bytes, used_bytes, expire_at, switch_status, status, created_at, updated_at 
+		FROM subscription WHERE sub_token = ?`, token)
+	return a.scanSubscription(row)
+}
+
+// AddSubscriptionUsage atomically increments used_bytes by bytes.
+// If limit_bytes > 0 and used_bytes >= limit_bytes, switch_status is set to "off" and circuitBroken is true.
+func (a *AeroDB) AddSubscriptionUsage(token string, bytes int64) (*Subscription, bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		return nil, false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row := tx.QueryRow(`SELECT sub_id, user_id, user_uuid, sub_slug, sub_token, sub_ticket_seed, plan_id, plan_name, assigned_nodes_json, limit_bytes, used_bytes, expire_at, switch_status, status, created_at, updated_at 
+		FROM subscription WHERE sub_token = ?`, token)
+	sub, err := a.scanSubscription(row)
+	if err != nil {
+		return nil, false, err
+	}
+
+	newUsed := sub.UsedBytes + bytes
+	nowStr := time.Now().Format(time.RFC3339)
+	circuitBroken := false
+	newSwitch := sub.SwitchStatus
+	if sub.LimitBytes > 0 && newUsed >= sub.LimitBytes {
+		newSwitch = "off"
+		circuitBroken = true
+	}
+
+	_, err = tx.Exec(`UPDATE subscription SET used_bytes = ?, switch_status = ?, updated_at = ? WHERE sub_token = ?`,
+		newUsed, newSwitch, nowStr, token)
+	if err != nil {
+		return nil, false, fmt.Errorf("update subscription usage: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("commit tx: %w", err)
+	}
+
+	sub.UsedBytes = newUsed
+	sub.SwitchStatus = newSwitch
+	return sub, circuitBroken, nil
+}
+
+// AddSubscriptionUsageBatch atomically increments usage for a batch of metering records in a single transaction.
+// It checks limit_bytes for circuit breaking, sets switch_status to "off" if limit is reached,
+// and returns a map indicating which tokens are revoked (e.g. over quota, expired, switched off, or not found).
+func (a *AeroDB) AddSubscriptionUsageBatch(records []MeteringRecord) (map[string]bool, error) {
+	if len(records) == 0 {
+		return make(map[string]bool), nil
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Aggregate bytes by token
+	deltas := make(map[string]int64)
+	for _, rec := range records {
+		tok := strings.TrimSpace(rec.Token)
+		if tok == "" {
+			continue
+		}
+		deltas[tok] += (rec.BytesUp + rec.BytesDown)
+	}
+
+	tx, err := a.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin batch tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now()
+	nowStr := now.Format(time.RFC3339)
+	revokedMap := make(map[string]bool)
+
+	for tok, delta := range deltas {
+		row := tx.QueryRow(`SELECT sub_id, user_id, user_uuid, sub_slug, sub_token, sub_ticket_seed, plan_id, plan_name, assigned_nodes_json, limit_bytes, used_bytes, expire_at, switch_status, status, created_at, updated_at 
+			FROM subscription WHERE sub_token = ?`, tok)
+		sub, err := a.scanSubscription(row)
+		if err != nil {
+			// Token not found in database -> revoked
+			revokedMap[tok] = true
+			continue
+		}
+
+		newUsed := sub.UsedBytes + delta
+		newSwitch := sub.SwitchStatus
+		isRevoked := false
+
+		if sub.LimitBytes > 0 && newUsed >= sub.LimitBytes {
+			newSwitch = "off"
+			isRevoked = true
+		}
+		if !sub.ExpireAt.IsZero() && now.After(sub.ExpireAt) {
+			isRevoked = true
+		}
+		if sub.SwitchStatus == "off" || !sub.Status {
+			isRevoked = true
+		}
+
+		_, err = tx.Exec(`UPDATE subscription SET used_bytes = ?, switch_status = ?, updated_at = ? WHERE sub_token = ?`,
+			newUsed, newSwitch, nowStr, tok)
+		if err != nil {
+			return nil, fmt.Errorf("batch update token %s: %w", tok, err)
+		}
+
+		revokedMap[tok] = isRevoked
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit batch tx: %w", err)
+	}
+
+	return revokedMap, nil
 }
 
 func (a *AeroDB) scanSubscription(row *sql.Row) (*Subscription, error) {

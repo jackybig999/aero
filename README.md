@@ -25,23 +25,29 @@ Next-generation, commercial-grade anti-censorship tunneling framework powered by
 6. **零系统环境破坏**：全量网络捕获收敛于 L3 TUN 与 L4 gVisor 用户态协议栈，严禁篡改系统代理与注册表。
 7. **HTTP/2 回退与降级防御 (P4)**：TUN 模式下若 UDP/443 (QUIC) 拨号失败，禁止将整机流量降级走 TCP 伪装隧道，立即阻断全局 TUN 驱动（不打开虚拟网卡、不安装 `/1` 路由），向客户端返回 `UDP_UNAVAILABLE` 状态，仅保留本地 55555 代理端口监听。
 8. **移动端通道抽象与契约 (P5)**：Android/iOS 仅依赖标准 `StartTunnel(fd int)` 与 `CopyTunnel` 双向流转，描述符严格由系统层 `VpnService` 或 `NEPacketTunnelProvider` 创建，排除路由仅放节点公网 IP，不篡改主机路由表。
-9. **跳间凭证与 ECH 真实协商 (P7)**：支持 `single`、`ingress`、`egress` 拓扑角色，跳间凭证与用户 Token 严格隔离；三项硬性条件齐全时方开启真实 ECH。
+9. **跳间凭证与 ECH 真实协商 (阶段四规范)**：支持 `single`、`ingress`、`egress` 拓扑角色，跳间凭证与用户 Token 严格隔离；ECH 采用订阅驱动解耦公网 HTTPS RR，防审查抗封锁全面硬化。
 
 ---
 
-## ECH 真实协商与多跳凭证规范 (P7 Specification)
+## ECH 真实协商与抗封锁规范 (阶段四规范落地)
 
 ### 1. 边缘节点拓扑角色与跳间凭证
 - **Role 字段**：只接受 `single`（默认单机）、`ingress`（多跳入口）、`egress`（多跳出口）。
 - **HopCredential 凭证**：当 Role 为 `ingress` 或 `egress` 时强制要求配置跳间凭证；若为空启动直接失败（报错 `hop credential required`）。跳间凭证是节点内部集群专用密钥，与用户 Token 绝非同一个值。
 
-### 2. ECH（Encrypted Client Hello）严格硬化准则
-边缘节点必须**同时满足以下三项硬性条件**才激活 ECH：
-1. **Go 工具链版本**：满足 Go 1.26.0+ 原生 ECH 支持；
-2. **密钥配置**：配置中提供了真实有效的 `EncryptedClientHelloKeys`；
-3. **DNS 记录**：域名权威 DNS 已发布对应的 HTTPS RR（Type 65 / RFC 9460）记录。
+### 2. ECH（Encrypted Client Hello）订阅驱动机制与解耦
+- **订阅驱动模式**：服务端 ECH 公钥配置发布进节点订阅 JSON，客户端解析读取后写入 `EncryptedClientHelloConfigList`。
+- **解耦公网 HTTPS RR**：服务端 ECH 激活不再强依赖公网 DNS 的 HTTPS RR（Type 65 / RFC 9460）记录。只要 Go 工具链版本满足（Go 1.26.0+ 原生 ECH 支持）且配置了有效的 `EncryptedClientHelloKeys`，服务端即开启 ECH（日志输出 `[EDGE] ECH enabled for domain ...`）。
+- **标准 TLS 1.3 回退**：未配置 ECH 时，严格保持标准 TLS 1.3 握手，并在启动日志中明确输出 `[EDGE] ECH disabled`。严禁填充虚假 ECH 配置或伪造 GREASE 特征。
 
-> ⚠️ **合规红线**：若缺少以上任一条件，边缘服务一律按普通 TLS 1.3 启动，并在启动日志中明确输出 `[EDGE] ECH disabled`。严禁填充虚假 ECH 配置或伪造 GREASE 特征。客户端仅在订阅显式下发 ECH 配置列表时，才在 TLS 握手层设置 `EncryptedClientHelloConfigList`。
+### 3. 外层 SNI 与双层流量安全边界
+- **外层 SNI（Public Name）可见性**：在网络监听与 DPI 视角下，QUIC / TLS 外层 SNI 仍然可见。
+- **安全隔离事实**：AERO 协议客户端外层 SNI 严格为**边缘节点/网关域名**，绝非用户实际访问的目标网站域名。
+- **内层加密保护**：用户实际访问的目标域名与业务载荷 100% 运行在内层 HTTP/3 MASQUE / CONNECT-IP 加密隧道中，受到端到端完全保护。
+
+### 4. 抗封锁与网络抗审查规范 (Anti-Censorship Guardrails)
+- **ClientHello Scrambling（切开 SNI）**：`quic-go` 协议栈默认开启 ClientHello Scrambling，将 SNI 扩展切分到多个加密包/帧中以挫败特征匹配。**生产环境严禁设置环境变量 `QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING`**。
+- **DPLPMTUD 规范遵循 (`InitialPacketSize == 0`)**：保持 RFC 8899 与 RFC 9000 规范标准，`InitialPacketSize` 保持默认值 0，交由协议栈协商自适应，**严禁人为注入不可控的固定或随机填充指纹**，防止成为审查系统的特定识别标志。
 
 ---
 

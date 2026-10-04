@@ -83,6 +83,20 @@ func (s *AppService) GetProfileStatusCache(id int64) (string, bool) {
 	return "", false
 }
 
+// getCurrentUserID 获取当前会话的用户ID (未登录则默认为 1)
+func (s *AppService) getCurrentUserID() int64 {
+	if s.DB == nil {
+		return 1
+	}
+	var val string
+	if err := s.DB.QueryRow(`SELECT val FROM app_session WHERE key = 'current_user_id'`).Scan(&val); err == nil {
+		if id, err := strconv.ParseInt(val, 10, 64); err == nil && id > 0 {
+			return id
+		}
+	}
+	return 1
+}
+
 // StartProfile 启动指定环境的浏览器进程
 func (s *AppService) StartProfile(id int64) error {
 	var kernelType, kernelVersion, fpJSON, notes string
@@ -193,6 +207,7 @@ func (s *AppService) StopProfile(id int64) error {
 // CreateProfileRequest 高级指纹环境创建与编辑参数
 type CreateProfileRequest struct {
 	ID            int64  `json:"id"`
+	UserID        int64  `json:"user_id"`
 	Name          string `json:"name"`
 	Notes         string `json:"notes"`
 	KernelType    string `json:"kernel_type"`
@@ -281,12 +296,17 @@ func (s *AppService) CreateProfileAdvanced(req *CreateProfileRequest) (*Profile,
 
 	fpBytes, _ := json.Marshal(fp)
 
+	userID := req.UserID
+	if userID <= 0 {
+		userID = s.getCurrentUserID()
+	}
+
 	var proxyID int64 = 0
 	if req.ProxyMode == "custom" && req.ProxyRaw != "" {
 		proxyCfg, _ := ParseProxyString(req.ProxyRaw)
 		if proxyCfg != nil {
-			r, err := s.DB.Exec(`INSERT INTO proxies (user_id, raw_input, protocol, host, port, username, password, status) VALUES (1, ?, ?, ?, ?, ?, ?, 'ready')`,
-				req.ProxyRaw, proxyCfg.Protocol, proxyCfg.Host, proxyCfg.Port, proxyCfg.Username, proxyCfg.Password,
+			r, err := s.DB.Exec(`INSERT INTO proxies (user_id, raw_input, protocol, host, port, username, password, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready')`,
+				userID, req.ProxyRaw, proxyCfg.Protocol, proxyCfg.Host, proxyCfg.Port, proxyCfg.Username, proxyCfg.Password,
 			)
 			if err == nil {
 				proxyID, _ = r.LastInsertId()
@@ -303,8 +323,8 @@ func (s *AppService) CreateProfileAdvanced(req *CreateProfileRequest) (*Profile,
 		}
 	}
 
-	res, err := s.DB.Exec(`INSERT INTO profiles (user_id, name, notes, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status) VALUES (1, ?, ?, ?, ?, ?, ?, ?, 'stopped')`,
-		req.Name, notes, req.KernelType, req.KernelVersion, proxyID, string(fpBytes), s.DataDir,
+	res, err := s.DB.Exec(`INSERT INTO profiles (user_id, name, notes, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stopped')`,
+		userID, req.Name, notes, req.KernelType, req.KernelVersion, proxyID, string(fpBytes), s.DataDir,
 	)
 	if err != nil {
 		return nil, err
@@ -313,7 +333,7 @@ func (s *AppService) CreateProfileAdvanced(req *CreateProfileRequest) (*Profile,
 	id, _ := res.LastInsertId()
 	return &Profile{
 		ID:                id,
-		UserID:            1,
+		UserID:            userID,
 		Name:              req.Name,
 		Notes:             notes,
 		KernelType:        req.KernelType,
@@ -441,9 +461,22 @@ func (s *AppService) UpdateProfileAdvanced(req *CreateProfileRequest) (*Profile,
 	return &updated, nil
 }
 
-// ListProfiles 查询全部环境列表并自愈异常状态
-func (s *AppService) ListProfiles() ([]*Profile, error) {
-	rows, err := s.DB.Query(`SELECT id, user_id, name, notes, icon_color, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status, last_launched_at, created_at FROM profiles ORDER BY id DESC`)
+// ListProfiles 查询环境列表并自愈异常状态。支持多用户隔离查询（可选传入 targetUserID 或自动使用当前会话 user_id）
+func (s *AppService) ListProfiles(userIDs ...int64) ([]*Profile, error) {
+	var targetUserID int64 = 0
+	if len(userIDs) > 0 {
+		targetUserID = userIDs[0]
+	} else {
+		targetUserID = s.getCurrentUserID()
+	}
+
+	var rows *sql.Rows
+	var err error
+	if targetUserID > 0 {
+		rows, err = s.DB.Query(`SELECT id, user_id, name, notes, icon_color, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status, last_launched_at, created_at FROM profiles WHERE user_id = ? ORDER BY id DESC`, targetUserID)
+	} else {
+		rows, err = s.DB.Query(`SELECT id, user_id, name, notes, icon_color, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status, last_launched_at, created_at FROM profiles ORDER BY id DESC`)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -600,20 +633,113 @@ func (s *AppService) CloneProfile(id int64) (*Profile, error) {
 	fp.AudioNoise = 0.0001 + float64(time.Now().UnixNano()%1000)/1000000.0
 	fpBytes, _ := json.Marshal(fp)
 
+	userID := p.UserID
+	if userID <= 0 {
+		userID = s.getCurrentUserID()
+	}
+
 	cloneName := p.Name + " (副本)"
-	res, err := s.DB.Exec(`INSERT INTO profiles (user_id, name, notes, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status) VALUES (1, ?, ?, ?, ?, ?, ?, ?, 'stopped')`,
-		cloneName, p.Notes, p.KernelType, p.KernelVersion, p.ProxyID, string(fpBytes), s.DataDir,
+	res, err := s.DB.Exec(`INSERT INTO profiles (user_id, name, notes, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stopped')`,
+		userID, cloneName, p.Notes, p.KernelType, p.KernelVersion, p.ProxyID, string(fpBytes), s.DataDir,
 	)
 	if err != nil {
 		return nil, err
 	}
 	newID, _ := res.LastInsertId()
 	p.ID = newID
+	p.UserID = userID
 	p.Name = cloneName
 	p.Status = "stopped"
 	p.FingerprintConfig = string(fpBytes)
 	p.CreatedAt = time.Now()
 	return &p, nil
+}
+
+// GetProfile 获取指定 ID 的环境详情
+func (s *AppService) GetProfile(id int64) (*Profile, error) {
+	var p Profile
+	err := s.DB.QueryRow(`SELECT id, user_id, name, notes, icon_color, kernel_type, kernel_version, proxy_id, fingerprint_config, data_dir, status, last_launched_at, created_at FROM profiles WHERE id = ?`, id).Scan(
+		&p.ID, &p.UserID, &p.Name, &p.Notes, &p.IconColor, &p.KernelType, &p.KernelVersion, &p.ProxyID, &p.FingerprintConfig, &p.DataDir, &p.Status, &p.LastLaunchedAt, &p.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("未找到环境 %d: %w", id, err)
+	}
+	return &p, nil
+}
+
+// GetProxyConfig 获取关联的代理配置
+func (s *AppService) GetProxyConfig(proxyID int64) (*ProxyConfig, error) {
+	if proxyID <= 0 {
+		return nil, nil
+	}
+	var proto, host, user, pass string
+	var port int
+	err := s.DB.QueryRow(`SELECT protocol, host, port, username, password FROM proxies WHERE id = ?`, proxyID).Scan(
+		&proto, &host, &port, &user, &pass,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &ProxyConfig{
+		Enabled:  true,
+		Protocol: proto,
+		Host:     host,
+		Port:     port,
+		Username: user,
+		Password: pass,
+	}, nil
+}
+
+// ExportProfileConfig 将指定环境导出为外部 JSON 配置文件
+func (s *AppService) ExportProfileConfig(profileID int64, exportPath string) error {
+	p, err := s.GetProfile(profileID)
+	if err != nil {
+		return err
+	}
+	var proxyCfg *ProxyConfig
+	if p.ProxyID > 0 {
+		proxyCfg, _ = s.GetProxyConfig(p.ProxyID)
+	}
+	var fp FingerprintConfig
+	if p.FingerprintConfig != "" {
+		_ = json.Unmarshal([]byte(p.FingerprintConfig), &fp)
+	}
+	return ExportProfileConfig(p, proxyCfg, &fp, exportPath)
+}
+
+// ImportProfileConfig 从外部 JSON 配置文件导入创建新环境
+func (s *AppService) ImportProfileConfig(importPath string) (*Profile, error) {
+	dto, err := ImportProfileConfig(importPath)
+	if err != nil {
+		return nil, err
+	}
+	req := &CreateProfileRequest{
+		UserID:        s.getCurrentUserID(),
+		Name:          dto.Name,
+		Notes:         dto.Notes,
+		KernelType:    dto.KernelType,
+		KernelVersion: dto.KernelVersion,
+	}
+	if dto.FingerprintConfig != nil {
+		req.Languages = strings.Join(dto.FingerprintConfig.Languages, ",")
+		req.Timezone = dto.FingerprintConfig.Timezone
+		if dto.FingerprintConfig.ScreenWidth > 0 && dto.FingerprintConfig.ScreenHeight > 0 {
+			req.Resolution = fmt.Sprintf("%dx%d", dto.FingerprintConfig.ScreenWidth, dto.FingerprintConfig.ScreenHeight)
+		}
+		req.CPUCores = dto.FingerprintConfig.HardwareConcurrency
+		req.MemoryGB = dto.FingerprintConfig.DeviceMemory
+		req.WebGLVendor = dto.FingerprintConfig.WebGLVendor
+		req.WebGLRenderer = dto.FingerprintConfig.WebGLRenderer
+		req.CanvasNoise = dto.FingerprintConfig.CanvasNoise != 0
+		req.AudioNoise = dto.FingerprintConfig.AudioNoise != 0
+		req.UserAgent = dto.FingerprintConfig.UserAgent
+		req.Platform = dto.FingerprintConfig.Platform
+	}
+	if dto.ProxyHost != "" && dto.ProxyPort > 0 {
+		req.ProxyMode = "custom"
+		req.ProxyRaw = fmt.Sprintf("%s://%s:%d", dto.ProxyProtocol, dto.ProxyHost, dto.ProxyPort)
+	}
+	return s.CreateProfileAdvanced(req)
 }
 
 // BatchStartProfiles 批量启动环境

@@ -33,7 +33,7 @@ type darwinDevice struct {
 // OpenTunDevice 创建 macOS utun 设备
 func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 	if mtu <= 0 {
-		mtu = 1224
+		mtu = 1360
 	}
 	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, 2)
 	if err != nil {
@@ -227,7 +227,7 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runMac("ifconfig", devName, "inet", tunIP, tunIP)
 	_ = runMac("ifconfig", devName, "up")
 
-	_ = SetInterfaceMTU(devName, 1224)
+	_ = SetInterfaceMTU(devName, 1360)
 	RegisterVirtualNICMTUSetter(func(mtu int) error {
 		return SetInterfaceMTU(devName, mtu)
 	})
@@ -235,11 +235,14 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runMac("route", "add", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "add", "-net", "128.0.0.0/1", "-interface", devName)
 
+	_ = runMac("route", "add", "-inet6", "::/1", "-interface", devName)
+	_ = runMac("route", "add", "-inet6", "8000::/1", "-interface", devName)
+
 	if err := SetupDarwinDNS(); err != nil {
 		log.Printf("[TUN] Darwin DNS configuration warning: %v", err)
 	}
 
-	log.Printf("[TUN] Routes configured on %s (MTU=1224)", devName)
+	log.Printf("[TUN] Routes configured on %s (MTU=1360)", devName)
 	return nil
 }
 
@@ -251,6 +254,8 @@ func TeardownRoutes(devName string) {
 	if err := RestoreDarwinDNS(); err != nil {
 		log.Printf("[TUN] Darwin DNS restore warning: %v", err)
 	}
+	_ = runMac("route", "delete", "-inet6", "::/1", "-interface", devName)
+	_ = runMac("route", "delete", "-inet6", "8000::/1", "-interface", devName)
 	_ = runMac("route", "delete", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "delete", "-net", "128.0.0.0/1", "-interface", devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
@@ -419,7 +424,31 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 	return lc.ListenPacket(ctx, network, ":0")
 }
 
+var (
+	darwinCmdExecutorMu sync.RWMutex
+	darwinCmdExecutor   func(name string, args ...string) error
+)
+
+// SetCmdExecutorForTest sets the command execution hook for unit testing and returns a restore function.
+func SetCmdExecutorForTest(f func(name string, args ...string) error) func() {
+	darwinCmdExecutorMu.Lock()
+	orig := darwinCmdExecutor
+	darwinCmdExecutor = f
+	darwinCmdExecutorMu.Unlock()
+	return func() {
+		darwinCmdExecutorMu.Lock()
+		darwinCmdExecutor = orig
+		darwinCmdExecutorMu.Unlock()
+	}
+}
+
 func runMac(name string, args ...string) error {
+	darwinCmdExecutorMu.RLock()
+	execFn := darwinCmdExecutor
+	darwinCmdExecutorMu.RUnlock()
+	if execFn != nil {
+		return execFn(name, args...)
+	}
 	cmd := exec.Command(name, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s %v: %w (%s)", name, args, err, strings.TrimSpace(string(out)))
@@ -525,6 +554,8 @@ func CleanAero0StaleRoutes() {
 
 	if shouldCleanUtun(name, ifconfigText, ifaceExists) {
 		if ifaceExists {
+			_ = runMac("route", "delete", "-inet6", "::/1", "-interface", name)
+			_ = runMac("route", "delete", "-inet6", "8000::/1", "-interface", name)
 			_ = runMac("route", "delete", "-net", "0.0.0.0/1", "-interface", name)
 			_ = runMac("route", "delete", "-net", "128.0.0.0/1", "-interface", name)
 		}

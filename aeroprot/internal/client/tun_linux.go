@@ -38,7 +38,7 @@ type linuxDevice struct {
 // OpenTunDevice 创建 Linux TUN 设备
 func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 	if mtu <= 0 {
-		mtu = 1224
+		mtu = 1360
 	}
 	file, err := os.OpenFile(tunDevice, os.O_RDWR, 0)
 	if err != nil {
@@ -188,7 +188,7 @@ func SetupRoutes(devName, ipv4 string) error {
 	}
 	_ = runLinux("ip", "addr", "add", ipv4, "dev", devName)
 
-	_ = SetInterfaceMTU(devName, 1224)
+	_ = SetInterfaceMTU(devName, 1360)
 	RegisterVirtualNICMTUSetter(func(mtu int) error {
 		return SetInterfaceMTU(devName, mtu)
 	})
@@ -196,11 +196,14 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runLinux("ip", "route", "replace", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "replace", "128.0.0.0/1", "dev", devName)
 
+	_ = runLinux("ip", "-6", "route", "replace", "::/1", "dev", devName)
+	_ = runLinux("ip", "-6", "route", "replace", "8000::/1", "dev", devName)
+
 	if err := SetupLinuxDNS(devName); err != nil {
 		log.Printf("[TUN] Linux DNS configuration warning: %v", err)
 	}
 
-	log.Printf("[TUN] Routes configured on %s (MTU=1224)", devName)
+	log.Printf("[TUN] Routes configured on %s (MTU=1360)", devName)
 	return nil
 }
 
@@ -212,6 +215,8 @@ func TeardownRoutes(devName string) {
 	if err := RestoreLinuxDNS(devName); err != nil {
 		log.Printf("[TUN] Linux DNS restore warning: %v", err)
 	}
+	_ = runLinux("ip", "-6", "route", "del", "::/1", "dev", devName)
+	_ = runLinux("ip", "-6", "route", "del", "8000::/1", "dev", devName)
 	_ = runLinux("ip", "route", "del", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "del", "128.0.0.0/1", "dev", devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
@@ -362,7 +367,31 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 	return lc.ListenPacket(ctx, network, ":0")
 }
 
+var (
+	linuxCmdExecutorMu sync.RWMutex
+	linuxCmdExecutor   func(name string, args ...string) error
+)
+
+// SetCmdExecutorForTest sets the command execution hook for unit testing and returns a restore function.
+func SetCmdExecutorForTest(f func(name string, args ...string) error) func() {
+	linuxCmdExecutorMu.Lock()
+	orig := linuxCmdExecutor
+	linuxCmdExecutor = f
+	linuxCmdExecutorMu.Unlock()
+	return func() {
+		linuxCmdExecutorMu.Lock()
+		linuxCmdExecutor = orig
+		linuxCmdExecutorMu.Unlock()
+	}
+}
+
 func runLinux(name string, args ...string) error {
+	linuxCmdExecutorMu.RLock()
+	execFn := linuxCmdExecutor
+	linuxCmdExecutorMu.RUnlock()
+	if execFn != nil {
+		return execFn(name, args...)
+	}
 	cmd := exec.Command(name, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%s %v: %w (%s)", name, args, err, strings.TrimSpace(string(out)))
@@ -372,6 +401,8 @@ func runLinux(name string, args ...string) error {
 
 // CleanAero0StaleRoutes 清理残留路由（仅指定 dev aero0 删除，绝不误伤其他网络）
 func CleanAero0StaleRoutes() {
+	_ = runLinux("ip", "-6", "route", "del", "::/1", "dev", "aero0")
+	_ = runLinux("ip", "-6", "route", "del", "8000::/1", "dev", "aero0")
 	_ = runLinux("ip", "route", "del", "0.0.0.0/1", "dev", "aero0")
 	_ = runLinux("ip", "route", "del", "128.0.0.0/1", "dev", "aero0")
 }

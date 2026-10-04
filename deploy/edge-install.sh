@@ -29,7 +29,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.0.4"
+VERSION="1.0.5"
 REPO="jackybig999/aero"
 
 usage() {
@@ -154,14 +154,24 @@ AERO_ADVERTISE=$ADVERTISE_HOST
 CONF
 chmod 600 "$CONFIG_DIR/edge.conf"
 
+# --- edge.yaml: 规范化注入跳频备用端口与 ECH 配置 ---
+cat > "$CONFIG_DIR/edge.yaml" << 'EOF'
+{
+  "alt_listen_ports": [2083, 2087, 8443],
+  "ech": ""
+}
+EOF
+chmod 644 "$CONFIG_DIR/edge.yaml"
+
 # --- binary: backup existing for rollback ---
 echo "[bin] install aeroprot-edge -> $INSTALL_DIR/aero-edge"
 if [[ -f "$INSTALL_DIR/aero-edge" ]]; then
     cp -f "$INSTALL_DIR/aero-edge" "$INSTALL_DIR/aero-edge.bak" 2>/dev/null || true
 fi
 
-BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/aeroprot-edge-linux-${ARCH}"
-LATEST_URL="https://github.com/${REPO}/releases/latest/download/aeroprot-edge-linux-${ARCH}"
+BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/edge_linux_${ARCH}"
+LATEST_URL="https://github.com/${REPO}/releases/latest/download/edge_linux_${ARCH}"
+LEGACY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/aeroprot-edge-linux-${ARCH}"
 installed_ok=0
 
 if command -v curl >/dev/null 2>&1; then
@@ -170,6 +180,9 @@ if command -v curl >/dev/null 2>&1; then
         installed_ok=1
     elif curl -fsSL "$LATEST_URL" -o "$INSTALL_DIR/aeroprot-edge" 2>/dev/null; then
         echo "[bin] 成功从官方最新 Release 拉取服务端二进制产物。"
+        installed_ok=1
+    elif curl -fsSL "$LEGACY_URL" -o "$INSTALL_DIR/aeroprot-edge" 2>/dev/null; then
+        echo "[bin] 成功从官方兼容 Release 拉取服务端二进制产物。"
         installed_ok=1
     fi
 fi
@@ -320,16 +333,13 @@ EnvironmentFile=-$CONFIG_DIR/edge.conf
 ExecStart=$INSTALL_DIR/aero-edge \\
   -token $TOKEN \\
   -listen :${PRIMARY_PORT} \\
-  -ports ${PORTS} \\
   -profile small \\
   -data-dir $DATA_DIR \\
   -domain $DOMAIN \\
-  -sni $SNI \\
   -advertise-host $ADVERTISE_HOST \\
   -cert $CERT \\
   -key $KEY \\
-  -log-file $LOG_DIR/aero-edge.log \\
-  -q
+  -config $CONFIG_DIR/edge.yaml
 LimitNOFILE=65535
 
 [Install]

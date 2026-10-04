@@ -89,6 +89,7 @@ func NewAeroPayDB(dbPath string) (*AeroPayDB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open aeropay db: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 
 	schema := `
 	CREATE TABLE IF NOT EXISTS income (
@@ -572,6 +573,7 @@ func NewSQLiteLedgerStore(dbPath string) (*SQLiteLedgerStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite db: %w", err)
 	}
+	db.SetMaxOpenConns(1)
 	schema := `
 	CREATE TABLE IF NOT EXISTS ledger_entries (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

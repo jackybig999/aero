@@ -60,8 +60,14 @@ type ServerConfig struct {
 	AllowSelfSignedCertForTest bool                          `json:"-"`                        // 仅允许单元测试显式开启，生产环境严禁自签
 	Role                       string                        `json:"role,omitempty"`           // single|ingress|egress, default single
 	HopCredential              string                        `json:"hop_credential,omitempty"` // hop credential for multi-hop (strictly distinct from user token)
+	NextHopAddr                string                        `json:"next_hop_addr,omitempty" yaml:"next_hop_addr"`
+	NextHopSNI                 string                        `json:"next_hop_sni,omitempty" yaml:"next_hop_sni"`
 	ECH                        string                        `json:"ech,omitempty" yaml:"ech"`
 	EncryptedClientHelloKeys   []tls.EncryptedClientHelloKey `json:"-"` // ECH server keys (never serialised)
+	ObfsPassword               string                        `json:"obfs_password,omitempty" yaml:"obfs_password"`
+	FallbackObfsPasswords      []string                      `json:"fallback_obfs_passwords,omitempty" yaml:"fallback_obfs_passwords"`
+	PaddingJitter              bool                          `json:"padding_jitter,omitempty" yaml:"padding_jitter"`
+	AltListenPorts             []int                         `json:"alt_listen_ports,omitempty" yaml:"alt_listen_ports"`
 }
 
 // Server is the unified edge server instance
@@ -82,10 +88,11 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	tlsCert      *tls.Certificate
-	httpServer   *http.Server
-	tcpListener  net.Listener
-	quicListener *quic.Listener
+	tlsCert          *tls.Certificate
+	httpServer       *http.Server
+	tcpListener      net.Listener
+	quicListener     *quic.Listener
+	altQuicListeners []*quic.Listener
 
 	startedAt time.Time
 }
@@ -115,6 +122,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			return nil, fmt.Errorf("hop credential required: multi-hop role %s requires valid hop credential (hop credential must not be empty and is strictly distinct from user token)", role)
 		}
 	}
+	if role == "ingress" {
+		if strings.TrimSpace(cfg.NextHopAddr) == "" && !cfg.AllowSelfSignedCertForTest {
+			return nil, fmt.Errorf("next hop address required: ingress role requires valid next_hop_addr in production")
+		}
+	}
 
 	if cfg.Listen == "" {
 		cfg.Listen = ":443"
@@ -131,7 +143,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	// 1. Validator & TokenStore (tokens.json)
-	validator := NewValidator()
+	walPath := filepath.Join(absDataDir, "nonce.wal")
+	validator := NewValidator(walPath)
 	tokenStore, err := OpenTokenStore(absDataDir, validator)
 	if err != nil {
 		return nil, fmt.Errorf("open token store: %w", err)
@@ -223,6 +236,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	// 5. QUIC Server
 	quicServer := NewQUICServer(validator, connLimit, bwLimit, dialGuard, rateLimit)
+	quicServer.SetServerConfig(&cfg)
 	if cfg.AllowSelfSignedCertForTest {
 		quicServer.SetAllowLoopbackForTest(true)
 	}
@@ -255,6 +269,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		startedAt:    time.Now(),
 	}
 
+	if cfg.ObfsPassword != "" && len(cfg.FallbackObfsPasswords) > 0 {
+		RegisterFallbackPasswords(cfg.ObfsPassword, cfg.FallbackObfsPasswords)
+	}
+
 	return srv, nil
 }
 
@@ -266,18 +284,15 @@ func (s *Server) Start() error {
 		NextProtos:   []string{"h2", "http/1.1"},
 	}
 
-	// ECH (Encrypted Client Hello) 严格硬化协商 (P7 规范)：
-	// 仅在同时满足三项硬性条件时开启 ECH：
-	// 1) Go 工具链版本满足（当前 Go 1.26.0+）；
-	// 2) 配置中提供了有效的 EncryptedClientHelloKeys；
-	// 3) 域名已存在 HTTPS RR 记录。
+	// ECH (Encrypted Client Hello) 阶段四规范：
+	// 订阅驱动模式下，服务端 ECH 无须依赖公网 HTTPS RR (Type 65) 记录。
+	// 1) Go 工具链版本满足（Go 1.26.0+ 原生 ECH 支持）；
+	// 2) 配置中提供了有效的 EncryptedClientHelloKeys。
 	// 缺任何一项，服务按普通 TLS 1.3 启动，日志明确打印 "ECH disabled"。禁止填充虚假 ECH 配置或伪造 GREASE。
 	if !isGo126OrLater(runtime.Version()) {
 		log.Printf("[EDGE] ECH disabled: toolchain version %s does not meet requirement (Go 1.26.0+ required)", runtime.Version())
 	} else if len(s.cfg.EncryptedClientHelloKeys) == 0 {
 		log.Printf("[EDGE] ECH disabled: no EncryptedClientHelloKeys provided in configuration")
-	} else if !checkDomainHasHTTPSRR(s.cfg.Domain) {
-		log.Printf("[EDGE] ECH disabled: domain %s has no HTTPS RR (Type 65) record", s.cfg.Domain)
 	} else {
 		tlsCfg.EncryptedClientHelloKeys = s.cfg.EncryptedClientHelloKeys
 		log.Printf("[EDGE] ECH enabled for domain %s (keys count: %d)", s.cfg.Domain, len(s.cfg.EncryptedClientHelloKeys))
@@ -308,6 +323,25 @@ func (s *Server) Start() error {
 		return fmt.Errorf("quic listen %s: %w", s.cfg.Listen, err)
 	}
 	s.quicListener = quicLn
+
+	// 2b. Multi-port Hopping Alternative Listeners
+	host := ""
+	if h, _, herr := net.SplitHostPort(s.cfg.Listen); herr == nil {
+		host = h
+	}
+	for _, port := range s.cfg.AltListenPorts {
+		if port <= 0 || port > 65535 {
+			continue
+		}
+		altAddr := net.JoinHostPort(host, strconv.Itoa(port))
+		altLn, aerr := StartQUIC(altAddr, tlsCfg, s.quicServer, s.ctx)
+		if aerr == nil {
+			s.altQuicListeners = append(s.altQuicListeners, altLn)
+			log.Printf("[EDGE] QUIC multi-port hopping listener active on %s", altAddr)
+		} else {
+			log.Printf("[EDGE] [WARN] Failed to bind alt QUIC port %s: %v", altAddr, aerr)
+		}
+	}
 
 	if s.geoHandler != nil {
 		s.geoHandler.StartCronUpdate(s.ctx)
@@ -415,6 +449,59 @@ func (s *Server) Close() {
 	}
 	if s.quicListener != nil {
 		_ = s.quicListener.Close()
+	}
+	for _, altLn := range s.altQuicListeners {
+		if altLn != nil {
+			_ = altLn.Close()
+		}
+	}
+	s.altQuicListeners = nil
+	if s.validator != nil {
+		s.validator.Close()
+	}
+	if s.cfg.ObfsPassword != "" {
+		RegisterFallbackPasswords(s.cfg.ObfsPassword, nil)
+	}
+}
+
+// AltAddrs returns addresses of all active alternative QUIC listeners
+func (s *Server) AltAddrs() []string {
+	var res []string
+	for _, ln := range s.altQuicListeners {
+		if ln != nil {
+			res = append(res, ln.Addr().String())
+		}
+	}
+	return res
+}
+
+// Addr returns the QUIC listener address (or TCP listener address if QUIC is nil)
+func (s *Server) Addr() string {
+	if s.quicListener != nil {
+		return s.quicListener.Addr().String()
+	}
+	if s.tcpListener != nil {
+		return s.tcpListener.Addr().String()
+	}
+	return s.cfg.Listen
+}
+
+// QUICServer returns the underlying QUICServer instance
+func (s *Server) QUICServer() *QUICServer {
+	return s.quicServer
+}
+
+// SetNextHopDialerForTest sets custom NextHop TCP dialer on Server's QUICServer
+func (s *Server) SetNextHopDialerForTest(d func(nextHopAddr, target, hopCred string) (net.Conn, error)) {
+	if s.quicServer != nil {
+		s.quicServer.SetNextHopDialerForTest(d)
+	}
+}
+
+// SetNextHopUDPDialerForTest sets custom NextHop UDP dialer on Server's QUICServer
+func (s *Server) SetNextHopUDPDialerForTest(d func(nextHopAddr, target, hopCred string) (net.Conn, error)) {
+	if s.quicServer != nil {
+		s.quicServer.SetNextHopUDPDialerForTest(d)
 	}
 }
 

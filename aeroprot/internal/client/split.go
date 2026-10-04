@@ -413,12 +413,6 @@ func (e *SplitEngine) loadBuiltinRules() {
 		IPRanges:       builtinChinaIPRanges(),
 	})
 
-	e.rules = append(e.rules, Rule{
-		Name:           "Apple Services",
-		Strategy:       DIRECT,
-		DomainSuffixes: []string{"apple.com", "icloud.com", "itunes.com", "aaplimg.com"},
-	})
-
 	// 预解析 IPRanges
 	for i := range e.rules {
 		if len(e.rules[i].IPRanges) > 0 {
@@ -457,7 +451,7 @@ func builtinChinaDomains() []string {
 		"bytedance.com", "douyin.com", "iesdouyin.com", "tiktokv.com", "byteimg.com",
 		"163.com", "126.com", "netease.com",
 		"jd.com", "360buyimg.com", "360.cn", "qhstatic.com", "qhimg.com",
-		"msn.cn", "bing.cn", "bing.com", "microsoft.com", "windowsupdate.com",
+		"msn.cn", "bing.cn",
 		"bilibili.com", "hdslb.com", "zhihu.com", "weibo.com", "sina.com",
 		"sinaimg.cn", "sina.cn", "douban.com", "doubanio.com",
 		"xiaohongshu.com", "xhscdn.com", "gov.cn", "edu.cn", "org.cn",

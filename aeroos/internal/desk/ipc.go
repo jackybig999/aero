@@ -182,6 +182,46 @@ func RegisterSharedIPCHandlers(w IPCBinder, appService *AppService, dataDir stri
 		return p
 	})
 
+	w.Bind("goExportProfileConfig", func(id int64, exportPath string) map[string]interface{} {
+		err := appService.ExportProfileConfig(id, exportPath)
+		if err != nil {
+			log.Printf("[ERROR] 导出环境配置失败: %v\n", err)
+			return map[string]interface{}{"status": "error", "error": err.Error()}
+		}
+		log.Printf("[OK] 成功导出环境 #%d 配置至: %s\n", id, exportPath)
+		return map[string]interface{}{"status": "ok"}
+	})
+
+	w.Bind("ExportProfileConfig", func(id int64, exportPath string) map[string]interface{} {
+		err := appService.ExportProfileConfig(id, exportPath)
+		if err != nil {
+			log.Printf("[ERROR] 导出环境配置失败: %v\n", err)
+			return map[string]interface{}{"status": "error", "error": err.Error()}
+		}
+		log.Printf("[OK] 成功导出环境 #%d 配置至: %s\n", id, exportPath)
+		return map[string]interface{}{"status": "ok"}
+	})
+
+	w.Bind("goImportProfileConfig", func(importPath string) map[string]interface{} {
+		p, err := appService.ImportProfileConfig(importPath)
+		if err != nil {
+			log.Printf("[ERROR] 导入环境配置失败: %v\n", err)
+			return map[string]interface{}{"status": "error", "error": err.Error()}
+		}
+		log.Printf("[OK] 成功从 %s 导入环境 #%d [%s]\n", importPath, p.ID, p.Name)
+		return map[string]interface{}{"status": "ok", "profile": p}
+	})
+
+	w.Bind("ImportProfileConfig", func(importPath string) map[string]interface{} {
+		p, err := appService.ImportProfileConfig(importPath)
+		if err != nil {
+			log.Printf("[ERROR] 导入环境配置失败: %v\n", err)
+			return map[string]interface{}{"status": "error", "error": err.Error()}
+		}
+		log.Printf("[OK] 成功从 %s 导入环境 #%d [%s]\n", importPath, p.ID, p.Name)
+		return map[string]interface{}{"status": "ok", "profile": p}
+	})
+
 	// 2. 批量操作接口
 	w.Bind("goBatchStartProfiles", func(idsJSON string) map[string]interface{} {
 		var ids []int64
@@ -426,6 +466,33 @@ func RegisterNetHandlers(w IPCBinder, bridge *ClientBridge, daemon *ClientDaemon
 			return map[string]interface{}{"ok": false, "error": err.Error()}
 		}
 		return res
+	})
+
+	w.Bind("goGetNodes", func() []NodeInfo {
+		nodes, err := bridge.GetNodes()
+		if err != nil {
+			log.Printf("[IPC-NET] goGetNodes error: %v", err)
+			return []NodeInfo{}
+		}
+		return nodes
+	})
+
+	w.Bind("goProbeAllNodes", func() []NodeInfo {
+		nodes, err := bridge.ProbeNodes()
+		if err != nil {
+			log.Printf("[IPC-NET] goProbeAllNodes error: %v", err)
+			return []NodeInfo{}
+		}
+		return nodes
+	})
+
+	w.Bind("goSelectNode", func(address string) map[string]interface{} {
+		err := bridge.SelectNode(address)
+		if err != nil {
+			log.Printf("[IPC-NET] goSelectNode error: %v", err)
+			return map[string]interface{}{"status": "error", "error": err.Error()}
+		}
+		return map[string]interface{}{"status": "ok", "active": address}
 	})
 }
 

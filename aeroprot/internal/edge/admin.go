@@ -28,6 +28,7 @@ type AdminHandler struct {
 	connLimit  *ConnLimiter
 	bwLimit    *BandwidthLimiter
 	dialGuard  *DialGuard
+	quicServer *QUICServer
 	startedAt  time.Time
 }
 
@@ -43,6 +44,11 @@ func NewAdminHandler(key string, v *Validator, ts *TokenStore, ss *SubStore, cl 
 		dialGuard:  dg,
 		startedAt:  time.Now(),
 	}
+}
+
+// SetQUICServer links the QUICServer instance for disaster-recovery policy inspection.
+func (h *AdminHandler) SetQUICServer(qs *QUICServer) {
+	h.quicServer = qs
 }
 
 func (h *AdminHandler) isLoopback(r *http.Request) bool {
@@ -135,6 +141,13 @@ func (h *AdminHandler) handleStatus(w http.ResponseWriter) {
 		"bw_per_user":    bw,
 		"max_dial":       dialCap,
 		"uptime_sec":     time.Since(h.startedAt).Seconds(),
+	}
+	if h.quicServer != nil {
+		policy := h.quicServer.OfflinePolicy()
+		body["offline_policy"] = map[string]any{
+			"grace_period_sec": policy.GracePeriod.Seconds(),
+			"max_burst_bytes":  policy.MaxBurstPerToken,
+		}
 	}
 	writeJSON(w, body)
 }
@@ -329,4 +342,9 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
+}
+
+// Revoke removes a token from TokenStore and Validator, persisting changes to disk.
+func (s *TokenStore) Revoke(token string) error {
+	return s.Remove(token)
 }

@@ -187,7 +187,12 @@ func ValidatePassword(p string) error {
 }
 
 func HashPassword(password string) string {
-	salt := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))[:16]
+	saltBytes := make([]byte, 16)
+	if _, err := rand.Read(saltBytes); err != nil {
+		h := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+		copy(saltBytes, h[:16])
+	}
+	salt := hex.EncodeToString(saltBytes)
 	h := sha256.Sum256([]byte(salt + password))
 	return fmt.Sprintf("sha256:%s:%x", salt, h)
 }
@@ -1847,7 +1852,7 @@ func SeedAdmin(svc *UserService, db UserStore) {
 		if !existing.IsStaff {
 			_ = db.SetStaff(existing.ID, true)
 		}
-		if existing.PasswordHash == "" || !CheckPassword(initPwd, existing.PasswordHash) {
+		if existing.PasswordHash == "" {
 			_ = db.SetPassword(existing.ID, HashPassword(initPwd))
 		}
 		if existing.SubSlug != "superadmin" {

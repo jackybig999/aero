@@ -116,7 +116,198 @@ function initNetworkCenter() {
       }
       applyBtn.textContent = '同步';
       refreshNetStatus();
+      loadNodes(false);
     });
+  }
+
+  ensureNodesDashboardCard();
+  loadNodes(false);
+
+  window.goPingNetNode = async () => {
+    await runNodesProbe();
+  };
+}
+
+let isProbingNodes = false;
+let currentNodesList = [];
+
+function ensureNodesDashboardCard() {
+  if ($('nodesBoardCard')) return;
+  const netContainer = document.querySelector('.net-container');
+  if (!netContainer) return;
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = 'nodesBoardCard';
+  card.style.cssText = 'padding:10px 12px;margin-bottom:0';
+  card.innerHTML = `
+    <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-weight:700;color:var(--text);font-size:12px">供应商线路看板</span>
+        <span id="nodesCountBadge" class="tag tag-blue" style="font-size:10px;padding:1px 6px">0 节点</span>
+      </div>
+      <button type="button" class="btn btn-sm btn-blue" id="btnProbeAllNodes" style="padding:2px 8px;font-size:11px">⚡ 一键测速</button>
+    </div>
+    <div id="nodesListContainer" style="display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto;padding-right:2px">
+      <div style="color:var(--muted);font-size:11px;text-align:center;padding:12px">暂无可用线路节点，请先载入专属订阅</div>
+    </div>
+  `;
+  netContainer.appendChild(card);
+
+  const probeBtn = $('btnProbeAllNodes');
+  if (probeBtn) {
+    probeBtn.addEventListener('click', runNodesProbe);
+  }
+}
+
+async function runNodesProbe() {
+  if (isProbingNodes) return;
+  isProbingNodes = true;
+  const btn = $('btnProbeAllNodes');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '测速中...';
+  }
+  const pingBtn = $('btnPingNode');
+  if (pingBtn) pingBtn.textContent = '测速中...';
+
+  try {
+    if (typeof window.goProbeAllNodes === 'function') {
+      const nodes = await window.goProbeAllNodes();
+      renderNodesList(nodes || []);
+    }
+  } catch (e) {
+    console.warn('runNodesProbe failed', e);
+  } finally {
+    isProbingNodes = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '⚡ 一键测速';
+    }
+    if (pingBtn) pingBtn.textContent = '⚡ 测速';
+    refreshNetStatus();
+  }
+}
+
+async function loadNodes(forceProbe = false) {
+  ensureNodesDashboardCard();
+  if (forceProbe) {
+    await runNodesProbe();
+    return;
+  }
+  if (isProbingNodes) return;
+  try {
+    if (typeof window.goGetNodes === 'function') {
+      const nodes = await window.goGetNodes();
+      renderNodesList(nodes || []);
+    }
+  } catch (e) {
+    console.warn('loadNodes error', e);
+  }
+}
+
+function renderNodesList(nodes) {
+  currentNodesList = nodes || [];
+  const countBadge = $('nodesCountBadge');
+  if (countBadge) {
+    countBadge.textContent = `${currentNodesList.length} 节点`;
+  }
+
+  const container = $('nodesListContainer');
+  if (!container) return;
+
+  if (currentNodesList.length === 0) {
+    container.innerHTML = `<div style="color:var(--muted);font-size:11px;text-align:center;padding:12px">暂无可用线路节点，请先载入专属订阅</div>`;
+    return;
+  }
+
+  container.innerHTML = '';
+  currentNodesList.forEach((n) => {
+    const item = document.createElement('div');
+    item.className = 'node-item' + (n.active ? ' active' : '');
+
+    // 时延展示规则: <100ms 绿色、100-200ms 黄色、>200ms 红色、超时灰色
+    let badgeBg = 'rgba(107, 114, 128, 0.15)';
+    let badgeColor = '#9ca3af';
+    let badgeBorder = 'rgba(107, 114, 128, 0.3)';
+    let latencyText = '超时';
+
+    if (n.latency_ms > 0) {
+      if (n.latency_ms < 100) {
+        badgeBg = 'rgba(34, 197, 94, 0.15)';
+        badgeColor = '#22c55e';
+        badgeBorder = 'rgba(34, 197, 94, 0.3)';
+        latencyText = `${n.latency_ms} ms`;
+      } else if (n.latency_ms <= 200) {
+        badgeBg = 'rgba(234, 179, 8, 0.15)';
+        badgeColor = '#eab308';
+        badgeBorder = 'rgba(234, 179, 8, 0.3)';
+        latencyText = `${n.latency_ms} ms`;
+      } else {
+        badgeBg = 'rgba(239, 68, 68, 0.15)';
+        badgeColor = '#ef4444';
+        badgeBorder = 'rgba(239, 68, 68, 0.3)';
+        latencyText = `${n.latency_ms} ms`;
+      }
+    } else if (n.latency_ms === 0) {
+      badgeBg = 'rgba(34, 197, 94, 0.15)';
+      badgeColor = '#22c55e';
+      badgeBorder = 'rgba(34, 197, 94, 0.3)';
+      latencyText = '< 1 ms';
+    }
+
+    const itemBorder = n.active ? '1px solid #3b82f6' : '1px solid var(--line)';
+    const itemBg = n.active ? 'rgba(59, 130, 246, 0.1)' : 'rgba(255, 255, 255, 0.02)';
+
+    item.style.cssText = `display:flex;justify-content:space-between;align-items:center;padding:7px 10px;border-radius:6px;border:${itemBorder};background:${itemBg};cursor:pointer;transition:all 0.15s ease`;
+    item.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;overflow:hidden">
+        <span style="font-size:13px">${n.active ? '🟢' : '⚪'}</span>
+        <div style="display:flex;flex-direction:column;overflow:hidden">
+          <div style="display:flex;align-items:center;gap:6px">
+            <span style="font-size:12px;font-weight:${n.active ? '700' : '500'};color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHTML(n.name || n.address)}</span>
+            ${n.active ? '<span style="font-size:9px;background:#3b82f6;color:#fff;padding:0 4px;border-radius:3px">已连</span>' : ''}
+          </div>
+          <span style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHTML(n.address)}</span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+        <span style="font-size:11px;font-weight:600;padding:2px 7px;border-radius:4px;background:${badgeBg};color:${badgeColor};border:1px solid ${badgeBorder}">${latencyText}</span>
+      </div>
+    `;
+
+    item.addEventListener('mouseenter', () => {
+      if (!n.active) item.style.background = 'rgba(255, 255, 255, 0.06)';
+    });
+    item.addEventListener('mouseleave', () => {
+      if (!n.active) item.style.background = 'rgba(255, 255, 255, 0.02)';
+    });
+
+    item.addEventListener('click', async () => {
+      if (n.active) return;
+      item.style.opacity = '0.5';
+      await selectNodeSmooth(n.address);
+    });
+
+    container.appendChild(item);
+  });
+}
+
+async function selectNodeSmooth(addr) {
+  try {
+    if (typeof window.goSelectNode === 'function') {
+      const res = await window.goSelectNode(addr);
+      if (res && res.status === 'ok') {
+        if (typeof showToast === 'function') {
+          showToast(`已平滑切换线路: ${addr}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('selectNodeSmooth error', e);
+  } finally {
+    await refreshNetStatus();
+    await loadNodes(false);
   }
 }
 

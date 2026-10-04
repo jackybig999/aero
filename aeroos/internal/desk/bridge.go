@@ -56,6 +56,13 @@ func NewClientBridge(endpoint string) *ClientBridge {
 	}
 }
 
+// SetHTTPClient sets custom HTTP client for testing or custom transports
+func (b *ClientBridge) SetHTTPClient(client *http.Client) {
+	if client != nil {
+		b.client = client
+	}
+}
+
 // Ping checks if client API is reachable
 func (b *ClientBridge) Ping() bool {
 	resp, err := b.client.Get(b.endpoint + "/health")
@@ -145,6 +152,110 @@ func (b *ClientBridge) Probe() (map[string]interface{}, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// NodeInfo 表示供应商线路节点的运行与探测状态
+type NodeInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Address     string `json:"address"`
+	SNI         string `json:"sni"`
+	LineType    string `json:"line_type,omitempty"`
+	Active      bool   `json:"active"`
+	Reachable   bool   `json:"reachable"`
+	LatencyMs   int64  `json:"latency_ms"`
+	LastProbeAt string `json:"last_probe_at,omitempty"`
+}
+
+// GetNodes 获取客户端当前供应商线路节点列表
+func (b *ClientBridge) GetNodes() ([]NodeInfo, error) {
+	resp, err := b.client.Get(b.endpoint + "/api/v1/nodes")
+	if err != nil {
+		return nil, fmt.Errorf("get nodes failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get nodes status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Status string     `json:"status"`
+		Nodes  []NodeInfo `json:"nodes"`
+		Error  string     `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, fmt.Errorf("decode nodes failed: %w", err)
+	}
+	if res.Status == "error" {
+		return nil, fmt.Errorf("client api error: %s", res.Error)
+	}
+	if res.Nodes == nil {
+		return []NodeInfo{}, nil
+	}
+	return res.Nodes, nil
+}
+
+// ProbeNodes 并发探测所有节点延迟并返回最新结果
+func (b *ClientBridge) ProbeNodes() ([]NodeInfo, error) {
+	resp, err := b.client.Post(b.endpoint+"/api/v1/nodes/probe", "application/json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("probe nodes failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("probe nodes status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Status string     `json:"status"`
+		Nodes  []NodeInfo `json:"nodes"`
+		Error  string     `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, fmt.Errorf("decode probe results failed: %w", err)
+	}
+	if res.Status == "error" {
+		return nil, fmt.Errorf("client api error: %s", res.Error)
+	}
+	if res.Nodes == nil {
+		return []NodeInfo{}, nil
+	}
+	return res.Nodes, nil
+}
+
+// SelectNode 切换激活节点 (无感平滑切线)
+func (b *ClientBridge) SelectNode(address string) error {
+	payload, err := json.Marshal(map[string]string{"address": address})
+	if err != nil {
+		return err
+	}
+	resp, err := b.client.Post(b.endpoint+"/api/v1/nodes/select", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("select node failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("select node status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+		Active string `json:"active,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return fmt.Errorf("decode select response failed: %w", err)
+	}
+	if res.Status == "error" {
+		return fmt.Errorf("client switch node error: %s", res.Error)
+	}
+	return nil
 }
 
 // ClientDaemon 管理本地客户端后台守护进程

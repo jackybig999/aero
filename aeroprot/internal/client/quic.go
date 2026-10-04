@@ -24,7 +24,7 @@ import (
 )
 
 var (
-	// CurrentMaxDatagramSize 动态最大数据报载荷（初始 1200，对齐 Next-MTU 1224）
+	// CurrentMaxDatagramSize 动态最大数据报载荷（初始 1336，对齐 Next-MTU 1360）
 	CurrentMaxDatagramSize atomic.Int32
 
 	mtuSetterMu     sync.RWMutex
@@ -40,14 +40,14 @@ var (
 )
 
 func init() {
-	CurrentMaxDatagramSize.Store(1200)
+	CurrentMaxDatagramSize.Store(1336)
 }
 
 // GetCurrentMaxDatagramSize 获取当前最大数据报有效载荷大小
 func GetCurrentMaxDatagramSize() int {
 	sz := int(CurrentMaxDatagramSize.Load())
 	if sz <= 0 {
-		return 1200
+		return 1336
 	}
 	return sz
 }
@@ -185,6 +185,9 @@ type TransportConfig struct {
 	RemoteUDPAddr     *net.UDPAddr      // 已解析物理目标地址，避免二次裸查
 	PacketConnFactory PacketConnFactory // 可选针对单次传输定制的底层工厂
 	ECHConfigList     []byte            // 仅在订阅或配置显式携带 ECH 配置列表时生效
+	ObfsPassword      string
+	PaddingJitter     bool
+	AltPorts          []int // 多端口跳频备选端口 (Multi-port Hopping)
 }
 
 var (
@@ -288,6 +291,10 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 	}
 	udpAddr := cfg.RemoteUDPAddr
 
+	if cfg.ObfsPassword != "" {
+		pconn = NewSalamanderPacketConn(pconn, cfg.ObfsPassword, cfg.PaddingJitter)
+	}
+
 	quicDialHookMu.RLock()
 	hook := quicDialHook
 	quicDialHookMu.RUnlock()
@@ -311,6 +318,27 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 		conn, err = quic.DialEarly(ctx, pconn, udpAddr, cfg.TLSConfig, quicConfig)
 	} else {
 		conn, err = quic.Dial(ctx, pconn, udpAddr, cfg.TLSConfig, quicConfig)
+	}
+	if err != nil && len(cfg.AltPorts) > 0 && udpAddr != nil {
+		for _, altPort := range cfg.AltPorts {
+			if altPort <= 0 || altPort == udpAddr.Port {
+				continue
+			}
+			altAddr := &net.UDPAddr{IP: udpAddr.IP, Port: altPort, Zone: udpAddr.Zone}
+			var altConn *quic.Conn
+			var aerr error
+			if cfg.Enable0RTT {
+				altConn, aerr = quic.DialEarly(ctx, pconn, altAddr, cfg.TLSConfig, quicConfig)
+			} else {
+				altConn, aerr = quic.Dial(ctx, pconn, altAddr, cfg.TLSConfig, quicConfig)
+			}
+			if aerr == nil {
+				conn = altConn
+				err = nil
+				log.Printf("[QUIC] Multi-port hopping: primary port %d failed, connected via alt port %d", udpAddr.Port, altPort)
+				break
+			}
+		}
 	}
 	if err != nil {
 		_ = pconn.Close()
@@ -505,5 +533,26 @@ func (p *SessionPool) Reset() {
 			_ = c.Close()
 		}
 		delete(p.clients, addr)
+	}
+}
+
+// DrainGraceful 平滑排空全部客户端连接（旧客户端在超时后真正关闭，锁不覆盖超时时间）
+func (p *SessionPool) DrainGraceful(drainTimeout time.Duration) {
+	p.mu.Lock()
+	oldClients := make([]*Client, 0, len(p.clients))
+	for addr, c := range p.clients {
+		if c != nil {
+			oldClients = append(oldClients, c)
+		}
+		delete(p.clients, addr)
+	}
+	p.mu.Unlock()
+
+	if len(oldClients) > 0 {
+		time.AfterFunc(drainTimeout, func() {
+			for _, c := range oldClients {
+				_ = c.Close()
+			}
+		})
 	}
 }

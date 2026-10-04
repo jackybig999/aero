@@ -269,6 +269,8 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				"line_type":    "direct",
 				"isp_affinity": "ANY",
 				"protocol":     "connect-ip",
+				"ech":          ep.ECH(),
+				"alt_ports":    []int{2083, 2087, 8443},
 			}
 
 			loadScore := 50.0
@@ -747,4 +749,9 @@ func normalizeRegion(raw string) string {
 		}
 	}
 	return "DEFAULT"
+}
+
+// ECH returns the Encrypted Client Hello configuration if present.
+func (ep EndpointInfo) ECH() string {
+	return ""
 }

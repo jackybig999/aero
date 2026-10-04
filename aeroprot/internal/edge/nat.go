@@ -6,10 +6,13 @@ package edge
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,7 +56,9 @@ func NewUserSpaceNATRouter(parentCtx context.Context, server *QUICServer, token 
 	ep := channel.New(512, 1420, "")
 	s := stack.New(stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocol,
+			ipv4.NewProtocolWithOptions(ipv4.Options{
+				AllowExternalLoopbackTraffic: true,
+			}),
 			ipv6.NewProtocol,
 		},
 		TransportProtocols: []stack.TransportProtocolFactory{
@@ -147,28 +152,50 @@ func (r *UserSpaceNATRouter) pumpInbound() {
 
 		raw := buf[:n]
 
-		// Local ICMP echo fallback for diagnostic ping
-		if raw[0]>>4 == 4 && raw[9] == 1 && n >= 28 {
-			ihl := int(raw[0]&0x0F) * 4
-			if n >= ihl+8 && raw[ihl] == 8 { // Echo Request
-				reply := make([]byte, n)
-				copy(reply, raw)
-				copy(reply[12:16], raw[16:20])
-				copy(reply[16:20], raw[12:16])
-				reply[ihl] = 0
-				reply[ihl+1] = 0
-				reply[10] = 0
-				reply[11] = 0
-				ipChk := calcChecksum(reply[:ihl])
-				reply[10] = byte(ipChk >> 8)
-				reply[11] = byte(ipChk & 0xff)
-				reply[ihl+2] = 0
-				reply[ihl+3] = 0
-				icmpChk := calcChecksum(reply[ihl:])
-				reply[ihl+2] = byte(icmpChk >> 8)
-				reply[ihl+3] = byte(icmpChk & 0xff)
-				_, _ = r.conn.WritePacket(reply)
-				continue
+		// Real ICMP Echo forwarding
+		if raw[0]>>4 == 4 && len(raw) >= 28 {
+			if raw[9] == 1 { // ICMPv4
+				ihl := int(raw[0]&0x0f) * 4
+				if len(raw) < ihl+8 {
+					continue
+				}
+				icmpPayload := raw[ihl:]
+				if icmpPayload[0] == 8 && icmpPayload[1] == 0 { // Echo Request
+					dstIP := net.IP(raw[16:20])
+					srcIP := net.IP(raw[12:16])
+					if r.server != nil && !r.server.allowLoopbackForTest {
+						if blocked, _ := IsBlockedIP(dstIP); blocked {
+							continue
+						}
+					}
+
+					dstIPCopy := make(net.IP, len(dstIP))
+					copy(dstIPCopy, dstIP)
+					srcIPCopy := make(net.IP, len(srcIP))
+					copy(srcIPCopy, srcIP)
+					payloadCopy := make([]byte, len(icmpPayload))
+					copy(payloadCopy, icmpPayload)
+
+					go func(dst, src net.IP, req []byte) {
+						var replyPayload []byte
+						var err error
+						if r.server != nil && r.server.icmpForwardHook != nil {
+							replyPayload, err = r.server.icmpForwardHook(dst, req)
+						} else {
+							replyPayload, err = forwardRealICMPEcho(dst, req, 2*time.Second)
+						}
+						if err == nil && len(replyPayload) >= 8 && replyPayload[0] == 0 {
+							replyIPv4 := buildIPv4ICMPPacket(dst, src, replyPayload)
+							if replyIPv4 != nil {
+								if r.server != nil && r.server.bandwidthLimiter != nil {
+									r.server.bandwidthLimiter.Take(r.token, len(replyIPv4))
+								}
+								_, _ = r.conn.WritePacket(replyIPv4)
+							}
+						}
+					}(dstIPCopy, srcIPCopy, payloadCopy)
+					continue
+				}
 			}
 		}
 
@@ -328,7 +355,12 @@ func (r *UserSpaceNATRouter) handleUDP(req *udp.ForwarderRequest) bool {
 		if err != nil {
 			return
 		}
-		remoteUDP, err := net.DialUDP("udp", nil, dstUDP)
+		if !r.server.allowLoopbackForTest {
+			if blocked, _ := IsBlockedIP(dstUDP.IP); blocked {
+				return
+			}
+		}
+		remoteUDP, err := r.server.dialUDP("udp", nil, dstUDP)
 		if err != nil {
 			return
 		}
@@ -389,4 +421,107 @@ func (r *UserSpaceNATRouter) handleUDP(req *udp.ForwarderRequest) bool {
 	}()
 
 	return true
+}
+
+// forwardRealICMPEcho dials the target via raw ICMP, sends the Echo Request, and waits for Echo Reply.
+// Best practice note for Linux unprivileged deployment:
+// Raw ICMP ("ip4:icmp") requires raw socket permissions on Linux.
+// To allow unprivileged execution without root, configure systemd service with:
+//
+//	AmbientCapabilities=CAP_NET_RAW
+//
+// Or configure sysctl ping_group_range:
+//
+//	sysctl -w net.ipv4.ping_group_range="0 2147483647"
+//
+// If permission is denied, forwardRealICMPEcho logs a friendly warning and returns an error without panicking.
+func forwardRealICMPEcho(target net.IP, reqPayload []byte, timeout time.Duration) ([]byte, error) {
+	conn, err := net.DialTimeout("ip4:icmp", target.String(), timeout)
+	if err != nil {
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "permission denied") || strings.Contains(errStr, "operation not permitted") {
+			log.Printf("[WARN] [NAT] ICMP echo raw socket permission denied (target=%s): %v. Deployment best practice: configure AmbientCapabilities=CAP_NET_RAW in systemd service or set sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"", target.String(), err)
+		}
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
+	}
+
+	if _, err := conn.Write(reqPayload); err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, 65535)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		resp := buf[:n]
+		if len(resp) >= 20 && resp[0]>>4 == 4 {
+			ihl := int(resp[0]&0x0f) * 4
+			if len(resp) >= ihl+8 {
+				resp = resp[ihl:]
+			}
+		}
+		if len(resp) >= 8 && resp[0] == 0 {
+			if len(reqPayload) >= 8 {
+				if resp[4] == reqPayload[4] && resp[5] == reqPayload[5] {
+					reply := make([]byte, len(resp))
+					copy(reply, resp)
+					return reply, nil
+				}
+				continue
+			}
+			reply := make([]byte, len(resp))
+			copy(reply, resp)
+			return reply, nil
+		}
+	}
+}
+
+// buildIPv4ICMPPacket constructs a valid 20-byte IPv4 header followed by icmpPayload,
+// computing both IPv4 header checksum and ICMP message checksum.
+func buildIPv4ICMPPacket(src net.IP, dst net.IP, icmpPayload []byte) []byte {
+	src4 := src.To4()
+	dst4 := dst.To4()
+	if src4 == nil || dst4 == nil {
+		return nil
+	}
+
+	totalLen := 20 + len(icmpPayload)
+	if totalLen > 65535 {
+		return nil
+	}
+
+	pkt := make([]byte, totalLen)
+	// 1. IPv4 Header (20 bytes)
+	pkt[0] = 0x45 // Version 4, IHL 5 (20 bytes)
+	pkt[1] = 0x00 // DSCP / ECN
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	pkt[4] = 0x00 // Identification
+	pkt[5] = 0x00
+	pkt[6] = 0x00 // Flags & Fragment Offset
+	pkt[7] = 0x00
+	pkt[8] = 64 // TTL
+	pkt[9] = 1  // Protocol: ICMP
+	copy(pkt[12:16], src4)
+	copy(pkt[16:20], dst4)
+	ipChk := calcChecksum(pkt[:20])
+	binary.BigEndian.PutUint16(pkt[10:12], ipChk)
+
+	// 2. ICMP Payload
+	copy(pkt[20:], icmpPayload)
+	if len(icmpPayload) >= 4 {
+		// Zero out ICMP checksum field before computing
+		pkt[22] = 0
+		pkt[23] = 0
+		icmpChk := calcChecksum(pkt[20:])
+		binary.BigEndian.PutUint16(pkt[22:24], icmpChk)
+	}
+
+	return pkt
 }

@@ -62,6 +62,18 @@ func StartTunnelWithConn(ctx context.Context, fd int, ipConn io.ReadWriteCloser)
 	return CopyTunnel(ctx, f, ipConn)
 }
 
+// StartTunnelWithController 启动带生命周期控制器的 iOS 移动端 TUN 转发隧道。
+func StartTunnelWithController(fd int, ipConn io.ReadWriteCloser) (*MobileTunnelController, error) {
+	if fd <= 0 {
+		return nil, fmt.Errorf("TUN not supported on this platform")
+	}
+	f := os.NewFile(uintptr(fd), "tun")
+	if f == nil {
+		return nil, fmt.Errorf("invalid file descriptor: %d", fd)
+	}
+	return StartMobileTunnel(context.Background(), f, ipConn), nil
+}
+
 // OpenTunDevice 移动端占位
 func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 	return nil, fmt.Errorf("TUN not supported on this platform")
@@ -146,4 +158,9 @@ func DetectThirdPartyTUN() (bool, string, error) {
 		}
 	}
 	return false, "", nil
+}
+
+// SetCmdExecutorForTest 移动端占位
+func SetCmdExecutorForTest(f func(name string, args ...string) error) func() {
+	return func() {}
 }

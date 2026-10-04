@@ -57,3 +57,13 @@ data/
 *.db-shm
 *.db-wal
 
+# Internal audit reports, plans, specifications & rule documents (untracked)
+*REPORT*.md
+*PLAN*.md
+*RULES*.md
+*MANIFEST*.md
+AGENTS.md
+GEMINI.md
+PROJECT_RULES.md
+
+

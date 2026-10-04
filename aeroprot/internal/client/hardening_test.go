@@ -78,12 +78,12 @@ custom-bank.com.cn
 		t.Errorf("expected 198.51.100.42 to be DIRECT, got %v", strat)
 	}
 
-	// 验证保留了 AI 与 Apple 服务
+	// 验证保留了 AI 与移出直连后 Apple 服务默认走 PROXY
 	if strat := engine.MatchDomain("api.openai.com"); strat != AI {
 		t.Errorf("expected api.openai.com to remain AI, got %v", strat)
 	}
-	if strat := engine.MatchDomain("apple.com"); strat != DIRECT {
-		t.Errorf("expected apple.com to remain DIRECT, got %v", strat)
+	if strat := engine.MatchDomain("apple.com"); strat != PROXY {
+		t.Errorf("expected apple.com to be PROXY, got %v", strat)
 	}
 
 	// 验证 TotalRules 正常统计

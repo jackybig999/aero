@@ -90,6 +90,25 @@ func main() {
 		}
 	}
 
+	adminKey := os.Getenv("AERO_ADMIN_KEY")
+	if adminKey == "" {
+		adminKeyPath := filepath.Join(dataDir, "admin.key")
+		if b, err := os.ReadFile(adminKeyPath); err == nil && len(strings.TrimSpace(string(b))) >= 32 {
+			adminKey = strings.TrimSpace(string(b))
+			log.Printf("[SECURITY] Loaded persistent AERO admin key from %s", adminKeyPath)
+		} else {
+			raw := make([]byte, 32)
+			if _, err := rand.Read(raw); err != nil {
+				log.Fatalf("[FATAL] failed to generate CSPRNG AERO admin key: %v", err)
+			}
+			adminKey = hex.EncodeToString(raw)
+			if err := os.WriteFile(adminKeyPath, []byte(adminKey), 0o600); err != nil {
+				log.Fatalf("[FATAL] failed to persist AERO admin key: %v", err)
+			}
+			log.Printf("[SECURITY] Generated new 256-bit persistent AERO admin key at %s", adminKeyPath)
+		}
+	}
+
 	// 1. Double-Entry Financial Ledger & Settlement Database (aeropay.db)
 	payDBPath := filepath.Join(dataDir, "aeropay.db")
 	payDB, err := mid.NewAeroPayDB(payDBPath)
@@ -277,7 +296,10 @@ func main() {
 	nodeHandler.RegisterRoutes(api)
 	subBuilder.RegisterRoutes(api)
 	mid.NewVPSHandler(vpsSvc).RegisterRoutes(api)
-	mid.NewAeroHandler(vpsSvc).RegisterRoutes(api)
+	aeroHandler := mid.NewAeroHandler(vpsSvc)
+	aeroHandler.SetAeroDB(aeroDB)
+	aeroHandler.SetAdminKey(adminKey)
+	aeroHandler.RegisterRoutes(api)
 	payInHandler := mid.NewPayInHandler(payInSvc)
 	payInHandler.SetDeps(userDB, billingSvc, userSvc, vpsSvc)
 	payInHandler.RegisterRoutes(api)

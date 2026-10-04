@@ -59,6 +59,13 @@ func cleanAero0Routes() {
 	quiet("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", "aero0")
 	quiet("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", "aero0")
 
+	// IPv6 黑洞路由删除：彻底清理虚拟网卡绑定的 ::/1 与 8000::/1
+	quiet("netsh", "interface", "ipv6", "delete", "route", "::/1", "aero0")
+	quiet("netsh", "interface", "ipv6", "delete", "route", "8000::/1", "aero0")
+
+	// Windows NRPT 策略精准清理：执行 powershell 移除专属规则，防止 DNS 假死
+	quiet("powershell", "-NoProfile", "-NonInteractive", "-Command", "Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_aero0' } | Remove-DnsClientNrptRule -Force")
+
 	// 禁用并关闭 aero0 网卡
 	quiet("netsh", "interface", "set", "interface", "name=aero0", "admin=DISABLED")
 }
@@ -66,5 +73,5 @@ func cleanAero0Routes() {
 func quiet(name string, args ...string) {
 	cmd := exec.Command(name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	_ = cmd.Run()
+	_ = cmd.Run() // Best-effort cleanup; errors expected if routes or NRPT rules already deleted
 }

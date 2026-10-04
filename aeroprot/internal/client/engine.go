@@ -41,6 +41,9 @@ var (
 	ErrUDPUnavailable   = errors.New("UDP_UNAVAILABLE")
 	subSingleFlight     singleflight.Group
 	detectThirdPartyTUN = DetectThirdPartyTUN
+	openTunDeviceFn     = OpenTunDevice
+	setupRoutesFn       = SetupRoutes
+	teardownRoutesFn    = TeardownRoutes
 )
 
 // AppState 描述客户端当前运行状态
@@ -144,6 +147,16 @@ func (e *Engine) SessionManager() *SessionManager {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.sessionMgr
+}
+
+// DrainingSessionCount 获取当前会话管理器中排空队列的深度
+func (e *Engine) DrainingSessionCount() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.sessionMgr != nil {
+		return e.sessionMgr.DrainingCount()
+	}
+	return 0
 }
 
 // SetPacketConnFactory 设置当前引擎的物理网卡 Socket 工厂
@@ -412,14 +425,25 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 		e.dnsHandler.SetEdge(newHost, newIP)
 	}
 
-	// 仅在真实换线后重置连接池
-	e.sessionPool.Reset()
+	// 平滑软切线（Graceful Draining）：
+	// 旧 Session 标记为 draining，不立即 Close()，保留其宿主机保护路由，开启 20 秒排空定时器（锁绝不盖住这 20 秒！）；
+	// 新请求立刻走向新 Session。
 	if e.sessionMgr != nil {
-		e.sessionMgr.Reset()
+		e.sessionMgr.Drain(20 * time.Second)
+	}
+	if e.sessionPool != nil {
+		if sp, ok := e.sessionPool.(*SessionPool); ok && sp != nil {
+			sp.DrainGraceful(20 * time.Second)
+		} else {
+			e.sessionPool.Reset()
+		}
 	}
 
 	if e.mode == "tun" && e.running.Load() && oldIP != nil && (newIP == nil || !oldIP.Equal(newIP)) {
-		UnprotectHostRoute(oldIP.String())
+		oldIPStr := oldIP.String()
+		time.AfterFunc(20*time.Second, func() {
+			UnprotectHostRoute(oldIPStr)
+		})
 	}
 
 	log.Printf("[ENGINE] active node switched to %s (sni=%s)", addr, sni)
@@ -603,7 +627,7 @@ func (e *Engine) Start() error {
 		return nil
 	}
 
-	dev, err := OpenTunDevice("aero0", 1224)
+	dev, err := openTunDeviceFn("aero0", 1360)
 	if err != nil {
 		UnprotectHostRoute(ip.String())
 		if e.rootCancel != nil {
@@ -618,7 +642,7 @@ func (e *Engine) Start() error {
 	if err := e.stackEngine.Start(); err != nil {
 		_ = dev.Close()
 		e.tunDevice = nil
-		TeardownRoutes(dev.Name())
+		teardownRoutesFn(dev.Name())
 		UnprotectHostRoute(ip.String())
 		if e.rootCancel != nil {
 			e.rootCancel()
@@ -626,24 +650,20 @@ func (e *Engine) Start() error {
 		return rollback(fmt.Errorf("start stack: %w", err))
 	}
 
-	prefixStr := "10.88.0.2/24"
-	if e.sessionMgr != nil {
-		dialIPCtx, dialIPCancel := context.WithTimeout(startCtx, 3*time.Second)
-		_, prefixes, err := e.sessionMgr.DialIP(dialIPCtx)
-		dialIPCancel()
-		if err == nil && len(prefixes) > 0 {
-			prefixStr = prefixes[0].String()
-		}
-	}
+	// WebRTC 生产激活：探测成功且 stackEngine 启动后，显式激活 WebRTC
+	e.stackEngine.SetWebRTCActive(true)
 
-	if err := SetupRoutes(dev.Name(), prefixStr); err != nil {
+	// 路由配置固定使用 10.88.0.2/24，与 gVisor 保持一致；彻底剔除桌面 DialIP 调用
+	prefixStr := "10.88.0.2/24"
+
+	if err := setupRoutesFn(dev.Name(), prefixStr); err != nil {
 		if e.stackEngine != nil {
 			e.stackEngine.Stop()
 			e.stackEngine = nil
 		}
 		_ = dev.Close()
 		e.tunDevice = nil
-		TeardownRoutes(dev.Name())
+		teardownRoutesFn(dev.Name())
 		UnprotectHostRoute(ip.String())
 		if e.rootCancel != nil {
 			e.rootCancel()

@@ -38,8 +38,11 @@ type Session struct {
 	addr          string
 	sni           string
 	nonceSent     atomic.Bool
+	draining      atomic.Bool
 	closed        atomic.Bool
 	closeOnce     sync.Once
+	tcpDialer     func(ctx context.Context, target string) (net.Conn, error)
+	onClose       func()
 }
 
 // NewSession creates a new Session from an existing Client connection.
@@ -77,6 +80,16 @@ func NewSession(client *Client, token, addr, sni string) (*Session, error) {
 	}, nil
 }
 
+// MarkDraining marks the session as draining (no new streams accepted, existing streams continue).
+func (s *Session) MarkDraining() {
+	s.draining.Store(true)
+}
+
+// IsDraining reports whether the session is currently in draining mode.
+func (s *Session) IsDraining() bool {
+	return s.draining.Load()
+}
+
 // setAuthHeaders attaches authentication headers:
 // - Always: Authorization: Bearer <token>
 // - First request on connection: Aero-Timestamp (ms), Aero-Nonce (32 hex chars)
@@ -95,6 +108,13 @@ func (s *Session) setAuthHeaders(hdr http.Header) {
 func (s *Session) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 	if s.closed.Load() {
 		return nil, net.ErrClosed
+	}
+	if s.draining.Load() {
+		return nil, errors.New("session is draining")
+	}
+
+	if s.tcpDialer != nil {
+		return s.tcpDialer(ctx, target)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "//"+target, nil)
@@ -267,6 +287,9 @@ func (s *Session) Close() error {
 	s.closed.Store(true)
 	var err error
 	s.closeOnce.Do(func() {
+		if s.onClose != nil {
+			s.onClose()
+		}
 		if s.client != nil {
 			err = s.client.Close()
 		}
@@ -285,11 +308,15 @@ func (s *Session) IsAlive() bool {
 	return true
 }
 
+const maxDrainingSessions = 2
+
 // SessionManager manages active Session lifecycle, supporting dial, get, and reset.
 type SessionManager struct {
-	mu             sync.Mutex
-	currentSession *Session
-	dialHook       func(ctx context.Context) (*Session, error)
+	mu               sync.Mutex
+	currentSession   *Session
+	dialHook         func(ctx context.Context) (*Session, error)
+	drainingMu       sync.Mutex
+	drainingSessions []*Session
 }
 
 // NewSessionManager creates a new SessionManager.
@@ -309,12 +336,14 @@ func (m *SessionManager) GetSession(ctx context.Context) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.currentSession != nil && m.currentSession.IsAlive() {
+	if m.currentSession != nil && m.currentSession.IsAlive() && !m.currentSession.IsDraining() {
 		return m.currentSession, nil
 	}
 
 	if m.currentSession != nil {
-		_ = m.currentSession.Close()
+		if !m.currentSession.IsDraining() {
+			_ = m.currentSession.Close()
+		}
 		m.currentSession = nil
 	}
 
@@ -412,14 +441,85 @@ func (m *SessionManager) Ping(ctx context.Context) (time.Duration, error) {
 	return sess.Ping(ctx)
 }
 
-// Reset clears and closes the active session.
+// Reset clears and closes the active session and all draining sessions.
 func (m *SessionManager) Reset() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.currentSession != nil {
 		_ = m.currentSession.Close()
 		m.currentSession = nil
 	}
+	m.mu.Unlock()
+
+	m.drainingMu.Lock()
+	toClose := m.drainingSessions
+	m.drainingSessions = nil
+	m.drainingMu.Unlock()
+
+	for _, s := range toClose {
+		_ = s.Close()
+	}
+}
+
+// Drain marks the current session as draining, releases it from currentSession
+// so future requests establish a new session, and schedules its Close after drainTimeout.
+// If the draining queue depth exceeds maxDrainingSessions (2), the oldest draining
+// session is immediately closed and evicted from the queue to prevent session accumulation.
+// IMPORTANT: Locks are NOT held during session Close()!
+func (m *SessionManager) Drain(drainTimeout time.Duration) *Session {
+	m.mu.Lock()
+	oldSess := m.currentSession
+	m.currentSession = nil
+	m.mu.Unlock()
+
+	if oldSess == nil {
+		return nil
+	}
+
+	oldSess.MarkDraining()
+
+	m.drainingMu.Lock()
+	var toClose []*Session
+	for len(m.drainingSessions) >= maxDrainingSessions {
+		oldest := m.drainingSessions[0]
+		m.drainingSessions = m.drainingSessions[1:]
+		toClose = append(toClose, oldest)
+	}
+	m.drainingSessions = append(m.drainingSessions, oldSess)
+	m.drainingMu.Unlock()
+
+	for _, s := range toClose {
+		_ = s.Close()
+	}
+
+	time.AfterFunc(drainTimeout, func() {
+		m.drainingMu.Lock()
+		for i, s := range m.drainingSessions {
+			if s == oldSess {
+				m.drainingSessions = append(m.drainingSessions[:i], m.drainingSessions[i+1:]...)
+				break
+			}
+		}
+		m.drainingMu.Unlock()
+		_ = oldSess.Close()
+	})
+
+	return oldSess
+}
+
+// DrainingCount returns the number of sessions currently in draining state.
+func (m *SessionManager) DrainingCount() int {
+	m.drainingMu.Lock()
+	defer m.drainingMu.Unlock()
+	return len(m.drainingSessions)
+}
+
+// DrainingSessions returns a snapshot of currently draining sessions.
+func (m *SessionManager) DrainingSessions() []*Session {
+	m.drainingMu.Lock()
+	defer m.drainingMu.Unlock()
+	res := make([]*Session, len(m.drainingSessions))
+	copy(res, m.drainingSessions)
+	return res
 }
 
 var (

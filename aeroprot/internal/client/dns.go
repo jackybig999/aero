@@ -376,30 +376,8 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return buildEmptyResponse(pkt, qname, qtype)
 	}
 
-	// A 记录：优先尝试 DoH 解析 (POST /dns-query)
-	if h.dohResolver != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
-		respBytes, err := h.dohResolver(ctx, pkt)
-		cancel()
-		if err == nil && len(respBytes) >= 12 {
-			if len(pkt) >= 2 {
-				respBytes[0], respBytes[1] = pkt[0], pkt[1]
-			}
-			return respBytes
-		}
-	}
-
-	// 其次尝试隧道内短流解析 (StreamType_CONTROL)
-	if h.tunnelResolver != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
-		realIP, err := h.tunnelResolver(ctx, qnameLower)
-		cancel()
-		if err == nil && realIP != nil && realIP.To4() != nil {
-			return buildAResponse(pkt, qname, realIP)
-		}
-	}
-
-	// 隧道未建连、超时或解析失败：0ms 下发 198.18 Fake-IP
+	// 境外 A 记录查询：0ms 立即返回 198.18.0.0/15 Fake-IP（耗时 < 100ms），绝不先行同步等待 2.5 秒 DoH 往返！
+	// 真实域名保留在 Fake-IP 表，由后续 CONNECT 统一送交边缘解析。
 	if h.fakeIP != nil {
 		resp := h.fakeIP.FormatDNSResponse(qname)
 		if len(pkt) >= 2 && len(resp) >= 2 {

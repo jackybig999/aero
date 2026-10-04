@@ -7,12 +7,16 @@ package edge
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +34,14 @@ import (
 	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/sagernet/gvisor/pkg/buffer"
+	"github.com/sagernet/gvisor/pkg/tcpip"
+	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
+	"github.com/sagernet/gvisor/pkg/tcpip/header"
+	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
+	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
+	"github.com/sagernet/gvisor/pkg/tcpip/stack"
+	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/yosida95/uritemplate/v3"
 )
 
@@ -282,14 +294,27 @@ func TestSubscriptionStoreAndSigning(t *testing.T) {
 	// Test SubHandler
 	handler := &SubHandler{Store: store}
 
-	// 1. GET /sub/superadmin
+	// 1. GET /sub/superadmin -> must return 404 and contain NO token
 	reqAdmin := httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil)
 	recAdmin := httptest.NewRecorder()
 	if !handler.TryServe(recAdmin, reqAdmin) {
 		t.Fatal("TryServe should handle /sub/superadmin")
 	}
-	if recAdmin.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", recAdmin.Code)
+	if recAdmin.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", recAdmin.Code)
+	}
+	if strings.Contains(recAdmin.Body.String(), "token") {
+		t.Fatalf("response body must not contain token: %s", recAdmin.Body.String())
+	}
+
+	// 1b. GET /sub/{nodeSecret} -> must return 200
+	reqNode := httptest.NewRequest(http.MethodGet, "/sub/"+store.Secret(), nil)
+	recNode := httptest.NewRecorder()
+	if !handler.TryServe(recNode, reqNode) {
+		t.Fatal("TryServe should handle node secret")
+	}
+	if recNode.Code != http.StatusOK {
+		t.Fatalf("expected 200 for node secret, got %d", recNode.Code)
 	}
 
 	// 2. GET /sub/jacky888abc (User Slug)
@@ -696,6 +721,41 @@ func findTestAddr() (string, string) {
 		return "[::1]:0", "localhost"
 	}
 	return "127.0.0.1:0", "localhost"
+}
+
+func findTCPTestTarget() net.IP {
+	// First probe IPv4 127.0.0.1
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err == nil {
+		c, err2 := net.DialTimeout("tcp4", ln.Addr().String(), 100*time.Millisecond)
+		if err2 == nil {
+			_ = c.Close()
+			_ = ln.Close()
+			return net.ParseIP("127.0.0.1")
+		}
+		_ = ln.Close()
+	}
+	// Fallback to local unicast non-loopback IPv4 (bypasses Windows WFP loopback interception)
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ip4 := ipnet.IP.To4(); ip4 != nil {
+					ln2, err2 := net.Listen("tcp4", net.JoinHostPort(ip4.String(), "0"))
+					if err2 == nil {
+						c2, err3 := net.DialTimeout("tcp4", ln2.Addr().String(), 100*time.Millisecond)
+						if err3 == nil {
+							_ = c2.Close()
+							_ = ln2.Close()
+							return ip4
+						}
+						_ = ln2.Close()
+					}
+				}
+			}
+		}
+	}
+	return net.ParseIP("127.0.0.1")
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -1318,6 +1378,57 @@ func TestECHDisabledByDefault(t *testing.T) {
 	}
 }
 
+// TestPhase4Gate_EdgeECHWithoutHTTPSRR (阶段四规范验证)
+// 在不配置公网 HTTPS RR 的情况下，只要配置了 EncryptedClientHelloKeys，服务端成功启动并开启 ECH，日志包含 "ECH enabled"。
+func TestPhase4Gate_EdgeECHWithoutHTTPSRR(t *testing.T) {
+	dataDir := t.TempDir()
+
+	listenAddr, host := findTestAddr()
+	cfg := ServerConfig{
+		Listen:                     listenAddr,
+		Domain:                     host,
+		DataDir:                    dataDir,
+		Role:                       "single",
+		AllowSelfSignedCertForTest: true,
+		EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{
+			{
+				Config:      []byte("dummy-ech-config-phase4"),
+				PrivateKey:  []byte("dummy-ech-key-phase4"),
+				SendAsRetry: true,
+			},
+		},
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	// 捕获日志输出
+	var logBuf bytes.Buffer
+	origOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origOutput)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start() failed: %v", err)
+	}
+	defer func() {
+		if srv.tcpListener != nil {
+			_ = srv.tcpListener.Close()
+		}
+		if srv.quicListener != nil {
+			_ = srv.quicListener.Close()
+		}
+		srv.cancel()
+	}()
+
+	logText := logBuf.String()
+	if !strings.Contains(logText, "ECH enabled") {
+		t.Fatalf("expected log to contain 'ECH enabled', got:\n%s", logText)
+	}
+}
+
 // ==========================================
 // P2/P3 HTTP/3 MASQUE Integration Tests
 // ==========================================
@@ -1647,6 +1758,259 @@ func TestMASQUEConnectUDP(t *testing.T) {
 	}
 }
 
+func TestConnectUDP(t *testing.T) {
+	t.Run("LongRangeEcho", func(t *testing.T) {
+		t.Parallel()
+
+		listenAddr, host := findTestAddr()
+
+		// 1. Echo UDP Server
+		udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer udpConn.Close()
+
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, rAddr, err := udpConn.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				_, _ = udpConn.WriteTo(buf[:n], rAddr)
+			}
+		}()
+
+		// 2. Edge server
+		dataDir := t.TempDir()
+		edgeAddr, _ := findTestAddr()
+		cfg := ServerConfig{
+			Listen:                     edgeAddr,
+			Domain:                     host,
+			DataDir:                    dataDir,
+			Token:                      "long_range_udp_token",
+			AllowSelfSignedCertForTest: true,
+		}
+
+		srv, err := NewServer(cfg)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		if err := srv.Start(); err != nil {
+			t.Fatalf("srv.Start failed: %v", err)
+		}
+		defer srv.Close()
+
+		// 3. Dial HTTP/3 + MASQUE
+		tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+		quicConf := DefaultQUICConfig()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+
+		qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
+		if err != nil {
+			t.Fatalf("quic.DialAddr failed: %v", err)
+		}
+		defer qConn.CloseWithError(0, "normal")
+
+		tr := &http3.Transport{EnableDatagrams: true}
+		h3Conn := tr.NewClientConn(qConn)
+		masqueConn := masque.NewClientConn(h3Conn)
+
+		target := udpConn.LocalAddr().String()
+		tmpl := uritemplate.MustNew("https://" + host + "/.well-known/masque/udp/{target_host}/{target_port}/")
+		mReq, err := masque.NewRequest(ctx, tmpl, target)
+		if err != nil {
+			t.Fatalf("masque.NewRequest failed: %v", err)
+		}
+		mReq.Header().Set("Authorization", "Bearer long_range_udp_token")
+		mReq.Header().Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+		mReq.Header().Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+		mConn, resp, err := masqueConn.Dial(mReq)
+		if err != nil {
+			t.Fatalf("masqueConn.Dial failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("connect-udp rejected: %d %s", resp.StatusCode, resp.Status)
+		}
+		defer mConn.Close()
+
+		rUdpAddr, _ := net.ResolveUDPAddr("udp", target)
+
+		// 7 packets across 70 seconds:
+		// Target schedule in seconds: 10, 20, 30, 40, 46, 58, 70
+		schedule := []int{10, 20, 30, 40, 46, 58, 70}
+		start := time.Now()
+
+		for idx, targetSec := range schedule {
+			targetTime := start.Add(time.Duration(targetSec) * time.Second)
+			if wait := time.Until(targetTime); wait > 0 {
+				time.Sleep(wait)
+			}
+			elapsed := time.Since(start)
+			pktData := []byte(fmt.Sprintf("pkt-%d-target-%d", idx+1, targetSec))
+			if _, err := mConn.WriteTo(pktData, rUdpAddr); err != nil {
+				t.Fatalf("WriteTo pkt %d (sec %d) failed at %v: %v", idx+1, targetSec, elapsed, err)
+			}
+
+			recvBuf := make([]byte, 2048)
+			_ = mConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, _, err := mConn.ReadFrom(recvBuf)
+			if err != nil {
+				t.Fatalf("ReadFrom pkt %d (sec %d) failed at %v: %v", idx+1, targetSec, elapsed, err)
+			}
+			if !bytes.Equal(recvBuf[:n], pktData) {
+				t.Fatalf("pkt %d mismatch: sent %q, got %q", idx+1, pktData, recvBuf[:n])
+			}
+
+			if targetSec == 46 {
+				t.Logf("[ASSERT] 46s packet successfully read back at elapsed %v (45s deadlock eliminated!)", elapsed)
+			}
+			if targetSec == 70 {
+				t.Logf("[ASSERT] 70s packet successfully read back at elapsed %v (long-range keepalive verified!)", elapsed)
+			}
+		}
+	})
+
+	t.Run("IdleTimeout", func(t *testing.T) {
+		t.Parallel()
+
+		listenAddr, host := findTestAddr()
+
+		// 1. Echo UDP Server
+		udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer udpConn.Close()
+
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, rAddr, err := udpConn.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				_, _ = udpConn.WriteTo(buf[:n], rAddr)
+			}
+		}()
+
+		// 2. Edge server
+		dataDir := t.TempDir()
+		edgeAddr, _ := findTestAddr()
+		cfg := ServerConfig{
+			Listen:                     edgeAddr,
+			Domain:                     host,
+			DataDir:                    dataDir,
+			Token:                      "idle_timeout_udp_token",
+			AllowSelfSignedCertForTest: true,
+		}
+
+		srv, err := NewServer(cfg)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		if err := srv.Start(); err != nil {
+			t.Fatalf("srv.Start failed: %v", err)
+		}
+		defer srv.Close()
+
+		// 3. Dial HTTP/3 + MASQUE
+		tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+		quicConf := DefaultQUICConfig()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+		defer cancel()
+
+		qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
+		if err != nil {
+			t.Fatalf("quic.DialAddr failed: %v", err)
+		}
+		defer qConn.CloseWithError(0, "normal")
+
+		tr := &http3.Transport{EnableDatagrams: true}
+		h3Conn := tr.NewClientConn(qConn)
+		masqueConn := masque.NewClientConn(h3Conn)
+
+		target := udpConn.LocalAddr().String()
+		tmpl := uritemplate.MustNew("https://" + host + "/.well-known/masque/udp/{target_host}/{target_port}/")
+		mReq, err := masque.NewRequest(ctx, tmpl, target)
+		if err != nil {
+			t.Fatalf("masque.NewRequest failed: %v", err)
+		}
+		mReq.Header().Set("Authorization", "Bearer idle_timeout_udp_token")
+		mReq.Header().Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+		mReq.Header().Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+		mConn, resp, err := masqueConn.Dial(mReq)
+		if err != nil {
+			t.Fatalf("masqueConn.Dial failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("connect-udp rejected: %d %s", resp.StatusCode, resp.Status)
+		}
+		defer mConn.Close()
+
+		rUdpAddr, _ := net.ResolveUDPAddr("udp", target)
+
+		// Send initial probe to confirm active connection
+		probe := []byte("initial-probe")
+		if _, err := mConn.WriteTo(probe, rUdpAddr); err != nil {
+			t.Fatalf("initial WriteTo failed: %v", err)
+		}
+		recvBuf := make([]byte, 2048)
+		_ = mConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, _, err := mConn.ReadFrom(recvBuf)
+		if err != nil || !bytes.Equal(recvBuf[:n], probe) {
+			t.Fatalf("initial echo failed: %v", err)
+		}
+
+		if srv.quicServer.globalUDPCtx.Load() != 1 {
+			t.Fatalf("expected 1 active UDP slot before silence, got %d", srv.quicServer.globalUDPCtx.Load())
+		}
+
+		// 4. Silence for 50 seconds
+		t.Log("Beginning 50s silence period for idle watchdog timeout test...")
+		time.Sleep(50 * time.Second)
+
+		// 5. Assert that watchdog triggered and connection is closed:
+		// Server-side: srv.quicServer.globalUDPCtx must be 0 (slot released)
+		released := false
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if srv.quicServer.globalUDPCtx.Load() == 0 {
+				released = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !released {
+			t.Fatalf("expected server UDP slot to be released after 50s silence, got %d", srv.quicServer.globalUDPCtx.Load())
+		}
+		t.Log("[ASSERT] Server UDP slot successfully released by watchdog")
+
+		// Client-side: ReadFrom must fail because server closed stream
+		_, _ = mConn.WriteTo([]byte("probe-after-timeout"), rUdpAddr)
+		_ = mConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _, err = mConn.ReadFrom(recvBuf)
+		if err == nil {
+			t.Fatal("expected ReadFrom to fail after 50s silence, but packet was read")
+		}
+		t.Logf("[ASSERT] Connection verified closed on client (ReadFrom returned: %v)", err)
+	})
+}
+
 func TestCONNECTIPRoundtrip(t *testing.T) {
 	dataDir := t.TempDir()
 	listenAddr, host := findTestAddr()
@@ -1714,20 +2078,117 @@ func TestCONNECTIPRoundtrip(t *testing.T) {
 		t.Fatalf("expected assigned IP in 10.88.0.0/16, got %s", assignedIP.String())
 	}
 
-	// Build ICMP Echo Request packet
-	clientIPBytes := assignedIP.As4()
-	serverIPBytes := [4]byte{10, 88, 0, 1}
+	// Start a real TCP echo server on host
+	targetIP := findTCPTestTarget()
+	echoLn, err := net.Listen("tcp4", net.JoinHostPort(targetIP.String(), "0"))
+	if err != nil {
+		t.Fatalf("failed to listen on tcp: %v", err)
+	}
+	defer echoLn.Close()
+	echoPort := echoLn.Addr().(*net.TCPAddr).Port
 
-	icmpReq := make([]byte, 28) // 20-byte IPv4 + 8-byte ICMP
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	clientEP := channel.New(512, 1420, "")
+	clientStack := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocolWithOptions(ipv4.Options{
+				AllowExternalLoopbackTraffic: true,
+			}),
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{
+			tcp.NewProtocol,
+		},
+	})
+	nicID := tcpip.NICID(1)
+	if err := clientStack.CreateNIC(nicID, clientEP); err != nil {
+		t.Fatalf("CreateNIC failed: %v", err)
+	}
+	clientStack.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4(assignedIP.As4()).WithPrefix(),
+	}, stack.AddressProperties{})
+	clientStack.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: nicID},
+	})
+
+	pumpCtx, pumpCancel := context.WithCancel(ctx)
+	defer pumpCancel()
+
+	// Pump clientEP -> ipConn
+	go func() {
+		for {
+			pkt := clientEP.ReadContext(pumpCtx)
+			if pkt == nil {
+				return
+			}
+			view := pkt.ToView()
+			if view != nil {
+				b := view.AsSlice()
+				if len(b) > 0 {
+					_, _ = ipConn.WritePacket(b)
+				}
+				view.Release()
+			}
+			pkt.DecRef()
+		}
+	}()
+
+	var forgedICMPReceived atomic.Bool
+	dest1111 := [4]byte{1, 1, 1, 1}
+
+	// Pump ipConn -> clientEP
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			if pumpCtx.Err() != nil {
+				return
+			}
+			n, err := ipConn.ReadPacket(buf)
+			if err != nil {
+				return
+			}
+			if n < 20 {
+				continue
+			}
+			// Check if this is an ICMP Type 0 (Echo Reply) from 1.1.1.1
+			if buf[0]>>4 == 4 && buf[9] == 1 && n >= 28 && buf[20] == 0 {
+				if bytes.Equal(buf[12:16], dest1111[:]) {
+					forgedICMPReceived.Store(true)
+				}
+			}
+			v := buffer.NewViewSize(n)
+			copy(v.AsSlice(), buf[:n])
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload: buffer.MakeWithView(v),
+			})
+			clientEP.InjectInbound(header.IPv4ProtocolNumber, pkt)
+			pkt.DecRef()
+		}
+	}()
+
+	// 1. Send ICMP Echo Request to 1.1.1.1
+	icmpReq := make([]byte, 28)
 	icmpReq[0] = 0x45
 	binary.BigEndian.PutUint16(icmpReq[2:4], 28)
 	icmpReq[8] = 64
 	icmpReq[9] = 1 // ICMP
+	clientIPBytes := assignedIP.As4()
 	copy(icmpReq[12:16], clientIPBytes[:])
-	copy(icmpReq[16:20], serverIPBytes[:])
+	copy(icmpReq[16:20], dest1111[:])
 	ipChk := calcChecksum(icmpReq[:20])
 	binary.BigEndian.PutUint16(icmpReq[10:12], ipChk)
-
 	icmpReq[20] = 8 // Echo Request
 	icmpReq[21] = 0
 	binary.BigEndian.PutUint16(icmpReq[24:26], 1) // ID
@@ -1736,20 +2197,43 @@ func TestCONNECTIPRoundtrip(t *testing.T) {
 	binary.BigEndian.PutUint16(icmpReq[22:24], icmpChk)
 
 	if _, err := ipConn.WritePacket(icmpReq); err != nil {
-		t.Fatalf("WritePacket failed: %v", err)
+		t.Fatalf("WritePacket icmp failed: %v", err)
 	}
 
-	replyBuf := make([]byte, 1500)
-	n, err := ipConn.ReadPacket(replyBuf)
+	// 2. Perform end-to-end TCP payload echo
+	localAddr := tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFrom4(assignedIP.As4()),
+	}
+	var targetIP4 [4]byte
+	copy(targetIP4[:], targetIP.To4())
+	remoteAddr := tcpip.FullAddress{
+		Addr: tcpip.AddrFrom4(targetIP4),
+		Port: uint16(echoPort),
+	}
+	tcpConn, err := gonet.DialTCPWithBind(ctx, clientStack, localAddr, remoteAddr, ipv4.ProtocolNumber)
 	if err != nil {
-		t.Fatalf("ReadPacket failed: %v", err)
+		t.Fatalf("gonet.DialTCPWithBind failed: %v", err)
 	}
-	if n < 28 {
-		t.Fatalf("expected at least 28 bytes in reply, got %d", n)
+	defer tcpConn.Close()
+
+	payload := []byte("hello-aero-real-tcp-payload-roundtrip")
+	if _, err := tcpConn.Write(payload); err != nil {
+		t.Fatalf("tcpConn.Write failed: %v", err)
 	}
-	// Verify ICMP Echo Reply (Type 0)
-	if replyBuf[20] != 0 {
-		t.Fatalf("expected ICMP Echo Reply (type 0), got type %d", replyBuf[20])
+
+	recvBuf := make([]byte, 1024)
+	_ = tcpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := tcpConn.Read(recvBuf)
+	if err != nil {
+		t.Fatalf("tcpConn.Read failed: %v", err)
+	}
+	if !bytes.Equal(recvBuf[:n], payload) {
+		t.Fatalf("payload mismatch: expected %s, got %s", payload, recvBuf[:n])
+	}
+
+	if forgedICMPReceived.Load() {
+		t.Fatal("expected no forged ICMP Echo Type 0 reply for 1.1.1.1, but one was received")
 	}
 }
 
@@ -2275,5 +2759,1773 @@ func TestPrecompiledTemplatesInitialized(t *testing.T) {
 	}
 	if qs.ipTempl == nil {
 		t.Fatal("expected ipTempl to be initialized")
+	}
+}
+
+// ==========================================
+// Phase 2 Gate Unit Tests (Grok 4.7 Standard)
+// ==========================================
+
+// Gate 1: GET /sub/superadmin returns 404 with no token; correct node secret returns 200.
+func TestPhase2Gate1SuperadminBlocked(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewSubStore(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nodeToken := "node_bearer_token_secret_12345"
+	if err := store.Ensure(EnsureSubParams{
+		Name:     "TestNode",
+		Host:     "test.example.com",
+		Token:    nodeToken,
+		SNI:      "test.example.com",
+		LineType: "standard",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secretKey := store.Secret()
+	if secretKey == "" {
+		t.Fatal("expected non-empty secret key")
+	}
+
+	// Verify client-sub.json exists and is readable
+	clientSubPath := filepath.Join(tmpDir, "client-sub.json")
+	if _, err := os.Stat(clientSubPath); err != nil {
+		t.Fatalf("failed to stat client-sub.json: %v", err)
+	}
+
+	handler := &SubHandler{Store: store}
+
+	// 1. GET /sub/superadmin MUST return 404 and must NOT contain node token
+	reqAdmin := httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil)
+	recAdmin := httptest.NewRecorder()
+	handled := handler.TryServe(recAdmin, reqAdmin)
+	if !handled {
+		t.Fatal("TryServe should handle /sub/superadmin")
+	}
+	if recAdmin.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for /sub/superadmin, got %d", recAdmin.Code)
+	}
+	if strings.Contains(recAdmin.Body.String(), nodeToken) {
+		t.Fatalf("superadmin response must NOT contain token, got: %s", recAdmin.Body.String())
+	}
+
+	// 2. GET /sub/{nodeSecret} with correct node secret MUST return 200
+	reqValid := httptest.NewRequest(http.MethodGet, "/sub/"+secretKey, nil)
+	recValid := httptest.NewRecorder()
+	handled = handler.TryServe(recValid, reqValid)
+	if !handled {
+		t.Fatal("TryServe should handle /sub/{secret}")
+	}
+	if recValid.Code != http.StatusOK {
+		t.Fatalf("expected 200 for correct node secret, got %d", recValid.Code)
+	}
+	if !strings.Contains(recValid.Body.String(), nodeToken) {
+		t.Fatalf("expected valid response to contain node token")
+	}
+}
+
+// Gate 2: Target domains resolving to 127.0.0.1, 10.0.0.1, 169.254.169.254 result in 0 UDP dials and 403 Forbidden;
+// target resolving to public address allows payload roundtrip through real UDP socket.
+func TestPhase2Gate2SSRFConnectUDP(t *testing.T) {
+	v := NewValidator()
+	v.AddToken("valid_gate_token", "user", 24*time.Hour)
+	qs := NewQUICServer(v, nil, nil, nil, nil)
+	defer qs.Close()
+	qs.SetAllowLoopbackForTest(false) // Strict SSRF blocking
+
+	var dialCount atomic.Int32
+	qs.SetUDPDialFunc(func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
+		dialCount.Add(1)
+		return net.DialUDP(network, laddr, raddr)
+	})
+
+	blockedTargets := []struct {
+		domain string
+		ip     net.IP
+	}{
+		{"rebind-loopback.target:5353", net.IPv4(127, 0, 0, 1)},
+		{"rebind-private.target:5353", net.IPv4(10, 0, 0, 1)},
+		{"rebind-linklocal.target:5353", net.IPv4(169, 254, 169, 254)},
+	}
+
+	for _, tc := range blockedTargets {
+		t.Run(tc.domain, func(t *testing.T) {
+			qs.SetResolveUDPFunc(func(network, addr string) (*net.UDPAddr, error) {
+				return &net.UDPAddr{IP: tc.ip, Port: 5353}, nil
+			})
+
+			h, p, _ := net.SplitHostPort(tc.domain)
+			targetURL := "https://placeholder/.well-known/masque/udp/" + h + "/" + p + "/"
+			req := httptest.NewRequest(http.MethodGet, targetURL, nil)
+			req.Method = http.MethodConnect
+			req.Proto = "connect-udp"
+			req.Header.Set("Upgrade", "connect-udp")
+			req.Header.Set("Capsule-Protocol", "?1")
+			req.URL.Scheme = ""
+			req.URL.Host = ""
+			nonce := make([]byte, 32)
+			_, _ = io.ReadFull(rand.Reader, nonce)
+			req.Header.Set("Authorization", "Bearer valid_gate_token")
+			req.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+			req.Header.Set("Aero-Nonce", hex.EncodeToString(nonce))
+
+			rec := httptest.NewRecorder()
+			qs.serveConnectUDP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 Forbidden for SSRF target %s (%s), got %d", tc.domain, tc.ip, rec.Code)
+			}
+			proxyStatus := rec.Header().Get("Proxy-Status")
+			if !strings.Contains(proxyStatus, "destination_ip_prohibited") {
+				t.Fatalf("expected Proxy-Status destination_ip_prohibited, got %q", proxyStatus)
+			}
+			if dialCount.Load() != 0 {
+				t.Fatalf("expected UDP dial count to be 0, got %d", dialCount.Load())
+			}
+		})
+	}
+
+	t.Run("PublicIPResolutionRealUDPEcho", func(t *testing.T) {
+		listenAddr, host := findTestAddr()
+		udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
+		if err != nil {
+			t.Fatalf("failed to resolve udp listenAddr: %v", err)
+		}
+		echoUDP, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			t.Fatalf("failed to listen on udp: %v", err)
+		}
+		defer echoUDP.Close()
+
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, raddr, err := echoUDP.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				_, _ = echoUDP.WriteTo(buf[:n], raddr)
+			}
+		}()
+
+		// Full end-to-end QUIC / MASQUE CONNECT-UDP test
+		dataDir := t.TempDir()
+		edgeAddr, _ := findTestAddr()
+		cfg := ServerConfig{
+			Listen:                     edgeAddr,
+			Domain:                     host,
+			DataDir:                    dataDir,
+			Token:                      "public_udp_token",
+			AllowSelfSignedCertForTest: true,
+		}
+
+		srv, err := NewServer(cfg)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		if err := srv.Start(); err != nil {
+			t.Fatalf("srv.Start failed: %v", err)
+		}
+		defer srv.Close()
+
+		var publicDialCount atomic.Int32
+		targetHost := "public-service.example"
+		targetAddr := targetHost + ":5353"
+
+		// Server resolves target domain to public IP (198.51.100.1), then dials real echo UDP
+		srv.quicServer.SetResolveUDPFunc(func(network, addr string) (*net.UDPAddr, error) {
+			return &net.UDPAddr{IP: net.ParseIP("198.51.100.1"), Port: 5353}, nil
+		})
+		srv.quicServer.SetUDPDialFunc(func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
+			publicDialCount.Add(1)
+			return net.DialUDP("udp", nil, echoUDP.LocalAddr().(*net.UDPAddr))
+		})
+
+		tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+		quicConf := DefaultQUICConfig()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
+		if err != nil {
+			t.Fatalf("quic.DialAddr failed: %v", err)
+		}
+		defer qConn.CloseWithError(0, "normal")
+
+		tr := &http3.Transport{EnableDatagrams: true}
+		h3Conn := tr.NewClientConn(qConn)
+		masqueConn := masque.NewClientConn(h3Conn)
+
+		tmpl := uritemplate.MustNew("https://" + host + "/.well-known/masque/udp/{target_host}/{target_port}/")
+		mReq, err := masque.NewRequest(ctx, tmpl, targetAddr)
+		if err != nil {
+			t.Fatalf("masque.NewRequest failed: %v", err)
+		}
+		nonce := make([]byte, 32)
+		_, _ = io.ReadFull(rand.Reader, nonce)
+		mReq.Header().Set("Authorization", "Bearer public_udp_token")
+		mReq.Header().Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+		mReq.Header().Set("Aero-Nonce", hex.EncodeToString(nonce))
+
+		mConn, resp, err := masqueConn.Dial(mReq)
+		if err != nil {
+			t.Fatalf("masqueConn.Dial failed: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK, got: %d %s", resp.StatusCode, resp.Status)
+		}
+		defer mConn.Close()
+
+		rUdpAddr := echoUDP.LocalAddr().(*net.UDPAddr)
+		payload := []byte("hello-real-udp-echo-from-public-target")
+		if _, err := mConn.WriteTo(payload, rUdpAddr); err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+
+		recvBuf := make([]byte, 2048)
+		_ = mConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _, err := mConn.ReadFrom(recvBuf)
+		if err != nil {
+			t.Fatalf("ReadFrom failed: %v", err)
+		}
+		if !bytes.Equal(recvBuf[:n], payload) {
+			t.Fatalf("payload mismatch: expected %s, got %s", payload, recvBuf[:n])
+		}
+		if publicDialCount.Load() != 1 {
+			t.Fatalf("expected UDP dial count to be 1, got %d", publicDialCount.Load())
+		}
+	})
+}
+
+// Gate 3: 5 failed authentications with 5 different forged X-Forwarded-For headers;
+// jail ban strictly lands on physical RemoteAddr, forged IPs are NOT banned.
+func TestPhase2Gate3ClientIPRemoteAddrLock(t *testing.T) {
+	v := NewValidator()
+	v.AddToken("valid_token", "user", 24*time.Hour)
+	qs := NewQUICServer(v, nil, nil, nil, nil)
+	defer qs.Close()
+
+	physicalRemoteAddr := "203.0.113.199:54321"
+	physicalIP := "203.0.113.199"
+
+	forgedIPs := []string{
+		"192.0.2.1",
+		"192.0.2.2",
+		"192.0.2.3",
+		"192.0.2.4",
+		"192.0.2.5",
+	}
+
+	// 5 failed authentication requests, each with a different forged X-Forwarded-For header
+	for i, forgedIP := range forgedIPs {
+		req := httptest.NewRequest(http.MethodGet, "/.well-known/masque/ip/*/*/", nil)
+		req.RemoteAddr = physicalRemoteAddr
+		req.Header.Set("X-Forwarded-For", forgedIP)
+		req.Header.Set("Authorization", "Bearer wrong_token_"+strconv.Itoa(i))
+		rec := httptest.NewRecorder()
+
+		token, ok := qs.authRequest(rec, req)
+		if ok || token != "" {
+			t.Fatalf("expected authRequest to fail")
+		}
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("request %d expected 401, got %d", i+1, rec.Code)
+		}
+	}
+
+	// Assert: Physical RemoteAddr IP MUST be banned!
+	if !qs.AuthJail().IsBanned(physicalIP) {
+		t.Fatalf("expected physical IP %s to be banned in AuthFailureJail", physicalIP)
+	}
+
+	// Assert: None of the forged IPs from X-Forwarded-For must be banned!
+	for _, forgedIP := range forgedIPs {
+		if qs.AuthJail().IsBanned(forgedIP) {
+			t.Fatalf("forged IP %s must NOT be banned in AuthFailureJail", forgedIP)
+		}
+	}
+
+	// 6th request from physical RemoteAddr MUST receive 429 Too Many Requests
+	req6 := httptest.NewRequest(http.MethodGet, "/.well-known/masque/ip/*/*/", nil)
+	req6.RemoteAddr = physicalRemoteAddr
+	req6.Header.Set("X-Forwarded-For", "192.0.2.99")
+	req6.Header.Set("Authorization", "Bearer wrong_token_6")
+	rec6 := httptest.NewRecorder()
+
+	token6, ok6 := qs.authRequest(rec6, req6)
+	if ok6 || token6 != "" {
+		t.Fatalf("expected authRequest to fail for banned physical IP")
+	}
+	if rec6.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests, got %d", rec6.Code)
+	}
+	if rec6.Header().Get("Retry-After") != "900" {
+		t.Fatalf("expected Retry-After 900, got %q", rec6.Header().Get("Retry-After"))
+	}
+
+	// Request with physical RemoteAddr of forged IP must NOT be banned
+	reqForged := httptest.NewRequest(http.MethodGet, "/.well-known/masque/ip/*/*/", nil)
+	reqForged.RemoteAddr = "192.0.2.1:12345"
+	reqForged.Header.Set("Authorization", "Bearer valid_token")
+	reqForged.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	reqForged.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+	recForged := httptest.NewRecorder()
+
+	tok, ok := qs.authRequest(recForged, reqForged)
+	if !ok || tok != "valid_token" {
+		t.Fatalf("request from forged IP's physical address should NOT be banned, got ok=%v, code=%d", ok, recForged.Code)
+	}
+}
+
+// Gate 4: ICMP Echo to 1.1.1.1 receives no forged Type 0; CONNECT-IP real TCP payload roundtrip matches exactly.
+func TestPhase2Gate4NoForgedICMPAndConnectIPRealTCP(t *testing.T) {
+	TestCONNECTIPRoundtrip(t)
+}
+
+// Phase 5 Gate: Real ICMP Forwarding & Client Ping Connectivity
+func TestPhase5Gate_RealICMPForwarding(t *testing.T) {
+	dataDir := t.TempDir()
+	listenAddr, host := findTestAddr()
+	cfg := ServerConfig{
+		Listen:                     listenAddr,
+		Domain:                     host,
+		DataDir:                    dataDir,
+		Token:                      "connect_ip_token_p5",
+		AllowSelfSignedCertForTest: true,
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+	defer srv.Close()
+
+	srv.quicServer.SetAllowLoopbackForTest(false) // 严格拦截私网/回环 IP
+
+	// 注册带 15ms 模拟延迟的 icmpForwardHook
+	var hookCalls atomic.Int32
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		hookCalls.Add(1)
+		time.Sleep(15 * time.Millisecond)
+		if len(echoReq) < 8 {
+			return nil, errors.New("echo req too short")
+		}
+		// 构造真实 Echo Reply (Type 0, Code 0, 保留 ID、Sequence 与 Payload)
+		reply := make([]byte, len(echoReq))
+		copy(reply, echoReq)
+		reply[0] = 0 // Type 0 (Echo Reply)
+		reply[1] = 0 // Code 0
+		reply[2] = 0 // Reset checksum for recomputation
+		reply[3] = 0
+		return reply, nil
+	})
+
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+	quicConf := DefaultQUICConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.DialAddr failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "normal")
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+	connectIPClient := connectip.NewClientConn(h3Conn)
+
+	tmpl := uritemplate.MustNew("https://" + host + "/.well-known/masque/ip/*/*/")
+	ipReq, err := connectip.NewRequest(ctx, tmpl)
+	if err != nil {
+		t.Fatalf("connectip.NewRequest failed: %v", err)
+	}
+	ipReq.Header().Set("Authorization", "Bearer connect_ip_token_p5")
+	ipReq.Header().Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	ipReq.Header().Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+	ipConn, resp, err := connectIPClient.Dial(ipReq)
+	if err != nil {
+		t.Fatalf("connectIPClient.Dial failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("connect-ip rejected: %d %s", resp.StatusCode, resp.Status)
+	}
+	defer ipConn.Close()
+
+	assigned, err := ipConn.ReceiveAddressAssignment(ctx)
+	if err != nil {
+		t.Fatalf("ReceiveAddressAssignment failed: %v", err)
+	}
+	if len(assigned) == 0 {
+		t.Fatal("expected at least 1 assigned prefix")
+	}
+	assignedIP := assigned[0].IPPrefix.Addr()
+
+	packetCh := make(chan []byte, 20)
+	readCtx, readCancel := context.WithCancel(ctx)
+	defer readCancel()
+
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			if readCtx.Err() != nil {
+				return
+			}
+			n, err := ipConn.ReadPacket(buf)
+			if err != nil {
+				return
+			}
+			if n > 0 {
+				pkt := make([]byte, n)
+				copy(pkt, buf[:n])
+				select {
+				case packetCh <- pkt:
+				case <-readCtx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	// 1. 客户端发送发往 8.8.8.8 的 ICMP Echo Request
+	target8888 := net.ParseIP("8.8.8.8")
+	clientIPBytes := assignedIP.As4()
+
+	pingData := []byte("ping-p5-test-payload")
+	icmpPayload := make([]byte, 8+len(pingData))
+	icmpPayload[0] = 8                                   // Echo Request
+	icmpPayload[1] = 0                                   // Code 0
+	binary.BigEndian.PutUint16(icmpPayload[4:6], 0x4321) // Identifier
+	binary.BigEndian.PutUint16(icmpPayload[6:8], 0x0007) // Sequence
+	copy(icmpPayload[8:], pingData)
+	chk := calcChecksum(icmpPayload)
+	binary.BigEndian.PutUint16(icmpPayload[2:4], chk)
+
+	reqPkt := make([]byte, 20+len(icmpPayload))
+	reqPkt[0] = 0x45
+	binary.BigEndian.PutUint16(reqPkt[2:4], uint16(len(reqPkt)))
+	reqPkt[8] = 64
+	reqPkt[9] = 1 // ICMP
+	copy(reqPkt[12:16], clientIPBytes[:])
+	copy(reqPkt[16:20], target8888.To4())
+	ipChk := calcChecksum(reqPkt[:20])
+	binary.BigEndian.PutUint16(reqPkt[10:12], ipChk)
+	copy(reqPkt[20:], icmpPayload)
+
+	sendTime := time.Now()
+	if _, err := ipConn.WritePacket(reqPkt); err != nil {
+		t.Fatalf("WritePacket to 8.8.8.8 failed: %v", err)
+	}
+
+	// 验证从 CONNECT-IP 成功读回真实 ICMP Echo Reply
+	select {
+	case reply := <-packetCh:
+		rtt := time.Since(sendTime)
+		if len(reply) < 28 {
+			t.Fatalf("reply packet too short: %d", len(reply))
+		}
+		if reply[0]>>4 != 4 {
+			t.Fatalf("expected IPv4 reply, got version %d", reply[0]>>4)
+		}
+		if reply[9] != 1 {
+			t.Fatalf("expected ICMP protocol 1, got %d", reply[9])
+		}
+		// 验证源 IP 为 8.8.8.8
+		srcIP := net.IP(reply[12:16])
+		if !srcIP.Equal(target8888) {
+			t.Fatalf("expected source IP 8.8.8.8, got %v", srcIP)
+		}
+		// 验证目的 IP 为客户端分配的 IP
+		dstIP := net.IP(reply[16:20])
+		if !dstIP.Equal(net.IP(clientIPBytes[:])) {
+			t.Fatalf("expected dst IP %v, got %v", assignedIP, dstIP)
+		}
+
+		ihl := int(reply[0]&0x0f) * 4
+		replyICMP := reply[ihl:]
+		// 验证 Type == 0 (Echo Reply)
+		if replyICMP[0] != 0 {
+			t.Fatalf("expected ICMP Type 0 (Echo Reply), got %d", replyICMP[0])
+		}
+		if replyICMP[1] != 0 {
+			t.Fatalf("expected ICMP Code 0, got %d", replyICMP[1])
+		}
+		// 验证 Identifier 与 Sequence 完全吻合
+		replyID := binary.BigEndian.Uint16(replyICMP[4:6])
+		replySeq := binary.BigEndian.Uint16(replyICMP[6:8])
+		if replyID != 0x4321 {
+			t.Fatalf("expected Identifier 0x4321, got 0x%04x", replyID)
+		}
+		if replySeq != 0x0007 {
+			t.Fatalf("expected Sequence 0x0007, got 0x%04x", replySeq)
+		}
+		// 验证 Payload 数据
+		if string(replyICMP[8:]) != "ping-p5-test-payload" {
+			t.Fatalf("expected payload %q, got %q", "ping-p5-test-payload", string(replyICMP[8:]))
+		}
+		// 验证 RTT > 0 且包含了 15ms 模拟延迟
+		if rtt <= 0 {
+			t.Fatalf("expected RTT > 0, got %v", rtt)
+		}
+		if rtt < 14*time.Millisecond {
+			t.Fatalf("expected RTT >= 15ms simulated delay, got %v", rtt)
+		}
+		if hookCalls.Load() != 1 {
+			t.Fatalf("expected hook called 1 time, got %d", hookCalls.Load())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for ICMP Echo Reply from CONNECT-IP")
+	}
+
+	// 2. 测试发往 10.0.0.1 (私网 IP) 的 Echo Request，验证被 IsBlockedIP 拦截，hook 调用次数为 0
+	hookCalls.Store(0)
+	target10001 := net.ParseIP("10.0.0.1")
+
+	blockedReqPkt := make([]byte, 20+len(icmpPayload))
+	copy(blockedReqPkt, reqPkt)
+	copy(blockedReqPkt[16:20], target10001.To4())
+	blockedReqPkt[10] = 0
+	blockedReqPkt[11] = 0
+	ipChkBlocked := calcChecksum(blockedReqPkt[:20])
+	binary.BigEndian.PutUint16(blockedReqPkt[10:12], ipChkBlocked)
+
+	if _, err := ipConn.WritePacket(blockedReqPkt); err != nil {
+		t.Fatalf("WritePacket to 10.0.0.1 failed: %v", err)
+	}
+
+	// 等待并验证 hook 调用次数严格为 0，且无任何回包
+	select {
+	case unexp := <-packetCh:
+		t.Fatalf("unexpected packet returned for blocked target: %x", unexp)
+	case <-time.After(150 * time.Millisecond):
+		// 正确，未收到任何回包
+	}
+
+	if calls := hookCalls.Load(); calls != 0 {
+		t.Fatalf("expected 0 hook calls for blocked private IP 10.0.0.1, got %d", calls)
+	}
+}
+
+type tapPacketConn struct {
+	net.PacketConn
+	mu       sync.Mutex
+	sent     [][]byte
+	received [][]byte
+}
+
+func (t *tapPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	t.mu.Lock()
+	t.sent = append(t.sent, cp)
+	t.mu.Unlock()
+	return t.PacketConn.WriteTo(b, addr)
+}
+
+func (t *tapPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := t.PacketConn.ReadFrom(b)
+	if err == nil && n > 0 {
+		cp := make([]byte, n)
+		copy(cp, b[:n])
+		t.mu.Lock()
+		t.received = append(t.received, cp)
+		t.mu.Unlock()
+	}
+	return n, addr, err
+}
+
+func calcShannonEntropy(data []byte) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	var counts [256]int
+	for _, b := range data {
+		counts[b]++
+	}
+	var entropy float64
+	total := float64(len(data))
+	for _, c := range counts {
+		if c > 0 {
+			p := float64(c) / total
+			entropy -= p * math.Log2(p)
+		}
+	}
+	return entropy
+}
+
+// 阶段六门禁：QUIC 动态包长混淆与可选 Salamander 混淆引擎
+func TestPhase6Gate_SalamanderAndPadding(t *testing.T) {
+	dataDir := t.TempDir()
+	listenAddr, host := findTestAddr()
+	obfsKey := "aero-secret-salamander-key"
+
+	cfg := ServerConfig{
+		Listen:                     listenAddr,
+		Domain:                     host,
+		DataDir:                    dataDir,
+		Token:                      "salamander_gate_token_p6",
+		AllowSelfSignedCertForTest: true,
+		ObfsPassword:               obfsKey,
+		PaddingJitter:              true,
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+	defer srv.Close()
+
+	srv.quicServer.SetAllowLoopbackForTest(true)
+
+	// 1. 设置截获线路上真实 UDP 数据报的拦截 PacketConn
+	network := "udp4"
+	localBind := "127.0.0.1:0"
+	if strings.Contains(listenAddr, "[") || strings.HasPrefix(listenAddr, "::") {
+		network = "udp6"
+		localBind = "[::1]:0"
+	}
+
+	rawClientConn, err := net.ListenPacket(network, localBind)
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	defer rawClientConn.Close()
+
+	tap := &tapPacketConn{PacketConn: rawClientConn}
+	clientObfsConn := NewSalamanderPacketConn(tap, obfsKey, true)
+
+	tlsConf := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	quicConf := DefaultQUICConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	serverUDPAddr := srv.quicListener.Addr()
+
+	// 客户端进行 QUIC 握手
+	qConn, err := quic.Dial(ctx, clientObfsConn, serverUDPAddr, tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.Dial with salamander failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "normal")
+
+	// 进行 HTTP/3 数据传输 (GET /healthz) 验证收发数据成功
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+host+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	resp, err := h3Conn.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll body failed: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("expected body 'ok', got %q", string(body))
+	}
+
+	// 2. 检查截获的所有链路上数据报 (包括客户端发往服务端，以及服务端发往客户端)
+	tap.mu.Lock()
+	allPackets := append([][]byte{}, tap.sent...)
+	allPackets = append(allPackets, tap.received...)
+	tap.mu.Unlock()
+
+	if len(allPackets) == 0 {
+		t.Fatalf("no wire datagrams captured")
+	}
+
+	for i, pkt := range allPackets {
+		// a) 数据报长度全部分布在 [1280, 1380] 区间内
+		if len(pkt) < 1280 || len(pkt) > 1380 {
+			t.Fatalf("packet %d: length %d not in [1280, 1380]", i, len(pkt))
+		}
+
+		// b) 计算香农熵，断言信息熵 Shannon Entropy >= 7.5（表现为不可区分的高熵白噪声，无 QUIC 固定特征）
+		entropy := calcShannonEntropy(pkt)
+		if entropy < 7.5 {
+			t.Fatalf("packet %d: shannon entropy %.4f < 7.5 (expected high-entropy noise)", i, entropy)
+		}
+
+		// c) 绝对不包含明文 SNI 或 ALPN "h3"
+		if bytes.Contains(pkt, []byte(host)) {
+			t.Fatalf("packet %d: leaked plain SNI %q", i, host)
+		}
+		if bytes.Contains(pkt, []byte("\x02h3")) {
+			t.Fatalf("packet %d: leaked plain ALPN \\x02h3", i)
+		}
+		if bytes.Contains(pkt, []byte{0x00, 0x00, 0x00, 0x01}) {
+			t.Fatalf("packet %d: leaked QUIC v1 version magic", i)
+		}
+	}
+
+	// 3. 模拟错误密码连接：断言握手失败且服务端安全丢弃，不发生 panic
+	wrongRawConn, err := net.ListenPacket(network, localBind)
+	if err != nil {
+		t.Fatalf("ListenPacket for wrong conn failed: %v", err)
+	}
+	defer wrongRawConn.Close()
+
+	wrongObfsConn := NewSalamanderPacketConn(wrongRawConn, "wrong-password-for-salamander-999", true)
+	wrongCtx, wrongCancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer wrongCancel()
+
+	_, wrongErr := quic.Dial(wrongCtx, wrongObfsConn, serverUDPAddr, tlsConf, quicConf)
+	if wrongErr == nil {
+		t.Fatalf("expected dial with wrong password to fail, but succeeded")
+	}
+
+	// 验证服务端未 panic 且仍然健康可用
+	req2, err := http.NewRequestWithContext(ctx, "GET", "https://"+host+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("NewRequest 2 failed: %v", err)
+	}
+	resp2, err := h3Conn.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip 2 failed: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp2.StatusCode)
+	}
+}
+
+// ==========================================
+// Phase 7 Gate Test: Multi-Hop Chaining (Ingress -> Egress Cascading Relay)
+// ==========================================
+
+func TestPhase7Gate_MultiHopChaining(t *testing.T) {
+	// 1. 搭建目标 Echo TCP 服务
+	echoListen, _ := findTestAddr()
+	echoLn, err := net.Listen("tcp", echoListen)
+	if err != nil {
+		t.Fatalf("listen echo server failed: %v", err)
+	}
+	defer echoLn.Close()
+	echoAddr := echoLn.Addr().String()
+
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	// 2. 搭建 Egress 节点 (Role: "egress", HopCredential: "hop-secret-999")
+	egressDataDir := t.TempDir()
+	egressListen, egressHost := findTestAddr()
+	egressCfg := ServerConfig{
+		Listen:                     egressListen,
+		Domain:                     egressHost,
+		Role:                       "egress",
+		HopCredential:              "hop-secret-999",
+		DataDir:                    egressDataDir,
+		AllowSelfSignedCertForTest: true,
+	}
+	egressSrv, err := NewServer(egressCfg)
+	if err != nil {
+		t.Fatalf("NewServer egress failed: %v", err)
+	}
+	if err := egressSrv.Start(); err != nil {
+		t.Fatalf("egressSrv.Start failed: %v", err)
+	}
+	defer egressSrv.Close()
+
+	// 3. 搭建 Ingress 节点 (Role: "ingress", HopCredential: "hop-secret-999", NextHopAddr: egress.Addr())
+	ingressDataDir := t.TempDir()
+	ingressListen, ingressHost := findTestAddr()
+	clientToken := "client-user-token"
+	ingressCfg := ServerConfig{
+		Listen:                     ingressListen,
+		Domain:                     ingressHost,
+		Token:                      clientToken,
+		Role:                       "ingress",
+		HopCredential:              "hop-secret-999",
+		NextHopAddr:                egressSrv.Addr(),
+		DataDir:                    ingressDataDir,
+		AllowSelfSignedCertForTest: true,
+	}
+	ingressSrv, err := NewServer(ingressCfg)
+	if err != nil {
+		t.Fatalf("NewServer ingress failed: %v", err)
+	}
+	if err := ingressSrv.Start(); err != nil {
+		t.Fatalf("ingressSrv.Start failed: %v", err)
+	}
+	defer ingressSrv.Close()
+
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	quicConf := DefaultQUICConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// ----------------------------------------------------
+	// 场景一（端到端多跳中继成功）：
+	// 客户端使用普通用户 token 连接 Ingress，发起 CONNECT 目标 Echo 服务。
+	// 数据通过 Ingress -> Egress -> Echo 服务成功往返，断言发送与接收的数据完全一致！
+	// ----------------------------------------------------
+	qConn, err := quic.DialAddr(ctx, ingressSrv.Addr(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("dial ingress failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "normal")
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "//"+echoAddr, nil)
+	if err != nil {
+		t.Fatalf("create connect req failed: %v", err)
+	}
+	req.Proto = "HTTP/1.1"
+	req.Header.Set("Authorization", "Bearer "+clientToken)
+	req.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	req.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+	reqStr, err := h3Conn.OpenRequestStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenRequestStream on ingress failed: %v", err)
+	}
+	defer reqStr.Close()
+
+	if err := reqStr.SendRequestHeader(req); err != nil {
+		t.Fatalf("SendRequestHeader to ingress failed: %v", err)
+	}
+
+	resp, err := reqStr.ReadResponse()
+	if err != nil {
+		t.Fatalf("ReadResponse from ingress failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from Ingress relay, got %d, Proxy-Status: %s", resp.StatusCode, resp.Header.Get("Proxy-Status"))
+	}
+
+	testPayload := []byte("Phase7_MultiHop_Chaining_Payload_Verification_123456789")
+	if _, err := reqStr.Write(testPayload); err != nil {
+		t.Fatalf("write payload to ingress stream failed: %v", err)
+	}
+
+	buf := make([]byte, len(testPayload))
+	if _, err := io.ReadFull(reqStr, buf); err != nil {
+		t.Fatalf("read echoed payload failed: %v", err)
+	}
+	if !bytes.Equal(buf, testPayload) {
+		t.Fatalf("payload mismatch: expected %q, got %q", testPayload, buf)
+	}
+
+	// ----------------------------------------------------
+	// 场景二（安全隔离门禁）：
+	// 1) 客户端使用普通用户 token ("client-user-token") 直接连接 Egress，断言 Egress 严格返回 401 Unauthorized。
+	// 2) Ingress 使用错误的 HopCredential ("wrong-hop-key") 连接 Egress，断言 Egress 严格返回 401 Unauthorized。
+	// 3) 验证 Egress 端未记录或暴露任何客户端原始用户 token。
+	// ----------------------------------------------------
+
+	// 2.1 客户端使用普通用户 token 直接连接 Egress
+	qConnEgress, err := quic.DialAddr(ctx, egressSrv.Addr(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("dial egress directly failed: %v", err)
+	}
+	defer qConnEgress.CloseWithError(0, "normal")
+
+	h3ConnEgress := tr.NewClientConn(qConnEgress)
+
+	reqDirect, err := http.NewRequestWithContext(ctx, http.MethodConnect, "//"+echoAddr, nil)
+	if err != nil {
+		t.Fatalf("create direct req failed: %v", err)
+	}
+	reqDirect.Proto = "HTTP/1.1"
+	reqDirect.Header.Set("Authorization", "Bearer "+clientToken)
+	reqDirect.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	reqDirect.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+	reqStrDirect, err := h3ConnEgress.OpenRequestStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenRequestStream direct to egress failed: %v", err)
+	}
+	defer reqStrDirect.Close()
+
+	if err := reqStrDirect.SendRequestHeader(reqDirect); err != nil {
+		t.Fatalf("SendRequestHeader direct to egress failed: %v", err)
+	}
+
+	respDirect, err := reqStrDirect.ReadResponse()
+	if err != nil {
+		t.Fatalf("ReadResponse direct from egress failed: %v", err)
+	}
+	if respDirect.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when connecting directly to egress with user token, got %d", respDirect.StatusCode)
+	}
+	proxyStatus := respDirect.Header.Get("Proxy-Status")
+	if !strings.Contains(proxyStatus, "proxy_authorization_required") || !strings.Contains(proxyStatus, "invalid hop credential") {
+		t.Fatalf("expected Proxy-Status to contain proxy_authorization_required and invalid hop credential, got: %q", proxyStatus)
+	}
+
+	// 2.2 连接 Egress 时使用错误的 HopCredential
+	reqWrongHop, err := http.NewRequestWithContext(ctx, http.MethodConnect, "//"+echoAddr, nil)
+	if err != nil {
+		t.Fatalf("create wrong hop req failed: %v", err)
+	}
+	reqWrongHop.Proto = "HTTP/1.1"
+	reqWrongHop.Header.Set("Aero-Hop-Token", "wrong-hop-key")
+
+	reqStrWrongHop, err := h3ConnEgress.OpenRequestStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenRequestStream wrong hop to egress failed: %v", err)
+	}
+	defer reqStrWrongHop.Close()
+
+	if err := reqStrWrongHop.SendRequestHeader(reqWrongHop); err != nil {
+		t.Fatalf("SendRequestHeader wrong hop failed: %v", err)
+	}
+
+	respWrongHop, err := reqStrWrongHop.ReadResponse()
+	if err != nil {
+		t.Fatalf("ReadResponse wrong hop failed: %v", err)
+	}
+	if respWrongHop.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized with wrong hop key on egress, got %d", respWrongHop.StatusCode)
+	}
+
+	// 2.3 验证 Ingress 节点使用错误 HopCredential 时级联失败返回 502 Bad Gateway
+	ingressWrongDataDir := t.TempDir()
+	ingressWrongListen, ingressWrongHost := findTestAddr()
+	ingressWrongCfg := ServerConfig{
+		Listen:                     ingressWrongListen,
+		Domain:                     ingressWrongHost,
+		Token:                      clientToken,
+		Role:                       "ingress",
+		HopCredential:              "wrong-hop-key",
+		NextHopAddr:                egressSrv.Addr(),
+		DataDir:                    ingressWrongDataDir,
+		AllowSelfSignedCertForTest: true,
+	}
+	ingressWrongSrv, err := NewServer(ingressWrongCfg)
+	if err != nil {
+		t.Fatalf("NewServer ingressWrong failed: %v", err)
+	}
+	if err := ingressWrongSrv.Start(); err != nil {
+		t.Fatalf("ingressWrongSrv.Start failed: %v", err)
+	}
+	defer ingressWrongSrv.Close()
+
+	qConnWrongIngress, err := quic.DialAddr(ctx, ingressWrongSrv.Addr(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("dial wrong ingress failed: %v", err)
+	}
+	defer qConnWrongIngress.CloseWithError(0, "normal")
+
+	h3ConnWrongIngress := tr.NewClientConn(qConnWrongIngress)
+	reqCascadeFail, err := http.NewRequestWithContext(ctx, http.MethodConnect, "//"+echoAddr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqCascadeFail.Proto = "HTTP/1.1"
+	reqCascadeFail.Header.Set("Authorization", "Bearer "+clientToken)
+	reqCascadeFail.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	reqCascadeFail.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+	reqStrCascadeFail, err := h3ConnWrongIngress.OpenRequestStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenRequestStream cascade fail failed: %v", err)
+	}
+	defer reqStrCascadeFail.Close()
+
+	if err := reqStrCascadeFail.SendRequestHeader(reqCascadeFail); err != nil {
+		t.Fatalf("SendRequestHeader cascade fail failed: %v", err)
+	}
+
+	respCascadeFail, err := reqStrCascadeFail.ReadResponse()
+	if err != nil {
+		t.Fatalf("ReadResponse cascade fail failed: %v", err)
+	}
+	if respCascadeFail.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway from Ingress when egress rejects wrong hop credential, got %d", respCascadeFail.StatusCode)
+	}
+
+	// 2.4 验证 Egress 端未记录或暴露任何客户端原始用户 token
+	if egressSrv.tokenStore != nil && egressSrv.tokenStore.v.Validate(clientToken) {
+		t.Fatalf("egress validator must not contain or validate client user token")
+	}
+	for _, item := range egressSrv.tokenStore.List() {
+		if item.Token == clientToken {
+			t.Fatalf("egress token store must not contain client user token %q", clientToken)
+		}
+	}
+
+	// 2.5 验证生产环境下 Role == ingress 时 NextHopAddr 为空必须报错
+	prodIngressCfg := ServerConfig{
+		Listen:        ":443",
+		Domain:        "example.com",
+		Role:          "ingress",
+		HopCredential: "hop-secret-999",
+		NextHopAddr:   "",
+	}
+	_, errProd := NewServer(prodIngressCfg)
+	if errProd == nil || !strings.Contains(errProd.Error(), "next hop address required") {
+		t.Fatalf("expected NewServer with role=ingress and empty next_hop_addr in production to fail, got: %v", errProd)
+	}
+
+	// 2.6 验证 SetNextHopDialerForTest 和 SetNextHopUDPDialerForTest 钩子工作正常
+	var hookCalled atomic.Bool
+	ingressSrv.SetNextHopDialerForTest(func(nextHopAddr, target, hopCred string) (net.Conn, error) {
+		hookCalled.Store(true)
+		return nil, errors.New("mock dialer error")
+	})
+	c, errDial := ingressSrv.quicServer.dialNextHopTCP("127.0.0.1:1234", "target:80", "cred")
+	if errDial == nil || !hookCalled.Load() {
+		if c != nil {
+			_ = c.Close()
+		}
+		t.Fatalf("expected SetNextHopDialerForTest hook to be called and return error")
+	}
+	ingressSrv.SetNextHopDialerForTest(nil)
+
+	var udpHookCalled atomic.Bool
+	ingressSrv.SetNextHopUDPDialerForTest(func(nextHopAddr, target, hopCred string) (net.Conn, error) {
+		udpHookCalled.Store(true)
+		return nil, errors.New("mock udp dialer error")
+	})
+	u, errUDPDial := ingressSrv.quicServer.dialNextHopUDP("127.0.0.1:1234", "target:80", "cred")
+	if errUDPDial == nil || !udpHookCalled.Load() {
+		if u != nil {
+			_ = u.Close()
+		}
+		t.Fatalf("expected SetNextHopUDPDialerForTest hook to be called and return error")
+	}
+	ingressSrv.SetNextHopUDPDialerForTest(nil)
+}
+
+// TestPhase8Gate_EdgeQuotaRevocationAndDisconnect (Phase 8 Gate)
+// 验证边缘节点配额同步、即时会话阻断与吊销后的 401 拦截
+func TestPhase8Gate_EdgeQuotaRevocationAndDisconnect(t *testing.T) {
+	dataDir := t.TempDir()
+	listenAddr, host := findTestAddr()
+	clientToken := "tok_phase8_edge_test_user"
+	adminKey := "phase8_edge_admin_secret"
+
+	cfg := ServerConfig{
+		Listen:                     listenAddr,
+		Domain:                     host,
+		DataDir:                    dataDir,
+		Token:                      clientToken,
+		AdminKey:                   adminKey,
+		AllowSelfSignedCertForTest: true,
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	srv.quicServer.SetTokenStore(srv.tokenStore)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+	defer srv.Close()
+
+	// 1. 搭建模拟商业中台计量服务
+	var reportReceived atomic.Bool
+	midLn, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		midLn, _ = net.Listen("tcp", "127.0.0.1:0")
+	}
+	midServer := &httptest.Server{
+		Listener: midLn,
+		Config: &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/admin/metering" {
+					http.NotFound(w, r)
+					return
+				}
+				if r.Header.Get("Aero-Admin-Key") != adminKey {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				reportReceived.Store(true)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"code":           0,
+					"revoked_tokens": []string{clientToken},
+					"message":        "ok",
+				})
+			}),
+		},
+	}
+	midServer.Start()
+	defer midServer.Close()
+
+	// 2. 搭建客户端并连接 Edge 服务器
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	quicConf := DefaultQUICConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.DialAddr failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "normal")
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+
+	// 发送初始有效请求以验证连接成功并在服务器端完成绑定
+	req1, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req1.Header.Set("Content-Type", "application/dns-message")
+	req1.Header.Set("Authorization", "Bearer "+clientToken)
+	req1.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	req1.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+	resp1, err := h3Conn.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("RoundTrip 1 failed: %v", err)
+	}
+	_ = resp1.Body.Close()
+
+	if resp1.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("expected initial request to succeed, got 401")
+	}
+
+	// 3. 调用 SyncMeteringWithMid，注入模拟中台返回的 revoked_tokens 包含该客户端 token
+	revoked, err := srv.quicServer.SyncMeteringWithMid(ctx, midServer.URL, adminKey, []MeteringReportRecord{
+		{
+			Token:     clientToken,
+			BytesUp:   1024,
+			BytesDown: 2048,
+		},
+	})
+	if err != nil {
+		t.Fatalf("SyncMeteringWithMid failed: %v", err)
+	}
+	if !reportReceived.Load() {
+		t.Fatalf("midplatform did not receive metering report")
+	}
+	if len(revoked) != 1 || revoked[0] != clientToken {
+		t.Fatalf("expected revoked_tokens [%s], got %v", clientToken, revoked)
+	}
+
+	// 4. 断言该 token 被立即撤销
+	if srv.validator.Validate(clientToken) {
+		t.Fatalf("expected token %s to be revoked from validator", clientToken)
+	}
+
+	// 5. 断言现有连接被切断
+	select {
+	case <-qConn.Context().Done():
+		// 连接已被切断
+	case <-time.After(1 * time.Second):
+		t.Fatalf("expected active QUIC connection to be severed after token revocation")
+	}
+
+	// 6. 断言后续带有该 token 的请求严格返回 401 Unauthorized
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+
+	qConn2, err := quic.DialAddr(ctx2, srv.quicListener.Addr().String(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.DialAddr for second attempt failed: %v", err)
+	}
+	defer qConn2.CloseWithError(0, "normal")
+
+	h3Conn2 := tr.NewClientConn(qConn2)
+	req2, err := http.NewRequestWithContext(ctx2, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req2.Header.Set("Content-Type", "application/dns-message")
+	req2.Header.Set("Authorization", "Bearer "+clientToken)
+	req2.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	req2.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+	resp2, err := h3Conn2.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("subsequent RoundTrip failed: %v", err)
+	}
+	_ = resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for revoked token, got %d", resp2.StatusCode)
+	}
+}
+
+// TestFinalGate_SalamanderDualKeyRollover 验证服务端配置主密钥与备用密钥时，使用备用密钥的客户端能够正常握手与传输数据；使用未授权密钥则被静默丢弃。
+func TestFinalGate_SalamanderDualKeyRollover(t *testing.T) {
+	dataDir := t.TempDir()
+	listenAddr, host := findTestAddr()
+	primaryKey := "aero-salamander-primary-key-2026"
+	fallbackKey := "aero-salamander-fallback-key-2025"
+	unauthorizedKey := "aero-salamander-unauthorized-key-999"
+
+	cfg := ServerConfig{
+		Listen:                     listenAddr,
+		Domain:                     host,
+		DataDir:                    dataDir,
+		Token:                      "salamander_dual_key_token",
+		AllowSelfSignedCertForTest: true,
+		ObfsPassword:               primaryKey,
+		FallbackObfsPasswords:      []string{fallbackKey},
+		PaddingJitter:              true,
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+	defer srv.Close()
+
+	srv.quicServer.SetAllowLoopbackForTest(true)
+
+	network := "udp4"
+	localBind := "127.0.0.1:0"
+	if strings.Contains(listenAddr, "[") || strings.HasPrefix(listenAddr, "::") {
+		network = "udp6"
+		localBind = "[::1]:0"
+	}
+
+	tlsConf := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	quicConf := DefaultQUICConfig()
+	serverUDPAddr := srv.quicListener.Addr()
+
+	// 1. 验证使用备用密钥的客户端能够正常握手与传输数据
+	rawClientConn1, err := net.ListenPacket(network, localBind)
+	if err != nil {
+		t.Fatalf("ListenPacket 1 failed: %v", err)
+	}
+	defer rawClientConn1.Close()
+
+	tap1 := &tapPacketConn{PacketConn: rawClientConn1}
+	clientObfsConn1 := NewSalamanderPacketConn(tap1, fallbackKey, true, primaryKey)
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel1()
+
+	qConn1, err := quic.Dial(ctx1, clientObfsConn1, serverUDPAddr, tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.Dial with fallback key failed: %v", err)
+	}
+	defer qConn1.CloseWithError(0, "normal")
+
+	tr1 := &http3.Transport{EnableDatagrams: true}
+	h3Conn1 := tr1.NewClientConn(qConn1)
+
+	req1, err := http.NewRequestWithContext(ctx1, "GET", "https://"+host+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("NewRequest 1 failed: %v", err)
+	}
+	resp1, err := h3Conn1.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("RoundTrip with fallback key failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp1.StatusCode)
+	}
+	body1, err := io.ReadAll(resp1.Body)
+	if err != nil {
+		t.Fatalf("ReadAll body 1 failed: %v", err)
+	}
+	if string(body1) != "ok" {
+		t.Fatalf("expected body 'ok', got %q", string(body1))
+	}
+
+	// 2. 验证使用主密钥的客户端能够正常握手与传输数据
+	rawClientConn2, err := net.ListenPacket(network, localBind)
+	if err != nil {
+		t.Fatalf("ListenPacket 2 failed: %v", err)
+	}
+	defer rawClientConn2.Close()
+
+	tap2 := &tapPacketConn{PacketConn: rawClientConn2}
+	clientObfsConn2 := NewSalamanderPacketConn(tap2, primaryKey, true)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+
+	qConn2, err := quic.Dial(ctx2, clientObfsConn2, serverUDPAddr, tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.Dial with primary key failed: %v", err)
+	}
+	defer qConn2.CloseWithError(0, "normal")
+
+	tr2 := &http3.Transport{EnableDatagrams: true}
+	h3Conn2 := tr2.NewClientConn(qConn2)
+
+	req2, err := http.NewRequestWithContext(ctx2, "GET", "https://"+host+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("NewRequest 2 failed: %v", err)
+	}
+	resp2, err := h3Conn2.RoundTrip(req2)
+	if err != nil {
+		t.Fatalf("RoundTrip with primary key failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp2.StatusCode)
+	}
+	body2, err := io.ReadAll(resp2.Body)
+	if err != nil {
+		t.Fatalf("ReadAll body 2 failed: %v", err)
+	}
+	if string(body2) != "ok" {
+		t.Fatalf("expected body 'ok', got %q", string(body2))
+	}
+
+	// 3. 验证使用未授权密钥的客户端被静默丢弃 (握手超时)
+	rawClientConn3, err := net.ListenPacket(network, localBind)
+	if err != nil {
+		t.Fatalf("ListenPacket 3 failed: %v", err)
+	}
+	defer rawClientConn3.Close()
+
+	tap3 := &tapPacketConn{PacketConn: rawClientConn3}
+	clientObfsConn3 := NewSalamanderPacketConn(tap3, unauthorizedKey, true)
+
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel3()
+
+	_, wrongErr := quic.Dial(ctx3, clientObfsConn3, serverUDPAddr, tlsConf, quicConf)
+	if wrongErr == nil {
+		t.Fatalf("expected quic.Dial with unauthorized key to fail/timeout, but succeeded")
+	}
+}
+
+// TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging 验证中台离线时在 30 分钟宽限期内会话不中断，
+// 网络恢复后将离线积压流量打包批量回补上报，以及 WebRTC STUN 探针 15 秒快速老化与 >=60 防雪崩回收。
+func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
+	dataDir := t.TempDir()
+	listenAddr, host := findTestAddr()
+	clientToken := "gate_offline_and_webrtc_test_tok"
+	adminKey := "gate_offline_admin_secret"
+
+	cfg := ServerConfig{
+		Listen:                     listenAddr,
+		Domain:                     host,
+		DataDir:                    dataDir,
+		Token:                      clientToken,
+		AdminKey:                   adminKey,
+		AllowSelfSignedCertForTest: true,
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	srv.quicServer.SetTokenStore(srv.tokenStore)
+	srv.quicServer.SetAllowLoopbackForTest(true)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+	defer srv.Close()
+
+	// 1. 验证离线容灾策略默认值 (30m 宽限期, 500MB 突发流量)
+	defPolicy := srv.quicServer.OfflinePolicy()
+	if defPolicy.GracePeriod != 30*time.Minute {
+		t.Fatalf("expected default GracePeriod 30m, got %v", defPolicy.GracePeriod)
+	}
+	if defPolicy.MaxBurstPerToken != 500*1024*1024 {
+		t.Fatalf("expected default MaxBurstPerToken 500MB, got %d", defPolicy.MaxBurstPerToken)
+	}
+
+	// 2. 建立客户端 QUIC 连接
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	quicConf := DefaultQUICConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.DialAddr failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "normal")
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+
+	// 验证初始请求成功绑定 Token
+	req1, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req1.Header.Set("Content-Type", "application/dns-message")
+	req1.Header.Set("Authorization", "Bearer "+clientToken)
+	req1.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	req1.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+
+	resp1, err := h3Conn.RoundTrip(req1)
+	if err != nil {
+		t.Fatalf("RoundTrip 1 failed: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("expected initial request to succeed, got 401")
+	}
+
+	// 3. 模拟中台离线（网络分区/不可达）
+	deadLn, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		deadLn, _ = net.Listen("tcp", "127.0.0.1:0")
+	}
+	offlineURL := "http://" + deadLn.Addr().String() + "/admin/metering"
+	_ = deadLn.Close()
+
+	records1 := []MeteringReportRecord{
+		{
+			Token:     clientToken,
+			BytesUp:   1000,
+			BytesDown: 1000,
+		},
+	}
+	ctxOffline, cancelOffline := context.WithTimeout(context.Background(), 1*time.Second)
+	_, err = srv.quicServer.SyncMeteringWithMid(ctxOffline, offlineURL, adminKey, records1)
+	cancelOffline()
+	if err == nil {
+		t.Fatalf("expected error when midplatform is offline, got nil")
+	}
+
+	// 断言：处于 30 分钟宽限期内，不阻断现有活跃会话！
+	if !srv.validator.Validate(clientToken) {
+		t.Fatalf("expected clientToken to remain valid within offline grace period")
+	}
+	if srv.quicServer.OfflineSince().IsZero() {
+		t.Fatalf("expected offlineSince to be recorded on mid failure")
+	}
+	backlog := srv.quicServer.OfflineBacklog()
+	if len(backlog) != 1 || backlog[clientToken].BytesUp != 1000 {
+		t.Fatalf("expected offline backlog to store unsynced records, got: %v", backlog)
+	}
+
+	// 断言现有会话仍可顺畅通信
+	reqGrace, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqGrace.Header.Set("Content-Type", "application/dns-message")
+	reqGrace.Header.Set("Authorization", "Bearer "+clientToken)
+	reqGrace.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	reqGrace.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
+	respGrace, err := h3Conn.RoundTrip(reqGrace)
+	if err != nil {
+		t.Fatalf("RoundTrip during offline grace period failed: %v", err)
+	}
+	_ = respGrace.Body.Close()
+	if respGrace.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("session blocked prematurely during offline grace period")
+	}
+
+	// 4. 模拟中台故障恢复，测试批量回补上报 (Bulk Metering Sync)
+	var midReceivedReq atomic.Pointer[meteringReportReq]
+	midLn, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		midLn, _ = net.Listen("tcp", "127.0.0.1:0")
+	}
+	midServer := &httptest.Server{
+		Listener: midLn,
+		Config: &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/admin/metering" {
+					http.NotFound(w, r)
+					return
+				}
+				var mReq meteringReportReq
+				if err := json.NewDecoder(r.Body).Decode(&mReq); err != nil {
+					http.Error(w, err.Error(), 400)
+					return
+				}
+				midReceivedReq.Store(&mReq)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(meteringReportResp{
+					Code:          0,
+					RevokedTokens: []string{},
+					Message:       "ok",
+				})
+			}),
+		},
+	}
+	midServer.Start()
+	defer midServer.Close()
+
+	records2 := []MeteringReportRecord{
+		{
+			Token:     clientToken,
+			BytesUp:   500,
+			BytesDown: 500,
+		},
+	}
+	_, err = srv.quicServer.SyncMeteringWithMid(ctx, midServer.URL, adminKey, records2)
+	if err != nil {
+		t.Fatalf("SyncMeteringWithMid recovery failed: %v", err)
+	}
+
+	// 断言中台成功接收到打包积压的批量流量 (1000+500 = 1500)
+	recv := midReceivedReq.Load()
+	if recv == nil || len(recv.Records) != 1 {
+		t.Fatalf("midServer did not receive expected bulk report: %v", recv)
+	}
+	if recv.Records[0].BytesUp != 1500 {
+		t.Fatalf("expected bulk merged BytesUp=1500, got %d", recv.Records[0].BytesUp)
+	}
+	if len(srv.quicServer.OfflineBacklog()) != 0 {
+		t.Fatalf("expected offline backlog to be cleared after recovery")
+	}
+	if !srv.quicServer.OfflineSince().IsZero() {
+		t.Fatalf("expected offlineSince to be reset after recovery")
+	}
+
+	// 5. 验证宽限期超过 30 分钟后阻断会话
+	srv.quicServer.SetOfflineSinceForTest(time.Now().Add(-31 * time.Minute))
+	ctxExpired, cancelExpired := context.WithTimeout(context.Background(), 1*time.Second)
+	_, err = srv.quicServer.SyncMeteringWithMid(ctxExpired, offlineURL, adminKey, records1)
+	cancelExpired()
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expected grace period expired error, got: %v", err)
+	}
+
+	// 6. 验证 WebRTC STUN 探针与非 STUN 端口/特征识别
+	if !isSTUNTarget("10.0.0.1:3478") || !isSTUNTarget("webrtc.example.com:19302") || !isSTUNTarget("turn.aero:5349") {
+		t.Fatalf("expected isSTUNTarget to return true for standard STUN ports")
+	}
+	if isSTUNTarget("10.0.0.1:443") || isSTUNTarget("10.0.0.1:8080") {
+		t.Fatalf("expected isSTUNTarget to return false for non-STUN ports")
+	}
+	stunMsg := []byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 0x01, 0x02}
+	nonStunMsg := []byte{0x00, 0x01, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44, 0x01, 0x02}
+	if !isSTUNPayload(stunMsg) {
+		t.Fatalf("expected isSTUNPayload to return true for STUN magic cookie 0x2112A442")
+	}
+	if isSTUNPayload(nonStunMsg) {
+		t.Fatalf("expected isSTUNPayload to return false for non-STUN payload")
+	}
+
+	// 7. 验证看门狗快速老化与 >=60 防雪崩优先回收
+	srv.quicServer.SetUDPIdleTimeoutsForTest(40*time.Millisecond, 400*time.Millisecond)
+
+	var stunClosed atomic.Bool
+	stunTracker := &udpSessionTracker{
+		token:      clientToken,
+		isSTUN:     &atomic.Bool{},
+		lastActive: &atomic.Int64{},
+		closeFn: func() {
+			stunClosed.Store(true)
+		},
+	}
+	stunTracker.isSTUN.Store(true)
+	stunTracker.lastActive.Store(time.Now().UnixNano())
+	srv.quicServer.registerUDPSession(stunTracker)
+	defer srv.quicServer.unregisterUDPSession(stunTracker)
+
+	var normalClosed atomic.Bool
+	normalTracker := &udpSessionTracker{
+		token:      clientToken,
+		isSTUN:     &atomic.Bool{},
+		lastActive: &atomic.Int64{},
+		closeFn: func() {
+			normalClosed.Store(true)
+		},
+	}
+	normalTracker.isSTUN.Store(false)
+	normalTracker.lastActive.Store(time.Now().UnixNano())
+	srv.quicServer.registerUDPSession(normalTracker)
+	defer srv.quicServer.unregisterUDPSession(normalTracker)
+
+	// 模拟并发 UDP Context 达到预警阈值 60，STUN 探针静默 60ms (> 40ms 设定超时)
+	srv.quicServer.udpMu.Lock()
+	srv.quicServer.tokenUDPCtx[clientToken] = 60
+	srv.quicServer.udpMu.Unlock()
+	stunTracker.lastActive.Store(time.Now().Add(-60 * time.Millisecond).UnixNano())
+	normalTracker.lastActive.Store(time.Now().Add(-60 * time.Millisecond).UnixNano())
+
+	// 申请 UDP Slot 触发高水位防雪崩清理
+	acquired := srv.quicServer.acquireUDPSlot(clientToken)
+	if !acquired {
+		t.Fatalf("expected acquireUDPSlot to succeed after reclaiming stale STUN probe")
+	}
+	defer srv.quicServer.releaseUDPSlot(clientToken)
+
+	// 断言 STUN 探针被立即回收关闭，而正常长连接媒体流未被回收
+	if !stunClosed.Load() {
+		t.Fatalf("expected STUN probe to be fast-reclaimed under >=60 threshold")
+	}
+	if normalClosed.Load() {
+		t.Fatalf("normal media stream must NOT be reclaimed under >=60 threshold")
+	}
+}
+
+// TestValidator_NonceWALPersistence 验证 Validator Nonce WAL 持久化与防重启重放
+func TestValidator_NonceWALPersistence(t *testing.T) {
+	tempDir := t.TempDir()
+	walPath := filepath.Join(tempDir, "nonce.wal")
+
+	token := "wal_test_token"
+	nonce := []byte("0123456789abcdef0123456789abcdef")
+	ts := uint64(time.Now().UnixMilli())
+
+	v1 := NewValidator(walPath)
+	v1.AddToken(token, "test", 24*time.Hour)
+
+	// 第一次校验成功
+	if !v1.ValidateFull(token, ts, nonce) {
+		t.Fatalf("expected first ValidateFull to succeed")
+	}
+	// 同一实例重放被拒绝
+	if v1.ValidateFull(token, ts, nonce) {
+		t.Fatalf("expected replay ValidateFull to fail")
+	}
+	v1.Close()
+
+	// 模拟进程重启：启动新的 Validator 实例，指定同一 walPath
+	v2 := NewValidator(walPath)
+	defer v2.Close()
+	v2.AddToken(token, "test", 24*time.Hour)
+
+	// 重启后使用相同 Nonce 依然被拒绝（防重启重放窗口）
+	if v2.ValidateFull(token, ts, nonce) {
+		t.Fatalf("expected ValidateFull after restart to reject previously consumed nonce from WAL")
+	}
+
+	// 新的 Nonce 允许通过
+	newNonce := []byte("fedcba9876543210fedcba9876543210")
+	if !v2.ValidateFull(token, ts, newNonce) {
+		t.Fatalf("expected new nonce to be accepted by v2")
+	}
+}
+
+// TestMultiPortHopping 验证边缘节点多端口监听与客户端跳频容灾
+func TestMultiPortHopping(t *testing.T) {
+	dataDir := t.TempDir()
+	listenAddr, host := findTestAddr()
+
+	// 动态寻找一个未占用的 alt 端口
+	altPconn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket for alt port failed: %v", err)
+	}
+	altPort := altPconn.LocalAddr().(*net.UDPAddr).Port
+	_ = altPconn.Close()
+
+	cfg := ServerConfig{
+		Listen:                     listenAddr,
+		Domain:                     host,
+		DataDir:                    dataDir,
+		Token:                      "multi_port_test_tok",
+		AllowSelfSignedCertForTest: true,
+		AltListenPorts:             []int{altPort},
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+	defer srv.Close()
+
+	altAddrs := srv.AltAddrs()
+	if len(altAddrs) != 1 {
+		t.Fatalf("expected 1 alt addr, got %d", len(altAddrs))
+	}
+
+	// 客户端通过备用端口直连握手
+	tlsConf := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3"},
+	}
+	quicConf := DefaultQUICConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	network := "udp4"
+	localBind := "127.0.0.1:0"
+	if strings.Contains(listenAddr, "[") || strings.HasPrefix(listenAddr, "::") {
+		network = "udp6"
+		localBind = "[::1]:0"
+	}
+	pconn, err := net.ListenPacket(network, localBind)
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	defer pconn.Close()
+
+	// 连接到备用端口并完成 HTTP/3 GET /healthz
+	altUDPAddr, _ := net.ResolveUDPAddr("udp", altAddrs[0])
+	qConn, err := quic.Dial(ctx, pconn, altUDPAddr, tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.Dial to alt port failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "normal")
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+host+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	resp, err := h3Conn.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip via alt port failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
 	}
 }

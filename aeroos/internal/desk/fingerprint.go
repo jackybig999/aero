@@ -89,50 +89,98 @@ func GenerateFingerprintConfig(seed string, countryCode string, kernelType, kern
 	mems := []int{4, 8, 16}
 	cfg.DeviceMemory = mems[r.Intn(len(mems))]
 
-	gpus := []struct {
+	windowsGPUs := []struct {
 		Vendor   string
 		Renderer string
-		Platform string
 	}{
-		{
-			Vendor:   "Google Inc. (Apple)",
-			Renderer: "ANGLE (Apple, Apple M2, OpenGL 4.1)",
-			Platform: "MacIntel",
-		},
 		{
 			Vendor:   "Google Inc. (NVIDIA)",
 			Renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-			Platform: "Win32",
+		},
+		{
+			Vendor:   "Google Inc. (NVIDIA)",
+			Renderer: "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)",
 		},
 		{
 			Vendor:   "Google Inc. (Intel)",
 			Renderer: "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-			Platform: "Win32",
+		},
+		{
+			Vendor:   "Google Inc. (Intel)",
+			Renderer: "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		},
+		{
+			Vendor:   "Google Inc. (AMD)",
+			Renderer: "ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		},
+		{
+			Vendor:   "Google Inc. (AMD)",
+			Renderer: "ANGLE (AMD, AMD Radeon(TM) Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
 		},
 	}
-	gpu := gpus[r.Intn(len(gpus))]
-	cfg.WebGLVendor = gpu.Vendor
-	cfg.WebGLRenderer = gpu.Renderer
-	cfg.Platform = gpu.Platform
+
+	macGPUs := []struct {
+		Vendor   string
+		Renderer string
+	}{
+		{
+			Vendor:   "Google Inc. (Apple)",
+			Renderer: "ANGLE (Apple, Apple M1, OpenGL 4.1)",
+		},
+		{
+			Vendor:   "Google Inc. (Apple)",
+			Renderer: "ANGLE (Apple, Apple M2, OpenGL 4.1)",
+		},
+		{
+			Vendor:   "Google Inc. (Apple)",
+			Renderer: "ANGLE (Apple, Apple M3, OpenGL 4.1)",
+		},
+	}
 
 	if kernelType == "safari" {
 		cfg.Platform = "MacIntel"
-		cfg.WebGLVendor = "Google Inc. (Apple)"
-		cfg.WebGLRenderer = "ANGLE (Apple, Apple M2, OpenGL 4.1)"
 		cfg.UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15"
+		gpu := macGPUs[r.Intn(len(macGPUs))]
+		cfg.WebGLVendor = gpu.Vendor
+		cfg.WebGLRenderer = gpu.Renderer
 	} else if kernelType == "firefox" {
 		v := kernelVersion
 		if v == "" {
 			v = "134.0"
 		}
+		cfg.Platform = "Win32"
 		cfg.UserAgent = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:%s) Gecko/20100101 Firefox/%s", v, v)
+		gpu := windowsGPUs[r.Intn(len(windowsGPUs))]
+		cfg.WebGLVendor = gpu.Vendor
+		cfg.WebGLRenderer = gpu.Renderer
 	} else {
 		v := kernelVersion
 		if v == "" {
 			v = "133.0.6943.98"
 		}
 		major := strings.Split(v, ".")[0]
+		cfg.Platform = "Win32"
 		cfg.UserAgent = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36", major)
+		gpu := windowsGPUs[r.Intn(len(windowsGPUs))]
+		cfg.WebGLVendor = gpu.Vendor
+		cfg.WebGLRenderer = gpu.Renderer
+	}
+
+	// 平台级防御约束：若 UA 声明为 Windows，绝对禁止匹配 Apple GPU，且 Platform 固定为 Win32
+	if strings.Contains(cfg.UserAgent, "Windows") {
+		cfg.Platform = "Win32"
+		if strings.Contains(cfg.WebGLVendor, "Apple") || strings.Contains(cfg.WebGLRenderer, "Apple") {
+			gpu := windowsGPUs[r.Intn(len(windowsGPUs))]
+			cfg.WebGLVendor = gpu.Vendor
+			cfg.WebGLRenderer = gpu.Renderer
+		}
+	} else if strings.Contains(cfg.UserAgent, "Macintosh") || strings.Contains(cfg.UserAgent, "Mac OS X") {
+		cfg.Platform = "MacIntel"
+		if !strings.Contains(cfg.WebGLVendor, "Apple") && !strings.Contains(cfg.WebGLRenderer, "Apple") {
+			gpu := macGPUs[r.Intn(len(macGPUs))]
+			cfg.WebGLVendor = gpu.Vendor
+			cfg.WebGLRenderer = gpu.Renderer
+		}
 	}
 
 	cfg.CanvasNoise = (r.Float64() - 0.5) * 0.002

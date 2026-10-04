@@ -208,7 +208,7 @@ func (s *SubStore) writeClientSubLocked() error {
 	}
 	path := filepath.Join(s.dir, "client-sub.json")
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -427,8 +427,8 @@ func (h *SubHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
-	// 2. Check admin sub (/sub/superadmin) or node secret (/sub/{secret})
-	if secret != "superadmin" && secret != h.Store.Secret() {
+	// 2. Check node secret (/sub/{secret})
+	if secret != h.Store.Secret() {
 		http.NotFound(w, r)
 		return true
 	}

@@ -5,10 +5,13 @@
 package edge
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +30,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/yosida95/uritemplate/v3"
 	"golang.org/x/sync/singleflight"
 )
@@ -337,6 +341,48 @@ func (ct *ConnTracker) Remove(c *quic.Conn) {
 	ct.mu.Unlock()
 }
 
+// CloseByToken actively disconnects and removes all QUIC connections associated with the specified token.
+func (ct *ConnTracker) CloseByToken(token string) {
+	if ct == nil || token == "" {
+		return
+	}
+	ct.mu.Lock()
+	var toClose []*quic.Conn
+	for c, tok := range ct.conns {
+		if tok == token {
+			toClose = append(toClose, c)
+			delete(ct.conns, c)
+		}
+	}
+	ct.mu.Unlock()
+
+	for _, c := range toClose {
+		if c != nil {
+			_ = c.CloseWithError(0x100, "token revoked / quota exceeded")
+		}
+	}
+}
+
+// CloseAll actively disconnects and removes all tracked QUIC connections.
+func (ct *ConnTracker) CloseAll() {
+	if ct == nil {
+		return
+	}
+	ct.mu.Lock()
+	var toClose []*quic.Conn
+	for c := range ct.conns {
+		toClose = append(toClose, c)
+		delete(ct.conns, c)
+	}
+	ct.mu.Unlock()
+
+	for _, c := range toClose {
+		if c != nil {
+			_ = c.CloseWithError(0x101, "offline grace period expired")
+		}
+	}
+}
+
 // ==========================================
 // 4. QUIC Server Instance & UDP Context Management
 // ==========================================
@@ -346,8 +392,22 @@ const (
 	DefaultMaxGlobalUDP    = 4096
 )
 
+// OfflinePolicy defines disaster-recovery behavior when middle-platform is unreachable.
+type OfflinePolicy struct {
+	GracePeriod      time.Duration `json:"grace_period"`        // Default 30m
+	MaxBurstPerToken int64         `json:"max_burst_per_token"` // Default 500MB (500*1024*1024)
+}
+
+type udpSessionTracker struct {
+	token      string
+	isSTUN     *atomic.Bool
+	lastActive *atomic.Int64
+	closeFn    func()
+}
+
 // QUICServer manages QUIC connections, HTTP/3, MASQUE proxies, UDP contexts, and DNS
 type QUICServer struct {
+	cfg              *ServerConfig
 	validator        *Validator
 	connLimiter      *ConnLimiter
 	bandwidthLimiter *BandwidthLimiter
@@ -367,16 +427,524 @@ type QUICServer struct {
 	handlerMu sync.RWMutex
 	handler   http.Handler
 
+	tokenStore           *TokenStore
 	udpMu                sync.Mutex
 	tokenUDPCtx          map[string]int
 	globalUDPCtx         atomic.Int64
 	maxGlobalUDP         int64
 	allowLoopbackForTest bool
+	resolveUDPFn         func(network, addr string) (*net.UDPAddr, error)
+	udpDialFn            func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+	icmpForwardHook      func(target net.IP, echoReq []byte) ([]byte, error)
+	nextHopDialer        func(nextHopAddr, target, hopCred string) (net.Conn, error)
+	nextHopUDPDialer     func(nextHopAddr, target, hopCred string) (net.Conn, error)
+
+	// Disaster recovery & offline grace period
+	offlinePolicy  OfflinePolicy
+	offlineMu      sync.Mutex
+	offlineSince   time.Time
+	offlineBacklog map[string]*MeteringReportRecord
+	offlineBurst   map[string]int64
+
+	// WebRTC STUN fast aging & session tracking
+	udpSessions     map[*udpSessionTracker]struct{}
+	stunIdleTimeout time.Duration
+	udpIdleTimeout  time.Duration
+}
+
+// MeteringReportRecord represents an edge traffic usage record to be synced with midplatform.
+type MeteringReportRecord struct {
+	Token     string `json:"token"`
+	BytesUp   int64  `json:"bytes_up"`
+	BytesDown int64  `json:"bytes_down"`
+}
+
+type meteringReportReq struct {
+	NodeID  string                 `json:"node_id"`
+	Records []MeteringReportRecord `json:"records"`
+}
+
+type meteringReportResp struct {
+	Code          int      `json:"code"`
+	RevokedTokens []string `json:"revoked_tokens"`
+	Message       string   `json:"message"`
+}
+
+// SetTokenStore sets the token store for token management and revocation.
+func (s *QUICServer) SetTokenStore(ts *TokenStore) {
+	s.tokenStore = ts
+}
+
+// TokenStore returns the associated TokenStore instance.
+func (s *QUICServer) TokenStore() *TokenStore {
+	return s.tokenStore
+}
+
+// SetOfflinePolicy sets the offline disaster-recovery policy.
+func (s *QUICServer) SetOfflinePolicy(policy OfflinePolicy) {
+	s.offlineMu.Lock()
+	defer s.offlineMu.Unlock()
+	s.offlinePolicy = policy
+}
+
+// OfflinePolicy returns the current offline disaster-recovery policy.
+func (s *QUICServer) OfflinePolicy() OfflinePolicy {
+	s.offlineMu.Lock()
+	defer s.offlineMu.Unlock()
+	return s.offlinePolicy
+}
+
+// OfflineBacklog returns a snapshot of current unsynced backlog records.
+func (s *QUICServer) OfflineBacklog() map[string]MeteringReportRecord {
+	s.offlineMu.Lock()
+	defer s.offlineMu.Unlock()
+	res := make(map[string]MeteringReportRecord, len(s.offlineBacklog))
+	for k, v := range s.offlineBacklog {
+		res[k] = *v
+	}
+	return res
+}
+
+// SetOfflineSinceForTest overrides offlineSince timestamp for unit tests.
+func (s *QUICServer) SetOfflineSinceForTest(t time.Time) {
+	s.offlineMu.Lock()
+	defer s.offlineMu.Unlock()
+	s.offlineSince = t
+}
+
+// OfflineSince returns the time when edge first detected middle-platform failure.
+func (s *QUICServer) OfflineSince() time.Time {
+	s.offlineMu.Lock()
+	defer s.offlineMu.Unlock()
+	return s.offlineSince
+}
+
+// SetUDPIdleTimeoutsForTest sets custom idle timeouts for STUN and standard UDP sessions in unit tests.
+func (s *QUICServer) SetUDPIdleTimeoutsForTest(stunTimeout, normalTimeout time.Duration) {
+	s.stunIdleTimeout = stunTimeout
+	s.udpIdleTimeout = normalTimeout
+}
+
+func (s *QUICServer) registerUDPSession(tracker *udpSessionTracker) {
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	if s.udpSessions == nil {
+		s.udpSessions = make(map[*udpSessionTracker]struct{})
+	}
+	s.udpSessions[tracker] = struct{}{}
+}
+
+func (s *QUICServer) unregisterUDPSession(tracker *udpSessionTracker) {
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	delete(s.udpSessions, tracker)
+}
+
+func (s *QUICServer) reclaimStaleSTUN(token string) {
+	timeout := 15 * time.Second
+	if s.stunIdleTimeout > 0 {
+		timeout = s.stunIdleTimeout
+	}
+
+	var toClose []func()
+	now := time.Now()
+
+	s.udpMu.Lock()
+	for tracker := range s.udpSessions {
+		if tracker.token == token && tracker.isSTUN != nil && tracker.isSTUN.Load() {
+			if tracker.lastActive != nil && now.Sub(time.Unix(0, tracker.lastActive.Load())) >= timeout {
+				if tracker.closeFn != nil {
+					toClose = append(toClose, tracker.closeFn)
+				}
+			}
+		}
+	}
+	s.udpMu.Unlock()
+
+	for _, closeFn := range toClose {
+		closeFn()
+	}
+}
+
+// isSTUNTarget checks if the target port is a known STUN/TURN port (3478, 19302, 5349).
+func isSTUNTarget(target string) bool {
+	_, portStr, err := net.SplitHostPort(target)
+	if err == nil {
+		switch portStr {
+		case "3478", "19302", "5349":
+			return true
+		}
+	}
+	return false
+}
+
+// isSTUNPayload inspects the payload to detect RFC 5389 STUN magic cookie 0x2112A442.
+func isSTUNPayload(payload []byte) bool {
+	if len(payload) >= 8 {
+		return binary.BigEndian.Uint32(payload[4:8]) == 0x2112A442
+	}
+	return false
+}
+
+// SyncMeteringWithMid reports traffic to the middle platform and applies returned token revocations.
+// In the event of network partition or midplatform failure, it operates under an offline grace period
+// (default 30m) without disrupting active sessions, accumulating unsynced traffic into a local backlog,
+// enforcing MaxBurstPerToken, and automatically packing the backlog for bulk sync once connectivity resumes.
+func (s *QUICServer) SyncMeteringWithMid(ctx context.Context, midURL, adminKey string, records []MeteringReportRecord) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	url := strings.TrimSpace(midURL)
+	if !strings.HasSuffix(url, "/admin/metering") {
+		url = strings.TrimRight(url, "/") + "/admin/metering"
+	}
+
+	nodeID := "edge"
+	if s.cfg != nil && s.cfg.Domain != "" {
+		nodeID = s.cfg.Domain
+	}
+
+	// 1. Pack incoming records with existing offline backlog for bulk metering sync
+	s.offlineMu.Lock()
+	mergedMap := make(map[string]*MeteringReportRecord)
+	for tok, r := range s.offlineBacklog {
+		mergedMap[tok] = &MeteringReportRecord{
+			Token:     tok,
+			BytesUp:   r.BytesUp,
+			BytesDown: r.BytesDown,
+		}
+	}
+	for _, r := range records {
+		tok := strings.TrimSpace(r.Token)
+		if tok == "" {
+			continue
+		}
+		if existing, ok := mergedMap[tok]; ok {
+			existing.BytesUp += r.BytesUp
+			existing.BytesDown += r.BytesDown
+		} else {
+			mergedMap[tok] = &MeteringReportRecord{
+				Token:     tok,
+				BytesUp:   r.BytesUp,
+				BytesDown: r.BytesDown,
+			}
+		}
+	}
+	bulkRecords := make([]MeteringReportRecord, 0, len(mergedMap))
+	for _, rec := range mergedMap {
+		bulkRecords = append(bulkRecords, *rec)
+	}
+	s.offlineMu.Unlock()
+
+	reqData := meteringReportReq{
+		NodeID:  nodeID,
+		Records: bulkRecords,
+	}
+	reqBytes, err := json.Marshal(reqData)
+	if err != nil {
+		return nil, fmt.Errorf("marshal metering report: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create metering request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if adminKey != "" {
+		req.Header.Set("Aero-Admin-Key", adminKey)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, sendErr := client.Do(req)
+
+	// Check for network partition or midplatform failure
+	if sendErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
+		var postErr error
+		if sendErr != nil {
+			postErr = fmt.Errorf("send metering report: %w", sendErr)
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			postErr = fmt.Errorf("metering report returned HTTP %d: %s", resp.StatusCode, string(body))
+		}
+
+		s.offlineMu.Lock()
+		defer s.offlineMu.Unlock()
+
+		now := time.Now()
+		if s.offlineSince.IsZero() {
+			s.offlineSince = now
+		}
+
+		// Preserve merged backlog locally
+		s.offlineBacklog = mergedMap
+
+		// Track offline burst per token
+		var burstExceeded []string
+		for _, rec := range records {
+			tok := strings.TrimSpace(rec.Token)
+			if tok == "" {
+				continue
+			}
+			s.offlineBurst[tok] += (rec.BytesUp + rec.BytesDown)
+			if s.offlinePolicy.MaxBurstPerToken > 0 && s.offlineBurst[tok] > s.offlinePolicy.MaxBurstPerToken {
+				burstExceeded = append(burstExceeded, tok)
+			}
+		}
+
+		// Sever tokens that exceeded single-token offline burst limit
+		for _, tok := range burstExceeded {
+			if s.connTracker != nil {
+				s.connTracker.CloseByToken(tok)
+			}
+		}
+
+		// Evaluate grace period
+		withinGrace := now.Sub(s.offlineSince) <= s.offlinePolicy.GracePeriod
+		if !withinGrace {
+			// Grace period expired: block/sever all active sessions
+			if s.connTracker != nil {
+				s.connTracker.CloseAll()
+			}
+			return nil, fmt.Errorf("midplatform offline grace period (%v) expired: %w", s.offlinePolicy.GracePeriod, postErr)
+		}
+
+		// Within grace period: existing active sessions are not blocked!
+		return nil, fmt.Errorf("midplatform offline (within grace period %v): %w", s.offlinePolicy.GracePeriod, postErr)
+	}
+	defer resp.Body.Close()
+
+	var mResp meteringReportResp
+	if err := json.NewDecoder(resp.Body).Decode(&mResp); err != nil {
+		return nil, fmt.Errorf("decode metering response: %w", err)
+	}
+
+	// Middle platform sync succeeded: clear backlog, burst counters, and offline timer
+	s.offlineMu.Lock()
+	s.offlineBacklog = make(map[string]*MeteringReportRecord)
+	s.offlineBurst = make(map[string]int64)
+	s.offlineSince = time.Time{}
+	s.offlineMu.Unlock()
+
+	for _, token := range mResp.RevokedTokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if s.tokenStore != nil {
+			_ = s.tokenStore.Revoke(token)
+		} else if s.validator != nil {
+			s.validator.RemoveToken(token)
+		}
+		if s.connTracker != nil {
+			s.connTracker.CloseByToken(token)
+		}
+	}
+
+	return mResp.RevokedTokens, nil
+}
+
+// SetServerConfig sets the server configuration for QUICServer
+func (s *QUICServer) SetServerConfig(cfg *ServerConfig) {
+	s.cfg = cfg
+}
+
+// ServerConfig returns the server configuration
+func (s *QUICServer) ServerConfig() *ServerConfig {
+	return s.cfg
+}
+
+// SetICMPForwardHookForTest sets custom ICMP forward hook for testing
+func (s *QUICServer) SetICMPForwardHookForTest(hook func(target net.IP, echoReq []byte) ([]byte, error)) {
+	s.icmpForwardHook = hook
 }
 
 // SetAllowLoopbackForTest enables loopback dialing for unit tests.
 func (s *QUICServer) SetAllowLoopbackForTest(allow bool) {
 	s.allowLoopbackForTest = allow
+}
+
+// SetNextHopDialerForTest sets a custom dialer for next-hop cascading in tests
+func (s *QUICServer) SetNextHopDialerForTest(d func(nextHopAddr, target, hopCred string) (net.Conn, error)) {
+	s.nextHopDialer = d
+}
+
+// SetNextHopUDPDialerForTest sets a custom UDP dialer for next-hop cascading in tests
+func (s *QUICServer) SetNextHopUDPDialerForTest(d func(nextHopAddr, target, hopCred string) (net.Conn, error)) {
+	s.nextHopUDPDialer = d
+}
+
+// SetUDPDialFunc sets custom UDP dial function for testing
+func (s *QUICServer) SetUDPDialFunc(fn func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)) {
+	s.udpDialFn = fn
+}
+
+// SetResolveUDPFunc sets custom UDP resolution function for testing
+func (s *QUICServer) SetResolveUDPFunc(fn func(network, addr string) (*net.UDPAddr, error)) {
+	s.resolveUDPFn = fn
+}
+
+func (s *QUICServer) resolveUDP(network, addr string) (*net.UDPAddr, error) {
+	if s.resolveUDPFn != nil {
+		return s.resolveUDPFn(network, addr)
+	}
+	return net.ResolveUDPAddr(network, addr)
+}
+
+func (s *QUICServer) dialUDP(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
+	if s.udpDialFn != nil {
+		return s.udpDialFn(network, laddr, raddr)
+	}
+	return net.DialUDP(network, laddr, raddr)
+}
+
+type quicStreamConn struct {
+	stream *http3.RequestStream
+	qConn  *quic.Conn
+}
+
+func (c *quicStreamConn) Read(b []byte) (int, error) {
+	return c.stream.Read(b)
+}
+
+func (c *quicStreamConn) Write(b []byte) (int, error) {
+	return c.stream.Write(b)
+}
+
+func (c *quicStreamConn) Close() error {
+	var err1, err2 error
+	if c.stream != nil {
+		err1 = c.stream.Close()
+	}
+	if c.qConn != nil {
+		err2 = c.qConn.CloseWithError(0, "normal")
+	}
+	if err1 != nil {
+		return err1
+	}
+	return err2
+}
+
+func (c *quicStreamConn) LocalAddr() net.Addr {
+	if c.qConn != nil {
+		return c.qConn.LocalAddr()
+	}
+	return nil
+}
+
+func (c *quicStreamConn) RemoteAddr() net.Addr {
+	if c.qConn != nil {
+		return c.qConn.RemoteAddr()
+	}
+	return nil
+}
+
+func (c *quicStreamConn) SetDeadline(t time.Time) error {
+	if c.stream != nil {
+		return c.stream.SetDeadline(t)
+	}
+	return nil
+}
+
+func (c *quicStreamConn) SetReadDeadline(t time.Time) error {
+	if c.stream != nil {
+		return c.stream.SetReadDeadline(t)
+	}
+	return nil
+}
+
+func (c *quicStreamConn) SetWriteDeadline(t time.Time) error {
+	if c.stream != nil {
+		return c.stream.SetWriteDeadline(t)
+	}
+	return nil
+}
+
+var _ net.Conn = (*quicStreamConn)(nil)
+
+func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred string) (net.Conn, error) {
+	if s.nextHopDialer != nil {
+		return s.nextHopDialer(nextHopAddr, target, hopCred)
+	}
+
+	sni := ""
+	if s.cfg != nil && s.cfg.NextHopSNI != "" {
+		sni = s.cfg.NextHopSNI
+	} else {
+		host, _, err := net.SplitHostPort(nextHopAddr)
+		if err == nil && host != "" {
+			sni = host
+		} else {
+			sni = nextHopAddr
+		}
+	}
+
+	tlsConf := &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: s.allowLoopbackForTest,
+		NextProtos:         []string{"h3"},
+	}
+	quicConf := DefaultQUICConfig()
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
+
+	qConn, err := quic.DialAddr(dialCtx, nextHopAddr, tlsConf, quicConf)
+	if err != nil {
+		return nil, fmt.Errorf("dial next hop %s over quic: %w", nextHopAddr, err)
+	}
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+
+	targetHost := strings.TrimPrefix(target, "//")
+	targetHost = strings.TrimPrefix(targetHost, "/")
+	targetHost = strings.TrimPrefix(targetHost, "/")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, "//"+targetHost, nil)
+	if err != nil {
+		_ = qConn.CloseWithError(0, "failed to create request")
+		return nil, fmt.Errorf("create next hop connect request: %w", err)
+	}
+	req.Proto = "HTTP/1.1"
+	req.Header.Set("Aero-Hop-Token", hopCred)
+
+	reqStr, err := h3Conn.OpenRequestStream(dialCtx)
+	if err != nil {
+		_ = qConn.CloseWithError(0, "failed to open stream")
+		return nil, fmt.Errorf("open next hop request stream: %w", err)
+	}
+
+	if err := reqStr.SendRequestHeader(req); err != nil {
+		_ = reqStr.Close()
+		_ = qConn.CloseWithError(0, "failed to send header")
+		return nil, fmt.Errorf("send next hop request header: %w", err)
+	}
+
+	resp, err := reqStr.ReadResponse()
+	if err != nil {
+		_ = reqStr.Close()
+		_ = qConn.CloseWithError(0, "failed to read response")
+		return nil, fmt.Errorf("read next hop response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		proxyStatus := resp.Header.Get("Proxy-Status")
+		_ = reqStr.Close()
+		_ = qConn.CloseWithError(0, "next hop rejected")
+		return nil, fmt.Errorf("next hop connect rejected with status %d (Proxy-Status: %s)", resp.StatusCode, proxyStatus)
+	}
+
+	return &quicStreamConn{
+		stream: reqStr,
+		qConn:  qConn,
+	}, nil
+}
+
+func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Conn, error) {
+	if s.nextHopUDPDialer != nil {
+		return s.nextHopUDPDialer(nextHopAddr, target, hopCred)
+	}
+	return nil, fmt.Errorf("next hop udp relay not configured")
 }
 
 // NewQUICServer creates a new QUICServer instance
@@ -398,6 +966,13 @@ func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		maxGlobalUDP:     DefaultMaxGlobalUDP,
 		udpTempl:         uritemplate.MustNew("https://placeholder/.well-known/masque/udp/{target_host}/{target_port}/"),
 		ipTempl:          uritemplate.MustNew("https://placeholder/.well-known/masque/ip/*/*/"),
+		offlinePolicy: OfflinePolicy{
+			GracePeriod:      30 * time.Minute,
+			MaxBurstPerToken: 500 * 1024 * 1024,
+		},
+		offlineBacklog: make(map[string]*MeteringReportRecord),
+		offlineBurst:   make(map[string]int64),
+		udpSessions:    make(map[*udpSessionTracker]struct{}),
 	}
 	qs.h3Server = &http3.Server{
 		Handler:         qs,
@@ -450,9 +1025,19 @@ func (s *QUICServer) acquireUDPSlot(token string) bool {
 	}
 
 	s.udpMu.Lock()
+	n := s.tokenUDPCtx[token]
+	s.udpMu.Unlock()
+
+	if n >= 60 {
+		// When user concurrent UDP Context reaches alert threshold (>=60),
+		// prioritize reclaiming STUN probes that have been inactive for >= 15s.
+		s.reclaimStaleSTUN(token)
+	}
+
+	s.udpMu.Lock()
 	defer s.udpMu.Unlock()
 
-	n := s.tokenUDPCtx[token]
+	n = s.tokenUDPCtx[token]
 	if n >= MaxUDPContextsPerToken {
 		return false
 	}
@@ -521,6 +1106,10 @@ func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx conte
 	conn, err := net.ListenPacket(network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("quic listen packet %s: %w", addr, err)
+	}
+
+	if server != nil && server.cfg != nil && server.cfg.ObfsPassword != "" {
+		conn = NewSalamanderPacketConn(conn, server.cfg.ObfsPassword, server.cfg.PaddingJitter)
 	}
 
 	tr := &quic.Transport{
@@ -654,6 +1243,27 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 		return "", false
 	}
 
+	if s.cfg != nil && s.cfg.Role == "egress" {
+		hopHdr := strings.TrimSpace(r.Header.Get("Aero-Hop-Token"))
+		bearerHdr := ""
+		if authHdr := r.Header.Get("Authorization"); strings.HasPrefix(authHdr, "Bearer ") {
+			bearerHdr = strings.TrimSpace(strings.TrimPrefix(authHdr, "Bearer "))
+		}
+		expectedCred := []byte(s.cfg.HopCredential)
+		matchHop := hopHdr != "" && len(expectedCred) > 0 && subtle.ConstantTimeCompare([]byte(hopHdr), expectedCred) == 1
+		matchBearer := bearerHdr != "" && len(expectedCred) > 0 && subtle.ConstantTimeCompare([]byte(bearerHdr), expectedCred) == 1
+		if matchHop || matchBearer {
+			return s.cfg.HopCredential, true
+		}
+		if s.authJail != nil {
+			s.authJail.RecordFailure(remoteIP)
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
+		w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="invalid hop credential"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		return "", false
+	}
+
 	authHdr := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHdr, "Bearer ") {
 		if s.authJail != nil {
@@ -735,16 +1345,25 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 	return token, true
 }
 
+var relayBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 16384)
+		return &b
+	},
+}
+
 func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.authRequest(w, r)
 	if !ok {
 		return
 	}
 
-	target := r.RequestURI
+	target := strings.TrimPrefix(r.RequestURI, "//")
 	if target == "" || !strings.Contains(target, ":") {
-		target = r.Host
+		target = strings.TrimPrefix(r.Host, "//")
 	}
+	target = strings.TrimPrefix(target, "/")
+	target = strings.TrimPrefix(target, "/")
 	if target == "" {
 		w.Header().Set("Proxy-Status", "aero; error=destination_ip_unroutable")
 		w.WriteHeader(http.StatusBadRequest)
@@ -770,7 +1389,9 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 
 	var targetConn net.Conn
 	var err error
-	if s.dialGuard != nil {
+	if s.cfg != nil && s.cfg.Role == "ingress" && s.cfg.NextHopAddr != "" {
+		targetConn, err = s.dialNextHopTCP(s.cfg.NextHopAddr, target, s.cfg.HopCredential)
+	} else if s.dialGuard != nil {
 		targetConn, err = s.dialGuard.DialTimeout("tcp", target, 10*time.Second)
 	} else {
 		targetConn, err = net.DialTimeout("tcp", target, 10*time.Second)
@@ -795,7 +1416,9 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32768)
+		bufPtr := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufPtr)
+		buf := *bufPtr
 		for {
 			n, err := str.Read(buf)
 			if n > 0 {
@@ -815,7 +1438,9 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 32768)
+		bufPtr := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufPtr)
+		buf := *bufPtr
 		for {
 			n, err := targetConn.Read(buf)
 			if n > 0 {
@@ -869,42 +1494,188 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.releaseUDPSlot(token)
 
-	dstAddr, err := net.ResolveUDPAddr("udp", proxyReq.Target)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+	var targetUDP io.ReadWriteCloser
+	if s.cfg != nil && s.cfg.Role == "ingress" && s.cfg.NextHopAddr != "" {
+		uConn, err := s.dialNextHopUDP(s.cfg.NextHopAddr, proxyReq.Target, s.cfg.HopCredential)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		targetUDP = uConn
+	} else {
+		dstAddr, err := s.resolveUDP("udp", proxyReq.Target)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 
-	targetUDP, err := net.DialUDP("udp", nil, dstAddr)
-	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		return
+		if !s.allowLoopbackForTest {
+			if blocked, why := IsBlockedIP(dstAddr.IP); blocked {
+				w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+		}
+
+		uConn, err := s.dialUDP("udp", nil, dstAddr)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		targetUDP = uConn
 	}
 	defer targetUDP.Close()
 
-	// 45s 空闲滑动超时控制
-	lastActive := atomic.Int64{}
+	streamer, ok := w.(http3.HTTPStreamer)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	str := streamer.HTTPStream()
+	defer str.Close()
+
+	w.Header().Set("Capsule-Protocol", "?1")
+	w.WriteHeader(http.StatusOK)
+
+	// WebRTC ICE Candidate detection: target port 3478, 19302, 5349 or STUN Magic Cookie
+	var isSTUN atomic.Bool
+	if isSTUNTarget(proxyReq.Target) {
+		isSTUN.Store(true)
+	}
+
+	var lastActive atomic.Int64
 	lastActive.Store(time.Now().UnixNano())
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	closeOnce := sync.Once{}
+	closeSession := func() {
+		closeOnce.Do(func() {
+			cancel()
+			_ = targetUDP.Close()
+			str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
+			_ = str.Close()
+		})
+	}
+
+	sessionTracker := &udpSessionTracker{
+		token:      token,
+		isSTUN:     &isSTUN,
+		lastActive: &lastActive,
+		closeFn:    closeSession,
+	}
+	s.registerUDPSession(sessionTracker)
+	defer s.unregisterUDPSession(sessionTracker)
+
 	stopWatchdog := make(chan struct{})
 	defer close(stopWatchdog)
 
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		checkInterval := 1 * time.Second
+		if s.stunIdleTimeout > 0 && s.stunIdleTimeout < 1*time.Second {
+			checkInterval = s.stunIdleTimeout / 4
+			if checkInterval < 10*time.Millisecond {
+				checkInterval = 10 * time.Millisecond
+			}
+		}
+		ticker := time.NewTicker(checkInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-stopWatchdog:
 				return
 			case <-ticker.C:
-				if time.Since(time.Unix(0, lastActive.Load())) > 45*time.Second {
-					_ = targetUDP.Close()
+				timeout := 45 * time.Second
+				if s.udpIdleTimeout > 0 {
+					timeout = s.udpIdleTimeout
+				}
+				if isSTUN.Load() {
+					timeout = 15 * time.Second
+					if s.stunIdleTimeout > 0 {
+						timeout = s.stunIdleTimeout
+					}
+				}
+				if time.Since(time.Unix(0, lastActive.Load())) > timeout {
+					closeSession()
 					return
 				}
 			}
 		}
 	}()
 
-	_ = s.masqueProxy.ProxyConnectedSocket(w, proxyReq, targetUDP)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// 下行（QUIC -> UDP）
+	go func() {
+		defer wg.Done()
+		defer closeSession()
+
+		for {
+			data, err := str.ReceiveDatagram(ctx)
+			if err != nil {
+				break
+			}
+			contextID, n, err := quicvarint.Parse(data)
+			if err != nil {
+				continue
+			}
+			if contextID == 0 {
+				payload := data[n:]
+				if !isSTUN.Load() && isSTUNPayload(payload) {
+					isSTUN.Store(true)
+				}
+				lastActive.Store(time.Now().UnixNano())
+				if s.bandwidthLimiter != nil {
+					s.bandwidthLimiter.Take(token, len(payload))
+				}
+				if _, err := targetUDP.Write(payload); err != nil {
+					break
+				}
+			}
+		}
+	}()
+
+	// 上行（UDP -> QUIC）
+	go func() {
+		defer wg.Done()
+		defer closeSession()
+
+		buf := make([]byte, 2048)
+		buf[0] = 0x00 // contextID 0 in QUIC varint
+		for {
+			n, err := targetUDP.Read(buf[1:])
+			if n > 0 {
+				if !isSTUN.Load() && isSTUNPayload(buf[1:1+n]) {
+					isSTUN.Store(true)
+				}
+				lastActive.Store(time.Now().UnixNano())
+				if s.bandwidthLimiter != nil {
+					s.bandwidthLimiter.Take(token, n)
+				}
+				if serr := str.SendDatagram(buf[:1+n]); serr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// 监控请求流 EOF/取消以加速释放
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			if _, err := str.Read(buf); err != nil {
+				closeSession()
+				break
+			}
+		}
+	}()
+
+	wg.Wait()
 }
 
 func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {

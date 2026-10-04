@@ -269,7 +269,7 @@ func NewWebHandler(p WebPaths, api http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
 
-		if upath == "/health" || upath == "/healthz" || upath == "/metrics" || strings.HasPrefix(upath, "/api/") || strings.HasPrefix(upath, "/sub/") {
+		if upath == "/health" || upath == "/healthz" || upath == "/metrics" || upath == "/admin/metering" || strings.HasPrefix(upath, "/admin/metering") || strings.HasPrefix(upath, "/api/") || strings.HasPrefix(upath, "/sub/") {
 			api.ServeHTTP(w, r)
 			return
 		}
@@ -338,7 +338,7 @@ func NewFSWebHandler(embeddedFS fs.FS, p WebPaths, api http.Handler) http.Handle
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
 
-		if upath == "/health" || upath == "/healthz" || upath == "/metrics" || strings.HasPrefix(upath, "/api/") || strings.HasPrefix(upath, "/sub/") {
+		if upath == "/health" || upath == "/healthz" || upath == "/metrics" || upath == "/admin/metering" || strings.HasPrefix(upath, "/admin/metering") || strings.HasPrefix(upath, "/api/") || strings.HasPrefix(upath, "/sub/") {
 			api.ServeHTTP(w, r)
 			return
 		}
@@ -438,11 +438,26 @@ func serveSPAFromEmbeddedFS(w http.ResponseWriter, r *http.Request, fsys fs.FS, 
 
 // AeroHandler exposes /api/v1/aero/* endpoints for the modular AERO Console.
 type AeroHandler struct {
-	svc *VPSService
+	svc      *VPSService
+	db       *AeroDB
+	adminKey string
 }
 
 func NewAeroHandler(svc *VPSService) *AeroHandler {
 	return &AeroHandler{svc: svc}
+}
+
+func (h *AeroHandler) SetAeroDB(db *AeroDB) {
+	h.db = db
+}
+
+func (h *AeroHandler) SetAdminKey(key string) {
+	h.adminKey = key
+}
+
+// RegisterMeteringRoutes mounts HandleAdminMetering onto mux.
+func RegisterMeteringRoutes(mux *http.ServeMux, db *AeroDB, adminKey string) {
+	mux.HandleFunc("POST /admin/metering", HandleAdminMetering(db, adminKey))
 }
 
 func (h *AeroHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -468,6 +483,10 @@ func (h *AeroHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/restart/", h.RestartEdge)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/subs/sync/", h.SyncSubs)
 	mux.HandleFunc("POST /api/v1/aero/subs/broadcast/", h.BroadcastSubs)
+
+	if h.db != nil {
+		RegisterMeteringRoutes(mux, h.db, h.adminKey)
+	}
 }
 
 func (h *AeroHandler) VPSOptions(w http.ResponseWriter, r *http.Request) {

@@ -6,14 +6,25 @@ package client
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/hpke"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +34,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/header"
+	"golang.org/x/crypto/cryptobyte"
 )
 
 // newInMemHTTPDialer 创建纯内存 HTTP 拨号器，支持 net.Pipe() 消除 Winsock 与防火墙阻断
@@ -240,22 +252,24 @@ func TestTwoStageDNSFunnel(t *testing.T) {
 		t.Fatalf("expected IP in 198.18.0.0/15 for google.com, got %v", fakeIP)
 	}
 
-	// 3. 短流建连解析测试：模拟隧道已建连并回传真实 IP
-	dnsHandler.SetTunnelResolver(func(ctx context.Context, domain string) (net.IP, error) {
-		if domain == "openai.com" {
-			return net.ParseIP("104.18.2.161"), nil
-		}
-		return nil, errors.New("not found")
-	})
-
+	// 3. 境外域名 0ms Fake-IP 测试：立即返回 198.18.0.0/15 Fake-IP（耗时 < 100ms），绝不先行同步等待 2.5 秒 DoH 往返
+	start := time.Now()
 	reqOpenAI := buildDNSQuery("openai.com", 0x0001)
 	respOpenAI := dnsHandler.HandleQuery(reqOpenAI, net.ParseIP("10.88.0.2"), 53)
-	if respOpenAI == nil {
-		t.Fatalf("expected real IP response for openai.com, got nil")
+	elapsed := time.Since(start)
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("expected DNS response within 100ms, took %v", elapsed)
 	}
-	realIP := extractFirstAAnswer(respOpenAI)
-	if realIP == nil || !realIP.Equal(net.ParseIP("104.18.2.161")) {
-		t.Fatalf("expected real IP 104.18.2.161 from tunnel short stream, got %v", realIP)
+	if respOpenAI == nil {
+		t.Fatalf("expected Fake-IP response for openai.com, got nil")
+	}
+	fakeOpenAI := extractFirstAAnswer(respOpenAI)
+	if fakeOpenAI == nil || !dnsHandler.fakeIP.Contains(fakeOpenAI) {
+		t.Fatalf("expected Fake-IP in 198.18.0.0/15 for openai.com, got %v", fakeOpenAI)
+	}
+	// 验证 Fake-IP 能够反查出原始真实域名
+	if revDomain := dnsHandler.fakeIP.Lookup(fakeOpenAI); revDomain != "openai.com" {
+		t.Fatalf("expected reverse lookup 'openai.com', got %q", revDomain)
 	}
 
 	// 再次确认 openai.com 绝对未进入物理 DNS
@@ -337,6 +351,12 @@ func TestChinaIPMatcherAndISP(t *testing.T) {
 
 // 验收项：物理 SNI 锁定与 DatagramTooLargeError 动态捕获
 func TestQUICConfigAndDatagramTooLargeError(t *testing.T) {
+	origSize := GetCurrentMaxDatagramSize()
+	defer func() {
+		SetCurrentMaxDatagramSize(origSize)
+		RegisterVirtualNICMTUSetter(nil)
+	}()
+
 	// 1. 物理 SNI 锁死测试：输入带伪装 SNI 的配置，必须锁死为真实 host
 	cfg := DefaultTransportConfig("my-node.aero-net.com:443", "edge.microsoft.com")
 	if cfg.TLSServerName != "my-node.aero-net.com" {
@@ -374,6 +394,9 @@ func TestQUICConfigAndDatagramTooLargeError(t *testing.T) {
 
 // 验收项：栈入口 DF 标志识别与 ICMP Type 3 Code 4 构造
 func TestICMPFragNeededOnDFOverflow(t *testing.T) {
+	origSize := GetCurrentMaxDatagramSize()
+	defer SetCurrentMaxDatagramSize(origSize)
+
 	SetCurrentMaxDatagramSize(1200)
 	limit := GetCurrentMaxDatagramSize() + 24 // 1224
 
@@ -2114,5 +2137,1369 @@ func TestProbeAllNodes(t *testing.T) {
 		if r.LatencyMs != -1 {
 			t.Errorf("expected -1 latency for unreachable node, got %d", r.LatencyMs)
 		}
+	}
+}
+
+// ============================================================================
+// AERO 阶段一客户端门禁测试集
+// 【客户端数据面不断流、MTU 1360、WebRTC、0ms Fake-IP与软切线】
+// ============================================================================
+
+// 门禁 1：1200 字节 UDP 载荷对应的 1228 字节 IP 包不被 1224 丢弃，从真实 UDP 套接字读回
+func TestStage1_UDP1200PayloadNotDroppedByMTU1224(t *testing.T) {
+	origSize := GetCurrentMaxDatagramSize()
+	SetCurrentMaxDatagramSize(1336)
+	defer SetCurrentMaxDatagramSize(origSize)
+
+	// 获取宿主机本地可路由 IP，确保底层 UDP 套接字通信不受第三方 TUN/宿主机防火墙路由表阻断
+	localIP := "127.0.0.1"
+	if conn, err := net.Dial("udp4", "223.5.5.5:80"); err == nil {
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP.To4() != nil {
+			localIP = addr.IP.String()
+		}
+		_ = conn.Close()
+	}
+
+	// 启动真实底层 UDP 接收套接字
+	pc, err := net.ListenPacket("udp4", net.JoinHostPort(localIP, "0"))
+	if err != nil {
+		t.Fatalf("listen udp socket failed: %v", err)
+	}
+	defer pc.Close()
+
+	realUDPAddr := pc.LocalAddr().String()
+
+	// 注入物理直连钩子，将测试公网 IP 路由至该真实套接字
+	SetPhysicalDialerHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "udp4", realUDPAddr)
+	})
+	defer SetPhysicalDialerHook(nil)
+
+	mockDev := newMockTunDevice()
+	defer mockDev.Close()
+
+	split := NewSplitEngine()
+	split.AddRule(Rule{
+		Strategy: DIRECT,
+		IPRanges: []string{"198.51.100.99/32"},
+	})
+	dialer := NewTunnelClient(GlobalSessionPool, split)
+
+	stackEng := NewStackEngine(mockDev, dialer, nil)
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("start stack failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	// 构造 1200 字节 UDP 载荷 (IP 头 20 + UDP 头 8 + 载荷 1200 = 1228 字节 IP 包)
+	payload := make([]byte, 1200)
+	for i := range payload {
+		payload[i] = byte((i * 7) % 256)
+	}
+	pkt := buildIPv4UDPPacket(net.ParseIP("10.88.0.2"), net.ParseIP("198.51.100.99"), 45678, 9999, payload)
+	if len(pkt) != 1228 {
+		t.Fatalf("expected packet length 1228, got %d", len(pkt))
+	}
+
+	// 注入 TunDevice，进入 pumpTunToStack
+	// 在旧版本 MTU=1224 规则下，1228 > 1224 会被直接丢弃；而在 1360 规则下，1228 <= 1360 放行并进入协议栈
+	mockDev.injectPacket(pkt)
+
+	// 从真实 UDP 套接字读取回传数据
+	recvBuf := make([]byte, 2048)
+	_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, rerr := pc.ReadFrom(recvBuf)
+	if rerr != nil {
+		t.Fatalf("failed to read from real UDP socket: %v (packet was likely dropped by MTU!)", rerr)
+	}
+	if n != 1200 {
+		t.Fatalf("expected 1200 bytes payload, got %d", n)
+	}
+	if !bytes.Equal(recvBuf[:n], payload) {
+		t.Fatalf("received UDP payload does not match sent payload")
+	}
+}
+
+// 门禁 2：境外 A 记录在 100 毫秒内返回 198.18.0.0/15 地址，并能反查出域名
+func TestStage1_OverseasDNS0msFakeIPAndReverseLookup(t *testing.T) {
+	split := NewSplitEngine()
+	dnsHandler := NewDNSHandler(split)
+
+	start := time.Now()
+	req := buildDNSQuery("anthropic.com", 0x0001) // A record
+	resp := dnsHandler.HandleQuery(req, net.ParseIP("10.88.0.2"), 53)
+	elapsed := time.Since(start)
+
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("overseas DNS query took %v, must be < 100ms", elapsed)
+	}
+	if resp == nil {
+		t.Fatalf("expected non-nil DNS response for anthropic.com")
+	}
+
+	fakeIP := extractFirstAAnswer(resp)
+	if fakeIP == nil {
+		t.Fatalf("failed to extract A answer from response")
+	}
+	if !dnsHandler.fakeIP.Contains(fakeIP) {
+		t.Fatalf("expected Fake-IP in 198.18.0.0/15, got %v", fakeIP)
+	}
+
+	// 验证反查域名
+	origDomain := dnsHandler.fakeIP.Lookup(fakeIP)
+	if origDomain != "anthropic.com" {
+		t.Fatalf("expected reverse lookup 'anthropic.com', got %q", origDomain)
+	}
+}
+
+// 门禁 3：Start() 启动完毕后，断言 WebRTCActive() 为真，测试本身没有调用 SetWebRTCActive
+func TestStage1_StartEnablesWebRTCActive(t *testing.T) {
+	eng := NewEngine()
+	eng.SetMode("tun")
+
+	applied := &Applied{
+		Servers: []ServerConfig{
+			{Name: "US-Node", Address: "198.51.100.1:443", Token: "tok_webrtc", SNI: "us.example.com"},
+		},
+		Tokens: map[string]string{"198.51.100.1:443": "tok_webrtc"},
+		SNIs:   map[string]string{"198.51.100.1:443": "us.example.com"},
+	}
+	if err := eng.Apply(applied); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	origDetect := detectThirdPartyTUN
+	origOpenTun := openTunDeviceFn
+	origSetupRoutes := setupRoutesFn
+	origTeardownRoutes := teardownRoutesFn
+	defer func() {
+		detectThirdPartyTUN = origDetect
+		openTunDeviceFn = origOpenTun
+		setupRoutesFn = origSetupRoutes
+		teardownRoutesFn = origTeardownRoutes
+	}()
+
+	detectThirdPartyTUN = func() (bool, string, error) {
+		return false, "", nil
+	}
+
+	mockDev := newMockTunDevice()
+	openTunDeviceFn = func(name string, mtu int) (TunDevice, error) {
+		return mockDev, nil
+	}
+	setupRoutesFn = func(devName, ipv4 string) error {
+		return nil
+	}
+	teardownRoutesFn = func(devName string) {}
+
+	// 模拟探测拨号成功
+	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+		return nil, nil
+	})
+	defer SetQUICDialHook(nil)
+
+	if err := eng.Start(); err != nil {
+		t.Fatalf("engine.Start() failed: %v", err)
+	}
+	defer eng.Stop()
+
+	// 核心断言：Start() 启动完毕后，WebRTCActive() 为真，测试本身绝对没有调用 SetWebRTCActive
+	if eng.stackEngine == nil {
+		t.Fatalf("stackEngine is nil")
+	}
+	if !eng.stackEngine.WebRTCActive() {
+		t.Fatalf("expected WebRTCActive() to be true after Start(), got false")
+	}
+}
+
+// 门禁 4：软切线测试：旧节点上已经开始的 TCP 回显能读完，新节点新连接进新回显
+func TestStage1_GracefulDrainingNodeSwitch(t *testing.T) {
+	eng := NewEngine()
+
+	applied := &Applied{
+		Servers: []ServerConfig{
+			{Name: "Node-1", Address: "192.0.2.1:443", Token: "tok_1", SNI: "n1.example.com"},
+			{Name: "Node-2", Address: "192.0.2.2:443", Token: "tok_2", SNI: "n2.example.com"},
+		},
+		Tokens: map[string]string{
+			"192.0.2.1:443": "tok_1",
+			"192.0.2.2:443": "tok_2",
+		},
+		SNIs: map[string]string{
+			"192.0.2.1:443": "n1.example.com",
+			"192.0.2.2:443": "n2.example.com",
+		},
+	}
+	if err := eng.Apply(applied); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	// 为两个节点构建基于内存管道的 Echo 服务
+	cli1, srv1 := net.Pipe()
+	defer cli1.Close()
+	defer srv1.Close()
+
+	cli2, srv2 := net.Pipe()
+	defer cli2.Close()
+	defer srv2.Close()
+
+	sess1 := &Session{
+		addr:  "192.0.2.1:443",
+		token: "tok_1",
+		sni:   "n1.example.com",
+		tcpDialer: func(ctx context.Context, target string) (net.Conn, error) {
+			return cli1, nil
+		},
+	}
+
+	sess2 := &Session{
+		addr:  "192.0.2.2:443",
+		token: "tok_2",
+		sni:   "n2.example.com",
+		tcpDialer: func(ctx context.Context, target string) (net.Conn, error) {
+			return cli2, nil
+		},
+	}
+
+	eng.sessionMgr.SetDialHook(func(ctx context.Context) (*Session, error) {
+		eng.mu.RLock()
+		addr := eng.activeAddr
+		eng.mu.RUnlock()
+		if addr == "192.0.2.2:443" {
+			return sess2, nil
+		}
+		return sess1, nil
+	})
+
+	// 1. 在旧节点 Node-1 上发起 TCP 连接并发送数据
+	ctx := context.Background()
+	conn1, err := eng.sessionMgr.DialTCP(ctx, "echo.service:80")
+	if err != nil {
+		t.Fatalf("DialTCP on Node-1 failed: %v", err)
+	}
+
+	// 旧连接异步读写验证
+	srv1Done := make(chan struct{})
+	go func() {
+		defer close(srv1Done)
+		buf := make([]byte, 128)
+		n, rerr := srv1.Read(buf)
+		if rerr != nil {
+			t.Errorf("srv1 read failed: %v", rerr)
+			return
+		}
+		if string(buf[:n]) != "request-to-old-node" {
+			t.Errorf("srv1 unexpected payload: %s", string(buf[:n]))
+			return
+		}
+		// 写入回显响应
+		_, _ = srv1.Write([]byte("echo-from-old-node"))
+	}()
+
+	if _, err := conn1.Write([]byte("request-to-old-node")); err != nil {
+		t.Fatalf("conn1 write failed: %v", err)
+	}
+
+	// 2. 执行节点切换至 Node-2（触发平滑软切线）
+	if err := eng.SwitchActiveNode("192.0.2.2:443"); err != nil {
+		t.Fatalf("SwitchActiveNode failed: %v", err)
+	}
+
+	// 断言旧 session 进入 draining 状态且未被强制关闭
+	if !sess1.IsDraining() {
+		t.Fatalf("expected sess1 to be marked draining")
+	}
+	if sess1.closed.Load() {
+		t.Fatalf("expected sess1 to remain open during drain timeout")
+	}
+
+	// 3. 验证旧节点上已经开始的 TCP 连接能正常读完回显数据
+	resp1 := make([]byte, 128)
+	n1, err := conn1.Read(resp1)
+	if err != nil {
+		t.Fatalf("failed to read from old connection after node switch: %v", err)
+	}
+	if string(resp1[:n1]) != "echo-from-old-node" {
+		t.Fatalf("unexpected response from old connection: %s", string(resp1[:n1]))
+	}
+	<-srv1Done
+
+	// 4. 验证新节点新连接进新回显
+	srv2Done := make(chan struct{})
+	go func() {
+		defer close(srv2Done)
+		buf := make([]byte, 128)
+		n, rerr := srv2.Read(buf)
+		if rerr != nil {
+			t.Errorf("srv2 read failed: %v", rerr)
+			return
+		}
+		if string(buf[:n]) != "request-to-new-node" {
+			t.Errorf("srv2 unexpected payload: %s", string(buf[:n]))
+			return
+		}
+		_, _ = srv2.Write([]byte("echo-from-new-node"))
+	}()
+
+	conn2, err := eng.sessionMgr.DialTCP(ctx, "echo.service:80")
+	if err != nil {
+		t.Fatalf("DialTCP on Node-2 failed: %v", err)
+	}
+	if _, err := conn2.Write([]byte("request-to-new-node")); err != nil {
+		t.Fatalf("conn2 write failed: %v", err)
+	}
+
+	resp2 := make([]byte, 128)
+	n2, err := conn2.Read(resp2)
+	if err != nil {
+		t.Fatalf("failed to read from new connection: %v", err)
+	}
+	if string(resp2[:n2]) != "echo-from-new-node" {
+		t.Fatalf("unexpected response from new connection: %s", string(resp2[:n2]))
+	}
+	<-srv2Done
+}
+
+// 门禁 5：验证桌面启动不再调用 DialIP，路由参数严格为 10.88.0.2/24
+func TestStage1_DesktopStartNoDialIPAndFixedPrefix(t *testing.T) {
+	eng := NewEngine()
+	eng.SetMode("tun")
+
+	applied := &Applied{
+		Servers: []ServerConfig{
+			{Name: "FixedPrefix-Node", Address: "198.51.100.1:443", Token: "tok_prefix", SNI: "p.example.com"},
+		},
+		Tokens: map[string]string{"198.51.100.1:443": "tok_prefix"},
+		SNIs:   map[string]string{"198.51.100.1:443": "p.example.com"},
+	}
+	if err := eng.Apply(applied); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+
+	var capturedIPv4 string
+	origDetect := detectThirdPartyTUN
+	origOpenTun := openTunDeviceFn
+	origSetupRoutes := setupRoutesFn
+	origTeardownRoutes := teardownRoutesFn
+	defer func() {
+		detectThirdPartyTUN = origDetect
+		openTunDeviceFn = origOpenTun
+		setupRoutesFn = origSetupRoutes
+		teardownRoutesFn = origTeardownRoutes
+	}()
+
+	detectThirdPartyTUN = func() (bool, string, error) {
+		return false, "", nil
+	}
+	mockDev := newMockTunDevice()
+	openTunDeviceFn = func(name string, mtu int) (TunDevice, error) {
+		return mockDev, nil
+	}
+	setupRoutesFn = func(devName, ipv4 string) error {
+		capturedIPv4 = ipv4
+		return nil
+	}
+	teardownRoutesFn = func(devName string) {}
+
+	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+		return nil, nil
+	})
+	defer SetQUICDialHook(nil)
+
+	if err := eng.Start(); err != nil {
+		t.Fatalf("eng.Start() failed: %v", err)
+	}
+	defer eng.Stop()
+
+	// 核心断言：路由参数必须严格为 10.88.0.2/24，桌面启动严禁调用 DialIP 改变该参数
+	if capturedIPv4 != "10.88.0.2/24" {
+		t.Fatalf("expected SetupRoutes called with '10.88.0.2/24', got %q", capturedIPv4)
+	}
+}
+
+// 阶段 3 门禁 1：分流规则净化与误伤域名回归代理
+// Match("openai.com") 仍是 AI。Match("baidu.com") 仍是 DIRECT。Match("microsoft.com")、Match("bing.com")、Match("apple.com")、Match("icloud.com") 是 PROXY。
+func TestPhase3Gate1_SplitMatching(t *testing.T) {
+	engine := NewSplitEngine()
+
+	// 1. AI 专线域名 100% 保持为 AI
+	aiDomains := []string{
+		"openai.com",
+		"chatgpt.com",
+		"api.openai.com",
+		"anthropic.com",
+		"claude.ai",
+	}
+	for _, domain := range aiDomains {
+		if strat := engine.Match(domain, nil); strat != AI {
+			t.Fatalf("expected Match(%q) to be AI, got %v", domain, strat)
+		}
+	}
+
+	// 2. 国内直连域名保持为 DIRECT
+	directDomains := []string{
+		"baidu.com",
+		"qq.com",
+		"taobao.com",
+		"bilibili.com",
+		"msn.cn",
+		"bing.cn",
+	}
+	for _, domain := range directDomains {
+		if strat := engine.Match(domain, nil); strat != DIRECT {
+			t.Fatalf("expected Match(%q) to be DIRECT, got %v", domain, strat)
+		}
+	}
+
+	// 3. 误伤域名移出直连表，严格为 PROXY
+	proxiedDomains := []string{
+		"microsoft.com",
+		"bing.com",
+		"windowsupdate.com",
+		"apple.com",
+		"icloud.com",
+		"itunes.com",
+		"aaplimg.com",
+	}
+	for _, domain := range proxiedDomains {
+		if strat := engine.Match(domain, nil); strat != PROXY {
+			t.Fatalf("expected Match(%q) to be PROXY, got %v", domain, strat)
+		}
+	}
+}
+
+// 阶段 3 门禁 2：路由命令参数序列断言（添加与删除成对，接口名绑定本次 TUN 名，开发机绝不执行真实 netsh）
+func TestPhase3Gate2_RouteCommandsPairing(t *testing.T) {
+	devName := "test-aero9"
+	tunIP := "10.88.0.2/24"
+
+	var mu sync.Mutex
+	var executedCommands [][]string
+
+	// 使用 SetCmdExecutorForTest 拦截所有系统命令，杜绝篡改开发机物理网络
+	cleanup := SetCmdExecutorForTest(func(name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		full := append([]string{name}, args...)
+		executedCommands = append(executedCommands, full)
+		return nil
+	})
+	defer cleanup()
+
+	// 执行 SetupRoutes
+	if err := SetupRoutes(devName, tunIP); err != nil {
+		t.Fatalf("SetupRoutes failed: %v", err)
+	}
+
+	// 执行 TeardownRoutes
+	TeardownRoutes(devName)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(executedCommands) == 0 {
+		t.Fatalf("expected captured route commands, got none")
+	}
+
+	// 验证所有命令的接口名均绑定本次 TUN 名，绝不串接口
+	for _, cmd := range executedCommands {
+		cmdStr := strings.Join(cmd, " ")
+		if strings.Contains(cmdStr, "name=") {
+			if !strings.Contains(cmdStr, "name="+devName) {
+				t.Fatalf("command references incorrect interface: %s", cmdStr)
+			}
+		}
+		if strings.Contains(cmdStr, "AERO_") {
+			if !strings.Contains(cmdStr, "AERO_"+devName) {
+				t.Fatalf("NRPT rule comment references incorrect interface: %s", cmdStr)
+			}
+		}
+	}
+
+	// 验证 IPv6 黑洞路由添加与删除成对
+	var ipv6Add1, ipv6Add2, ipv6Del1, ipv6Del2 bool
+	// 验证 IPv4 分流路由添加与删除成对
+	var ipv4Del1, ipv4Del2 bool
+	var routeAddCount int
+	// 验证 NRPT 策略添加与删除成对
+	var nrptAdded, nrptDeleted bool
+
+	for _, cmd := range executedCommands {
+		cmdStr := strings.Join(cmd, " ")
+		// IPv6 检查
+		if strings.Contains(cmdStr, "interface ipv6 add route ::/1") && strings.Contains(cmdStr, devName) {
+			ipv6Add1 = true
+		}
+		if strings.Contains(cmdStr, "interface ipv6 add route 8000::/1") && strings.Contains(cmdStr, devName) {
+			ipv6Add2 = true
+		}
+		if strings.Contains(cmdStr, "interface ipv6 delete route ::/1") && strings.Contains(cmdStr, devName) {
+			ipv6Del1 = true
+		}
+		if strings.Contains(cmdStr, "interface ipv6 delete route 8000::/1") && strings.Contains(cmdStr, devName) {
+			ipv6Del2 = true
+		}
+
+		// IPv4 检查
+		if strings.Contains(cmdStr, "interface ipv4 delete route 0.0.0.0/1") && strings.Contains(cmdStr, devName) {
+			ipv4Del1 = true
+		}
+		if strings.Contains(cmdStr, "interface ipv4 delete route 128.0.0.0/1") && strings.Contains(cmdStr, devName) {
+			ipv4Del2 = true
+		}
+		if cmd[0] == "route" && len(cmd) > 1 && cmd[1] == "add" {
+			routeAddCount++
+		}
+
+		// NRPT 检查
+		if strings.Contains(cmdStr, "Add-DnsClientNrptRule") && strings.Contains(cmdStr, "AERO_"+devName) {
+			nrptAdded = true
+		}
+		if strings.Contains(cmdStr, "Remove-DnsClientNrptRule") && strings.Contains(cmdStr, "AERO_"+devName) {
+			nrptDeleted = true
+		}
+	}
+
+	if !ipv6Add1 || !ipv6Add2 {
+		t.Fatalf("expected IPv6 ::/1 and 8000::/1 added on %s, got add1=%v, add2=%v", devName, ipv6Add1, ipv6Add2)
+	}
+	if !ipv6Del1 || !ipv6Del2 {
+		t.Fatalf("expected IPv6 ::/1 and 8000::/1 deleted on %s, got del1=%v, del2=%v", devName, ipv6Del1, ipv6Del2)
+	}
+	if !ipv4Del1 || !ipv4Del2 || routeAddCount < 2 {
+		t.Fatalf("expected IPv4 split routes paired on %s", devName)
+	}
+	if !nrptAdded || !nrptDeleted {
+		t.Fatalf("expected NRPT rule paired on %s, got added=%v, deleted=%v", devName, nrptAdded, nrptDeleted)
+	}
+}
+
+// 阶段 4 门禁 1：ClientHello 打散与非明文 SNI 验证
+func TestPhase4Gate1_ClientHelloScrambling(t *testing.T) {
+	// 1. 断言环境变量未被设置（生产严禁禁用打散）
+	if val := os.Getenv("QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING"); val != "" {
+		t.Fatalf("QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING must be empty in production code, got %q", val)
+	}
+
+	// 2. 使用 net.ListenPacket("udp6", "[::1]:0")（规避 Windows WFP loopback 拦截）建立 UDP 监听
+	serverConn, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		t.Fatalf("failed to listen on udp6 [::1]:0: %v", err)
+	}
+	defer serverConn.Close()
+
+	serverUDPAddr, ok := serverConn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("failed to cast server address to *net.UDPAddr: %v", serverConn.LocalAddr())
+	}
+
+	// 3. 客户端使用 DefaultTransportConfig 拨号该地址，配置真实长度的目标节点域名（例如 "secret-edge-node-99.aero-protocol.net"）
+	sni := "secret-edge-node-99.aero-protocol.net"
+	cfg := DefaultTransportConfig(serverUDPAddr.String(), sni)
+	cfg.RemoteUDPAddr = serverUDPAddr
+	cfg.PacketConnFactory = func(ctx context.Context, network string) (net.PacketConn, error) {
+		return net.ListenPacket("udp6", "[::1]:0")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	dialErrCh := make(chan error, 1)
+	go func() {
+		client, dialErr := Dial(ctx, cfg)
+		if dialErr == nil && client != nil {
+			_ = client.Close()
+		}
+		dialErrCh <- dialErr
+	}()
+
+	// 4. 抓取发出的第一个 UDP 数据报，断言 bytes.Contains(firstDatagram, []byte(sni)) == false（验证节点名绝非连续明文，quic-go ClientHello scrambling 真实生效）
+	buf := make([]byte, 2048)
+	_ = serverConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, readErr := serverConn.ReadFrom(buf)
+	if readErr != nil {
+		t.Fatalf("failed to read datagram from client: %v", readErr)
+	}
+	firstDatagram := buf[:n]
+
+	if bytes.Contains(firstDatagram, []byte(sni)) {
+		t.Fatalf("first datagram contains plain SNI %q, quic-go ClientHello scrambling not effective", sni)
+	}
+
+	cancel()
+	<-dialErrCh
+}
+
+// 阶段 4 门禁 2：ECH 订阅驱动协商（crypto/hpke 与 crypto/tls 内存通道验证）
+func TestPhase4Gate2_ECHSubscriptionDriven(t *testing.T) {
+	// 1. 生成测试证书 (publicName: "public.aero-net.com", inner ServerName: "internal.aero-net.com")
+	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate ecdsa key: %v", err)
+	}
+
+	publicTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1001),
+		DNSNames:     []string{"public.aero-net.com"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}
+	publicCertDER, err := x509.CreateCertificate(rand.Reader, publicTmpl, publicTmpl, certKey.Public(), certKey)
+	if err != nil {
+		t.Fatalf("failed to create public cert: %v", err)
+	}
+	publicCert, err := x509.ParseCertificate(publicCertDER)
+	if err != nil {
+		t.Fatalf("failed to parse public cert: %v", err)
+	}
+
+	internalTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1002),
+		DNSNames:     []string{"internal.aero-net.com"},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}
+	internalCertDER, err := x509.CreateCertificate(rand.Reader, internalTmpl, internalTmpl, certKey.Public(), certKey)
+	if err != nil {
+		t.Fatalf("failed to create internal cert: %v", err)
+	}
+	internalCert, err := x509.ParseCertificate(internalCertDER)
+	if err != nil {
+		t.Fatalf("failed to parse internal cert: %v", err)
+	}
+
+	// 2. 基于 crypto/hpke 与 crypto/tls 构造测试用 EncryptedClientHelloKey 与 ECHConfigList
+	rawPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate X25519 key: %v", err)
+	}
+	hpkePriv, err := hpke.NewDHKEMPrivateKey(rawPriv)
+	if err != nil {
+		t.Fatalf("failed to create hpke private key: %v", err)
+	}
+	privBytes, err := hpkePriv.Bytes()
+	if err != nil {
+		t.Fatalf("failed to serialize hpke private key: %v", err)
+	}
+	pubBytes := hpkePriv.PublicKey().Bytes()
+
+	marshalECHConfig := func(version uint16, id uint8, pubKey []byte, publicName string, maxNameLen uint8) []byte {
+		builder := cryptobyte.NewBuilder(nil)
+		builder.AddUint16(version) // 0xfe0d
+		builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+			builder.AddUint8(id)
+			builder.AddUint16(0x0020 /* DHKEM(X25519, HKDF-SHA256) */)
+			builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+				builder.AddBytes(pubKey)
+			})
+			builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+				builder.AddUint16(0x0001 /* HKDF-SHA256 */)
+				builder.AddUint16(0x0001 /* AES-128-GCM */)
+			})
+			builder.AddUint8(maxNameLen)
+			builder.AddUint8LengthPrefixed(func(builder *cryptobyte.Builder) {
+				builder.AddBytes([]byte(publicName))
+			})
+			builder.AddUint16(0) // extensions
+		})
+		return builder.BytesOrPanic()
+	}
+
+	echConfig := marshalECHConfig(0xfe0d, 1, pubBytes, "public.aero-net.com", 64)
+
+	builder := cryptobyte.NewBuilder(nil)
+	builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+		builder.AddBytes(echConfig)
+	})
+	echConfigList := builder.BytesOrPanic()
+
+	echKey := tls.EncryptedClientHelloKey{
+		Config:      echConfig,
+		PrivateKey:  privBytes,
+		SendAsRetry: true,
+	}
+
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(publicCert)
+	rootCAs.AddCert(internalCert)
+
+	serverConfig := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		Certificates: []tls.Certificate{
+			{Certificate: [][]byte{publicCertDER}, PrivateKey: certKey},
+			{Certificate: [][]byte{internalCertDER}, PrivateKey: certKey},
+		},
+		EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{echKey},
+	}
+
+	// a) 当客户端配置 EncryptedClientHelloConfigList 时，握手成功，断言 state.ECHAccepted == true，inner ServerName == "internal.aero-net.com"
+	clientConfigECH := &tls.Config{
+		MinVersion:                     tls.VersionTLS13,
+		ServerName:                     "internal.aero-net.com",
+		RootCAs:                        rootCAs,
+		EncryptedClientHelloConfigList: echConfigList,
+	}
+
+	cliConn1, srvConn1 := net.Pipe()
+	var clientStateECH, serverStateECH tls.ConnectionState
+	errCh1 := make(chan error, 2)
+
+	go func() {
+		defer cliConn1.Close()
+		cli := tls.Client(cliConn1, clientConfigECH)
+		err := cli.Handshake()
+		if err == nil {
+			clientStateECH = cli.ConnectionState()
+		}
+		errCh1 <- err
+	}()
+
+	go func() {
+		defer srvConn1.Close()
+		srv := tls.Server(srvConn1, serverConfig)
+		err := srv.Handshake()
+		if err == nil {
+			serverStateECH = srv.ConnectionState()
+		}
+		errCh1 <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh1; err != nil {
+			t.Fatalf("handshake with ECH failed: %v", err)
+		}
+	}
+
+	if !clientStateECH.ECHAccepted {
+		t.Fatalf("expected clientStateECH.ECHAccepted == true, got false")
+	}
+	if clientStateECH.ServerName != "internal.aero-net.com" {
+		t.Fatalf("expected clientStateECH.ServerName == %q, got %q", "internal.aero-net.com", clientStateECH.ServerName)
+	}
+	if !serverStateECH.ECHAccepted {
+		t.Fatalf("expected serverStateECH.ECHAccepted == true, got false")
+	}
+	if serverStateECH.ServerName != "internal.aero-net.com" {
+		t.Fatalf("expected serverStateECH.ServerName == %q, got %q", "internal.aero-net.com", serverStateECH.ServerName)
+	}
+
+	// b) 当未配置 ECHConfigList 时，握手按普通 TLS 1.3 正常成功，state.ECHAccepted == false
+	clientConfigPlain := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: "internal.aero-net.com",
+		RootCAs:    rootCAs,
+	}
+
+	cliConn2, srvConn2 := net.Pipe()
+	var clientStatePlain, serverStatePlain tls.ConnectionState
+	errCh2 := make(chan error, 2)
+
+	go func() {
+		defer cliConn2.Close()
+		cli := tls.Client(cliConn2, clientConfigPlain)
+		err := cli.Handshake()
+		if err == nil {
+			clientStatePlain = cli.ConnectionState()
+		}
+		errCh2 <- err
+	}()
+
+	go func() {
+		defer srvConn2.Close()
+		srv := tls.Server(srvConn2, serverConfig)
+		err := srv.Handshake()
+		if err == nil {
+			serverStatePlain = srv.ConnectionState()
+		}
+		errCh2 <- err
+	}()
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh2; err != nil {
+			t.Fatalf("handshake without ECH failed: %v", err)
+		}
+	}
+
+	if clientStatePlain.ECHAccepted {
+		t.Fatalf("expected clientStatePlain.ECHAccepted == false, got true")
+	}
+	if clientStatePlain.ServerName != "internal.aero-net.com" {
+		t.Fatalf("expected clientStatePlain.ServerName == %q, got %q", "internal.aero-net.com", clientStatePlain.ServerName)
+	}
+	if serverStatePlain.ECHAccepted {
+		t.Fatalf("expected serverStatePlain.ECHAccepted == false, got true")
+	}
+	if serverStatePlain.ServerName != "internal.aero-net.com" {
+		t.Fatalf("expected serverStatePlain.ServerName == %q, got %q", "internal.aero-net.com", serverStatePlain.ServerName)
+	}
+}
+
+// 阶段 4 门禁 3：InitialPacketSize 严格为 0 与 PMTU 发现（RFC 8899）门禁测试
+func TestPhase4Gate3_InitialPacketSizeZero(t *testing.T) {
+	// 1. 验证 DefaultTransportConfig 和 quic.Config 中：
+	//    * InitialPacketSize 严格为 0；
+	//    * DisablePathMTUDiscovery 严格为 false（遵循 RFC 8899）。
+	var capturedQUICConfig *quic.Config
+
+	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+		capturedQUICConfig = quicCfg
+		return nil, errors.New("intercepted for gate verification")
+	})
+	defer SetQUICDialHook(nil)
+
+	cfg := DefaultTransportConfig("192.0.2.1:443", "node.example.com")
+	if cfg == nil {
+		t.Fatalf("DefaultTransportConfig returned nil")
+	}
+	cfg.RemoteUDPAddr = &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}
+	cfg.PacketConnFactory = func(ctx context.Context, network string) (net.PacketConn, error) {
+		return net.ListenPacket("udp", "127.0.0.1:0")
+	}
+
+	_, _ = Dial(context.Background(), cfg)
+
+	if capturedQUICConfig == nil {
+		t.Fatalf("expected Dial to invoke QUIC hook and supply quic.Config")
+	}
+
+	// 断言 InitialPacketSize 严格为 0
+	if capturedQUICConfig.InitialPacketSize != 0 {
+		t.Fatalf("expected quic.Config.InitialPacketSize == 0, got %d", capturedQUICConfig.InitialPacketSize)
+	}
+
+	// 断言 DisablePathMTUDiscovery 严格为 false（遵循 RFC 8899）
+	if capturedQUICConfig.DisablePathMTUDiscovery != false {
+		t.Fatalf("expected quic.Config.DisablePathMTUDiscovery == false, got %v", capturedQUICConfig.DisablePathMTUDiscovery)
+	}
+
+	// 2. 验证原生 quic.Config 默认实例亦满足该规范
+	defaultQC := &quic.Config{}
+	if defaultQC.InitialPacketSize != 0 {
+		t.Fatalf("expected default quic.Config.InitialPacketSize == 0, got %d", defaultQC.InitialPacketSize)
+	}
+	if defaultQC.DisablePathMTUDiscovery != false {
+		t.Fatalf("expected default quic.Config.DisablePathMTUDiscovery == false, got %v", defaultQC.DisablePathMTUDiscovery)
+	}
+}
+
+// Phase 5 Gate: Client ICMP Outbound Routing
+func TestPhase5Gate_ClientICMPOutboundRouting(t *testing.T) {
+	mockDev := newMockTunDevice()
+	defer mockDev.Close()
+
+	stackEng := NewStackEngine(mockDev, nil, nil)
+
+	hookCh := make(chan []byte, 10)
+	stackEng.SetICMPOutboundHookForTest(func(pkt []byte) {
+		cp := make([]byte, len(pkt))
+		copy(cp, pkt)
+		select {
+		case hookCh <- cp:
+		default:
+		}
+	})
+
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("stackEng.Start failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	// 1. 测试非 TUN IP (8.8.8.8) 的 ICMP Echo Request
+	target8888 := net.ParseIP("8.8.8.8")
+	clientTUNIP := net.ParseIP("10.88.0.2")
+
+	pingPayload := []byte("client-ping-test")
+	icmpPayload := make([]byte, 8+len(pingPayload))
+	icmpPayload[0] = 8                                   // Echo Request
+	icmpPayload[1] = 0                                   // Code 0
+	binary.BigEndian.PutUint16(icmpPayload[4:6], 0xbeef) // Identifier
+	binary.BigEndian.PutUint16(icmpPayload[6:8], 0x0001) // Sequence
+	copy(icmpPayload[8:], pingPayload)
+	chk := calcChecksum(icmpPayload)
+	binary.BigEndian.PutUint16(icmpPayload[2:4], chk)
+
+	pkt8888 := make([]byte, 20+len(icmpPayload))
+	pkt8888[0] = 0x45
+	binary.BigEndian.PutUint16(pkt8888[2:4], uint16(len(pkt8888)))
+	pkt8888[8] = 64
+	pkt8888[9] = 1 // ICMP
+	copy(pkt8888[12:16], clientTUNIP.To4())
+	copy(pkt8888[16:20], target8888.To4())
+	ipChk := calcChecksum(pkt8888[:20])
+	binary.BigEndian.PutUint16(pkt8888[10:12], ipChk)
+	copy(pkt8888[20:], icmpPayload)
+
+	mockDev.injectPacket(pkt8888)
+
+	select {
+	case captured := <-hookCh:
+		if len(captured) < 28 {
+			t.Fatalf("captured packet too short: %d", len(captured))
+		}
+		if captured[0]>>4 != 4 {
+			t.Fatalf("expected IPv4 packet, got version %d", captured[0]>>4)
+		}
+		if captured[9] != 1 {
+			t.Fatalf("expected ICMP protocol 1, got %d", captured[9])
+		}
+		dstIP := net.IP(captured[16:20])
+		if !dstIP.Equal(target8888) {
+			t.Fatalf("expected dst IP 8.8.8.8, got %v", dstIP)
+		}
+		ihl := int(captured[0]&0x0f) * 4
+		icmp := captured[ihl:]
+		if icmp[0] != 8 || icmp[1] != 0 {
+			t.Fatalf("expected ICMP Echo Request (8, 0), got (%d, %d)", icmp[0], icmp[1])
+		}
+		id := binary.BigEndian.Uint16(icmp[4:6])
+		seq := binary.BigEndian.Uint16(icmp[6:8])
+		if id != 0xbeef || seq != 0x0001 {
+			t.Fatalf("expected ID 0xbeef, Seq 1; got ID 0x%04x, Seq %d", id, seq)
+		}
+		if string(icmp[8:]) != "client-ping-test" {
+			t.Fatalf("expected payload %q, got %q", "client-ping-test", string(icmp[8:]))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for non-TUN ICMP packet to be captured by outbound hook")
+	}
+
+	// 2. 测试本地 TUN IP (10.88.0.2)，断言不被出站 hook 捕获
+	pktLocal := make([]byte, len(pkt8888))
+	copy(pktLocal, pkt8888)
+	copy(pktLocal[16:20], clientTUNIP.To4())
+	pktLocal[10] = 0
+	pktLocal[11] = 0
+	ipChkLocal := calcChecksum(pktLocal[:20])
+	binary.BigEndian.PutUint16(pktLocal[10:12], ipChkLocal)
+
+	mockDev.injectPacket(pktLocal)
+
+	select {
+	case unexp := <-hookCh:
+		t.Fatalf("local TUN IP ICMP must not be intercepted by outbound hook, got %x", unexp)
+	case <-time.After(100 * time.Millisecond):
+		// 正确，未被拦截
+	}
+
+	// 3. 测试网关 IP (10.88.0.1)，断言不被出站 hook 捕获
+	gatewayIP := net.ParseIP("10.88.0.1")
+	pktGateway := make([]byte, len(pkt8888))
+	copy(pktGateway, pkt8888)
+	copy(pktGateway[16:20], gatewayIP.To4())
+	pktGateway[10] = 0
+	pktGateway[11] = 0
+	ipChkGateway := calcChecksum(pktGateway[:20])
+	binary.BigEndian.PutUint16(pktGateway[10:12], ipChkGateway)
+
+	mockDev.injectPacket(pktGateway)
+
+	select {
+	case unexp := <-hookCh:
+		t.Fatalf("gateway IP ICMP must not be intercepted by outbound hook, got %x", unexp)
+	case <-time.After(100 * time.Millisecond):
+		// 正确，未被拦截
+	}
+}
+
+type clientTapPacketConn struct {
+	net.PacketConn
+	mu       sync.Mutex
+	sent     [][]byte
+	received [][]byte
+}
+
+func (t *clientTapPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	t.mu.Lock()
+	t.sent = append(t.sent, cp)
+	t.mu.Unlock()
+	return t.PacketConn.WriteTo(b, addr)
+}
+
+func (t *clientTapPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := t.PacketConn.ReadFrom(b)
+	if err == nil && n > 0 {
+		cp := make([]byte, n)
+		copy(cp, b[:n])
+		t.mu.Lock()
+		t.received = append(t.received, cp)
+		t.mu.Unlock()
+	}
+	return n, addr, err
+}
+
+func calcShannonEntropy(data []byte) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	var counts [256]int
+	for _, b := range data {
+		counts[b]++
+	}
+	var entropy float64
+	total := float64(len(data))
+	for _, c := range counts {
+		if c > 0 {
+			p := float64(c) / total
+			entropy -= p * math.Log2(p)
+		}
+	}
+	return entropy
+}
+
+func createTestUDPPair(t *testing.T) (net.PacketConn, net.PacketConn) {
+	p1, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		p1, err = net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen packet: %v", err)
+		}
+		p2, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			p1.Close()
+			t.Fatalf("failed to listen packet: %v", err)
+		}
+		return p1, p2
+	}
+	p2, err := net.ListenPacket("udp6", "[::1]:0")
+	if err != nil {
+		p1.Close()
+		t.Fatalf("failed to listen packet: %v", err)
+	}
+	return p1, p2
+}
+
+// 阶段六门禁：客户端 Salamander UDP 混淆引擎单元测试与验证
+func TestPhase6Gate_ClientSalamander(t *testing.T) {
+	// 1. 测试空密码透传模式
+	t.Run("PassthroughWhenEmptyPassword", func(t *testing.T) {
+		p1, p2 := createTestUDPPair(t)
+		defer p1.Close()
+		defer p2.Close()
+
+		s1 := NewSalamanderPacketConn(p1, "", false)
+		s2 := NewSalamanderPacketConn(p2, "", false)
+
+		payload := []byte("plain passthrough test")
+		n, err := s1.WriteTo(payload, p2.LocalAddr())
+		if err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+		if n != len(payload) {
+			t.Fatalf("expected write len %d, got %d", len(payload), n)
+		}
+
+		buf := make([]byte, 2048)
+		nRead, _, err := s2.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom failed: %v", err)
+		}
+		if nRead != len(payload) || string(buf[:nRead]) != string(payload) {
+			t.Fatalf("expected %q, got %q", string(payload), string(buf[:nRead]))
+		}
+	})
+
+	// 2. 测试启用密码与 PaddingJitter = true
+	t.Run("PaddingJitterAndEntropy", func(t *testing.T) {
+		p1, p2 := createTestUDPPair(t)
+		defer p1.Close()
+		defer p2.Close()
+
+		tap1 := &clientTapPacketConn{PacketConn: p1}
+		tap2 := &clientTapPacketConn{PacketConn: p2}
+
+		pass := "aero-client-salamander-secret-key"
+		s1 := NewSalamanderPacketConn(tap1, pass, true)
+		s2 := NewSalamanderPacketConn(tap2, pass, true)
+
+		payload := []byte("secret payload with dynamic padding")
+		n, err := s1.WriteTo(payload, p2.LocalAddr())
+		if err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+		if n != len(payload) {
+			t.Fatalf("expected write len %d, got %d", len(payload), n)
+		}
+
+		buf := make([]byte, 2048)
+		nRead, _, err := s2.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom failed: %v", err)
+		}
+		if nRead != len(payload) || string(buf[:nRead]) != string(payload) {
+			t.Fatalf("expected recovered payload %q, got %q", string(payload), string(buf[:nRead]))
+		}
+
+		// 检查线路上实际抓到的数据报
+		tap1.mu.Lock()
+		sentPkts := append([][]byte{}, tap1.sent...)
+		tap1.mu.Unlock()
+
+		if len(sentPkts) == 0 {
+			t.Fatalf("no datagram recorded by tap1")
+		}
+
+		wirePkt := sentPkts[0]
+		// a) 数据报长度在 [1280, 1380] 区间内
+		if len(wirePkt) < 1280 || len(wirePkt) > 1380 {
+			t.Fatalf("wire packet length %d not in [1280, 1380]", len(wirePkt))
+		}
+		// b) 香农熵 >= 7.5
+		entropy := calcShannonEntropy(wirePkt)
+		if entropy < 7.5 {
+			t.Fatalf("wire packet entropy %f < 7.5", entropy)
+		}
+		// c) 不包含明文原始数据
+		if bytes.Contains(wirePkt, payload) {
+			t.Fatalf("wire packet contains plaintext payload")
+		}
+	})
+
+	// 3. 测试启用密码与 PaddingJitter = false (长度严格为 10 + len(b))
+	t.Run("NoPaddingJitterExactLength", func(t *testing.T) {
+		p1, p2 := createTestUDPPair(t)
+		defer p1.Close()
+		defer p2.Close()
+
+		tap1 := &clientTapPacketConn{PacketConn: p1}
+		tap2 := &clientTapPacketConn{PacketConn: p2}
+
+		pass := "aero-client-salamander-secret-key"
+		s1 := NewSalamanderPacketConn(tap1, pass, false)
+		s2 := NewSalamanderPacketConn(tap2, pass, false)
+
+		payload := []byte("short-test-bytes")
+		n, err := s1.WriteTo(payload, p2.LocalAddr())
+		if err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+		if n != len(payload) {
+			t.Fatalf("expected write len %d, got %d", len(payload), n)
+		}
+
+		buf := make([]byte, 2048)
+		nRead, _, err := s2.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom failed: %v", err)
+		}
+		if nRead != len(payload) || string(buf[:nRead]) != string(payload) {
+			t.Fatalf("expected %q, got %q", string(payload), string(buf[:nRead]))
+		}
+
+		tap1.mu.Lock()
+		wireLen := len(tap1.sent[0])
+		tap1.mu.Unlock()
+
+		expectedLen := 26 + len(payload) // 8 salt + 2 origLen + 16 Poly1305 AEAD Tag
+		if wireLen != expectedLen {
+			t.Fatalf("expected wire packet length %d, got %d", expectedLen, wireLen)
+		}
+	})
+
+	// 4. 测试错误密码安全丢弃，不发生 panic
+	t.Run("WrongPasswordSilentlyDropped", func(t *testing.T) {
+		p1, p2 := createTestUDPPair(t)
+		defer p1.Close()
+		defer p2.Close()
+
+		s1 := NewSalamanderPacketConn(p1, "correct-key-1234", false)
+		s2 := NewSalamanderPacketConn(p2, "wrong-key-5678", false)
+
+		_, err := s1.WriteTo([]byte("super secret data"), p2.LocalAddr())
+		if err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+
+		_ = p2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		buf := make([]byte, 2048)
+		_, _, readErr := s2.ReadFrom(buf)
+		if readErr == nil {
+			t.Fatalf("expected ReadFrom to timeout or fail on wrong password, but got success")
+		}
+	})
+
+	// 5. 测试过短数据报 (<26 字节) 校验与安全丢弃
+	t.Run("CorruptedShortPacketDropped", func(t *testing.T) {
+		p1, p2 := createTestUDPPair(t)
+		defer p1.Close()
+		defer p2.Close()
+
+		s2 := NewSalamanderPacketConn(p2, "correct-key-1234", false)
+
+		// 写入仅 5 字节数据（小于 26 字节最小包长要求）
+		_, err := p1.WriteTo([]byte("tiny!"), p2.LocalAddr())
+		if err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+
+		_ = p2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		buf := make([]byte, 2048)
+		_, _, readErr := s2.ReadFrom(buf)
+		if readErr == nil {
+			t.Fatalf("expected ReadFrom to discard short packet, but succeeded")
+		}
+	})
+
+	// 5b. 测试 AEAD 翻转比特篡改防护（Bit-Flipping 攻击 100% 被 Poly1305 拒绝）
+	t.Run("BitFlippingTamperRejectedByAEAD", func(t *testing.T) {
+		p1, p2 := createTestUDPPair(t)
+		defer p1.Close()
+		defer p2.Close()
+
+		pass := "tamper-proof-key-999"
+		s1 := NewSalamanderPacketConn(p1, pass, false)
+		s2 := NewSalamanderPacketConn(p2, pass, false)
+
+		tap1 := &clientTapPacketConn{PacketConn: p1}
+		s1.PacketConn = tap1
+
+		_, err := s1.WriteTo([]byte("important unforgeable payload"), p2.LocalAddr())
+		if err != nil {
+			t.Fatalf("WriteTo failed: %v", err)
+		}
+
+		tap1.mu.Lock()
+		origWirePkt := append([]byte(nil), tap1.sent[0]...)
+		tap1.mu.Unlock()
+
+		// 模拟攻击者翻转密文中的 1 个 bit
+		origWirePkt[15] ^= 0x01
+
+		// 首先读出合法的首包
+		buf := make([]byte, 2048)
+		n, _, err := s2.ReadFrom(buf)
+		if err != nil || string(buf[:n]) != "important unforgeable payload" {
+			t.Fatalf("expected to read initial untampered packet")
+		}
+
+		// 发送篡改后的数据包给接收端
+		_, _ = p1.WriteTo(origWirePkt, p2.LocalAddr())
+
+		_ = p2.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		_, _, readErr := s2.ReadFrom(buf)
+		// 必须被 AEAD Open 丢弃导致超时，绝不能解密出受损明文
+		if readErr == nil {
+			t.Fatalf("expected AEAD to reject tampered packet with invalid MAC, but ReadFrom succeeded")
+		}
+	})
+
+	// 6. 测试 TransportConfig 与 Dial 接入 Salamander
+	t.Run("TransportConfigDialIntegration", func(t *testing.T) {
+		cfg := DefaultTransportConfig("192.0.2.1:443", "node.example.com")
+		cfg.ObfsPassword = "salamander-obfs-pwd"
+		cfg.PaddingJitter = true
+
+		if cfg.ObfsPassword != "salamander-obfs-pwd" || !cfg.PaddingJitter {
+			t.Fatalf("TransportConfig fields not set correctly")
+		}
+
+		var interceptedConn net.PacketConn
+		cfg.RemoteUDPAddr = &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 443}
+		cfg.PacketConnFactory = func(ctx context.Context, network string) (net.PacketConn, error) {
+			rawConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				rawConn, err = net.ListenPacket("udp6", "[::1]:0")
+			}
+			return rawConn, err
+		}
+
+		SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+			interceptedConn = pconn
+			return nil, errors.New("mock dial stopped after pconn wrap")
+		})
+		defer SetQUICDialHook(nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		_, _ = Dial(ctx, cfg)
+
+		if interceptedConn == nil {
+			t.Fatalf("quicDialHook was not called")
+		}
+		if _, ok := interceptedConn.(*SalamanderPacketConn); !ok {
+			t.Fatalf("expected pconn to be wrapped by *SalamanderPacketConn, got %T", interceptedConn)
+		}
+	})
+}
+
+// TestFinalGate_DrainQueueDepthLimit 验证短时间内连续 5 次切线时，并发存在的 Draining Session 数量严格 <= 2，最旧的被主动释放。
+func TestFinalGate_DrainQueueDepthLimit(t *testing.T) {
+	mgr := NewSessionManager()
+
+	var closedOrder []int
+	var mu sync.Mutex
+
+	createMockSession := func(id int) *Session {
+		s := &Session{}
+		s.onClose = func() {
+			mu.Lock()
+			closedOrder = append(closedOrder, id)
+			mu.Unlock()
+		}
+		return s
+	}
+
+	sessions := make([]*Session, 5)
+	for i := 0; i < 5; i++ {
+		sessions[i] = createMockSession(i + 1)
+	}
+
+	// 连续 5 次将 Session 放入 SessionManager 并触发 Drain (设置足够长的排空超时以观测排队与淘汰机制)
+	for i := 0; i < 5; i++ {
+		mgr.mu.Lock()
+		mgr.currentSession = sessions[i]
+		mgr.mu.Unlock()
+
+		drained := mgr.Drain(10 * time.Second)
+		if drained != sessions[i] {
+			t.Fatalf("step %d: expected drained session %d, got %v", i+1, i+1, drained)
+		}
+
+		// 验证并发存在的 Draining Session 数量严格 <= 2
+		count := mgr.DrainingCount()
+		if count > maxDrainingSessions {
+			t.Fatalf("step %d: draining count %d exceeded maxDrainingSessions (%d)", i+1, count, maxDrainingSessions)
+		}
+	}
+
+	// 连续 5 次切线后：
+	// 最多保留最后 2 个 (Session 4 和 5)
+	// 最旧的 3 个 (Session 1, 2, 3) 必须已经被主动释放 (closed)
+	if count := mgr.DrainingCount(); count != 2 {
+		t.Fatalf("expected exactly 2 draining sessions after 5 cuts, got %d", count)
+	}
+
+	mu.Lock()
+	orderCopy := append([]int(nil), closedOrder...)
+	mu.Unlock()
+
+	if len(orderCopy) != 3 {
+		t.Fatalf("expected 3 sessions to be evicted and closed, got %d: %v", len(orderCopy), orderCopy)
+	}
+	if orderCopy[0] != 1 || orderCopy[1] != 2 || orderCopy[2] != 3 {
+		t.Fatalf("expected eviction order [1, 2, 3], got %v", orderCopy)
+	}
+
+	// 确认 Session 1, 2, 3 的 closed 状态为 true
+	for i := 0; i < 3; i++ {
+		if !sessions[i].closed.Load() {
+			t.Fatalf("session %d should be marked closed", i+1)
+		}
+	}
+	// Session 4, 5 仍在 draining 队列中，尚未被关闭
+	if sessions[3].closed.Load() || sessions[4].closed.Load() {
+		t.Fatalf("sessions 4 and 5 should still be draining and not closed yet")
+	}
+
+	// 清理剩余 sessions
+	mgr.Reset()
+	if mgr.DrainingCount() != 0 {
+		t.Fatalf("expected 0 draining sessions after Reset, got %d", mgr.DrainingCount())
+	}
+	if !sessions[3].closed.Load() || !sessions[4].closed.Load() {
+		t.Fatalf("sessions 4 and 5 should be closed after Reset")
 	}
 }

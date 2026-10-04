@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,16 +36,89 @@ type Validator struct {
 
 	// nonceStore maps nonce hex string -> first used time
 	nonceStore map[string]time.Time
+
+	walPath string
+	stopCh  chan struct{}
 }
 
-// NewValidator creates a new Validator
-func NewValidator() *Validator {
+// NewValidator creates a new Validator with optional WAL persistence file path
+func NewValidator(walPath ...string) *Validator {
 	v := &Validator{
 		tokens:     make(map[string]*TokenInfo),
 		nonceStore: make(map[string]time.Time),
+		stopCh:     make(chan struct{}),
+	}
+	if len(walPath) > 0 && walPath[0] != "" {
+		v.walPath = walPath[0]
+		v.loadWAL()
 	}
 	go v.cleanupLoop()
 	return v
+}
+
+func (v *Validator) loadWAL() {
+	if v.walPath == "" {
+		return
+	}
+	data, err := os.ReadFile(v.walPath)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	now := time.Now()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			continue
+		}
+		tsMilli, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		t := time.UnixMilli(tsMilli)
+		if now.Sub(t) <= 5*time.Minute {
+			v.nonceStore[parts[0]] = t
+		}
+	}
+}
+
+func (v *Validator) appendWAL(nonce string, t time.Time) error {
+	if v.walPath == "" {
+		return nil
+	}
+	f, err := os.OpenFile(v.walPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%s %d\n", nonce, t.UnixMilli())
+	return err
+}
+
+func (v *Validator) compactWAL() error {
+	if v.walPath == "" {
+		return nil
+	}
+	var buf strings.Builder
+	for k, t := range v.nonceStore {
+		fmt.Fprintf(&buf, "%s %d\n", k, t.UnixMilli())
+	}
+	tmpPath := v.walPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(buf.String()), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, v.walPath)
+}
+
+// Close gracefully stops the validator cleanup loop
+func (v *Validator) Close() {
+	select {
+	case <-v.stopCh:
+	default:
+		close(v.stopCh)
+	}
 }
 
 // AddToken registers a token in memory
@@ -124,21 +199,34 @@ func (v *Validator) ValidateFull(token string, timestamp uint64, nonce []byte) b
 		}
 	}
 	v.nonceStore[nonceKey] = time.Now()
+	if v.walPath != "" {
+		_ = v.appendWAL(nonceKey, time.Now())
+	}
 	return true
 }
 
 func (v *Validator) cleanupLoop() {
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		v.mu.Lock()
-		cutoff := time.Now().Add(-10 * time.Minute)
-		for k, t := range v.nonceStore {
-			if t.Before(cutoff) {
-				delete(v.nonceStore, k)
+	for {
+		select {
+		case <-v.stopCh:
+			return
+		case <-ticker.C:
+			v.mu.Lock()
+			cutoff := time.Now().Add(-5 * time.Minute)
+			changed := false
+			for k, t := range v.nonceStore {
+				if t.Before(cutoff) {
+					delete(v.nonceStore, k)
+					changed = true
+				}
 			}
+			if changed && v.walPath != "" {
+				_ = v.compactWAL()
+			}
+			v.mu.Unlock()
 		}
-		v.mu.Unlock()
 	}
 }
 

@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -493,6 +496,29 @@ func fetchFirefoxVersions(ctx context.Context, client *http.Client) ([]KernelVer
 	return res, nil
 }
 
+// createKernelHTTPClient 创建支持本地代理回退的高可用 HTTP 客户端
+func createKernelHTTPClient(useProxy bool) *http.Client {
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	if useProxy {
+		if pURL, err := url.Parse("http://" + DefaultMixedProxy); err == nil {
+			transport.Proxy = http.ProxyURL(pURL)
+		}
+	} else {
+		transport.Proxy = http.ProxyFromEnvironment
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   0,
+	}
+}
+
 // DownloadAndExtractKernel 下载并解压内核至目标目录
 func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, progressFn func(percent int)) error {
 	if dlURL == "" {
@@ -533,6 +559,7 @@ func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, prog
 	var total int64
 	maxRetries := 5
 	var lastErr error
+	useProxy := false
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		select {
@@ -550,10 +577,21 @@ func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, prog
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", downloaded))
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		client := createKernelHTTPClient(useProxy)
+		resp, err := client.Do(req)
 		if err != nil {
+			if !useProxy {
+				log.Printf("[KERNEL-FETCH] 直连官方源超时或失败 (%v)，自动切换至本地代理 %s 进行境内网络重试...", err, DefaultMixedProxy)
+				useProxy = true
+			} else {
+				log.Printf("[KERNEL-FETCH] 本地代理重试官方内核源失败 (第 %d/%d 次): %v", attempt+1, maxRetries, err)
+			}
 			lastErr = fmt.Errorf("网络连接官方源失败: %w", err)
-			time.Sleep(1 * time.Second)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(1 * time.Second):
+			}
 			continue
 		}
 
@@ -561,6 +599,17 @@ func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, prog
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && total > 0 && downloaded >= total {
 				break
+			}
+			if !useProxy {
+				log.Printf("[KERNEL-FETCH] 官方源返回异常状态码 %d，自动切换本地代理 %s 进行重试...", resp.StatusCode, DefaultMixedProxy)
+				useProxy = true
+				lastErr = fmt.Errorf("下载官方内核返回异常状态码: %d", resp.StatusCode)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(1 * time.Second):
+				}
+				continue
 			}
 			return fmt.Errorf("下载官方内核返回异常状态码: %d", resp.StatusCode)
 		}
@@ -627,8 +676,16 @@ func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, prog
 			lastErr = nil
 			break
 		}
+		if !useProxy {
+			log.Printf("[KERNEL-FETCH] 官方源网络流中断 (%v)，自动切换至本地代理 %s 重试...", readErr, DefaultMixedProxy)
+			useProxy = true
+		}
 		lastErr = fmt.Errorf("网络流中断: %w (已自动保持断点，准备重试)", readErr)
-		time.Sleep(1 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
 	}
 
 	if lastErr != nil {
