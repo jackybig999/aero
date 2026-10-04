@@ -1370,6 +1370,21 @@ async function loadAeroSourceStatus() {
   }
 }
 
+function formatVpsLabel(v) {
+  if (!v) return '';
+  const ipDomain = v.ip ? (v.ip + (v.domain ? ' · ' + v.domain : '')) : (v.domain || '无IP');
+  return `#${v.id} · ${v.name || 'VPS'} (${ipDomain})`;
+}
+
+function getSelectedAeroVpsLabel() {
+  const sel = $('aeroVpsSelect');
+  if (sel && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) {
+    const text = sel.options[sel.selectedIndex].text.trim();
+    if (text) return text;
+  }
+  return `VPS #${currentAeroVpsId}`;
+}
+
 async function loadAeroVpsList() {
   const sel = $('aeroVpsSelect');
   if (!sel) return;
@@ -1383,7 +1398,7 @@ async function loadAeroVpsList() {
     }
     sel.innerHTML = items.map(v => `
       <option value="${v.id}" ${String(v.id) === String(currentAeroVpsId) ? 'selected' : ''}>
-        #${v.id} · ${v.name || 'VPS'} (${v.ip ? v.ip + (v.domain ? ' · ' + v.domain : '') : (v.domain || '无IP')})
+        ${escapeHtml(formatVpsLabel(v))}
       </option>
     `).join('');
     if (!currentAeroVpsId || !items.find(x => String(x.id) === String(currentAeroVpsId))) {
@@ -1712,9 +1727,7 @@ function initAeroEvents() {
   // 安装 / 升级 独立弹窗面板
   $('btnAeroInstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
-    const targetName = v ? `${v.name} (${v.domain || v.ip}:${v.ssh_port || 22})` : `VPS #${currentAeroVpsId}`;
-    $('installModalVpsName').value = targetName;
+    $('installModalVpsName').value = getSelectedAeroVpsLabel();
     $('installModalPort').value = '443';
     $('aeroInstallModal').classList.add('active');
   });
@@ -1729,9 +1742,7 @@ function initAeroEvents() {
   // 深度卸载 独立弹窗面板
   $('btnAeroUninstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    const v = cachedVpsList.find(x => String(x.id) === String(currentAeroVpsId));
-    const targetName = v ? `${v.name} (${v.domain || v.ip})` : `VPS #${currentAeroVpsId}`;
-    $('uninstallModalVpsName').value = targetName;
+    $('uninstallModalVpsName').value = getSelectedAeroVpsLabel();
     $('aeroUninstallModal').classList.add('active');
   });
   $('btnCancelUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
