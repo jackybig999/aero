@@ -191,7 +191,7 @@ jobs:
 
       - name: Resolve Release Tag and Version
         run: |
-          VER=$(cat VERSION 2>/dev/null || echo "1.0.5")
+          VER=$(cat VERSION 2>/dev/null || echo "1.0.6")
           VER=$(echo "$VER" | tr -d '[:space:]' | sed 's/^v//')
           echo "RELEASE_VER=$VER" >> $GITHUB_ENV
           echo "RELEASE_TAG=v$VER" >> $GITHUB_ENV
@@ -222,9 +222,9 @@ jobs:
           name: ${{ env.RELEASE_VER }}
           body: |
             ### 核心技术更新 (Release Highlights)
-            - **数据面与 MTU 动态适配**：全链路落地 ICMP Backpressure 与端到端 MTU 动态同步，根除大包黑洞与网络丢包。
-            - **抗主动探测与混淆防御**：升级 Salamander 双向混淆状态机与跳频监听机制，全方位抵御深度流量识别与封锁。
-            - **测速评估与配额事务硬化**：重构线路质量评估引擎与双库记账锁机制，彻底消除高并发死锁与数据漂移。
+            - **权威线缆契约与零空值零遗漏防线**：跨系统全面落地 Wire-Contract 测试与归一化流水线，强输入校验与未知字段拦截，彻底消除空值漂移与字段丢弃。
+            - **生产级单写者架构与资源回收无锁化**：单机 Pure-Go SQLite 数据库固化单写者连接池（SetMaxOpenConns(1)），无锁回收空闲上下文，彻底消除并发死锁与锁库崩溃。
+            - **零本地宿主订阅与标准 443 协议发布死线**：中台严格定位为管理控制台，全系统绝对严禁输出任何本地宿主带端口订阅，统一经由公网合法 SSL 证书的标准 443 HTTPS 域名发布；双向探活对齐与 Windows NRPT 自动自愈。
           draft: false
           prerelease: false
           make_latest: true
