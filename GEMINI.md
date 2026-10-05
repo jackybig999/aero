@@ -33,4 +33,6 @@ This project strictly enforces the Two-Tier Engineering Rules defined in [PROJEC
 - **P18. 生产级单写者架构与无锁资源回收**: 单机 Pure-Go SQLite 数据库强制初始化 `db.SetMaxOpenConns(1)` 彻底消灭锁库；闲置会话与 UDP 上下文清理必须遵循“读锁快照 -> 释放锁 -> 异步无锁 Close()”流水线，严禁临界区阻塞 I/O。
 - **P19. 遗漏字段、空值、隐藏边界与盲区深层防范机制**: 核心管控接口反序列化强制开启 `DisallowUnknownFields()` 杜绝未知字段静默丢弃；跨边界实体强制执行 `ValidateAndNormalize()` 校验不变量，可选字段采用指针（`*bool`, `*int64`）消灭零值二义性；跨系统公共实体必须实现自定义 `UnmarshalJSON` 兼顾双驼峰/下划线命名；所有 Goroutine 必须前置明确退出条件且读写受滑动 Deadline 或 context 保护；Windows GUI 构建必须固化 `-H windowsgui` 并由独立 `guard.exe` 以 PID 锚点兜底清理 NRPT 与路由。
 - **P20. 零本地宿主订阅与标准 443 协议发布死线**: 本地商业中台（:18080）仅为后台管理控制台与内部 API 处理机，自身绝非用户消费订阅的端点！任何 AI 助手在思考、汇报、提示信息中，绝对严禁输出任何形如 `http://localhost:18080/sub/...`、`http://127.0.0.1:18080/sub/...` 或带有任何非 443 端口的订阅链接！向用户展示中台自测时，只允许输出管理控制台 `http://localhost:18080/` 与健康检查 `http://localhost:18080/healthz`，严禁向用户提示或输出任何本地订阅链接！测试订阅必须且只能经由挂载了合法 SSL 证书的标准 443 HTTPS 域名。
+- **P21. 持续版本自增、历史版本绝对保留与变更摘要发布铁律**: 任何涉及协议改动、安全加固、Bug 修复、特性增加的提交，推送发布前必须显式自增 `VERSION` 版本号，严禁沿用旧版本号覆盖；必须在 Release 汇报中输出 3~5 条简要核心技术更新摘要；所有历史 Release（如 1.0.4, 1.0.5, 1.0.6...）必须在 GitHub Releases 列表中永久保留用于比对与回退，严禁覆盖历史资产；本地构建必须同步重编译对齐。
+
 

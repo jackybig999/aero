@@ -275,3 +275,13 @@
   3. **标准 443 唯一合法性**：生产与测试订阅链接必须且只能通过已配置有效证书的公网标准 443 HTTPS 域名进行下发（`https://<domain>/sub/superadmin` 或 `https://<domain>/sub/<username><6位随机码>`）。
   4. **前置回复自查过滤**：在每次向用户输出测试地址或接口列表时，必须前置过滤，严禁把中台本地地址与订阅链接拼装在一起；若要提供订阅测试指南，必须明确指引用户通过生产绑定的公网标准 HTTPS 443 域名进行测试。
 
+### U13. 持续版本自增、历史版本绝对保留与变更摘要发布铁律 (Continuous Versioning, Release Archive & Changelog Law) `[RELEASE/CORE]`
+* **准则背景**：杜绝开发与发布过程中“改了代码不升版本”、“覆盖老版本导致无法比对与回滚”、“发版无更新摘要”等低级发布故障，建立标准化发布生命周期管理。
+* **执行红线 (MUST)**：
+  1. **改动必自增版本号 (Strict Version Bump)**：任何涉及协议改动、安全加固、Bug 修复、特性增加或配置调整的工程提交，在推送发布前**必须显式递增 `VERSION` 文件的版本号**（Patch/Minor/Major），严禁沿用旧版本号进行重复提交或静默覆盖。
+  2. **历史版本绝对保留可查 (Historical Release Preservation)**：GitHub Releases 中的每一个历史版本（v1.0.4, v1.0.5, v1.0.6...）均为不可篡改的工程比对基线与回滚资产，**严禁覆盖已有 Release，严禁复用旧 Tag**；每次发版必须生成新的独立 Git Tag，确保所有老版本在 Releases 列表中永久保留，供用户比对验证与按需回退。
+  3. **简要更新摘要强制输出 (Mandatory Concise Changelog)**：每次发布必须在 Release 说明及汇报中，清晰、简要地列示本次版本修改了什么（3~5 条核心技术要点，严禁使用“完美”、“终极”等浮夸词汇，直击技术实质）。
+  4. **版本配置文件全链路对齐 (Release File Alignment)**：发版前必须确保：`VERSION` 文件、`deploy/edge-install.sh` 脚本默认版本、`.github/workflows/ci.yml` 发布标签三者 100% 强一致对齐。
+  5. **本地重编译同步生效 (Local Recompile Alignment)**：推送新版本后，本地 `tmp/` 下的各核心二进制（`mid.exe`, `client.exe`, `edge.exe` 等）必须同步重新编译，确保本地开发态与远程发布态完全对齐。
+
+
