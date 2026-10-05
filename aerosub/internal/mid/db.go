@@ -500,6 +500,9 @@ func (a *AeroDB) scanUser(row *sql.Row) (*User, error) {
 	u.Status = statusInt == 1
 	u.IsStaff = isStaffInt == 1
 	_ = json.Unmarshal([]byte(nodesJSON), &u.AssignedNodes)
+	if u.AssignedNodes == nil {
+		u.AssignedNodes = []string{}
+	}
 	if t, perr := time.Parse(time.RFC3339, expStr); perr == nil {
 		u.ExpireAt = t
 	}
@@ -520,7 +523,6 @@ func (a *AeroDB) ListUsers(page, pageSize int) ([]User, int, error) {
 	if offset < 0 {
 		offset = 0
 	}
-
 	rows, err := a.db.Query(`SELECT id, uuid, username, password_hash, email, phone, role, status, is_staff, plan_name, plan_months, price_cents, sub_slug, sub_token, sub_ticket_seed, assigned_nodes_json, expire_at, created_at, updated_at 
 		FROM user ORDER BY id DESC LIMIT ? OFFSET ?`, pageSize, offset)
 	if err != nil {
@@ -540,6 +542,9 @@ func (a *AeroDB) ListUsers(page, pageSize int) ([]User, int, error) {
 			u.Status = statusInt == 1
 			u.IsStaff = isStaffInt == 1
 			_ = json.Unmarshal([]byte(nodesJSON), &u.AssignedNodes)
+			if u.AssignedNodes == nil {
+				u.AssignedNodes = []string{}
+			}
 			if t, perr := time.Parse(time.RFC3339, expStr); perr == nil {
 				u.ExpireAt = t
 			}
@@ -881,6 +886,9 @@ func (a *AeroDB) scanSubscription(row *sql.Row) (*Subscription, error) {
 	s.Status = statusInt == 1
 	s.SwitchStatus = sw
 	_ = json.Unmarshal([]byte(nodesJSON), &s.AssignedNodes)
+	if s.AssignedNodes == nil {
+		s.AssignedNodes = []string{}
+	}
 	if t, perr := time.Parse(time.RFC3339, expStr); perr == nil {
 		s.ExpireAt = t
 	}
@@ -920,6 +928,9 @@ func (a *AeroDB) ListSubscriptions(userID uint64) ([]*Subscription, error) {
 			s.Status = statusInt == 1
 			s.SwitchStatus = sw
 			_ = json.Unmarshal([]byte(nodesJSON), &s.AssignedNodes)
+			if s.AssignedNodes == nil {
+				s.AssignedNodes = []string{}
+			}
 			if t, perr := time.Parse(time.RFC3339, expStr); perr == nil {
 				s.ExpireAt = t
 			}
@@ -1026,6 +1037,9 @@ func (a *AeroDB) ListOrders(userID uint64) ([]Order, error) {
 		var paidStr sql.NullString
 		if err := rows.Scan(&o.OrderNo, &o.UserID, &o.PlanID, &o.PlanName, &nodesJSON, &o.AmountCents, &o.PayChannel, &o.Status, &createdStr, &paidStr); err == nil {
 			_ = json.Unmarshal([]byte(nodesJSON), &o.AssignedNodes)
+			if o.AssignedNodes == nil {
+				o.AssignedNodes = []string{}
+			}
 			if t, perr := time.Parse(time.RFC3339, createdStr); perr == nil {
 				o.CreatedAt = t
 			}
@@ -1102,6 +1116,9 @@ func (a *AeroDB) ListPlans() ([]Plan, error) {
 			p.Status = statusInt == 1
 			p.DurationMonths = p.PeriodValue
 			_ = json.Unmarshal([]byte(nodesJSON), &p.AssignedNodes)
+			if p.AssignedNodes == nil {
+				p.AssignedNodes = []string{}
+			}
 			if t, perr := time.Parse(time.RFC3339, createdStr); perr == nil {
 				p.CreatedAt = t
 			}
@@ -1157,6 +1174,9 @@ func (a *AeroDB) GetPlan(id int64) (*Plan, error) {
 	p.Status = statusInt == 1
 	p.DurationMonths = p.PeriodValue
 	_ = json.Unmarshal([]byte(nodesJSON), &p.AssignedNodes)
+	if p.AssignedNodes == nil {
+		p.AssignedNodes = []string{}
+	}
 	if t, perr := time.Parse(time.RFC3339, createdStr); perr == nil {
 		p.CreatedAt = t
 	}

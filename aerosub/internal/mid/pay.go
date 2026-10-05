@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -910,7 +911,12 @@ func (h *LedgerHandler) SettleBatch(w http.ResponseWriter, r *http.Request) {
 		Channel   string `json:"channel"`
 		TargetRef string `json:"target_ref"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	outEntry, count, err := h.store.SettleBatch(req.Channel, req.TargetRef)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp(1002, err.Error()))
@@ -1146,7 +1152,12 @@ func (h *BillingHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Price  *int64 `json:"price_cents"`
 		Status *bool  `json:"status"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	_ = h.svc.UpdatePlan(int32(id), req.Price, req.Status)
 	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "message": "success"})
 }

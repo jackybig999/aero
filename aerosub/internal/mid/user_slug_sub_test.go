@@ -116,6 +116,18 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		if srv["token"] != expectedTok {
 			t.Errorf("expected server token to be user SubToken %s, got %v", expectedTok, srv["token"])
 		}
+		// 验证 0-DNS 公网 IP 必须存在且非空
+		if ip, ok := srv["ip"].(string); !ok || ip == "" {
+			t.Errorf("expected server 'ip' to be non-empty, got %v", srv["ip"])
+		}
+		// 验证跳频备用端口必须包含默认备用端口
+		if ports, ok := srv["alt_ports"].([]any); !ok || len(ports) == 0 {
+			t.Errorf("expected server 'alt_ports' to be non-empty array, got %v", srv["alt_ports"])
+		}
+		// 验证运营商优选标签必须下发
+		if isp, ok := srv["isp_affinity"].(string); !ok || isp == "" {
+			t.Errorf("expected server 'isp_affinity' to be non-empty, got %v", srv["isp_affinity"])
+		}
 	}
 
 	// 4. 测试用户 Alice 专属 Slug 订阅下发: GET /sub/{alice_slug}

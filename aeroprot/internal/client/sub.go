@@ -34,15 +34,43 @@ type ServerConfig struct {
 	Name        string   `json:"name" yaml:"name"`
 	Host        string   `json:"host,omitempty" yaml:"host"`
 	Address     string   `json:"address" yaml:"addr"`
+	IP          string   `json:"ip,omitempty" yaml:"ip"`
 	Token       string   `json:"token" yaml:"token"`
 	SNI         string   `json:"sni" yaml:"sni"`
 	Protocol    string   `json:"protocol" yaml:"protocol"`
 	PinSPKI     []string `json:"pin_spki,omitempty" yaml:"pin_spki"`
 	PurityScore int      `json:"purityScore,omitempty"`
 	AIBlocked   bool     `json:"aiBlocked,omitempty"`
-	LineType    string   `json:"lineType,omitempty" yaml:"line_type"`
-	ISPAffinity string   `json:"ispAffinity,omitempty" yaml:"isp_affinity"`
+	LineType    string   `json:"line_type,omitempty" yaml:"line_type"`
+	ISPAffinity string   `json:"isp_affinity,omitempty" yaml:"isp_affinity"`
+	AltPorts    []int    `json:"alt_ports,omitempty" yaml:"alt_ports"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
+}
+
+// UnmarshalJSON 兼容 snake_case 与 camelCase，杜绝跨系统命名失配导致的静默丢弃
+func (s *ServerConfig) UnmarshalJSON(data []byte) error {
+	type Alias ServerConfig
+	aux := struct {
+		*Alias
+		LegacyISPAffinity string `json:"ispAffinity"`
+		LegacyLineType    string `json:"lineType"`
+		LegacyAltPorts    []int  `json:"altPorts"`
+	}{
+		Alias: (*Alias)(s),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if s.ISPAffinity == "" && aux.LegacyISPAffinity != "" {
+		s.ISPAffinity = aux.LegacyISPAffinity
+	}
+	if s.LineType == "" && aux.LegacyLineType != "" {
+		s.LineType = aux.LegacyLineType
+	}
+	if len(s.AltPorts) == 0 && len(aux.LegacyAltPorts) > 0 {
+		s.AltPorts = aux.LegacyAltPorts
+	}
+	return nil
 }
 
 // sortServersByISP 纯函数：使用 sort.SliceStable 优先将 ISPAffinity == isp 的节点排在前面
@@ -97,6 +125,60 @@ func (s *Subscription) IsExpired() bool {
 	return time.Now().Unix() > s.ExpireAt
 }
 
+// ValidateAndNormalize 强校验与主动安全兜底，杜绝遗漏字段与空值
+func (s *Subscription) ValidateAndNormalize() error {
+	if s == nil || len(s.Servers) == 0 {
+		return fmt.Errorf("empty subscription: no servers configured")
+	}
+	defaultAltPorts := []int{2083, 8443, 2087}
+	for i := range s.Servers {
+		srv := &s.Servers[i]
+		if strings.TrimSpace(srv.Address) == "" && strings.TrimSpace(srv.Host) == "" {
+			return fmt.Errorf("server[%d] missing address and host", i)
+		}
+		if strings.TrimSpace(srv.Address) == "" && srv.Host != "" {
+			srv.Address = strings.TrimSpace(srv.Host)
+			if !strings.Contains(srv.Address, ":") {
+				srv.Address = net.JoinHostPort(srv.Address, "443")
+			}
+		}
+		if strings.TrimSpace(srv.Host) == "" && srv.Address != "" {
+			if h, _, err := net.SplitHostPort(strings.TrimSpace(srv.Address)); err == nil {
+				srv.Host = h
+			} else {
+				srv.Host = strings.TrimSpace(srv.Address)
+			}
+		}
+		if strings.TrimSpace(srv.Name) == "" {
+			srv.Name = srv.Address
+		}
+		if strings.TrimSpace(srv.Token) == "" {
+			return fmt.Errorf("server[%d] (%s) missing token", i, srv.Name)
+		}
+		// 若服务端未下发备用端口，主动注入高防备用端口池，保障自愈避障能力
+		if len(srv.AltPorts) == 0 {
+			srv.AltPorts = append([]int(nil), defaultAltPorts...)
+		}
+		// 若 IP 为空，尝试从 Host 或 Address 中提取有效 IPv4 自动补齐，杜绝空值
+		if srv.IP == "" {
+			hostCandidate := strings.TrimSpace(srv.Host)
+			if hostCandidate == "" && srv.Address != "" {
+				if h, _, err := net.SplitHostPort(strings.TrimSpace(srv.Address)); err == nil {
+					hostCandidate = h
+				} else {
+					hostCandidate = strings.TrimSpace(srv.Address)
+				}
+			}
+			if hostCandidate != "" {
+				if ip := net.ParseIP(hostCandidate); ip != nil && ip.To4() != nil {
+					srv.IP = ip.String()
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // ToBase64 序列化为 base64
 func (s *Subscription) ToBase64() (string, error) {
 	data, err := json.Marshal(s)
@@ -117,6 +199,8 @@ type Applied struct {
 	SNIs          map[string]string
 	Servers       []ServerConfig
 	ECHConfigs    map[string][]byte
+	IPs           map[string]string
+	AltPorts      map[string][]int
 }
 
 // ApplySubscription 将订阅转为拨号参数
@@ -131,6 +215,8 @@ func ApplySubscription(s *Subscription) (*Applied, error) {
 		Tokens:     make(map[string]string),
 		SNIs:       make(map[string]string),
 		ECHConfigs: make(map[string][]byte),
+		IPs:        make(map[string]string),
+		AltPorts:   make(map[string][]int),
 	}
 	var addrs []string
 	var validServers []ServerConfig
@@ -152,11 +238,18 @@ func ApplySubscription(s *Subscription) (*Applied, error) {
 			// 物理 SNI 始终等于节点域名
 			srv.SNI = host
 		}
+		srv.Address = addr
 		validServers = append(validServers, srv)
 		addrs = append(addrs, addr)
 		out.Tokens[addr] = srv.Token
 		if srv.SNI != "" {
 			out.SNIs[addr] = srv.SNI
+		}
+		if srv.IP != "" {
+			out.IPs[addr] = srv.IP
+		}
+		if len(srv.AltPorts) > 0 {
+			out.AltPorts[addr] = append([]int(nil), srv.AltPorts...)
 		}
 		if srv.ECH != "" {
 			trimmed := strings.TrimSpace(srv.ECH)
@@ -354,6 +447,9 @@ func ParseSubscriptionBytes(data []byte) (*Subscription, error) {
 	}
 	if sub.Version != "aero/3.0" {
 		return nil, fmt.Errorf("unsupported subscription version %q (expected aero/3.0)", sub.Version)
+	}
+	if err := sub.ValidateAndNormalize(); err != nil {
+		return nil, fmt.Errorf("subscription validation failed: %w", err)
 	}
 	return &sub, nil
 }

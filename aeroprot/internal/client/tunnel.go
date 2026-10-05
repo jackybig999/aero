@@ -17,12 +17,13 @@ import (
 )
 
 var (
-	contextIDCounter atomic.Uint32
-	activeEdgeAddr   atomic.Pointer[string]
-	activeEdgeToken  atomic.Pointer[string]
-	activeEdgeSNI    atomic.Pointer[string]
-	activeEdgeIP     atomic.Pointer[net.IP]
-	activeEdgeECH    atomic.Pointer[[]byte]
+	contextIDCounter   atomic.Uint32
+	activeEdgeAddr     atomic.Pointer[string]
+	activeEdgeToken    atomic.Pointer[string]
+	activeEdgeSNI      atomic.Pointer[string]
+	activeEdgeIP       atomic.Pointer[net.IP]
+	activeEdgeECH      atomic.Pointer[[]byte]
+	activeEdgeAltPorts atomic.Pointer[[]int]
 
 	inboundDatagramHandlers sync.Map // map[uint32]func(payload []byte)
 )
@@ -52,6 +53,24 @@ func SetActiveEdge(addr, tok, sni string, ip net.IP, ech ...[]byte) {
 	} else {
 		activeEdgeECH.Store(nil)
 	}
+}
+
+// SetActiveEdgeAltPorts 设置当前激活节点的备用轮试端口池
+func SetActiveEdgeAltPorts(ports []int) {
+	if len(ports) > 0 {
+		pCopy := append([]int(nil), ports...)
+		activeEdgeAltPorts.Store(&pCopy)
+	} else {
+		activeEdgeAltPorts.Store(nil)
+	}
+}
+
+func getActiveEdgeAltPorts() []int {
+	p := activeEdgeAltPorts.Load()
+	if p != nil && *p != nil {
+		return append([]int(nil), (*p)...)
+	}
+	return nil
 }
 
 func getActiveEdgeECH() []byte {
@@ -220,6 +239,9 @@ func (tc *TunnelClient) getActiveQUICClient(ctx context.Context) (*Client, error
 	if ech := getActiveEdgeECH(); len(ech) > 0 {
 		cfg.ECHConfigList = ech
 	}
+	if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
+		cfg.AltPorts = altPorts
+	}
 	if ip != nil {
 		port := 443
 		if _, portStr, err := net.SplitHostPort(addr); err == nil {
@@ -318,6 +340,9 @@ func (tc *TunnelClient) SendDatagram(contextID uint32, payload []byte) error {
 	cfg := DefaultTransportConfig(addr, sni)
 	if ech := getActiveEdgeECH(); len(ech) > 0 {
 		cfg.ECHConfigList = ech
+	}
+	if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
+		cfg.AltPorts = altPorts
 	}
 	if ip != nil {
 		port := 443

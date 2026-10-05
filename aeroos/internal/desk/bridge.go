@@ -25,7 +25,7 @@ type NetStatus struct {
 	Mode        string `json:"mode"`
 	Listen      string `json:"listen"`
 	Node        string `json:"node"`
-	RTTMs       uint32 `json:"rtt_ms"`
+	RTTMs       int64  `json:"rtt_ms"`
 	SubURL      string `json:"sub_url"`
 	SubURLMask  string `json:"sub_url_mask"`
 	LastError   string `json:"last_error"`
@@ -63,14 +63,21 @@ func (b *ClientBridge) SetHTTPClient(client *http.Client) {
 	}
 }
 
-// Ping checks if client API is reachable
+// Ping checks if client API is reachable (probes /healthz with fallback to /health)
 func (b *ClientBridge) Ping() bool {
-	resp, err := b.client.Get(b.endpoint + "/health")
-	if err != nil {
-		return false
+	resp, err := b.client.Get(b.endpoint + "/healthz")
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return true
+		}
 	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	respFallback, errFallback := b.client.Get(b.endpoint + "/health")
+	if errFallback == nil {
+		defer respFallback.Body.Close()
+		return respFallback.StatusCode == http.StatusOK
+	}
+	return false
 }
 
 // GetStatus queries current network and connection state
@@ -159,9 +166,12 @@ type NodeInfo struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Address     string `json:"address"`
+	IP          string `json:"ip,omitempty"`
 	SNI         string `json:"sni"`
 	LineType    string `json:"line_type,omitempty"`
+	ISPAffinity string `json:"isp_affinity,omitempty"`
 	Active      bool   `json:"active"`
+	Connected   bool   `json:"connected"`
 	Reachable   bool   `json:"reachable"`
 	LatencyMs   int64  `json:"latency_ms"`
 	LastProbeAt string `json:"last_probe_at,omitempty"`

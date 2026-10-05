@@ -43,12 +43,14 @@ type SubServer struct {
 	Name        string   `json:"name"`
 	Host        string   `json:"host"`
 	Address     string   `json:"address,omitempty"`
+	IP          string   `json:"ip,omitempty"`
 	Token       string   `json:"token"`
 	SNI         string   `json:"sni"`
 	Protocol    string   `json:"protocol"`
 	PinSPKI     []string `json:"pin_spki,omitempty"`
 	LineType    string   `json:"line_type,omitempty"`
 	ISPAffinity string   `json:"isp_affinity,omitempty"`
+	AltPorts    []int    `json:"alt_ports,omitempty"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
 }
 
@@ -83,11 +85,13 @@ type EnsureSubParams struct {
 	Name        string
 	Host        string
 	Address     string
+	IP          string
 	Token       string
 	SNI         string
 	PinSPKI     []string
 	LineType    string
 	ISPAffinity string
+	AltPorts    []int
 	ECH         string
 }
 
@@ -153,16 +157,30 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 		}
 	}
 
+	altPorts := p.AltPorts
+	if len(altPorts) == 0 {
+		altPorts = []int{2083, 2087, 8443}
+	}
+
+	ip := p.IP
+	if ip == "" {
+		if parsed := net.ParseIP(host); parsed != nil && parsed.To4() != nil {
+			ip = parsed.String()
+		}
+	}
+
 	srv := SubServer{
 		Name:        p.Name,
 		Host:        host,
 		Address:     p.Address,
+		IP:          ip,
 		Token:       p.Token,
 		SNI:         p.SNI,
 		Protocol:    "connect-ip",
 		PinSPKI:     p.PinSPKI,
 		LineType:    p.LineType,
 		ISPAffinity: p.ISPAffinity,
+		AltPorts:    altPorts,
 		ECH:         p.ECH,
 	}
 
@@ -490,14 +508,21 @@ func BootstrapSubscription(cfg ServerConfig, cert *tls.Certificate) (*SubStore, 
 		}
 	}
 
+	altPorts := cfg.AltPorts
+	if len(altPorts) == 0 && len(cfg.AltListenPorts) > 0 {
+		altPorts = append([]int(nil), cfg.AltListenPorts...)
+	}
+
 	if err := store.Ensure(EnsureSubParams{
 		Name:        "default",
 		Address:     addr,
+		IP:          cfg.IP,
 		Token:       cfg.Token,
 		SNI:         sni,
 		PinSPKI:     pins,
 		LineType:    cfg.LineType,
 		ISPAffinity: cfg.ISPAffinity,
+		AltPorts:    altPorts,
 		ECH:         cfg.ECH,
 	}); err != nil {
 		return nil, "", err

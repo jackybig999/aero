@@ -175,12 +175,14 @@ async function refreshStatus() {
       let changed = false
       currentNodes.forEach((n) => {
         const shouldBeActive = (n.address === st.node)
-        if (n.active !== shouldBeActive) {
+        const shouldBeConnected = shouldBeActive && !!st.connected
+        if (n.active !== shouldBeActive || n.connected !== shouldBeConnected) {
           n.active = shouldBeActive
+          n.connected = shouldBeConnected
           changed = true
         }
       })
-      if (changed) renderNodes(currentNodes)
+      if (changed) filterAndRenderNodes()
     } else if (currentNodes.length === 0 && st.connected) {
       fetchNodes()
     }
@@ -593,6 +595,8 @@ function doClientLogout() {
 
 let currentNodes = []
 let isProbingNodes = false
+let selectedISP = 'ALL'
+let searchKeyword = ''
 
 function getLatencyClass(lat, reachable, probed) {
   if (!probed) return 'lat-gray'
@@ -602,16 +606,59 @@ function getLatencyClass(lat, reachable, probed) {
   return 'lat-red'
 }
 
+function getIspTagClass(isp) {
+  if (!isp) return 'tag-blue'
+  const upper = isp.toUpperCase()
+  if (upper === 'CT' || upper.includes('电信')) return 'tag-ct'
+  if (upper === 'CU' || upper.includes('联通')) return 'tag-cu'
+  if (upper === 'CM' || upper.includes('移动')) return 'tag-cm'
+  if (upper === 'BGP') return 'tag-bgp'
+  return 'tag-blue'
+}
+
+function getIspLabel(isp) {
+  if (!isp) return ''
+  const upper = isp.toUpperCase()
+  if (upper === 'CT' || upper.includes('电信')) return '电信优选'
+  if (upper === 'CU' || upper.includes('联通')) return '联通优选'
+  if (upper === 'CM' || upper.includes('移动')) return '移动优选'
+  if (upper === 'BGP') return 'BGP骨干'
+  return isp
+}
+
+function filterAndRenderNodes() {
+  let list = currentNodes || []
+  if (selectedISP !== 'ALL') {
+    list = list.filter((n) => {
+      const isp = (n.isp_affinity || '').toUpperCase()
+      if (selectedISP === 'CT') return isp === 'CT' || isp.includes('电信')
+      if (selectedISP === 'CU') return isp === 'CU' || isp.includes('联通')
+      if (selectedISP === 'CM') return isp === 'CM' || isp.includes('移动')
+      return isp === selectedISP
+    })
+  }
+  if (searchKeyword) {
+    const kw = searchKeyword.toLowerCase()
+    list = list.filter((n) => {
+      return (n.name && n.name.toLowerCase().includes(kw)) ||
+             (n.address && n.address.toLowerCase().includes(kw)) ||
+             (n.ip && n.ip.toLowerCase().includes(kw)) ||
+             (n.sni && n.sni.toLowerCase().includes(kw))
+    })
+  }
+  renderNodes(list)
+}
+
 function renderNodes(nodes) {
   const container = $('nodesList')
   const badge = $('nodesCountBadge')
   if (!container) return
   if (!nodes || nodes.length === 0) {
-    container.innerHTML = '<div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">暂无线路数据，请先载入订阅</div>'
-    if (badge) badge.textContent = '0 节点'
+    container.innerHTML = '<div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">' + (currentNodes.length > 0 ? '无匹配线路' : '暂无线路数据，请先载入订阅') + '</div>'
+    if (badge) badge.textContent = (currentNodes ? currentNodes.length : 0) + ' 节点'
     return
   }
-  if (badge) badge.textContent = nodes.length + ' 节点'
+  if (badge) badge.textContent = currentNodes.length + ' 节点'
   container.innerHTML = ''
 
   nodes.forEach((n) => {
@@ -638,11 +685,20 @@ function renderNodes(nodes) {
       typeTag.textContent = n.line_type
       nameRow.appendChild(typeTag)
     }
+
+    if (n.isp_affinity) {
+      const ispTag = document.createElement('span')
+      ispTag.className = 'tag-sm ' + getIspTagClass(n.isp_affinity)
+      ispTag.style.fontSize = '9px'
+      ispTag.style.padding = '1px 4px'
+      ispTag.textContent = getIspLabel(n.isp_affinity)
+      nameRow.appendChild(ispTag)
+    }
     infoCol.appendChild(nameRow)
 
     const addrSpan = document.createElement('span')
     addrSpan.className = 'node-addr'
-    addrSpan.textContent = n.address
+    addrSpan.textContent = n.address + (n.ip ? ' (' + n.ip + ')' : '')
     infoCol.appendChild(addrSpan)
 
     item.appendChild(infoCol)
@@ -652,8 +708,13 @@ function renderNodes(nodes) {
 
     if (n.active) {
       const activeTag = document.createElement('span')
-      activeTag.className = 'badge-connected'
-      activeTag.textContent = '已连接'
+      if (n.connected) {
+        activeTag.className = 'badge-connected'
+        activeTag.textContent = '已连接'
+      } else {
+        activeTag.className = 'badge-preferred'
+        activeTag.textContent = '当前首选'
+      }
       badgeWrap.appendChild(activeTag)
     }
 
@@ -701,7 +762,7 @@ async function fetchNodes() {
     const res = await api('GET', '/api/v1/nodes')
     if (res && res.status === 'ok' && Array.isArray(res.nodes)) {
       currentNodes = res.nodes
-      renderNodes(currentNodes)
+      filterAndRenderNodes()
     }
   } catch {}
 }
@@ -720,7 +781,7 @@ async function probeAllNodes() {
     const res = await api('POST', '/api/v1/nodes/probe')
     if (res && res.status === 'ok' && Array.isArray(res.nodes)) {
       currentNodes = res.nodes
-      renderNodes(currentNodes)
+      filterAndRenderNodes()
       msg('全部线路测速完成', 'ok')
     } else if (res && res.code === 'RATE_LIMITED') {
       msg('测速请求过于频繁，请稍候再试', 'err')
@@ -959,6 +1020,23 @@ function init() {
   if ($('btnProbeAllNodes')) {
     $('btnProbeAllNodes').onclick = probeAllNodes
   }
+
+  const searchInput = $('nodeSearchInput')
+  if (searchInput) {
+    searchInput.oninput = (e) => {
+      searchKeyword = (e.target.value || '').trim()
+      filterAndRenderNodes()
+    }
+  }
+
+  document.querySelectorAll('.node-isp-btn').forEach((btn) => {
+    btn.onclick = () => {
+      document.querySelectorAll('.node-isp-btn').forEach((b) => b.classList.remove('active'))
+      btn.classList.add('active')
+      selectedISP = btn.getAttribute('data-isp') || 'ALL'
+      filterAndRenderNodes()
+    }
+  })
 
   fetchNodes()
   setInterval(refreshStatus, 2000)

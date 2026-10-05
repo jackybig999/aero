@@ -362,6 +362,12 @@ func (m *SessionManager) GetSession(ctx context.Context) (*Session, error) {
 	}
 
 	cfg := DefaultTransportConfig(addr, sni)
+	if ech := getActiveEdgeECH(); len(ech) > 0 {
+		cfg.ECHConfigList = ech
+	}
+	if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
+		cfg.AltPorts = altPorts
+	}
 	if ip != nil {
 		port := 443
 		if _, portStr, err := net.SplitHostPort(addr); err == nil {

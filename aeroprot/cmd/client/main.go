@@ -62,11 +62,13 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// 1. 探活与健康检查白名单 (Rule P6)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	// 1. 探活与健康检查白名单 (Rule P6 & U8: 双路由兼容)
+	healthHandler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("OK\n"))
-	})
+	}
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/health", healthHandler)
 
 	// 2. 状态查询
 	mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {

@@ -332,7 +332,12 @@ func (h *NodeHandler) Heartbeat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AgentVersion string `json:"agent_version"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"code": 1002, "message": "invalid json body: " + err.Error()})
+			return
+		}
+	}
 
 	if req.AgentVersion != "" {
 		if err := h.svc.Heartbeat(id, req.AgentVersion); err != nil {
@@ -409,7 +414,12 @@ func (h *NodeHandler) CascadeDelete(w http.ResponseWriter, r *http.Request) {
 			VPSID uint64 `json:"vps_id"`
 			IP    string `json:"ip"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if r.Body != nil {
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"code": 1002, "message": "invalid json body: " + err.Error()})
+				return
+			}
+		}
 		vpsID, ip = req.VPSID, req.IP
 	}
 	if vpsID == 0 && ip == "" {
@@ -452,7 +462,12 @@ func (h *NodeHandler) CleanOrphans(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ValidVPSIDs []uint64 `json:"valid_vps_ids"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"code": 1002, "message": "invalid json body: " + err.Error()})
+			return
+		}
+	}
 	validMap := make(map[uint64]bool)
 	for _, id := range req.ValidVPSIDs {
 		validMap[id] = true
@@ -1721,7 +1736,12 @@ func (h *VPSHandler) RenewCert(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Force bool `json:"force"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	res, err := h.svc.RenewCert(ctx, id, req.Force)

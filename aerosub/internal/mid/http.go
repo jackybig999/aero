@@ -582,7 +582,10 @@ func (h *AeroHandler) Install(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err == nil && len(body) > 0 {
-		_ = json.Unmarshal(body, &req)
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, errResp(1001, "invalid json body: "+err.Error()))
+			return
+		}
 	}
 	if req.VPSID == 0 {
 		vpsID, err := parseReqVPSID(r)
@@ -706,7 +709,12 @@ func (h *AeroHandler) AddToken(w http.ResponseWriter, r *http.Request) {
 		Label    string `json:"label"`
 		TTLHours int    `json:"ttl_hours"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1001, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	tok := req.Token
 	if tok == "" {
 		tok = "tok_" + strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -748,7 +756,12 @@ func (h *AeroHandler) RenewCert(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Force bool `json:"force"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1001, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 	res, err := h.svc.RenewCert(ctx, id, req.Force)

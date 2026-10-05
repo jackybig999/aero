@@ -7,6 +7,7 @@ package edge
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -177,7 +178,14 @@ type addTokenAdminReq struct {
 
 func (h *AdminHandler) handleAddToken(w http.ResponseWriter, r *http.Request) {
 	var req addTokenAdminReq
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid json body: " + err.Error()})
+			return
+		}
+	}
 	ttl := time.Duration(req.TTLHours) * time.Hour
 	if ttl <= 0 {
 		ttl = 365 * 24 * time.Hour

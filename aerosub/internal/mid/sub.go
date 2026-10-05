@@ -257,22 +257,6 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				token = "usr_" + user.Username
 			}
 
-			// 方案 A 物理域名锁死: ServerName 始终等于物理节点域名
-			srv := map[string]any{
-				"name":         name,
-				"host":         host,
-				"address":      fmt.Sprintf("%s:%d", host, port),
-				"token":        token,
-				"sni":          host,
-				"serverName":   host,
-				"pin_spki":     []string{},
-				"line_type":    "direct",
-				"isp_affinity": "ANY",
-				"protocol":     "connect-ip",
-				"ech":          ep.ECH(),
-				"alt_ports":    []int{2083, 2087, 8443},
-			}
-
 			loadScore := 50.0
 			isTier1 := false
 			vps := vpsMap[ep.VPSID]
@@ -292,6 +276,42 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				if vps.Metrics != nil && !vps.Metrics.ProbeOK {
 					continue
 				}
+			}
+
+			nodeIP := ep.IP
+			if nodeIP == "" && vps != nil {
+				nodeIP = vps.IP
+			}
+
+			ispAffinity := "ANY"
+			if vps != nil {
+				lowerRemark := strings.ToLower(vps.Remark + " " + vps.Name)
+				if strings.Contains(lowerRemark, "cn2") || strings.Contains(lowerRemark, "电信") || strings.Contains(lowerRemark, "ct") {
+					ispAffinity = "CT"
+				} else if strings.Contains(lowerRemark, "9929") || strings.Contains(lowerRemark, "4837") || strings.Contains(lowerRemark, "联通") || strings.Contains(lowerRemark, "cu") {
+					ispAffinity = "CU"
+				} else if strings.Contains(lowerRemark, "cmin2") || strings.Contains(lowerRemark, "移动") || strings.Contains(lowerRemark, "cm") {
+					ispAffinity = "CM"
+				} else {
+					ispAffinity = "BGP"
+				}
+			}
+
+			// 方案 A 物理域名锁死: ServerName 始终等于物理节点域名
+			srv := map[string]any{
+				"name":         name,
+				"host":         host,
+				"address":      fmt.Sprintf("%s:%d", host, port),
+				"ip":           nodeIP,
+				"token":        token,
+				"sni":          host,
+				"serverName":   host,
+				"pin_spki":     []string{},
+				"line_type":    "direct",
+				"isp_affinity": ispAffinity,
+				"protocol":     "connect-ip",
+				"ech":          ep.ECH(),
+				"alt_ports":    []int{2083, 2087, 8443},
 			}
 			if vps != nil {
 				srv["purityScore"] = vps.PurityScore

@@ -250,13 +250,24 @@ func (s *nodeSentinel) failover(ctx context.Context) bool {
 			candPort = p
 		}
 
-		candIP, rerr := resolvePhysicalIPv4(candHost)
-		if rerr != nil || candIP == nil {
+		var candIP net.IP
+		if srv.IP != "" {
+			if parsed := net.ParseIP(srv.IP); parsed != nil {
+				candIP = parsed.To4()
+			}
+		}
+		if candIP == nil {
+			candIP, _ = resolvePhysicalIPv4(candHost)
+		}
+		if candIP == nil {
 			continue
 		}
 
 		cfg := DefaultTransportConfig(srv.Address, srv.SNI)
 		cfg.RemoteUDPAddr = &net.UDPAddr{IP: candIP, Port: candPort}
+		if len(srv.AltPorts) > 0 {
+			cfg.AltPorts = srv.AltPorts
+		}
 
 		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		client, err := dial(probeCtx, cfg)

@@ -297,4 +297,3 @@ func TestSuperadminProtection(t *testing.T) {
 		t.Fatalf("failed to delete normal user: %v", err)
 	}
 }
-

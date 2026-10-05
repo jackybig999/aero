@@ -61,12 +61,25 @@
       .badge-connected {
         font-size: 10px;
         font-weight: 700;
-        color: var(--blue);
-        background: rgba(59, 130, 246, 0.15);
+        color: #22c55e;
+        background: rgba(34, 197, 94, 0.15);
         padding: 2px 6px;
         border-radius: 4px;
-        border: 1px solid rgba(59, 130, 246, 0.3);
+        border: 1px solid rgba(34, 197, 94, 0.3);
       }
+      .badge-preferred {
+        font-size: 10px;
+        font-weight: 600;
+        color: #60a5fa;
+        background: rgba(59, 130, 246, 0.12);
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid rgba(59, 130, 246, 0.25);
+      }
+      .tag-ct { background: #1e3a8a; color: #93c5fd; }
+      .tag-cu { background: #7c2d12; color: #fdba74; }
+      .tag-cm { background: #14532d; color: #86efac; }
+      .tag-bgp { background: #581c87; color: #d8b4fe; }
       .latency-badge {
         font-size: 10px;
         font-weight: 700;
@@ -261,6 +274,16 @@
             <span id="nodesCountBadge" class="tag-sm tag-blue" style="font-size:10px;">0 节点</span>
           </div>
           <button type="button" id="btnProbeAllNodes" class="badge-btn" style="cursor:pointer;padding:4px 8px;font-size:11px;font-weight:600;">⚡ 测速全部线路</button>
+        </div>
+        <!-- 节点搜索与 ISP 筛选工具栏 -->
+        <div class="nodes-filter-bar" style="display:flex;gap:6px;align-items:center;margin-top:6px;">
+          <input type="text" id="nodeSearchInput" placeholder="🔍 搜索节点名/IP/域名..." style="flex:1;min-width:0;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:3px 6px;font-size:11px;color:var(--text);outline:none;" />
+          <div class="node-isp-filters" style="display:flex;gap:3px;flex-shrink:0;">
+            <button type="button" class="tab-btn active node-isp-btn" data-isp="ALL" style="padding:2px 6px;font-size:10px;">全部</button>
+            <button type="button" class="tab-btn node-isp-btn" data-isp="CT" style="padding:2px 6px;font-size:10px;">电信</button>
+            <button type="button" class="tab-btn node-isp-btn" data-isp="CU" style="padding:2px 6px;font-size:10px;">联通</button>
+            <button type="button" class="tab-btn node-isp-btn" data-isp="CM" style="padding:2px 6px;font-size:10px;">移动</button>
+          </div>
         </div>
         <div id="nodesList" class="nodes-list" style="margin-top:8px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto;padding-right:2px;">
           <div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">暂无线路数据，请先载入订阅</div>

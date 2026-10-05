@@ -55,8 +55,10 @@ type ServerConfig struct {
 	BWUser                     int                           `json:"bw_user"`        // bytes/s per token
 	AdvertiseHost              string                        `json:"advertise_host"` // host in subscription
 	CoverName                  string                        `json:"cover_name"`     // cover site title
-	LineType                   string                        `json:"line_type,omitempty"`
-	ISPAffinity                string                        `json:"isp_affinity,omitempty"`
+	LineType                   string                        `json:"line_type,omitempty" yaml:"line_type"`
+	ISPAffinity                string                        `json:"isp_affinity,omitempty" yaml:"isp_affinity"`
+	IP                         string                        `json:"ip,omitempty" yaml:"ip"`
+	AltPorts                   []int                         `json:"alt_ports,omitempty" yaml:"alt_ports"`
 	AllowSelfSignedCertForTest bool                          `json:"-"`                        // 仅允许单元测试显式开启，生产环境严禁自签
 	Role                       string                        `json:"role,omitempty"`           // single|ingress|egress, default single
 	HopCredential              string                        `json:"hop_credential,omitempty"` // hop credential for multi-hop (strictly distinct from user token)

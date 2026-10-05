@@ -3503,3 +3503,116 @@ func TestFinalGate_DrainQueueDepthLimit(t *testing.T) {
 		t.Fatalf("sessions 4 and 5 should be closed after Reset")
 	}
 }
+
+// 门禁：TestWireContract_Strict 验证中台/边缘下发的真实订阅 JSON 在客户端被 100% 完整解析，零字段遗漏、零空字符、零驼峰/下划线兼容漂移
+func TestWireContract_Strict(t *testing.T) {
+	wireJSON := `{
+		"version": "aero/3.0",
+		"generated_at": 1728000000,
+		"servers": [
+			{
+				"name": "HK-Node-CT",
+				"address": "hk.aero-net.com:443",
+				"ip": "154.213.18.99",
+				"sni": "hk.aero-net.com",
+				"token": "tok_ct_123456",
+				"line_type": "VIP",
+				"isp_affinity": "CT",
+				"alt_ports": [2083, 2087, 8443]
+			},
+			{
+				"name": "JP-Node-CU",
+				"address": "154.213.19.100:2083",
+				"sni": "jp.aero-net.com",
+				"token": "tok_cu_654321",
+				"lineType": "BGP",
+				"ispAffinity": "CU",
+				"altPorts": [443, 8443]
+			}
+		]
+	}`
+
+	sub, err := ParseSubscriptionBytes([]byte(wireJSON))
+	if err != nil {
+		t.Fatalf("ParseSubscriptionBytes failed: %v", err)
+	}
+
+	if len(sub.Servers) != 2 {
+		t.Fatalf("expected 2 servers, got %d", len(sub.Servers))
+	}
+
+	// 1. 验证 Node 1 (snake_case 原生字段)
+	s1 := sub.Servers[0]
+	if s1.Address != "hk.aero-net.com:443" {
+		t.Errorf("s1.Address = %q, want hk.aero-net.com:443", s1.Address)
+	}
+	if s1.IP != "154.213.18.99" {
+		t.Errorf("s1.IP = %q, want 154.213.18.99 (0-DNS 物理公网 IP 严禁丢失或为空)", s1.IP)
+	}
+	if s1.ISPAffinity != "CT" {
+		t.Errorf("s1.ISPAffinity = %q, want CT", s1.ISPAffinity)
+	}
+	if s1.LineType != "VIP" {
+		t.Errorf("s1.LineType = %q, want VIP", s1.LineType)
+	}
+	if len(s1.AltPorts) != 3 || s1.AltPorts[0] != 2083 || s1.AltPorts[1] != 2087 || s1.AltPorts[2] != 8443 {
+		t.Errorf("s1.AltPorts = %v, want [2083, 2087, 8443]", s1.AltPorts)
+	}
+
+	// 2. 验证 Node 2 (camelCase 兼容与 IP 自动回填)
+	s2 := sub.Servers[1]
+	if s2.Address != "154.213.19.100:2083" {
+		t.Errorf("s2.Address = %q, want 154.213.19.100:2083", s2.Address)
+	}
+	if s2.IP != "154.213.19.100" {
+		t.Errorf("s2.IP = %q, want 154.213.19.100 (应从 IPv4 地址自动回填)", s2.IP)
+	}
+	if s2.ISPAffinity != "CU" {
+		t.Errorf("s2.ISPAffinity = %q, want CU (camelCase ispAffinity 解析失败)", s2.ISPAffinity)
+	}
+	if s2.LineType != "BGP" {
+		t.Errorf("s2.LineType = %q, want BGP (camelCase lineType 解析失败)", s2.LineType)
+	}
+	if len(s2.AltPorts) != 2 || s2.AltPorts[0] != 443 || s2.AltPorts[1] != 8443 {
+		t.Errorf("s2.AltPorts = %v, want [443, 8443]", s2.AltPorts)
+	}
+
+	// 3. 验证 ApplySubscription 映射表
+	applied, err := ApplySubscription(sub)
+	if err != nil {
+		t.Fatalf("ApplySubscription failed: %v", err)
+	}
+	if applied.IPs["hk.aero-net.com:443"] != "154.213.18.99" {
+		t.Errorf("applied.IPs['hk.aero-net.com:443'] = %q, want 154.213.18.99", applied.IPs["hk.aero-net.com:443"])
+	}
+	if applied.IPs["154.213.19.100:2083"] != "154.213.19.100" {
+		t.Errorf("applied.IPs['154.213.19.100:2083'] = %q, want 154.213.19.100", applied.IPs["154.213.19.100:2083"])
+	}
+	ports1 := applied.AltPorts["hk.aero-net.com:443"]
+	if len(ports1) != 3 || ports1[0] != 2083 {
+		t.Errorf("applied.AltPorts['hk.aero-net.com:443'] = %v, want [2083, 2087, 8443]", ports1)
+	}
+
+	// 4. 验证 Engine.GetNodes 状态与语义
+	eng := NewEngine()
+	if err := eng.Apply(applied); err != nil {
+		t.Fatalf("eng.Apply failed: %v", err)
+	}
+	nodes := eng.GetNodes()
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(nodes))
+	}
+	n1 := nodes[0]
+	if !n1.Active {
+		t.Errorf("first node should be active by default")
+	}
+	if n1.Connected {
+		t.Errorf("n1.Connected should be false when engine is stopped")
+	}
+	if n1.IP != "154.213.18.99" {
+		t.Errorf("n1.IP = %q, want 154.213.18.99", n1.IP)
+	}
+	if n1.ISPAffinity != "CT" {
+		t.Errorf("n1.ISPAffinity = %q, want CT", n1.ISPAffinity)
+	}
+}

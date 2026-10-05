@@ -287,6 +287,20 @@ func (e *Engine) LoadAndApplySubscriptionBytes(data []byte) (*Applied, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	ctx, cancel := context.WithTimeout(e.getContext(), 2*time.Second)
+	defer cancel()
+	ispRes := DetectISP(ctx, 500*time.Millisecond)
+	bestISP := "DEFAULT"
+	if ispRes != nil && ispRes.BestISP != "" {
+		bestISP = ispRes.BestISP
+	}
+	sortServersByISP(applied.Servers, bestISP)
+
+	e.mu.Lock()
+	e.currentISP = bestISP
+	e.mu.Unlock()
+
 	if err := e.Apply(applied); err != nil {
 		return nil, err
 	}
@@ -395,16 +409,31 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	newHost, _, _ := net.SplitHostPort(addr)
 
 	var newIP net.IP
-	if newHost != "" {
+	if e.appliedSub != nil && e.appliedSub.IPs != nil {
+		if ipStr, ok := e.appliedSub.IPs[addr]; ok && ipStr != "" {
+			if parsed := net.ParseIP(ipStr); parsed != nil {
+				newIP = parsed.To4()
+			}
+		}
+	}
+	if newIP == nil && newHost != "" {
 		ip, rerr := resolvePhysicalIPv4(newHost)
 		if rerr != nil {
 			return fmt.Errorf("resolve active node %s: %w", newHost, rerr)
 		}
 		newIP = ip
-		if e.mode == "tun" && e.running.Load() {
-			_ = ProtectHostRoute(newIP.String())
+	}
+	if newIP != nil && e.mode == "tun" && e.running.Load() {
+		_ = ProtectHostRoute(newIP.String())
+	}
+
+	var altPorts []int
+	if e.appliedSub != nil && e.appliedSub.AltPorts != nil {
+		if ap, ok := e.appliedSub.AltPorts[addr]; ok && len(ap) > 0 {
+			altPorts = ap
 		}
 	}
+	SetActiveEdgeAltPorts(altPorts)
 
 	e.activeAddr = addr
 	e.activeToken = tok
@@ -1506,9 +1535,12 @@ type NodeInfo struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Address     string `json:"address"`
+	IP          string `json:"ip,omitempty"`
 	SNI         string `json:"sni"`
 	LineType    string `json:"line_type,omitempty"`
+	ISPAffinity string `json:"isp_affinity,omitempty"`
 	Active      bool   `json:"active"`
+	Connected   bool   `json:"connected"`
 	Reachable   bool   `json:"reachable"`
 	LatencyMs   int64  `json:"latency_ms"`
 	LastProbeAt string `json:"last_probe_at,omitempty"`
@@ -1530,14 +1562,17 @@ func (e *Engine) GetNodes() []NodeInfo {
 			name = fmt.Sprintf("%s (%s)", s.LineType, s.Address)
 		}
 		info := NodeInfo{
-			ID:        s.Address,
-			Name:      name,
-			Address:   s.Address,
-			SNI:       s.SNI,
-			LineType:  s.LineType,
-			Active:    s.Address == e.activeAddr,
-			Reachable: true,
-			LatencyMs: -1,
+			ID:          s.Address,
+			Name:        name,
+			Address:     s.Address,
+			IP:          s.IP,
+			SNI:         s.SNI,
+			LineType:    s.LineType,
+			ISPAffinity: s.ISPAffinity,
+			Active:      s.Address == e.activeAddr,
+			Connected:   s.Address == e.activeAddr && e.running.Load(),
+			Reachable:   true,
+			LatencyMs:   -1,
 		}
 		res = append(res, info)
 	}
@@ -1580,14 +1615,17 @@ func (e *Engine) ProbeAllNodes(ctx context.Context) []NodeInfo {
 			name = fmt.Sprintf("%s (%s)", s.LineType, s.Address)
 		}
 		results[i] = NodeInfo{
-			ID:        s.Address,
-			Name:      name,
-			Address:   s.Address,
-			SNI:       s.SNI,
-			LineType:  s.LineType,
-			Active:    s.Address == activeAddr,
-			Reachable: false,
-			LatencyMs: -1,
+			ID:          s.Address,
+			Name:        name,
+			Address:     s.Address,
+			IP:          s.IP,
+			SNI:         s.SNI,
+			LineType:    s.LineType,
+			ISPAffinity: s.ISPAffinity,
+			Active:      s.Address == activeAddr,
+			Connected:   s.Address == activeAddr && e.running.Load(),
+			Reachable:   false,
+			LatencyMs:   -1,
 		}
 	}
 
@@ -1615,8 +1653,16 @@ func (e *Engine) ProbeAllNodes(ctx context.Context) []NodeInfo {
 				if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
 					port = p
 				}
-				ip, rerr := resolvePhysicalIPv4(host)
-				if rerr != nil || ip == nil {
+				var ip net.IP
+				if srv.IP != "" {
+					if parsed := net.ParseIP(srv.IP); parsed != nil {
+						ip = parsed.To4()
+					}
+				}
+				if ip == nil {
+					ip, _ = resolvePhysicalIPv4(host)
+				}
+				if ip == nil {
 					resChan <- probeResult{idx: idx, reachable: false, rttMs: -1}
 					continue
 				}
@@ -1624,6 +1670,9 @@ func (e *Engine) ProbeAllNodes(ctx context.Context) []NodeInfo {
 				cfg := DefaultTransportConfig(srv.Address, srv.SNI)
 				cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
 				cfg.ConnectTimeout = 2500 * time.Millisecond
+				if len(srv.AltPorts) > 0 {
+					cfg.AltPorts = srv.AltPorts
+				}
 				if echConfigs != nil {
 					if c, ok := echConfigs[srv.Address]; ok && len(c) > 0 {
 						cfg.ECHConfigList = c

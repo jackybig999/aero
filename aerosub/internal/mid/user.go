@@ -1524,7 +1524,12 @@ func (h *UserHandler) Login(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Portal   string `json:"portal"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	token, user, err := h.svc.Login(req.Username, req.Password)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"code": 1003, "message": "invalid credentials"})
@@ -1703,7 +1708,12 @@ func (h *UserHandler) RenewUser(w http.ResponseWriter, r *http.Request) {
 		PlanMonths int32  `json:"plan_months"`
 		PriceCents int64  `json:"price_cents"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	if req.PlanMonths <= 0 {
 		req.PlanMonths = 1
 	}
@@ -1764,7 +1774,12 @@ func (h *UserHandler) CreateUserSubscription(w http.ResponseWriter, r *http.Requ
 		LimitBytes    int64    `json:"limit_bytes"`
 		AssignedNodes []string `json:"assigned_nodes"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	if req.PlanName == "" {
 		req.PlanName = "独立自定义订阅"
 	}
@@ -1810,7 +1825,12 @@ func (h *UserHandler) SwitchSubscription(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		SwitchStatus string `json:"switch_status"` // "on" or "off"
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	if req.SwitchStatus != "on" && req.SwitchStatus != "off" {
 		req.SwitchStatus = "off"
 	}
@@ -1835,7 +1855,12 @@ func (h *UserHandler) RenewSubscription(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		PlanMonths int32 `json:"duration_months"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errResp(1002, "invalid json body: "+err.Error()))
+			return
+		}
+	}
 	if req.PlanMonths <= 0 {
 		req.PlanMonths = 1
 	}
