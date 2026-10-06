@@ -3794,3 +3794,119 @@ func TestI18n_SymmetricalDictionary(t *testing.T) {
 	}
 }
 
+func TestSNIProfile_InstantLoadAndOptimization(t *testing.T) {
+	start := time.Now()
+	prof := LoadSNIProfile()
+	elapsed := time.Since(start)
+	if elapsed > 20*time.Millisecond {
+		t.Errorf("LoadSNIProfile took too long: %v (expected < 20ms)", elapsed)
+	}
+	if prof == nil {
+		t.Fatalf("LoadSNIProfile returned nil")
+	}
+	snis := GetOptimalSNIs()
+	if len(snis) == 0 {
+		t.Fatalf("GetOptimalSNIs returned empty list")
+	}
+	if len(snis) > 3 {
+		t.Errorf("expected at most 3 top SNIs, got %d", len(snis))
+	}
+}
+
+func TestChainProxy_Socks5Handshake(t *testing.T) {
+	// 启动模拟 SOCKS5 服务端
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// 1. 协商
+		buf := make([]byte, 128)
+		n, _ := conn.Read(buf)
+		if n < 3 || buf[0] != 0x05 {
+			return
+		}
+		_, _ = conn.Write([]byte{0x05, 0x02}) // 要求用户密码鉴权
+
+		// 2. 鉴权
+		n, _ = conn.Read(buf)
+		if n < 2 || buf[0] != 0x01 {
+			return
+		}
+		_, _ = conn.Write([]byte{0x01, 0x00}) // 鉴权成功
+
+		// 3. 请求
+		n, _ = conn.Read(buf)
+		if n < 4 || buf[0] != 0x05 || buf[1] != 0x01 {
+			return
+		}
+		// 返回成功 0x05, 0x00, 0x00, 0x01, 127.0.0.1:80
+		_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80})
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := socks5ClientHandshake(ctx, clientConn, "example.com:443", "testuser", "testpass"); err != nil {
+		t.Fatalf("socks5ClientHandshake failed: %v", err)
+	}
+}
+
+func TestChainProxy_HTTPHandshake(t *testing.T) {
+	// 启动模拟 HTTP CONNECT 代理服务端
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		line, _ := br.ReadString('\n')
+		if !strings.HasPrefix(line, "CONNECT ") {
+			return
+		}
+		for {
+			l, _ := br.ReadString('\n')
+			if l == "\r\n" || l == "\n" || l == "" {
+				break
+			}
+		}
+		_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := httpConnectHandshake(ctx, clientConn, "example.com:443", "user", "pass"); err != nil {
+		t.Fatalf("httpConnectHandshake failed: %v", err)
+	}
+}
+
+

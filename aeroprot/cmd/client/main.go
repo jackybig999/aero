@@ -26,8 +26,8 @@ import (
 )
 
 var (
-	connectLimiter = rate.NewLimiter(rate.Every(time.Second), 1)          // 1 RPS
-	probeLimiter   = rate.NewLimiter(rate.Every(200*time.Millisecond), 5) // 5 RPS
+	connectLimiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 10) // 10 burst, 10 RPS on localhost
+	probeLimiter   = rate.NewLimiter(rate.Every(100*time.Millisecond), 10) // 10 burst
 )
 
 //go:embed ui/*
@@ -75,6 +75,53 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		st := eng.GetState()
 		_ = json.NewEncoder(w).Encode(st)
+	})
+
+	// 2b. TUN 虚拟网卡冲撞状态检查 (前置防呆与弹窗指引)
+	mux.HandleFunc("/api/v1/tun/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		conflict, vpnName, err := client.DetectThirdPartyTUN()
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":   "ok",
+			"conflict": conflict,
+			"vpn":      vpnName,
+			"error":    errMsg,
+			"mode":     eng.GetMode(),
+		})
+	})
+
+	// 2c. 链式代理配置 (静态住宅出口净化)
+	mux.HandleFunc("/api/v1/chain/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			var cfg client.ChainProxyConfig
+			if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+				http.Error(w, `{"status":"error","error":"invalid json body"}`, http.StatusBadRequest)
+				return
+			}
+			if err := eng.SetChainProxyConfig(cfg); err != nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "config": eng.GetChainProxyConfig()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "config": eng.GetChainProxyConfig()})
+	})
+
+	// 2d. 本机 ISP 特化与优选伪装 SNI 查询
+	mux.HandleFunc("/api/v1/sni/profile", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		prof := client.LoadSNIProfile()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":   "ok",
+			"profile":  prof,
+			"top_snis": client.GetOptimalSNIs(),
+		})
 	})
 
 	// 3. 订阅导入

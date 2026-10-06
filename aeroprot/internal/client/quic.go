@@ -121,9 +121,14 @@ func CertSPKI(cert *x509.Certificate) string {
 
 // MakeVerifyPeerCertificate 构造严格证书校验器：
 // 1. 系统根证书先校验（若上层未构建 verifiedChains 则强制执行系统根证书链校验）；
-// 2. 系统根证书校验通过后，若配置了 SPKI 钉扎，进一步核对 SPKI 钉扎；
-// 3. 两者均满足才放行。
-func MakeVerifyPeerCertificate(serverName string) func([][]byte, [][]*x509.Certificate) error {
+// 2. 支持对物理节点主机名或 SNI 双向合规校验（防伪装 SNI 导致合法证书被误阻断）；
+// 3. 系统根证书校验通过后，若配置了 SPKI 钉扎，进一步核对 SPKI 钉扎；
+// 4. 全部条件满足才放行，绝不跳过 CA 校验。
+func MakeVerifyPeerCertificate(serverName string, nodeHost ...string) func([][]byte, [][]*x509.Certificate) error {
+	altHost := ""
+	if len(nodeHost) > 0 {
+		altHost = nodeHost[0]
+	}
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {
 			return errors.New("tls: no certificates presented by peer")
@@ -142,15 +147,32 @@ func MakeVerifyPeerCertificate(serverName string) func([][]byte, [][]*x509.Certi
 
 		// 1. 系统根证书先校验
 		if len(verifiedChains) == 0 {
+			intermediates := x509.NewCertPool()
+			for i := 1; i < len(certs); i++ {
+				intermediates.AddCert(certs[i])
+			}
+
+			// 首先尝试以 serverName 校验系统 CA
 			opts := x509.VerifyOptions{
 				DNSName:       serverName,
-				Intermediates: x509.NewCertPool(),
-			}
-			for i := 1; i < len(certs); i++ {
-				opts.Intermediates.AddCert(certs[i])
+				Intermediates: intermediates,
 			}
 			var err error
 			verifiedChains, err = leaf.Verify(opts)
+
+			// 若存在节点真实域名且 serverName 匹配失败，尝试以 altHost 校验系统 CA
+			if err != nil && altHost != "" && altHost != serverName {
+				opts2 := x509.VerifyOptions{
+					DNSName:       altHost,
+					Intermediates: intermediates,
+				}
+				var err2 error
+				verifiedChains, err2 = leaf.Verify(opts2)
+				if err2 == nil {
+					err = nil
+				}
+			}
+
 			if err != nil {
 				return fmt.Errorf("tls: system CA verification failed: %w", err)
 			}
@@ -164,7 +186,11 @@ func MakeVerifyPeerCertificate(serverName string) func([][]byte, [][]*x509.Certi
 			_, ok := pinsSet[leafSPKI]
 			pinsMu.RUnlock()
 			if !ok {
-				return fmt.Errorf("tls: SPKI pin mismatch for %s", serverName)
+				targetName := serverName
+				if altHost != "" {
+					targetName = fmt.Sprintf("%s/%s", serverName, altHost)
+				}
+				return fmt.Errorf("tls: SPKI pin mismatch for %s", targetName)
 			}
 			return nil
 		}
@@ -225,14 +251,14 @@ func DefaultTransportConfig(addr, sni string) *TransportConfig {
 }
 
 // defaultTLSConfig 构造默认 TLS 配置（生产强制严格验证证书）
-func defaultTLSConfig(serverName string) *tls.Config {
+func defaultTLSConfig(serverName string, nodeHost ...string) *tls.Config {
 	cfg := &tls.Config{
 		ServerName:            serverName,
 		MinVersion:            tls.VersionTLS13,
 		NextProtos:            []string{"h3"},
 		ClientSessionCache:    globalSessionCache,
 		InsecureSkipVerify:    false, // 显式设为 false，禁止跳过系统根证书校验
-		VerifyPeerCertificate: MakeVerifyPeerCertificate(serverName),
+		VerifyPeerCertificate: MakeVerifyPeerCertificate(serverName, nodeHost...),
 	}
 	return cfg
 }
@@ -256,7 +282,13 @@ func (c *Client) ActualPort() int {
 // Dial 建立 QUIC 连接
 func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 	if cfg.TLSConfig == nil {
-		cfg.TLSConfig = defaultTLSConfig(cfg.TLSServerName)
+		nodeHost := ""
+		if h, _, err := net.SplitHostPort(cfg.Address); err == nil {
+			nodeHost = h
+		} else {
+			nodeHost = cfg.Address
+		}
+		cfg.TLSConfig = defaultTLSConfig(cfg.TLSServerName, nodeHost)
 	}
 
 	// 客户端仅在订阅或配置显式携带 ECH 配置列表时，才设置 EncryptedClientHelloConfigList
@@ -349,40 +381,120 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 		return client, nil
 	}
 
+	candidatePorts := []int{udpAddr.Port}
+	for _, altPort := range cfg.AltPorts {
+		if altPort > 0 && altPort != udpAddr.Port {
+			candidatePorts = append(candidatePorts, altPort)
+		}
+	}
+
+	tr := &quic.Transport{Conn: pconn}
 	var conn *quic.Conn
 	var err error
-	if cfg.Enable0RTT {
-		conn, err = quic.DialEarly(ctx, pconn, udpAddr, cfg.TLSConfig, quicConfig)
+
+	if len(candidatePorts) == 1 {
+		if cfg.Enable0RTT {
+			conn, err = tr.DialEarly(ctx, udpAddr, cfg.TLSConfig, quicConfig)
+		} else {
+			conn, err = tr.Dial(ctx, udpAddr, cfg.TLSConfig, quicConfig)
+		}
 	} else {
-		conn, err = quic.Dial(ctx, pconn, udpAddr, cfg.TLSConfig, quicConfig)
-	}
-	if err != nil && len(cfg.AltPorts) > 0 && udpAddr != nil {
-		for _, altPort := range cfg.AltPorts {
-			if altPort <= 0 || altPort == udpAddr.Port {
-				continue
-			}
-			altAddr := &net.UDPAddr{IP: udpAddr.IP, Port: altPort, Zone: udpAddr.Zone}
-			var altConn *quic.Conn
-			var aerr error
-			if cfg.Enable0RTT {
-				altConn, aerr = quic.DialEarly(ctx, pconn, altAddr, cfg.TLSConfig, quicConfig)
-			} else {
-				altConn, aerr = quic.Dial(ctx, pconn, altAddr, cfg.TLSConfig, quicConfig)
-			}
-			if aerr == nil {
-				conn = altConn
-				err = nil
-				actualPort = altPort
-				log.Printf("[QUIC] Multi-port hopping: primary port %d failed, connected via alt port %d", udpAddr.Port, altPort)
-				cfg.RemoteUDPAddr.Port = altPort
-				host, _, splitErr := net.SplitHostPort(cfg.Address)
-				if splitErr == nil {
-					cfg.Address = net.JoinHostPort(host, strconv.Itoa(altPort))
+		// RFC 8305 Happy Eyeballs 并发阶梯竞速 (Ladder Delay: 200ms)
+		raceCtx, raceCancel := context.WithCancel(ctx)
+		defer raceCancel()
+
+		type dialRes struct {
+			conn *quic.Conn
+			port int
+			err  error
+		}
+		resCh := make(chan dialRes, len(candidatePorts))
+		var activeDials atomic.Int32
+
+		launchDial := func(port int) {
+			activeDials.Add(1)
+			go func() {
+				defer activeDials.Add(-1)
+				targetAddr := &net.UDPAddr{IP: udpAddr.IP, Port: port, Zone: udpAddr.Zone}
+				var c *quic.Conn
+				var dErr error
+				if cfg.Enable0RTT {
+					c, dErr = tr.DialEarly(raceCtx, targetAddr, cfg.TLSConfig, quicConfig)
+				} else {
+					c, dErr = tr.Dial(raceCtx, targetAddr, cfg.TLSConfig, quicConfig)
 				}
-				break
+				if dErr == nil {
+					select {
+					case resCh <- dialRes{conn: c, port: port}:
+					case <-raceCtx.Done():
+						_ = c.CloseWithError(0, "race cancelled")
+					}
+				} else {
+					select {
+					case resCh <- dialRes{err: dErr, port: port}:
+					case <-raceCtx.Done():
+					}
+				}
+			}()
+		}
+
+		// 启动主端口 (443) 尝试
+		launchDial(candidatePorts[0])
+		attemptIdx := 1
+		ladderTicker := time.NewTicker(200 * time.Millisecond)
+		defer ladderTicker.Stop()
+
+		var firstErr error
+
+		for {
+			select {
+			case <-ctx.Done():
+				raceCancel()
+				_ = tr.Close()
+				_ = pconn.Close()
+				return nil, ctx.Err()
+
+			case <-ladderTicker.C:
+				if attemptIdx < len(candidatePorts) {
+					launchDial(candidatePorts[attemptIdx])
+					attemptIdx++
+				} else {
+					ladderTicker.Stop()
+				}
+
+			case res := <-resCh:
+				if res.conn != nil {
+					raceCancel()
+					conn = res.conn
+					actualPort = res.port
+					if res.port != udpAddr.Port {
+						log.Printf("[QUIC] Multi-port hopping (RFC 8305): primary port %d failed/slow, connected via alt port %d", udpAddr.Port, res.port)
+						cfg.RemoteUDPAddr.Port = res.port
+						host, _, splitErr := net.SplitHostPort(cfg.Address)
+						if splitErr == nil {
+							cfg.Address = net.JoinHostPort(host, strconv.Itoa(res.port))
+						}
+					}
+					err = nil
+					goto dialDone
+				} else {
+					if firstErr == nil {
+						firstErr = res.err
+					}
+					// 若当前尝试已失败，且后续端口尚未启动，立即启动下一个备用端口（不等满 200ms）
+					if attemptIdx < len(candidatePorts) {
+						launchDial(candidatePorts[attemptIdx])
+						attemptIdx++
+					} else if activeDials.Load() == 0 {
+						err = fmt.Errorf("all %d candidate ports failed, primary error: %w", len(candidatePorts), firstErr)
+						goto dialDone
+					}
+				}
 			}
 		}
 	}
+
+dialDone:
 	if err != nil {
 		_ = pconn.Close()
 		return nil, fmt.Errorf("quic dial %s: %w", cfg.Address, err)

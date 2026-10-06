@@ -209,6 +209,46 @@ async function refreshStatus() {
   }
 }
 
+async function checkUpfrontTUNConflict() {
+  try {
+    const res = await api('GET', '/api/v1/tun/status')
+    if (res && res.conflict) {
+      return res.vpn || t('thirdPartyVPN')
+    }
+  } catch {}
+  return null
+}
+
+function showTunConflictModal(vpnName, onProceed) {
+  const modal = $('tunConflictModal')
+  if (!modal) {
+    if (onProceed) onProceed()
+    return
+  }
+  const desc = $('tunConflictModalDesc')
+  if (desc) {
+    desc.textContent = t('tunConflictDesc', { name: vpnName || t('thirdPartyVPN') })
+  }
+  modal.hidden = false
+
+  $('btnTunConflictSysproxy').onclick = async () => {
+    modal.hidden = true
+    setModeUI('sysproxy')
+    await api('POST', '/api/v1/mode', { mode: 'sysproxy' }).catch(() => null)
+    if (onProceed) onProceed()
+  }
+
+  $('btnTunConflictIgnore').onclick = () => {
+    modal.hidden = true
+    if (onProceed) onProceed()
+  }
+
+  $('btnTunConflictCancel').onclick = () => {
+    modal.hidden = true
+    msg(t('tunConflictCancel'), 'info')
+  }
+}
+
 async function ensureImported(strict = false) {
   if (isImporting) return
   isImporting = true
@@ -228,15 +268,31 @@ async function ensureImported(strict = false) {
       }
       return
     }
-    try {
-      localStorage.setItem(SUB_KEY, sub)
-    } catch {}
-    const imp = await api('POST', '/api/v1/import', { sub })
-    if (imp && (imp.status === 'error' || imp.error)) throw new Error(imp.error || 'import')
-    fetchNodes()
+
+    if (strict && selectedMode() === 'tun') {
+      const vpn = await checkUpfrontTUNConflict()
+      if (vpn) {
+        showTunConflictModal(vpn, () => {
+          doActualImport(sub)
+        })
+        return
+      }
+    }
+
+    await doActualImport(sub)
   } finally {
     isImporting = false
   }
+}
+
+async function doActualImport(sub) {
+  try {
+    localStorage.setItem(SUB_KEY, sub)
+  } catch {}
+  const imp = await api('POST', '/api/v1/import', { sub })
+  if (imp && (imp.status === 'error' || imp.error)) throw new Error(imp.error || 'import')
+  msg(t('subLoadedOk'), 'ok')
+  fetchNodes()
 }
 
 async function onPower() {
@@ -255,6 +311,17 @@ async function onConnect() {
     msg(t('needSub'), 'err')
     return
   }
+  if (selectedMode() === 'tun') {
+    const vpn = await checkUpfrontTUNConflict()
+    if (vpn) {
+      showTunConflictModal(vpn, () => proceedConnect(sub))
+      return
+    }
+  }
+  await proceedConnect(sub)
+}
+
+async function proceedConnect(sub) {
   try {
     localStorage.setItem(SUB_KEY, sub)
   } catch {}
@@ -930,36 +997,46 @@ function init() {
       if (cur === targetMode) return // 重复点击当前单选卡，直接保持，绝不跳变！
 
       const prevMode = cur
-      setModeUI(targetMode)
-
-      if ($('btnPower').classList.contains('on')) {
-        busy = true // 置 busy，阻断 2 秒轮询将乐观选择盖掉
-        msg(t('connecting'))
-        try {
-          const r = await api('POST', '/api/v1/mode', { mode: targetMode })
-          if (r && r.code === 'CONFLICT_TUN') {
-            setModeUI(r.mode || prevMode)
-            handleTUNConflict(r.vpn || '')
-            return
-          }
-          if (r && (r.status === 'error' || r.error)) {
-            setModeUI(r.mode || prevMode)
-            msg(r.error || 'mode switch failed', 'err')
-            await refreshStatus()
-            return
-          }
-          msg(t('connectedAs') + ' · ' + modeLabel(targetMode), 'ok')
-          await refreshStatus()
-        } catch (err) {
-          setModeUI(prevMode)
-          msg(err.message || String(err), 'err')
-          await refreshStatus()
-        } finally {
-          busy = false
+      if (targetMode === 'tun') {
+        const vpn = await checkUpfrontTUNConflict()
+        if (vpn) {
+          showTunConflictModal(vpn, () => switchModeNow(targetMode, prevMode))
+          return
         }
       }
+      await switchModeNow(targetMode, prevMode)
     })
   })
+
+  async function switchModeNow(targetMode, prevMode) {
+    setModeUI(targetMode)
+    if ($('btnPower').classList.contains('on')) {
+      busy = true // 置 busy，阻断 2 秒轮询将乐观选择盖掉
+      msg(t('connecting'))
+      try {
+        const r = await api('POST', '/api/v1/mode', { mode: targetMode })
+        if (r && r.code === 'CONFLICT_TUN') {
+          setModeUI(r.mode || prevMode)
+          handleTUNConflict(r.vpn || '')
+          return
+        }
+        if (r && (r.status === 'error' || r.error)) {
+          setModeUI(r.mode || prevMode)
+          msg(r.error || 'mode switch failed', 'err')
+          await refreshStatus()
+          return
+        }
+        msg(t('connectedAs') + ' · ' + modeLabel(targetMode), 'ok')
+        await refreshStatus()
+      } catch (err) {
+        setModeUI(prevMode)
+        msg(err.message || String(err), 'err')
+        await refreshStatus()
+      } finally {
+        busy = false
+      }
+    }
+  }
 
   $('btnPower').onclick = onPower
   $('btnPaste').onclick = pasteSub
@@ -1061,6 +1138,74 @@ function init() {
       filterAndRenderNodes()
     }
   })
+
+  // 链式代理折叠展开与配置处理
+  const chainToggle = $('chainProxyToggleHeader')
+  const chainBody = $('chainProxyBody')
+  const chainIcon = $('chainToggleIcon')
+  if (chainToggle && chainBody) {
+    chainToggle.onclick = () => {
+      const isHidden = chainBody.style.display === 'none'
+      chainBody.style.display = isHidden ? 'block' : 'none'
+      if (chainIcon) chainIcon.textContent = isHidden ? '▲' : '▼'
+    }
+  }
+
+  function updateChainBadge(enabled) {
+    const b = $('chainStatusBadge')
+    if (!b) return
+    if (enabled) {
+      b.className = 'tag-sm tag-blue'
+      b.textContent = t('chainEnabled')
+    } else {
+      b.className = 'tag-sm'
+      b.style.background = '#21262d'
+      b.style.color = '#8b949e'
+      b.textContent = t('chainDisabled')
+    }
+  }
+
+  async function loadChainProxyUI() {
+    try {
+      const res = await api('GET', '/api/v1/chain/config')
+      if (res && res.status === 'ok' && res.config) {
+        const c = res.config
+        if ($('chainEnableToggle')) $('chainEnableToggle').checked = !!c.enabled
+        if ($('chainProtoSelect')) $('chainProtoSelect').value = c.protocol || 'socks5'
+        if ($('chainHostInput')) $('chainHostInput').value = c.host || ''
+        if ($('chainPortInput')) $('chainPortInput').value = c.port ? String(c.port) : ''
+        if ($('chainUserInput')) $('chainUserInput').value = c.username || ''
+        if ($('chainPassInput')) $('chainPassInput').value = c.password || ''
+        updateChainBadge(!!c.enabled)
+      }
+    } catch {}
+  }
+
+  if ($('btnSaveChainProxy')) {
+    $('btnSaveChainProxy').onclick = async () => {
+      const payload = {
+        enabled: $('chainEnableToggle') ? $('chainEnableToggle').checked : false,
+        protocol: $('chainProtoSelect') ? $('chainProtoSelect').value : 'socks5',
+        host: $('chainHostInput') ? $('chainHostInput').value.trim() : '',
+        port: $('chainPortInput') ? parseInt($('chainPortInput').value.trim(), 10) || 0 : 0,
+        username: $('chainUserInput') ? $('chainUserInput').value.trim() : '',
+        password: $('chainPassInput') ? $('chainPassInput').value : ''
+      }
+      try {
+        const res = await api('POST', '/api/v1/chain/config', payload)
+        if (res && res.status === 'ok') {
+          updateChainBadge(payload.enabled)
+          msg(t('chainSaveOk'), 'ok')
+        } else {
+          msg(res.error || 'save failed', 'err')
+        }
+      } catch (e) {
+        msg(e.message || String(e), 'err')
+      }
+    }
+  }
+
+  loadChainProxyUI()
 
   fetchNodes()
   setInterval(refreshStatus, 2000)

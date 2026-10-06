@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -104,6 +105,9 @@ type Engine struct {
 	killSwitch        atomic.Bool
 	sentinel          *nodeSentinel
 	packetConnFactory PacketConnFactory
+
+	chainProxyMu  sync.RWMutex
+	chainProxyCfg ChainProxyConfig
 }
 
 // NewEngine 创建客户端引擎
@@ -140,7 +144,57 @@ func NewEngine() *Engine {
 	}
 	eng.sentinel = newNodeSentinel(eng)
 	SetPacketConnFactory(ListenPhysicalPacket)
+	eng.loadChainProxyConfig()
+	StartAsyncSNIProber(context.Background())
 	return eng
+}
+
+func (e *Engine) chainProxyPath() string {
+	return filepath.Join(GetDataDir(), "chain_proxy.json")
+}
+
+func (e *Engine) loadChainProxyConfig() {
+	p := e.chainProxyPath()
+	data, err := os.ReadFile(p)
+	if err == nil {
+		var cfg ChainProxyConfig
+		if jerr := json.Unmarshal(data, &cfg); jerr == nil {
+			e.chainProxyMu.Lock()
+			e.chainProxyCfg = cfg
+			e.chainProxyMu.Unlock()
+			if e.tunnelClient != nil {
+				e.tunnelClient.SetChainProxy(&cfg)
+			}
+		}
+	}
+}
+
+// GetChainProxyConfig 获取当前配置的链式代理参数
+func (e *Engine) GetChainProxyConfig() ChainProxyConfig {
+	e.chainProxyMu.RLock()
+	defer e.chainProxyMu.RUnlock()
+	return e.chainProxyCfg
+}
+
+// SetChainProxyConfig 设置并持久化链式代理配置 (静态住宅出口净化)
+func (e *Engine) SetChainProxyConfig(cfg ChainProxyConfig) error {
+	e.chainProxyMu.Lock()
+	defer e.chainProxyMu.Unlock()
+	e.chainProxyCfg = cfg
+	if e.tunnelClient != nil {
+		e.tunnelClient.SetChainProxy(&cfg)
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	p := e.chainProxyPath()
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, p)
 }
 
 // SessionManager 获取当前会话管理器

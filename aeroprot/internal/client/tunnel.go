@@ -5,10 +5,14 @@
 package client
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -190,6 +194,16 @@ func (tc *TunnelClient) classifyTarget(raw string) streamTarget {
 	return st
 }
 
+// ChainProxyConfig 链式代理配置 (静态住宅 IP 出口净化)
+type ChainProxyConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Protocol string `json:"protocol"` // "socks5" or "http"
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
 // TunnelClient 客户端隧道管理器
 type TunnelClient struct {
 	pool        ISessionPool
@@ -199,6 +213,27 @@ type TunnelClient struct {
 	cancel      context.CancelFunc
 	cancelLoop  atomic.Pointer[context.CancelFunc]
 	sessionMgr  *SessionManager
+	chainProxy  atomic.Pointer[ChainProxyConfig]
+}
+
+// SetChainProxy 配置可选的链式代理 (静态住宅 IP 出口净化)
+func (tc *TunnelClient) SetChainProxy(cfg *ChainProxyConfig) {
+	if cfg != nil {
+		cCopy := *cfg
+		tc.chainProxy.Store(&cCopy)
+	} else {
+		tc.chainProxy.Store(nil)
+	}
+}
+
+// GetChainProxy 获取当前配置的链式代理
+func (tc *TunnelClient) GetChainProxy() *ChainProxyConfig {
+	cp := tc.chainProxy.Load()
+	if cp != nil {
+		cCopy := *cp
+		return &cCopy
+	}
+	return nil
 }
 
 // SetSessionManager binds a SessionManager to TunnelClient
@@ -305,8 +340,13 @@ func (tc *TunnelClient) runDatagramReceiveLoop(ctx context.Context, client *Clie
 }
 
 // DialTCP 拨号建立经由 AERO 隧道的 TCP 业务流连接
-// 规则：单流最多重试 1 次（不睡眠，使用 select 和 ctx.Done() 退避）；单流超时绝对不调用 GlobalSessionPool.Remove！
+// 规则：若开启链式代理，流量经由 AERO 隧道级联至静态住宅代理出站以净化出口；单流最多重试 1 次
 func (tc *TunnelClient) DialTCP(ctx context.Context, target string) (net.Conn, error) {
+	cp := tc.chainProxy.Load()
+	if cp != nil && cp.Enabled && cp.Host != "" && cp.Port > 0 {
+		return tc.dialChainTCP(ctx, target, cp)
+	}
+
 	if tc.sessionMgr != nil {
 		return tc.sessionMgr.DialTCP(ctx, target)
 	}
@@ -331,6 +371,154 @@ func (tc *TunnelClient) DialTCP(ctx context.Context, target string) (net.Conn, e
 	}
 
 	return nil, fmt.Errorf("dial TCP %s failed (after max 1 retry): %w", target, lastErr)
+}
+
+func (tc *TunnelClient) dialChainTCP(ctx context.Context, target string, cp *ChainProxyConfig) (net.Conn, error) {
+	if tc.sessionMgr == nil {
+		return nil, fmt.Errorf("session manager required for chain proxy dialing")
+	}
+	chainAddr := net.JoinHostPort(cp.Host, strconv.Itoa(cp.Port))
+	conn, err := tc.sessionMgr.DialTCP(ctx, chainAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dial chain proxy %s via tunnel: %w", chainAddr, err)
+	}
+
+	proto := strings.ToLower(strings.TrimSpace(cp.Protocol))
+	if proto == "http" {
+		if herr := httpConnectHandshake(ctx, conn, target, cp.Username, cp.Password); herr != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("http chain handshake to %s failed: %w", target, herr)
+		}
+		return conn, nil
+	}
+
+	// 默认为 SOCKS5
+	if serr := socks5ClientHandshake(ctx, conn, target, cp.Username, cp.Password); serr != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 chain handshake to %s failed: %w", target, serr)
+	}
+	return conn, nil
+}
+
+func socks5ClientHandshake(ctx context.Context, conn net.Conn, target string, user, pass string) error {
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return fmt.Errorf("invalid target address: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return fmt.Errorf("invalid port in %s", target)
+	}
+
+	// 1. 发送 Method 协商
+	if user != "" || pass != "" {
+		if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+			return fmt.Errorf("write socks5 greeting: %w", err)
+		}
+	} else {
+		if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+			return fmt.Errorf("write socks5 greeting: %w", err)
+		}
+	}
+
+	methodResp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, methodResp); err != nil {
+		return fmt.Errorf("read socks5 method resp: %w", err)
+	}
+	if methodResp[0] != 0x05 {
+		return fmt.Errorf("unsupported socks version: 0x%02x", methodResp[0])
+	}
+
+	// 2. 身份验证
+	if methodResp[1] == 0x02 { // USERNAME/PASSWORD (RFC 1929)
+		authReq := make([]byte, 0, 3+len(user)+len(pass))
+		authReq = append(authReq, 0x01, byte(len(user)))
+		authReq = append(authReq, []byte(user)...)
+		authReq = append(authReq, byte(len(pass)))
+		authReq = append(authReq, []byte(pass)...)
+		if _, err := conn.Write(authReq); err != nil {
+			return fmt.Errorf("write socks5 auth req: %w", err)
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			return fmt.Errorf("read socks5 auth resp: %w", err)
+		}
+		if authResp[1] != 0x00 {
+			return fmt.Errorf("socks5 auth rejected by chain proxy: 0x%02x", authResp[1])
+		}
+	} else if methodResp[1] != 0x00 {
+		return fmt.Errorf("unsupported socks5 auth method: 0x%02x", methodResp[1])
+	}
+
+	// 3. 发起 CONNECT 请求
+	req := make([]byte, 0, 6+len(host))
+	req = append(req, 0x05, 0x01, 0x00) // VER=5, CMD=CONNECT, RSV=0
+	ip := net.ParseIP(host)
+	if ip4 := ip.To4(); ip4 != nil {
+		req = append(req, 0x01) // ATYP=IPv4
+		req = append(req, ip4...)
+	} else if ip6 := ip.To16(); ip6 != nil && !strings.Contains(host, ".") {
+		req = append(req, 0x04) // ATYP=IPv6
+		req = append(req, ip6...)
+	} else {
+		req = append(req, 0x03, byte(len(host))) // ATYP=Domain
+		req = append(req, []byte(host)...)
+	}
+	var pBuf [2]byte
+	binary.BigEndian.PutUint16(pBuf[:], uint16(port))
+	req = append(req, pBuf[:]...)
+
+	if _, err := conn.Write(req); err != nil {
+		return fmt.Errorf("write socks5 connect req: %w", err)
+	}
+
+	// 4. 读取连接响应
+	respHeader := make([]byte, 4)
+	if _, err := io.ReadFull(conn, respHeader); err != nil {
+		return fmt.Errorf("read socks5 connect resp: %w", err)
+	}
+	if respHeader[1] != 0x00 {
+		return fmt.Errorf("socks5 connect rejected: rep=0x%02x", respHeader[1])
+	}
+
+	// 丢弃绑定的 BND.ADDR 与 BND.PORT
+	switch respHeader[3] {
+	case 0x01: // IPv4
+		b := make([]byte, 4+2)
+		_, _ = io.ReadFull(conn, b)
+	case 0x04: // IPv6
+		b := make([]byte, 16+2)
+		_, _ = io.ReadFull(conn, b)
+	case 0x03: // Domain
+		lenBuf := make([]byte, 1)
+		_, _ = io.ReadFull(conn, lenBuf)
+		b := make([]byte, int(lenBuf[0])+2)
+		_, _ = io.ReadFull(conn, b)
+	}
+
+	return nil
+}
+
+func httpConnectHandshake(ctx context.Context, conn net.Conn, target string, user, pass string) error {
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+	if user != "" || pass != "" {
+		cred := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+		req += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", cred)
+	}
+	req += "Proxy-Connection: Keep-Alive\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return fmt.Errorf("write http connect req: %w", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		return fmt.Errorf("read http connect resp: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http proxy connect %s rejected: %s", target, resp.Status)
+	}
+	return nil
 }
 
 // RegisterUDPContext 注册出站 UDP Context，服务端建立对应 UDP 端点

@@ -403,6 +403,12 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 	tr := &http.Transport{
 		Proxy: nil,
 		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err == nil && net.ParseIP(host) == nil {
+				if ip, rerr := resolvePhysicalIPv4(host); rerr == nil && ip != nil {
+					addr = net.JoinHostPort(ip.String(), port)
+				}
+			}
 			return DialPhysicalDirect(c, network, addr)
 		},
 		ForceAttemptHTTP2:     true,

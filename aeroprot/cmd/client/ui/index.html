@@ -290,6 +290,52 @@
         </div>
       </section>
 
+      <!-- 链式代理配置：静态住宅 IP 出口净化 (可选) -->
+      <section class="card" id="chainProxyCard">
+        <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" id="chainProxyToggleHeader">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span style="font-weight:700;" data-i18n="chainTitle">链式代理 (住宅IP净化)</span>
+            <span id="chainStatusBadge" class="tag-sm" style="font-size:10px;background:#21262d;color:#8b949e;" data-i18n="chainDisabled">未开启</span>
+          </div>
+          <span id="chainToggleIcon" style="font-size:11px;color:var(--muted);">▼</span>
+        </div>
+        <div id="chainProxyBody" style="display:none;margin-top:8px;">
+          <p style="font-size:10px;color:var(--muted);margin-bottom:8px;" data-i18n="chainTip">通过 AERO 隧道级联上游住宅/数据中心代理，实现出口 IP 净化与抗封锁</p>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+            <label style="font-size:11px;font-weight:600;" data-i18n="chainEnable">启用链式出口代理</label>
+            <input type="checkbox" id="chainEnableToggle" style="accent-color:var(--accent);cursor:pointer;" />
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px;">
+            <div>
+              <label style="font-size:10px;color:var(--muted);" data-i18n="chainProto">代理协议</label>
+              <select id="chainProtoSelect" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;">
+                <option value="socks5">SOCKS5</option>
+                <option value="http">HTTP (CONNECT)</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--muted);" data-i18n="chainPort">端口</label>
+              <input type="number" id="chainPortInput" placeholder="1080" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
+            </div>
+          </div>
+          <div style="margin-bottom:6px;">
+            <label style="font-size:10px;color:var(--muted);" data-i18n="chainHost">服务器地址 (IP或域名)</label>
+            <input type="text" id="chainHostInput" placeholder="例如 1.2.3.4 或 proxy.example.com" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
+            <div>
+              <label style="font-size:10px;color:var(--muted);" data-i18n="chainUser">用户名 (可选)</label>
+              <input type="text" id="chainUserInput" placeholder="用户名" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--muted);" data-i18n="chainPass">密码 (可选)</label>
+              <input type="password" id="chainPassInput" placeholder="密码" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
+            </div>
+          </div>
+          <button type="button" id="btnSaveChainProxy" class="btn-conflict-primary" style="width:100%;padding:6px;font-size:11px;" data-i18n="chainSave">保存链式配置</button>
+        </div>
+      </section>
+
       <!-- 第三方 TUN 冲突交互卡片 (互斥提示与双动作引导) -->
       <div id="conflictBox" class="conflict-card" hidden>
         <div class="conflict-hd">
@@ -304,6 +350,22 @@
       </div>
 
       <p id="msg" class="msg"></p>
+    </div>
+
+    <!-- 前置虚拟网卡 TUN 冲突提醒弹窗 -->
+    <div id="tunConflictModal" class="sheet" hidden>
+      <div class="sheet-card" style="text-align:left;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+          <span style="font-size:20px;">⚠️</span>
+          <h2 style="margin:0;font-size:14px;font-weight:700;" data-i18n="tunConflictTitle">虚拟网卡/TUN 占用冲突检测</h2>
+        </div>
+        <p id="tunConflictModalDesc" class="muted" style="font-size:11px;line-height:1.5;margin-bottom:12px;" data-i18n="tunConflictDesc">检测到宿主机已运行其他虚拟网卡或 TUN 模式。同时开启两款 TUN 可能会导致系统全局路由冲突或死锁。</p>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <button type="button" id="btnTunConflictSysproxy" class="btn-conflict-primary" style="width:100%;padding:8px;font-size:11px;" data-i18n="tunConflictSysproxy">切换为系统代理模式载入 (推荐)</button>
+          <button type="button" id="btnTunConflictIgnore" class="sheet-btn" style="width:100%;padding:8px;font-size:11px;" data-i18n="tunConflictIgnore">忽略并继续当前操作</button>
+          <button type="button" id="btnTunConflictCancel" class="sheet-cancel" style="width:100%;padding:6px;font-size:11px;" data-i18n="tunConflictCancel">暂不载入 / 取消</button>
+        </div>
+      </div>
     </div>
 
     <!-- 扫码弹层 -->
