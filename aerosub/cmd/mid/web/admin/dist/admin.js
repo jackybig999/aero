@@ -13,6 +13,7 @@ let cachedVpsList = [];
 let cachedNodeList = [];
 let cachedUserList = [];
 let cachedLedgerList = [];
+let cachedPayAccounts = [];
 let ledgerFilter = 'all'; // 'all' | 'in' | 'out' | 'unsettled'
 let autoProbeTimer = null;
 let cfReady = false;
@@ -480,6 +481,12 @@ function initEvents() {
   $('btnLedgerUnsettled')?.addEventListener('click', () => filterLedger('unsettled'));
   $('btnBatchSettle')?.addEventListener('click', doBatchSettle);
   $('btnDashSettle')?.addEventListener('click', doBatchSettle);
+
+  // Payment Accounts in Ledger
+  $('btnRefreshPayAccounts')?.addEventListener('click', () => loadPayAccounts());
+  $('btnCancelPayAccountModal')?.addEventListener('click', () => $('payAccountModal').classList.remove('active'));
+  $('btnClosePayAccountModal')?.addEventListener('click', () => $('payAccountModal').classList.remove('active'));
+  $('btnSavePayAccount')?.addEventListener('click', savePayAccount);
 
   // Subs Tab Events
   $('btnRefreshPlans')?.addEventListener('click', () => loadPlansTable());
@@ -2046,6 +2053,7 @@ async function loadLedger() {
   } catch (e) {
     console.warn('loadLedger error', e);
   }
+  await loadPayAccounts();
 }
 
 function filterLedger(mode) {
@@ -2135,6 +2143,123 @@ async function doBatchSettle() {
     loadDashboard();
   } catch (e) {
     alert(`结算失败: ${e.message}`);
+  }
+}
+
+async function loadPayAccounts() {
+  const tbody = $('payAccountsTableBody');
+  if (!tbody) return;
+  try {
+    const res = await apiCall('/payment/accounts');
+    cachedPayAccounts = (res && (res.accounts || res.results)) || (Array.isArray(res) ? res : []);
+    renderPayAccounts();
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--red)">加载通道失败: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+function renderPayAccounts() {
+  const tbody = $('payAccountsTableBody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  if (!cachedPayAccounts || cachedPayAccounts.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted)">暂无已配置的收单通道</td></tr>';
+    return;
+  }
+
+  cachedPayAccounts.forEach(acc => {
+    const tr = document.createElement('tr');
+    const isCreem = acc.channel === 'creem';
+    const rateText = isCreem ? '3.9% + $0.40 (极速出海)' : '7.0% + $0.50 (全球/PayPal)';
+    const modeTag = acc.is_test ? '<span class="tag tag-amber">沙盒测试</span>' : '<span class="tag tag-green">正式生产</span>';
+    const statusTag = acc.enabled ? '<span class="tag tag-green">已启用</span>' : '<span class="tag tag-red">已停用</span>';
+    const hasKey = acc.api_key && acc.api_key.length > 0;
+    const credText = hasKey ? `<span class="mono" style="font-size:11px;color:var(--blue)">${escapeHtml(acc.api_key)}</span>` : '<span style="color:var(--amber);font-size:11px">⚠️ 待配置 (当前为合规沙盒链路)</span>';
+
+    tr.innerHTML = `
+      <td><span class="tag tag-blue">#${acc.priority || 1}</span></td>
+      <td>
+        <b>${acc.icon === 'paypal' ? '🅿️' : '💳'} ${escapeHtml(acc.display_name || acc.channel)}</b>
+        <div style="font-size:11px;color:var(--muted)">通道ID: <code>${escapeHtml(acc.channel)}</code></div>
+      </td>
+      <td>${modeTag}</td>
+      <td><span style="font-size:12px">${rateText}</span></td>
+      <td>${statusTag}</td>
+      <td>${credText}</td>
+      <td>
+        <button class="btn btn-sm btn-blue" onclick="openEditPayAccount('${escapeHtml(acc.channel)}')">维护/编辑配置</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+window.openEditPayAccount = (channel) => {
+  const acc = cachedPayAccounts.find(a => a.channel === channel);
+  if (!acc) return;
+  $('payAccChannel').value = acc.channel;
+  $('payAccDisplayName').value = acc.display_name || '';
+  $('payAccApiKey').value = acc.api_key || '';
+  $('payAccWebhookSecret').value = acc.webhook_secret || '';
+  $('payAccStoreID').value = acc.store_id || '';
+  $('payAccPriority').value = acc.priority || 1;
+  $('payAccIsTest').checked = !!acc.is_test;
+  $('payAccEnabled').checked = !!acc.enabled;
+
+  if (acc.plan_mapping) {
+    $('payAccPlanMapping').value = JSON.stringify(acc.plan_mapping);
+  } else {
+    $('payAccPlanMapping').value = '{}';
+  }
+
+  const storeWrap = $('payAccStoreIdWrap');
+  if (storeWrap) {
+    storeWrap.style.display = (acc.channel === 'lemonsqueezy') ? 'block' : 'none';
+  }
+
+  $('payAccountModal').classList.add('active');
+};
+
+async function savePayAccount() {
+  const channel = $('payAccChannel').value.trim();
+  const displayName = $('payAccDisplayName').value.trim();
+  const apiKey = $('payAccApiKey').value.trim();
+  const webhookSecret = $('payAccWebhookSecret').value.trim();
+  const storeID = $('payAccStoreID').value.trim();
+  const priority = parseInt($('payAccPriority').value, 10) || 1;
+  const isTest = $('payAccIsTest').checked;
+  const enabled = $('payAccEnabled').checked;
+
+  let planMapping = {};
+  const mappingStr = $('payAccPlanMapping').value.trim();
+  if (mappingStr) {
+    try {
+      planMapping = JSON.parse(mappingStr);
+    } catch (e) {
+      return alert('套餐映射 JSON 格式不合法: ' + e.message);
+    }
+  }
+
+  try {
+    await apiCall('/payment/accounts', {
+      method: 'POST',
+      body: JSON.stringify({
+        channel: channel,
+        display_name: displayName,
+        api_key: apiKey,
+        webhook_secret: webhookSecret,
+        store_id: storeID,
+        plan_mapping: planMapping,
+        priority: priority,
+        is_test: isTest,
+        enabled: enabled
+      })
+    });
+    alert('支付通道与账户配置保存成功！密匙已由 AES-256-GCM 安全加密落库。');
+    $('payAccountModal').classList.remove('active');
+    loadPayAccounts();
+  } catch (e) {
+    alert(`保存失败: ${e.message}`);
   }
 }
 

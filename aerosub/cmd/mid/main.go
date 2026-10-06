@@ -300,8 +300,22 @@ func main() {
 	aeroHandler.SetAeroDB(aeroDB)
 	aeroHandler.SetAdminKey(adminKey)
 	aeroHandler.RegisterRoutes(api)
+	gatewayRegistry := mid.NewGatewayRegistry(payDB, box)
+	_ = gatewayRegistry.Reload()
+	payWebhookHandler := mid.NewPayWebhookHandler(gatewayRegistry, payDB, userDB, billingSvc, userSvc, vpsSvc, box)
+	payWebhookHandler.RegisterRoutes(api)
+
+	// Issue #9: Cross-database reconciliation for completed income with unfulfilled orders
+	if n, err := payWebhookHandler.ReconcileUnfulfilledOrders(); err != nil {
+		log.Printf("[RECONCILE_ALERT] Startup reconciliation error: %v", err)
+	} else if n > 0 {
+		log.Printf("[RECONCILE] Startup successfully healed %d unfulfilled orders", n)
+	}
+	payWebhookHandler.StartReconciliationLoop(context.Background(), 5*time.Minute)
+
 	payInHandler := mid.NewPayInHandler(payInSvc)
 	payInHandler.SetDeps(userDB, billingSvc, userSvc, vpsSvc)
+	payInHandler.SetGateways(gatewayRegistry, payDB)
 	payInHandler.RegisterRoutes(api)
 	mid.NewPayOutHandler(payOutSvc).RegisterRoutes(api)
 	mid.NewLedgerHandler(payDB).RegisterRoutes(api)

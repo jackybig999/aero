@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -157,18 +158,27 @@ func (l *BandwidthLimiter) Rate() float64 {
 	return l.rate
 }
 
-// Take deducts n bytes; sleeps until available if rate exceeded
-func (l *BandwidthLimiter) Take(token string, n int) {
+// TakeContext deducts n bytes; sleeps until available or until ctx is canceled
+func (l *BandwidthLimiter) TakeContext(ctx context.Context, token string, n int) error {
 	if l == nil || l.rate <= 0 || n <= 0 || token == "" {
-		return
+		return nil
 	}
 	for {
 		wait := l.tryTake(token, n)
 		if wait <= 0 {
-			return
+			return nil
 		}
-		time.Sleep(wait)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
 	}
+}
+
+// Take deducts n bytes; sleeps until available if rate exceeded (backward compatibility wrapper)
+func (l *BandwidthLimiter) Take(token string, n int) {
+	_ = l.TakeContext(context.Background(), token, n)
 }
 
 func (l *BandwidthLimiter) tryTake(token string, n int) time.Duration {

@@ -193,6 +193,7 @@ func GenerateFingerprintConfig(seed string, countryCode string, kernelType, kern
 func BuildFingerprintScript(cfg *FingerprintConfig) string {
 	langJSON, _ := json.Marshal(cfg.Languages)
 	platformJSON, _ := json.Marshal(cfg.Platform)
+	tzJSON, _ := json.Marshal(cfg.Timezone)
 	vendorJSON, _ := json.Marshal(cfg.WebGLVendor)
 	rendererJSON, _ := json.Marshal(cfg.WebGLRenderer)
 
@@ -225,6 +226,29 @@ func BuildFingerprintScript(cfg *FingerprintConfig) string {
         Object.defineProperty(screen, 'colorDepth', { get: () => %d });
         Object.defineProperty(screen, 'pixelDepth', { get: () => %d });
         Object.defineProperty(window, 'devicePixelRatio', { get: () => %f });
+    } catch (e) {}
+
+    try {
+        const targetTz = %s;
+        if (targetTz) {
+            const origDateTimeFormat = Intl.DateTimeFormat;
+            const origResolvedOptions = origDateTimeFormat.prototype.resolvedOptions;
+            origDateTimeFormat.prototype.resolvedOptions = function() {
+                const res = origResolvedOptions.apply(this, arguments);
+                res.timeZone = targetTz;
+                return res;
+            };
+            Date.prototype.getTimezoneOffset = function() {
+                try {
+                    const now = this || new Date();
+                    const utcDate = new Date(now.toLocaleString('en-US', { timeZone: 'UTC' }));
+                    const tzDate = new Date(now.toLocaleString('en-US', { timeZone: targetTz }));
+                    return Math.round((utcDate.getTime() - tzDate.getTime()) / 60000);
+                } catch (err) {
+                    return 0;
+                }
+            };
+        }
     } catch (e) {}
 
     try {
@@ -288,6 +312,7 @@ func BuildFingerprintScript(cfg *FingerprintConfig) string {
 		cfg.ColorDepth,
 		cfg.ColorDepth,
 		cfg.DevicePixelRatio,
+		string(tzJSON),
 		string(vendorJSON),
 		string(rendererJSON),
 		string(vendorJSON),

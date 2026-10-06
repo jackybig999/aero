@@ -1,0 +1,11 @@
+# AERO Engineering Profile
+# Declares active capabilities per GLOBAL MASTER RULES v1.4.0 §0.6
+
+language: go            # go 1.26+ per §1.1
+profile: service        # service (multi-binary client/edge/mid/desk)
+persistence: sqlite     # pure-Go SQLite with single-writer lock-free reaping
+network: inbound        # handles QUIC, HTTP/3, TUN, and REST control plane
+concurrency: in-process # in-process goroutines, channels, and event loops
+frontend: embedded      # native HTML5/CSS/JS embedded via //go:embed
+tenancy: multi          # multi-tenant edge node and midplatform
+replicas: 1             # single node deployment

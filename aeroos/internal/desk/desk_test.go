@@ -29,6 +29,12 @@ func TestFingerprintGeneration(t *testing.T) {
 	if !strings.Contains(script, "webdriver") {
 		t.Errorf("expected script to contain webdriver protection")
 	}
+	if !strings.Contains(script, "America/New_York") {
+		t.Errorf("expected script to contain target timezone America/New_York")
+	}
+	if !strings.Contains(script, "getTimezoneOffset") {
+		t.Errorf("expected script to contain getTimezoneOffset hook")
+	}
 }
 
 func TestProxyParsing(t *testing.T) {

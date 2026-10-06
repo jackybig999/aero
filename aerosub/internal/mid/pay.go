@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,7 @@ type IncomeRecord struct {
 	AmountCents    int64      `json:"amount_cents"`
 	PayChannel     string     `json:"pay_channel"`
 	ChannelTradeNo string     `json:"channel_trade_no"`
+	ExternalID     string     `json:"external_id,omitempty"`
 	Status         string     `json:"status"` // completed | pending | refunded
 	Settled        bool       `json:"settled"`
 	SettledBatchNo string     `json:"settled_batch_no,omitempty"`
@@ -103,6 +105,7 @@ func NewAeroPayDB(dbPath string) (*AeroPayDB, error) {
 		amount_cents INTEGER NOT NULL,
 		pay_channel TEXT NOT NULL,
 		channel_trade_no TEXT DEFAULT '',
+		external_id TEXT DEFAULT '',
 		status TEXT NOT NULL,
 		settled INTEGER NOT NULL DEFAULT 0,
 		settled_batch_no TEXT DEFAULT '',
@@ -156,14 +159,46 @@ func NewAeroPayDB(dbPath string) (*AeroPayDB, error) {
 		created_at TEXT NOT NULL
 	);
 	CREATE INDEX IF NOT EXISTS idx_double_entry_dir ON double_entry_ledger(direction, settled);
+
+	CREATE TABLE IF NOT EXISTS payment_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel TEXT NOT NULL,
+		event_id TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		order_no TEXT NOT NULL,
+		amount_cents INTEGER NOT NULL DEFAULT 0,
+		payload TEXT NOT NULL,
+		status TEXT NOT NULL,
+		processed_at TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		UNIQUE(channel, event_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_payment_events_order ON payment_events(order_no);
+
+	CREATE TABLE IF NOT EXISTS pay_channel_config (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel TEXT UNIQUE NOT NULL,
+		display_name TEXT NOT NULL,
+		icon TEXT DEFAULT '',
+		api_key_enc TEXT NOT NULL DEFAULT '',
+		webhook_secret_enc TEXT NOT NULL DEFAULT '',
+		store_id TEXT DEFAULT '',
+		plan_mapping_json TEXT NOT NULL DEFAULT '{}',
+		is_test INTEGER NOT NULL DEFAULT 1,
+		priority INTEGER NOT NULL DEFAULT 1,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		updated_at TEXT NOT NULL
+	);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("init aeropay schema: %w", err)
 	}
+	_, _ = db.Exec(`ALTER TABLE income ADD COLUMN external_id TEXT DEFAULT ''`)
 
 	p := &AeroPayDB{db: db}
 	p.ensureDefaultTarget()
+	p.ensureDefaultChannels()
 	return p, nil
 }
 
@@ -188,6 +223,171 @@ func (p *AeroPayDB) ensureDefaultTarget() {
 	}
 }
 
+func (p *AeroPayDB) ensureDefaultChannels() {
+	var count int
+	_ = p.db.QueryRow(`SELECT count(*) FROM pay_channel_config`).Scan(&count)
+	if count == 0 {
+		nowStr := time.Now().Format(time.RFC3339)
+		_, _ = p.db.Exec(`INSERT INTO pay_channel_config 
+			(channel, display_name, icon, api_key_enc, webhook_secret_enc, store_id, plan_mapping_json, is_test, priority, enabled, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?)`,
+			"creem", "国际信用卡 / Apple Pay (极速通道 - 推荐)", "card", "", "", "", `{"1":"prod_monthly","2":"prod_quarterly","3":"prod_annual","4":"prod_unlimited"}`, nowStr)
+		_, _ = p.db.Exec(`INSERT INTO pay_channel_config 
+			(channel, display_name, icon, api_key_enc, webhook_secret_enc, store_id, plan_mapping_json, is_test, priority, enabled, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 1, 2, 1, ?)`,
+			"lemonsqueezy", "PayPal / 全球信用卡 (保障通道)", "paypal", "", "", "1000", `{"1":"1001","2":"1002","3":"1003","4":"1004"}`, nowStr)
+	}
+}
+
+func (p *AeroPayDB) ListPayChannelConfigs() ([]PayChannelConfig, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	rows, err := p.db.Query(`SELECT id, channel, display_name, icon, api_key_enc, webhook_secret_enc, store_id, plan_mapping_json, is_test, priority, enabled, updated_at FROM pay_channel_config ORDER BY priority ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []PayChannelConfig
+	for rows.Next() {
+		var c PayChannelConfig
+		var mapJSON, updatedStr string
+		var isTestInt, enabledInt int
+		if err := rows.Scan(&c.ID, &c.Channel, &c.DisplayName, &c.Icon, &c.APIKey, &c.WebhookSecret, &c.StoreID, &mapJSON, &isTestInt, &c.Priority, &enabledInt, &updatedStr); err == nil {
+			c.IsTest = isTestInt == 1
+			c.Enabled = enabledInt == 1
+			c.PlanMapping = UnmarshalPlanMapping(mapJSON)
+			if t, perr := time.Parse(time.RFC3339, updatedStr); perr == nil {
+				c.UpdatedAt = t
+			}
+			list = append(list, c)
+		}
+	}
+	return list, nil
+}
+
+func (p *AeroPayDB) GetPayChannelConfig(channel string) (*PayChannelConfig, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var c PayChannelConfig
+	var mapJSON, updatedStr string
+	var isTestInt, enabledInt int
+	err := p.db.QueryRow(`SELECT id, channel, display_name, icon, api_key_enc, webhook_secret_enc, store_id, plan_mapping_json, is_test, priority, enabled, updated_at FROM pay_channel_config WHERE channel = ?`, channel).
+		Scan(&c.ID, &c.Channel, &c.DisplayName, &c.Icon, &c.APIKey, &c.WebhookSecret, &c.StoreID, &mapJSON, &isTestInt, &c.Priority, &enabledInt, &updatedStr)
+	if err != nil {
+		return nil, err
+	}
+	c.IsTest = isTestInt == 1
+	c.Enabled = enabledInt == 1
+	c.PlanMapping = UnmarshalPlanMapping(mapJSON)
+	if t, perr := time.Parse(time.RFC3339, updatedStr); perr == nil {
+		c.UpdatedAt = t
+	}
+	return &c, nil
+}
+
+func (p *AeroPayDB) SavePayChannelConfig(cfg *PayChannelConfig) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	nowStr := time.Now().Format(time.RFC3339)
+	isTestInt := 0
+	if cfg.IsTest {
+		isTestInt = 1
+	}
+	enabledInt := 0
+	if cfg.Enabled {
+		enabledInt = 1
+	}
+	mapJSON := MarshalPlanMapping(cfg.PlanMapping)
+
+	_, err := p.db.Exec(`INSERT INTO pay_channel_config 
+		(channel, display_name, icon, api_key_enc, webhook_secret_enc, store_id, plan_mapping_json, is_test, priority, enabled, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(channel) DO UPDATE SET
+			display_name = excluded.display_name,
+			icon = excluded.icon,
+			api_key_enc = CASE WHEN excluded.api_key_enc != '' THEN excluded.api_key_enc ELSE pay_channel_config.api_key_enc END,
+			webhook_secret_enc = CASE WHEN excluded.webhook_secret_enc != '' THEN excluded.webhook_secret_enc ELSE pay_channel_config.webhook_secret_enc END,
+			store_id = excluded.store_id,
+			plan_mapping_json = excluded.plan_mapping_json,
+			is_test = excluded.is_test,
+			priority = excluded.priority,
+			enabled = excluded.enabled,
+			updated_at = excluded.updated_at`,
+		cfg.Channel, cfg.DisplayName, cfg.Icon, cfg.APIKey, cfg.WebhookSecret, cfg.StoreID, mapJSON, isTestInt, cfg.Priority, enabledInt, nowStr)
+	return err
+}
+
+func (p *AeroPayDB) RecordPaymentEvent(event *WebhookEvent) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	nowStr := time.Now().Format(time.RFC3339)
+	res, err := p.db.Exec(`INSERT OR IGNORE INTO payment_events 
+		(channel, event_id, event_type, order_no, amount_cents, payload, status, processed_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'processed', ?, ?)`,
+		event.Provider, event.EventID, event.EventType, event.OrderNo, event.AmountCents, event.RawPayload, nowStr, nowStr)
+	if err != nil {
+		return false, err
+	}
+	affected, _ := res.RowsAffected()
+	return affected > 0, nil
+}
+
+func (p *AeroPayDB) GetIncomeByOrderNo(orderNo string) (*IncomeRecord, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	var r IncomeRecord
+	var paidStr, settledBatch, extID sql.NullString
+	var createdStr string
+	var settledInt int
+
+	err := p.db.QueryRow(`SELECT id, order_no, user_id, sub_id, plan_id, plan_name, amount_cents, pay_channel, channel_trade_no, external_id, status, settled, settled_batch_no, paid_at, created_at FROM income WHERE order_no = ?`, orderNo).
+		Scan(&r.ID, &r.OrderNo, &r.UserID, &r.SubID, &r.PlanID, &r.PlanName, &r.AmountCents, &r.PayChannel, &r.ChannelTradeNo, &extID, &r.Status, &settledInt, &settledBatch, &paidStr, &createdStr)
+	if err != nil {
+		return nil, err
+	}
+	r.Settled = settledInt == 1
+	if extID.Valid {
+		r.ExternalID = extID.String
+	}
+	if settledBatch.Valid {
+		r.SettledBatchNo = settledBatch.String
+	}
+	if paidStr.Valid && paidStr.String != "" {
+		if t, perr := time.Parse(time.RFC3339, paidStr.String); perr == nil {
+			r.PaidAt = &t
+		}
+	}
+	if t, perr := time.Parse(time.RFC3339, createdStr); perr == nil {
+		r.CreatedAt = t
+	}
+	return &r, nil
+}
+
+func (p *AeroPayDB) UpdateIncomeStatus(orderNo, status, tradeNo, externalID string, paidAt *time.Time) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	paidStr := sql.NullString{}
+	if paidAt != nil {
+		paidStr = sql.NullString{String: paidAt.Format(time.RFC3339), Valid: true}
+	}
+
+	_, err := p.db.Exec(`UPDATE income SET 
+		status = ?, 
+		channel_trade_no = CASE WHEN ? != '' THEN ? ELSE channel_trade_no END,
+		external_id = CASE WHEN ? != '' THEN ? ELSE external_id END,
+		paid_at = CASE WHEN ? THEN ? ELSE paid_at END
+		WHERE order_no = ?`,
+		status, tradeNo, tradeNo, externalID, externalID, paidStr.Valid, paidStr.String, orderNo)
+	return err
+}
+
 func (p *AeroPayDB) RecordIncome(order *Order) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -200,9 +400,10 @@ func (p *AeroPayDB) RecordIncome(order *Order) error {
 
 	now := time.Now()
 	nowStr := now.Format(time.RFC3339)
-	paidStr := nowStr
+	var paidStr *string
 	if order.PaidAt != nil {
-		paidStr = order.PaidAt.Format(time.RFC3339)
+		p := order.PaidAt.Format(time.RFC3339)
+		paidStr = &p
 	}
 
 	_, err = tx.Exec(`INSERT OR REPLACE INTO income 
@@ -213,13 +414,15 @@ func (p *AeroPayDB) RecordIncome(order *Order) error {
 		return fmt.Errorf("insert income: %w", err)
 	}
 
-	ledgerNo := fmt.Sprintf("LDG-%s-%04d", now.Format("20060102150405"), now.Nanosecond()%10000)
-	_, err = tx.Exec(`INSERT INTO double_entry_ledger
-		(ledger_no, user_id, amount_cents, direction, channel, channel_ref, settled, created_at)
-		VALUES (?, ?, ?, 'IN', ?, ?, 0, ?)`,
-		ledgerNo, order.UserID, order.AmountCents, order.PayChannel, order.OrderNo, nowStr)
-	if err != nil {
-		return fmt.Errorf("insert double entry: %w", err)
+	if order.Status == "completed" {
+		ledgerNo := fmt.Sprintf("LDG-%s-%04d", now.Format("20060102150405"), now.Nanosecond()%10000)
+		_, err = tx.Exec(`INSERT INTO double_entry_ledger
+			(ledger_no, user_id, amount_cents, direction, channel, channel_ref, settled, created_at)
+			VALUES (?, ?, ?, 'IN', ?, ?, 0, ?)`,
+			ledgerNo, order.UserID, order.AmountCents, order.PayChannel, order.OrderNo, nowStr)
+		if err != nil {
+			return fmt.Errorf("insert double entry: %w", err)
+		}
 	}
 
 	return tx.Commit()
@@ -232,7 +435,7 @@ func (p *AeroPayDB) ListIncome(offset, limit int) ([]IncomeRecord, int64, error)
 	var total int64
 	_ = p.db.QueryRow(`SELECT count(*) FROM income`).Scan(&total)
 
-	rows, err := p.db.Query(`SELECT id, order_no, user_id, sub_id, plan_id, plan_name, amount_cents, pay_channel, channel_trade_no, status, settled, settled_batch_no, paid_at, created_at FROM income ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
+	rows, err := p.db.Query(`SELECT id, order_no, user_id, sub_id, plan_id, plan_name, amount_cents, pay_channel, channel_trade_no, external_id, status, settled, settled_batch_no, paid_at, created_at FROM income ORDER BY id DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -241,11 +444,14 @@ func (p *AeroPayDB) ListIncome(offset, limit int) ([]IncomeRecord, int64, error)
 	var list []IncomeRecord
 	for rows.Next() {
 		var r IncomeRecord
-		var paidStr, settledBatch sql.NullString
+		var paidStr, settledBatch, extID sql.NullString
 		var createdStr string
 		var settledInt int
-		if err := rows.Scan(&r.ID, &r.OrderNo, &r.UserID, &r.SubID, &r.PlanID, &r.PlanName, &r.AmountCents, &r.PayChannel, &r.ChannelTradeNo, &r.Status, &settledInt, &settledBatch, &paidStr, &createdStr); err == nil {
+		if err := rows.Scan(&r.ID, &r.OrderNo, &r.UserID, &r.SubID, &r.PlanID, &r.PlanName, &r.AmountCents, &r.PayChannel, &r.ChannelTradeNo, &extID, &r.Status, &settledInt, &settledBatch, &paidStr, &createdStr); err == nil {
 			r.Settled = settledInt == 1
+			if extID.Valid {
+				r.ExternalID = extID.String
+			}
 			if settledBatch.Valid {
 				r.SettledBatchNo = settledBatch.String
 			}
@@ -261,6 +467,52 @@ func (p *AeroPayDB) ListIncome(offset, limit int) ([]IncomeRecord, int64, error)
 		}
 	}
 	return list, total, nil
+}
+
+// ListRecentCompletedIncome returns the most recent completed income records for reconciliation.
+func (p *AeroPayDB) ListRecentCompletedIncome(limit int) ([]IncomeRecord, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	rows, err := p.db.Query(`SELECT id, order_no, user_id, sub_id, plan_id, plan_name, amount_cents, pay_channel, channel_trade_no, external_id, status, settled, settled_batch_no, paid_at, created_at 
+		FROM income 
+		WHERE status = 'completed' 
+		ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []IncomeRecord
+	for rows.Next() {
+		var r IncomeRecord
+		var paidStr, settledBatch, extID sql.NullString
+		var createdStr string
+		var settledInt int
+		if err := rows.Scan(&r.ID, &r.OrderNo, &r.UserID, &r.SubID, &r.PlanID, &r.PlanName, &r.AmountCents, &r.PayChannel, &r.ChannelTradeNo, &extID, &r.Status, &settledInt, &settledBatch, &paidStr, &createdStr); err == nil {
+			r.Settled = settledInt == 1
+			if extID.Valid {
+				r.ExternalID = extID.String
+			}
+			if settledBatch.Valid {
+				r.SettledBatchNo = settledBatch.String
+			}
+			if paidStr.Valid && paidStr.String != "" {
+				if t, perr := time.Parse(time.RFC3339, paidStr.String); perr == nil {
+					r.PaidAt = &t
+				}
+			}
+			if t, perr := time.Parse(time.RFC3339, createdStr); perr == nil {
+				r.CreatedAt = t
+			}
+			list = append(list, r)
+		}
+	}
+	return list, nil
 }
 
 // ----------------------------------------------------------------------
@@ -1250,6 +1502,8 @@ type PayInHandler struct {
 	billing   *BillingService
 	usersSvc  *UserService
 	vpsSvc    *VPSService
+	reg       *GatewayRegistry
+	payDB     *AeroPayDB
 }
 
 func NewPayInHandler(svc *PayInService) *PayInHandler {
@@ -1261,6 +1515,11 @@ func (h *PayInHandler) SetDeps(userStore UserStore, billing *BillingService, use
 	h.billing = billing
 	h.usersSvc = usersSvc
 	h.vpsSvc = vpsSvc
+}
+
+func (h *PayInHandler) SetGateways(reg *GatewayRegistry, payDB *AeroPayDB) {
+	h.reg = reg
+	h.payDB = payDB
 }
 
 func (h *PayInHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -1315,10 +1574,29 @@ func (h *PayInHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PayInHandler) Channels(w http.ResponseWriter, r *http.Request) {
+	if h.payDB != nil {
+		configs, err := h.payDB.ListPayChannelConfigs()
+		if err == nil && len(configs) > 0 {
+			var channels []map[string]any
+			for _, cfg := range configs {
+				if cfg.Enabled {
+					channels = append(channels, map[string]any{
+						"channel":  cfg.Channel,
+						"name":     cfg.DisplayName,
+						"icon":     cfg.Icon,
+						"enabled":  cfg.Enabled,
+						"is_test":  cfg.IsTest,
+						"priority": cfg.Priority,
+					})
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": channels})
+			return
+		}
+	}
 	channels := []map[string]any{
-		{"channel": "wechat", "name": "微信支付", "icon": "wechat", "enabled": true},
-		{"channel": "alipay", "name": "支付宝", "icon": "alipay", "enabled": true},
-		{"channel": "bankcard", "name": "银行卡", "icon": "bankcard", "enabled": true},
+		{"channel": "creem", "name": "国际信用卡 / Apple Pay (极速通道 - 推荐)", "icon": "card", "enabled": true, "is_test": true, "priority": 1},
+		{"channel": "lemonsqueezy", "name": "PayPal / 全球信用卡 (保障通道)", "icon": "paypal", "enabled": true, "is_test": true, "priority": 2},
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": channels})
 }
@@ -1360,8 +1638,8 @@ func (h *PayInHandler) Checkout(w http.ResponseWriter, r *http.Request) {
 		AssignedNodes []string `json:"assigned_nodes"`
 		Channel       string   `json:"channel"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"code": 1002, "message": "invalid body"})
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"code": 1002, "message": "invalid body: " + err.Error()})
 		return
 	}
 
@@ -1389,80 +1667,32 @@ func (h *PayInHandler) Checkout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Channel == "" {
-		req.Channel = "alipay"
+		req.Channel = "creem"
 	}
+	req.Channel = strings.ToLower(strings.TrimSpace(req.Channel))
 
-	now := time.Now()
-	orderNo := fmt.Sprintf("ORD-%s-%d", now.Format("20060102"), now.UnixNano()%1000000)
-
-	nodesToSet := req.AssignedNodes
-	var targetSub *Subscription
-
+	var u *User
 	if h.userStore != nil {
-		u, err := h.userStore.GetUser(uid)
+		u, err = h.userStore.GetUser(uid)
 		if err != nil || u == nil {
 			writeJSON(w, http.StatusNotFound, map[string]any{"code": 1001, "message": "user not found"})
 			return
 		}
-
-		if req.SubID != "" {
-			if sub, err := h.userStore.GetSubscription(req.SubID); err == nil && sub != nil && sub.UserID == uid {
-				if renewed, err := h.userStore.RenewSubscription(sub.SubID, plan.DurationMonths, plan.PriceCents, plan.Name); err == nil {
-					targetSub = renewed
-					nodesToSet = renewed.AssignedNodes
-					if plan.TrafficBytes > 0 {
-						targetSub.LimitBytes = plan.TrafficBytes
-						_ = h.userStore.UpdateTraffic(uid, -1, plan.TrafficBytes)
-					}
-				}
-			}
-		}
-
-		if targetSub == nil {
-			newSlug := GenerateSubscriptionSlug(u.Username)
-			seedRaw := make([]byte, 24)
-			_, _ = rand.Read(seedRaw)
-			newSeed := "sec_" + hex.EncodeToString(seedRaw)
-			tokRaw := make([]byte, 16)
-			_, _ = rand.Read(tokRaw)
-			newTok := hex.EncodeToString(tokRaw)
-
-			baseExp := now.AddDate(0, int(plan.DurationMonths), 0)
-			limitBytes := plan.TrafficBytes
-			if limitBytes <= 0 {
-				limitBytes = 100 * 1024 * 1024 * 1024
-			}
-			newSub := &Subscription{
-				SubID:         fmt.Sprintf("sub_%s", newSlug),
-				UserID:        uid,
-				UserUUID:      u.UUID,
-				SubSlug:       newSlug,
-				SubToken:      newTok,
-				SubTicketSeed: newSeed,
-				PlanName:      plan.Name,
-				AssignedNodes: nodesToSet,
-				LimitBytes:    limitBytes,
-				UsedBytes:     0,
-				ExpireAt:      baseExp,
-				Status:        true,
-				CreatedAt:     now,
-				UpdatedAt:     now,
-			}
-			_ = h.userStore.CreateSubscription(newSub)
-			targetSub = newSub
-
-			_ = h.userStore.UpdateUser(uid, UpdateUserParams{
-				PlanName:      &plan.Name,
-				PlanMonths:    &plan.DurationMonths,
-				PriceCents:    &plan.PriceCents,
-				AssignedNodes: &nodesToSet,
-				ExpireAt:      &baseExp,
-			})
-			if plan.TrafficBytes > 0 {
-				_ = h.userStore.UpdateTraffic(uid, -1, plan.TrafficBytes)
-			}
-		}
+	} else {
+		writeJSON(w, http.StatusNotFound, map[string]any{"code": 1001, "message": "user store unavailable"})
+		return
 	}
+
+	now := time.Now()
+	randBytes := make([]byte, 4)
+	if _, err := rand.Read(randBytes); err != nil {
+		binary.BigEndian.PutUint32(randBytes, uint32(now.UnixNano()))
+	}
+	orderNo := fmt.Sprintf("ORD-%s-%06d-%s",
+		now.Format("20060102150405"),
+		now.UnixMicro()%1000000,
+		hex.EncodeToString(randBytes))
+	nodesToSet := req.AssignedNodes
 
 	order := &Order{
 		OrderNo:       orderNo,
@@ -1472,47 +1702,60 @@ func (h *PayInHandler) Checkout(w http.ResponseWriter, r *http.Request) {
 		AssignedNodes: nodesToSet,
 		AmountCents:   plan.PriceCents,
 		PayChannel:    req.Channel,
-		Status:        "completed",
+		Status:        "pending",
 		CreatedAt:     now,
-		PaidAt:        &now,
 	}
 
 	if h.userStore != nil {
 		_ = h.userStore.CreateOrder(order)
 	}
 
-	if h.svc != nil {
-		_, _ = h.svc.CreateOrder(uid, req.Channel, plan.PriceCents)
-	}
+	var checkoutURL string
+	if h.reg != nil {
+		gw, gwErr := h.reg.Get(req.Channel)
+		if gwErr == nil && gw != nil {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				proto := "https"
+				if r.TLS == nil && !strings.HasPrefix(r.Header.Get("X-Forwarded-Proto"), "https") {
+					proto = "http"
+				}
+				origin = fmt.Sprintf("%s://%s", proto, r.Host)
+			}
+			successURL := fmt.Sprintf("%s/?payment=success&order_no=%s", origin, orderNo)
+			cancelURL := fmt.Sprintf("%s/?payment=cancel&order_no=%s", origin, orderNo)
 
-	if h.vpsSvc != nil && targetSub != nil {
-		go func(sub *Subscription) {
-			u, _ := h.userStore.GetUser(sub.UserID)
-			if u != nil && h.vpsSvc.eps != nil {
-				for _, ep := range h.vpsSvc.eps.List() {
-					if !ep.Installed || ep.Host == "" {
-						continue
-					}
-					matched := len(sub.AssignedNodes) == 0
-					for _, nodeName := range sub.AssignedNodes {
-						if ep.Name == nodeName || ep.Host == nodeName {
-							matched = true
-							break
-						}
-					}
-					if matched {
-						_ = h.vpsSvc.SyncUsersToEdge(ep.VPSID, []*User{u})
-					}
+			sessReq := CheckoutSessionReq{
+				OrderNo:     orderNo,
+				PlanID:      uint64(plan.ID),
+				PlanName:    plan.Name,
+				AmountCents: plan.PriceCents,
+				UserID:      uid,
+				UserEmail:   u.Email,
+				SuccessURL:  successURL,
+				CancelURL:   cancelURL,
+			}
+			if err := sessReq.ValidateAndNormalize(); err == nil {
+				sessResp, err := gw.CreateCheckout(r.Context(), sessReq)
+				if err == nil && sessResp != nil {
+					checkoutURL = sessResp.CheckoutURL
 				}
 			}
-		}(targetSub)
+		}
+	}
+
+	if checkoutURL == "" {
+		checkoutURL = fmt.Sprintf("/api/v1/payments/mock/checkout?order_no=%s&amount=%d&provider=%s", orderNo, plan.PriceCents, req.Channel)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"code": 0,
 		"data": map[string]any{
-			"order":   order,
-			"message": "支付与节点绑定已完成",
+			"order":        order,
+			"order_no":     orderNo,
+			"checkout_url": checkoutURL,
+			"status":       "pending",
+			"message":      "支付会话创建成功，正在跳转全球结算收银台...",
 		},
 	})
 }

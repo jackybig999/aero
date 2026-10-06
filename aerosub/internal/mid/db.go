@@ -1054,6 +1054,30 @@ func (a *AeroDB) ListOrders(userID uint64) ([]Order, error) {
 	return list, nil
 }
 
+func (a *AeroDB) GetOrderByOrderNo(orderNo string) (*Order, error) {
+	row := a.db.QueryRow(`SELECT order_no, user_id, plan_id, plan_name, assigned_nodes_json, amount_cents, pay_channel, status, created_at, paid_at FROM order_record WHERE order_no = ?`, orderNo)
+	var o Order
+	var nodesJSON string
+	var createdStr string
+	var paidStr sql.NullString
+	if err := row.Scan(&o.OrderNo, &o.UserID, &o.PlanID, &o.PlanName, &nodesJSON, &o.AmountCents, &o.PayChannel, &o.Status, &createdStr, &paidStr); err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(nodesJSON), &o.AssignedNodes)
+	if o.AssignedNodes == nil {
+		o.AssignedNodes = []string{}
+	}
+	if t, perr := time.Parse(time.RFC3339, createdStr); perr == nil {
+		o.CreatedAt = t
+	}
+	if paidStr.Valid && paidStr.String != "" {
+		if t, perr := time.Parse(time.RFC3339, paidStr.String); perr == nil {
+			o.PaidAt = &t
+		}
+	}
+	return &o, nil
+}
+
 func (a *AeroDB) UpdateOrderStatus(orderNo string, status string) error {
 	nowStr := time.Now().Format(time.RFC3339)
 	var paidStr *string

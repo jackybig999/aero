@@ -122,9 +122,10 @@ func InitDB(dbPath string) (*sql.DB, error) {
 	_, _ = db.Exec("PRAGMA busy_timeout = 5000;")
 	_, _ = db.Exec("PRAGMA synchronous = NORMAL;")
 
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
+	// 生产级单写者架构与无锁资源回收：单机 Pure-Go SQLite 数据库强制初始化 SetMaxOpenConns(1) 彻底消灭锁库 (PROJECT_RULES.md P18)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
 
 	if err := migrateSchema(db); err != nil {
 		db.Close()

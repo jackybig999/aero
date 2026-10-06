@@ -10,7 +10,19 @@
   let activeTab = 'subs';
   let cachedNodes = [];
   let cachedPlans = [];
+  let cachedChannels = [];
   let selectedPlanId = null;
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, s => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    })[s]);
+  }
 
   function init() {
     bindAuthEvents();
@@ -98,6 +110,18 @@
     if (topEl) topEl.textContent = uname;
     document.getElementById('userBadge').textContent = uname[0].toUpperCase();
     fetchUserFromDb();
+
+    // Check payment redirect parameters
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('payment') === 'success') {
+      showToast('🎉 支付成功！您的 AERO 专属订阅已自动生效与开通！', 'success');
+      window.history.replaceState({}, document.title, window.location.pathname);
+      activeTab = 'subs';
+    } else if (urlParams.get('payment') === 'cancel') {
+      showToast('支付已取消或已中断', 'info');
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+
     switchTab(activeTab);
   }
 
@@ -397,6 +421,10 @@
           cachedNodes = nResp.data || (Array.isArray(nResp) ? nResp : []);
         } catch (_) {}
       }
+      try {
+        const cResp = await apiRequest('/payments/in/channels/');
+        cachedChannels = cResp.data || (Array.isArray(cResp) ? cResp : []);
+      } catch (_) {}
       const resp = await apiRequest('/plans/');
       cachedPlans = resp.data?.results || (Array.isArray(resp.data) ? resp.data : (Array.isArray(resp) ? resp : []));
       renderPlans(cachedPlans);
@@ -419,8 +447,8 @@
       const isSelected = selectedPlanId === p.id;
       return `
         <div class="plan-card ${isSelected ? 'selected' : ''}" data-id="${p.id}" style="cursor:pointer">
-          <div style="font-weight:700;font-size:16px">${p.name}</div>
-          <div class="plan-price">¥ ${price}</div>
+          <div style="font-weight:700;font-size:16px">${escapeHtml(p.name)}</div>
+          <div class="plan-price">$ ${price} USD</div>
           <div style="font-size:12px;color:var(--muted)">有效期 ${p.duration_months || 1} 个月</div>
           <div style="font-size:12px;color:var(--muted)">流量: ${p.traffic_bytes && p.traffic_bytes > 0 ? (p.traffic_bytes / (1024*1024*1024)).toFixed(0) + ' GB' : '高速不限流量'}</div>
           <button class="btn ${isSelected ? 'btn-primary' : 'btn-ghost'}" style="margin-top:10px;pointer-events:none">
@@ -436,11 +464,11 @@
     if (hasLiveNodes) {
       nodeOptionsHtml = cachedNodes.map(n => {
         const addr = n.address || n.ip || '';
-        const regionTag = n.region ? `<span style="color:var(--blue);font-size:11px">· ${n.region}</span>` : '';
+        const regionTag = n.region ? `<span style="color:var(--blue);font-size:11px">· ${escapeHtml(n.region)}</span>` : '';
         return `
         <label style="display:inline-flex;align-items:center;gap:6px;padding:8px 14px;background:var(--bg);border:1px solid var(--line);border-radius:6px;font-size:12px;cursor:pointer">
-          <input type="checkbox" name="assignNode" value="${n.name || addr}" checked />
-          <b>${n.name || addr}</b> ${addr ? `<span style="color:var(--muted)">(${addr})</span>` : ''} ${regionTag}
+          <input type="checkbox" name="assignNode" value="${escapeHtml(n.name || addr)}" checked />
+          <b>${escapeHtml(n.name || addr)}</b> ${addr ? `<span style="color:var(--muted)">(${escapeHtml(addr)})</span>` : ''} ${regionTag}
         </label>
       `;
       }).join(' ');
@@ -450,11 +478,22 @@
 
     const priceFormatted = selectedPlan ? ((selectedPlan.price_cents || 0) / 100).toFixed(2) : '0.00';
 
+    const channels = (cachedChannels && cachedChannels.length > 0) ? cachedChannels : [
+      { channel: 'creem', name: '国际信用卡 / Apple Pay (极速通道 - 推荐)', icon: 'card', enabled: true },
+      { channel: 'lemonsqueezy', name: 'PayPal / 全球信用卡 (保障通道)', icon: 'paypal', enabled: true }
+    ];
+    let channelOptionsHtml = channels.filter(c => c.enabled).map((c, idx) => `
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="radio" name="payChannel" value="${escapeHtml(c.channel)}" ${idx === 0 ? 'checked' : ''} />
+        ${c.icon === 'paypal' ? '🅿️' : '💳'} ${escapeHtml(c.name || c.display_name || c.channel)}
+      </label>
+    `).join(' ');
+
     const checkoutHtml = `
       <div class="card" style="margin-top:20px;grid-column:1 / -1">
         <div class="card-header">
           <span class="card-title">🚀 套餐开通与边缘节点调度</span>
-          <span class="tag tag-blue">${selectedPlan ? selectedPlan.name : '选择套餐'}</span>
+          <span class="tag tag-blue">${selectedPlan ? escapeHtml(selectedPlan.name) : '选择套餐'}</span>
         </div>
         <div style="font-size:12px;color:var(--muted);margin-bottom:16px">
           所选节点将自动从中台节点库授权生成专属 AERO 订阅凭证，开通后即刻生效。
@@ -481,20 +520,15 @@
         </div>
 
         <div style="margin-bottom:18px">
-          <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px">支付结转通道:</label>
-          <div style="display:flex;gap:16px">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
-              <input type="radio" name="payChannel" value="alipay" checked /> 支付宝结转 (在线直通)
-            </label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
-              <input type="radio" name="payChannel" value="wechat" /> 微信支付
-            </label>
+          <label style="font-size:12px;color:var(--muted);display:block;margin-bottom:6px">全球结转收银通道 (MoR 托管合规):</label>
+          <div style="display:flex;gap:16px;flex-wrap:wrap">
+            ${channelOptionsHtml}
           </div>
         </div>
 
         <div style="display:flex;align-items:center;gap:16px;border-top:1px solid var(--line);padding-top:16px">
           <button class="btn btn-primary" id="btnConfirmCheckout" ${!hasLiveNodes ? 'disabled style="opacity:0.5;cursor:not-allowed"' : ''} style="padding:10px 24px;font-size:14px;font-weight:600">
-            ${!hasLiveNodes ? '暂无可接入节点 (无法订购)' : `立即开通并绑定节点 (实付: ¥ ${priceFormatted})`}
+            ${!hasLiveNodes ? '暂无可接入节点 (无法订购)' : `立即开通并绑定节点 (实付: $ ${priceFormatted} USD)`}
           </button>
           <span id="checkoutMsg" style="font-size:12px;color:var(--red)">${!hasLiveNodes ? '⚠️ 当前中台尚未上线可用边缘节点，请等待节点就绪后再订购' : ''}</span>
         </div>
@@ -518,9 +552,9 @@
           return;
         }
         btnCheckout.disabled = true;
-        btnCheckout.innerText = '正在开通并同步节点...';
+        btnCheckout.innerText = '正在创建支付会话...';
 
-        const channel = document.querySelector('input[name="payChannel"]:checked')?.value || 'alipay';
+        const channel = document.querySelector('input[name="payChannel"]:checked')?.value || 'creem';
         const allocMode = document.querySelector('input[name="nodeAllocMode"]:checked')?.value || 'auto';
         let assignedNodes = [];
         if (allocMode === 'manual') {
@@ -538,13 +572,21 @@
               assigned_nodes: assignedNodes
             })
           });
-          showToast('套餐开通成功！专属订阅已生成', 'success');
-          const subBtn = document.querySelector('.menu-item[data-tab="subs"]');
-          if (subBtn) subBtn.click();
+          const checkoutUrl = resp.data?.checkout_url;
+          if (checkoutUrl) {
+            showToast('支付会话创建成功，正在跳转收银台...', 'info');
+            setTimeout(() => {
+              window.location.href = checkoutUrl;
+            }, 500);
+          } else {
+            showToast('套餐开通成功！专属订阅已生成', 'success');
+            const subBtn = document.querySelector('.menu-item[data-tab="subs"]');
+            if (subBtn) subBtn.click();
+          }
         } catch (err) {
           showToast('开通失败: ' + err.message, 'error');
           btnCheckout.disabled = false;
-          btnCheckout.innerText = `立即开通并绑定节点 (实付: ¥ ${priceFormatted})`;
+          btnCheckout.innerText = `立即开通并绑定节点 (实付: $ ${priceFormatted} USD)`;
         }
       });
     }
@@ -563,11 +605,11 @@
       }
       tbody.innerHTML = orders.map((o) => `
         <tr>
-          <td><span style="font-family:monospace">${o.order_no || o.id}</span></td>
-          <td>${o.plan_name || '订阅套餐'}</td>
-          <td><b>¥ ${((o.amount_cents || 0)/100).toFixed(2)}</b></td>
-          <td><span class="tag ${o.status === 'PAID' ? 'tag-green' : 'tag-muted'}">${o.status || '未支付'}</span></td>
-          <td>${o.created_at || '-'}</td>
+          <td><span style="font-family:monospace">${escapeHtml(o.order_no || o.id)}</span></td>
+          <td>${escapeHtml(o.plan_name || '订阅套餐')}</td>
+          <td><b>$ ${((o.amount_cents || 0)/100).toFixed(2)} USD</b></td>
+          <td><span class="tag ${o.status === 'completed' || o.status === 'PAID' ? 'tag-green' : 'tag-muted'}">${escapeHtml(o.status || '未支付')}</span></td>
+          <td>${escapeHtml(o.created_at || '-')}</td>
         </tr>
       `).join('');
     } catch (err) {

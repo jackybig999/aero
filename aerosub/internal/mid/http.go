@@ -20,14 +20,29 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// safeGo launches a background goroutine protected by recover() against panics,
+// fulfilling GLOBAL MASTER RULES v1.4.0 and Level 1 Rule 8.
+func safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC RECOVER] goroutine %s panicked: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
+}
 
 // ============================================================================
 // Shared HTTP JSON Serialization Helpers
@@ -48,6 +63,16 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 // errResp produces standard code/message error maps.
 func errResp(code int, msg string) map[string]any {
 	return map[string]any{"code": code, "message": msg}
+}
+
+// decodeStrictJSON decodes request JSON body and disallows unknown fields per PROJECT_RULES.md P19.
+func decodeStrictJSON(r *http.Request, dst any) error {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return fmt.Errorf("strict decode: %w", err)
+	}
+	return nil
 }
 
 // ============================================================================
@@ -129,13 +154,19 @@ func isPublicAPI(method, path string) bool {
 	if method == http.MethodGet && path == "/api/v1/plans/" {
 		return true
 	}
-	if method == http.MethodGet && path == "/api/v1/payments/in/channels/" {
+	if method == http.MethodGet && (path == "/api/v1/payments/in/channels/" || path == "/api/v1/payments/in/channels") {
 		return true
 	}
 	if method == http.MethodGet && (path == "/api/v1/nodes/" || path == "/api/v1/nodes/available/") {
 		return true
 	}
 	if method == http.MethodPost && strings.HasPrefix(path, "/api/v1/nodes/") && strings.HasSuffix(path, "/heartbeat/") {
+		return true
+	}
+	if method == http.MethodPost && strings.HasPrefix(path, "/api/v1/webhooks/") {
+		return true
+	}
+	if strings.HasPrefix(path, "/api/v1/payments/mock/") {
 		return true
 	}
 	return false

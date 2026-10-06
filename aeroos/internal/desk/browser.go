@@ -528,18 +528,22 @@ func LaunchChrome(chromePath, dataDir string, profileID int64, proxyCfg *ProxyCo
 	activeInstances[profileID] = inst
 	activeInstancesMu.Unlock()
 
-	// 方案双轨保障 (b): 若 CDP 端口就绪，调用 CDP 方法 Page.addScriptToEvaluateOnNewDocument 注册注入
+	// 方案双轨保障 (b): 若 CDP 端口就绪，调用 CDP 方法 Page.addScriptToEvaluateOnNewDocument 注册注入并下发时区覆写
 	if fpScript != "" {
-		go func() {
+		tz := ""
+		if fpCfg != nil {
+			tz = fpCfg.Timezone
+		}
+		go func(targetTz string) {
 			if err := inst.CheckCDPReady(4 * time.Second); err == nil {
 				for retry := 0; retry < 3; retry++ {
-					if err := RegisterCDPFingerprintScript(inst.CDPPort, fpScript); err == nil {
+					if err := RegisterCDPFingerprintScript(inst.CDPPort, fpScript, targetTz); err == nil {
 						break
 					}
 					time.Sleep(200 * time.Millisecond)
 				}
 			}
-		}()
+		}(tz)
 	}
 
 	go func() {
@@ -936,8 +940,8 @@ func BuildChromeFingerprintExtension(targetDir string, jsCode string) error {
 	return nil
 }
 
-// RegisterCDPFingerprintScript 通过 CDP 接口调用 Page.addScriptToEvaluateOnNewDocument 注入指纹对抗代码
-func RegisterCDPFingerprintScript(cdpPort int, script string) error {
+// RegisterCDPFingerprintScript 通过 CDP 接口调用 Page.addScriptToEvaluateOnNewDocument 注入指纹对抗代码并设置底层时区覆写
+func RegisterCDPFingerprintScript(cdpPort int, script string, timezone ...string) error {
 	client := &http.Client{Timeout: 1500 * time.Millisecond}
 	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json", cdpPort))
 	if err != nil {
@@ -953,11 +957,16 @@ func RegisterCDPFingerprintScript(cdpPort int, script string) error {
 		return err
 	}
 
+	tz := ""
+	if len(timezone) > 0 && timezone[0] != "" {
+		tz = timezone[0]
+	}
+
 	var lastErr error
 	injected := false
 	for _, target := range targets {
 		if (target.Type == "page" || target.Type == "other") && target.WebSocketDebuggerURL != "" {
-			if err := sendCDPAddScript(target.WebSocketDebuggerURL, script); err != nil {
+			if err := sendCDPAddScript(target.WebSocketDebuggerURL, script, tz); err != nil {
 				lastErr = err
 			} else {
 				injected = true
@@ -970,7 +979,7 @@ func RegisterCDPFingerprintScript(cdpPort int, script string) error {
 	return nil
 }
 
-func sendCDPAddScript(wsURL, script string) error {
+func sendCDPAddScript(wsURL, script string, timezone ...string) error {
 	ws, err := websocket.Dial(wsURL, "", "http://127.0.0.1")
 	if err != nil {
 		return err
@@ -1002,6 +1011,21 @@ func sendCDPAddScript(wsURL, script string) error {
 
 	_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 	_ = json.NewDecoder(ws).Decode(&dummy)
+
+	// 下发底层 CDP 时区覆写 (解决 Windows Chromium 忽略 TZ 环境变量缺陷)
+	if len(timezone) > 0 && timezone[0] != "" {
+		tzReq := map[string]interface{}{
+			"id":     3,
+			"method": "Emulation.setTimezoneOverride",
+			"params": map[string]interface{}{
+				"timezoneId": timezone[0],
+			},
+		}
+		if err := json.NewEncoder(ws).Encode(tzReq); err == nil {
+			_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			_ = json.NewDecoder(ws).Decode(&dummy)
+		}
+	}
 
 	return nil
 }

@@ -1,21 +1,24 @@
 # AERO 项目研发与执行准则 (PROJECT_RULES.md)
 
-> **Version**: 2.2.0-hardened (Aligned with GLOBAL MASTER RULES v1.0.0 & Universal Pre-Flight Protocol)  
-> **Last-Updated**: 2026-10-02  
+> **Version**: 2.3.0-hardened (Aligned with GLOBAL MASTER RULES v1.0.0 & §0.6 Project Profile)  
+> **Last-Updated**: 2026-10-05  
 > **Maintainer**: Jacky  
-> **Language-Stack**: Go 1.24+ (Solidified, per GLOBAL MASTER RULES §1.3)  
+> **Language-Stack**: Go 1.26+ (Solidified, per GLOBAL MASTER RULES v1.0.0 §1.1)  
 > **Repository-Module**: `module github.com/aero-protocol/aero`  
+> **Engineering-Profile**: `engineering-profile.yaml` (Service, SQLite, Inbound, In-Process, Embedded, Multi-Tenant)  
 
 ---
 
 ## 语言选型固化 (Solidified Tech Stack) `[REVIEW]`
-- **核心语言**: Go 1.24+ 标准工程，单模块单一代码树。
-- **选型锁定状态**: 已固化锁定为 **Go**（Go 1.24+），后续会话自动继承，禁止反复询问，不可擅自切换至 Rust 或其他语言。
+- **核心语言**: Go 1.26+ 标准工程，单模块单一代码树。
+- **选型锁定状态**: 已固化锁定为 **Go**（Go 1.26+，`go.mod` 声明 `go 1.26.0`），后续会话自动继承，禁止反复询问，不可擅自切换至 Rust 或其他语言。
 
 ---
 
 ## 第一部分：全局底座准则继承说明
-本项目无条件继承 `GLOBAL MASTER RULES v1.0.0` 的全部规范（涵盖 §0 规范性约定、§1 技术栈准入与前端零信任、§2 目录结构、§3 构建产物隔离与三路径模型、§4 跨进程与跨子系统解耦契约、§5 API 兼容性、§6 数据所有权与数据库加固、§7 契约驱动前后端联动、§8 研发流程闭环、§9 测试规范、§10 CI/CD 卡点、§11 依赖管理、§12 日志与可观测性、§13 错误处理与异步安全、§14 运行时验证、§15 发布回滚、§16 稳定性工程、§17 资源效率预算、§18 豁免与审核）。
+遵循 §0.5 规则层级结构（L0 全局底座 `GLOBAL_ENGINEERING_RULES.md` -> L1 项目特化 `PROJECT_RULES.md` -> L2 代理手册 `AGENTS.md` / `GEMINI.md` -> 剖面 `engineering-profile.yaml`）。
+本项目无条件继承 `GLOBAL MASTER RULES v1.0.0` 的全部规范（涵盖 §0 规范性约定、§1 技术栈准入与前端零信任、§2 目录结构、§3 构建产物隔离与三路径模型、§4 跨进程与跨子系统解耦契约、§5 API 兼容性、§6 数据所有权与数据库加固、§7 契约驱动前后端联动、§8 研发流程闭环、§9 测试规范、§10 CI/CD 卡点、§11 依赖与安全管理、§12 日志与可观测性、§13 错误处理与异步安全、§14 运行时验证、§15 跨环境与配置、§16 发布回滚、§17 变更说明、§18 豁免与审核、§19 稳定性工程、§20 资源效率预算、§21 分布式与并发状态、§22 监控与应急、§23 AI 协作边界、§24 遗留代码治理、§25 文档规范、§26 轮值与交接、§27 供应链安全、§28 移动端/跨平台、§29 Go 语言特化反模式禁令、§30 Rust 语言特化反模式禁令、§31 提交与审查规范、§32 并发模型、§33 任务与变更颗粒度）。
+项目特化规则仅对 AERO 专有网络协议、数据面架构、专属业务参数及本地环境做细化或收紧，**MUST NOT** 削弱全局底座任何条款（§18.1）。
 
 ---
 
@@ -128,7 +131,7 @@
 
 > 本部分沉淀自本项目多轮严格工程审计与实战复盘，适用于 AERO 全仓及任何追求工业级高可靠交付的工程项目。所有开发人员与自动代理必须无条件遵循。
 
-### U1. 交付预检与 Git 索引对齐准则 (Pre-Flight Git Alignment Gate) `[CI/RELEASE]`
+### U1. 交付预检与 Git 索引对齐准则 (Pre-Flight Git Alignment Gate) `[CI]`
 * **根因警示**：本地工作区物理文件的存在极易造成“本地测试通过 = 可以发布”的虚假安全感。若新增源码、单元测试或 `//go:embed` 静态资产未纳入 Git 追踪（处于 `??` 状态），一旦推送到远端或由 CI/VPS 克隆构建，将立即引发严重的 `undefined symbol` 或 `pattern no matching files` 编译崩溃事故。
 * **执行红线 (MUST)**：
   1. **零未跟踪红线 (Zero Untracked Files)**：
@@ -160,7 +163,7 @@
      - **缓存与运行时零污染**：开发态和调试态的临时缓存文件（如 `.last-sub-body`、动态规则临时文件、临时日志）一律强制限制在 `tmp/` 内部生成；
      - **源码神圣不可侵犯**：源码目录与根目录除升级、维护、修复 bug 显式修改源码与必要工程配置文件外，严禁写入、衍生或残留任何垃圾文件，违者视为严重工程违规。
 
-### U3. 可逆操作与安全备份契约 (Non-Destructive Operations & Rollback Contract) `[OPS]`
+### U3. 可逆操作与安全备份契约 (Non-Destructive Operations & Rollback Contract) `[LOCAL]`
 * **根因警示**：在环境整治、垃圾清理或重构瘦身时，直接使用不可逆的硬删除（如 `rm -rf` / `Remove-Item`）极其容易导致误删有用文件且无法自证与恢复。
 * **执行红线 (MUST)**：
   1. **备份优先，严禁直接硬删除 (Archive Before Clean)**：
@@ -171,7 +174,7 @@
   3. **依赖白名单前置排查 (Preservation Whitelist)**：
      - 执行清理前必须对全仓代码进行静态扫描（检索 `//go:embed` 路径、驱动文件、配置文件等），凡被代码显式引用的文件绝对列入保护白名单，严禁过度清理。
 
-### U4. 高可靠网络与数据面对抗工程模式 (Advanced Data-Plane & Network Defense Patterns) `[ARCH]`
+### U4. 高可靠网络与数据面对抗工程模式 (Advanced Data-Plane & Network Defense Patterns) `[CI]`
 * **架构模式萃取 (MUST)**：
   1. **反 DPI 包长密码学动态抖动 (Anti-DPI Cryptographic Jitter)**：
      - 传输层（QUIC/TLS）握手包长严禁硬编码固定数值（如固定 1350 会暴露极其明显的静态流量指纹）；
@@ -197,9 +200,7 @@
   7. **生产环境强证书阻断 (Production Zero Self-Signed Cert)**：
      - 边缘节点生产模式严禁降级使用自签名 TLS 证书（防止中间人探测与审查嗅探）；自签证书逻辑仅允许在单元测试配置中显式声明开启（`AllowSelfSignedCertForTest: true`），生产启动若缺少合法证书必须硬拒绝启动。
 
-
-
-### U5. 反假大空与真实交付铁律 (Zero-Hype & Reality-First Protocol) `[CORE]`
+### U5. 反假大空与真实交付铁律 (Zero-Hype & Reality-First Protocol) `[REVIEW]`
 * **准则背景**：杜绝盲目自信与浮躁心态，禁止以局部单元测试全绿掩盖跨系统、跨网络真实运行态缺陷。
 * **执行红线 (MUST)**：
   1. **绝对词汇禁令 (Banned Vocabulary)**：严禁在思考、汇报、总结、提交信息中使用“完美”、“工业级终极”、“无可挑剔”、“彻底搞定”等任何夸大、浮躁、情绪化的词汇。所有技术汇报只能陈述：输入参数、输出结果、真实网络用例、具体缺陷、修改行数。
@@ -207,7 +208,7 @@
   3. **数据链路必须逐行 5 步穿透追踪 (Mandatory 5-Step Traceability)**：修改或审查任何配置或字段，必须严格走完完整数据链路：`生成端构造 -> 网络 JSON 序列化 -> 接收端结构体反序列化 -> 业务引擎字段提取 -> 最终系统调用`，严禁只在单个文件中确认函数存在就妄下结论。
   4. **每次执行前置审视自省 (Mandatory Pre-Execution Check)**：每次对话和每次执行前，主代理必须强制自检本条铁律，确保杜绝假大空。
 
-### U6. 权威线缆契约与零遗漏零空值工程防线 (Wire-Contract-First & Zero-Omission Protocol) `[CORE/CI]`
+### U6. 权威线缆契约与零遗漏零空值工程防线 (Wire-Contract-First & Zero-Omission Protocol) `[CI]`
 * **准则背景**：汲取 Google gRPC、Tailscale、Cloudflare 工业级系统实践，消除 Go `encoding/json` 默认静默丢弃未匹配 key 和空字符零值漂移的顽疾。
 * **执行红线 (MUST)**：
   1. **防线一：真实线路字节串优先测试 (Wire-Contract-First Testing)**：
@@ -222,36 +223,36 @@
      - 针对 Windows GUI 客户端交付产物，所有 CI 编译与自动化构建脚本必须强制注入 `-ldflags="-H windowsgui -s -w"`；
      - 必须通过自动化单测（使用标准库 `debug/pe` 读取 OptionalHeader）断言 `Subsystem == 2`（`IMAGE_SUBSYSTEM_WINDOWS_GUI`），任何带有控制台黑框（Subsystem 3）的二进制产物在构建测试阶段直接熔断拦截。
 
-### U7. 零静默吞咽与强输入校验门禁 (Zero-Silent-Failure & Strict Input Validation Gate) `[CORE/CI]`
+### U7. 零静默吞咽与强输入校验门禁 (Zero-Silent-Failure & Strict Input Validation Gate) `[CI]`
 * **准则背景**：彻底消灭由于 `_ = json.NewDecoder(r.Body).Decode(&req)` 或 `_ = json.Unmarshal` 导致畸形或空请求体被静默吞咽、底层携带空值盲目执行的高危隐患。
 * **执行红线 (MUST)**：
   1. **输入反序列化必须捕获错误**：全仓 HTTP 处理函数凡涉及 JSON 解码，必须做显式 `err != nil` 校验；发生错误立即阻断并响应 `http.StatusBadRequest` (400) 及详细 JSON 错误提示，严禁进入业务逻辑。
   2. **数值类型严格防御**：跨系统时延、计数、时间戳字段必须使用有符号整数（如 `int64`），绝对严禁声明为 `uint32`，防止网络断开时返回 `-1` 导致 Go 反序列化崩溃。
   3. **显式错误链路追踪**：内部函数所有错误向上返回时必须使用 `fmt.Errorf("context: %w", err)`，保证错误链条完整，杜绝裸错误返回或直接置空。
 
-### U8. 路由探活与健康检查双向对齐 (Bi-Directional API Routing & Healthcheck Alignment) `[CORE]`
+### U8. 路由探活与健康检查双向对齐 (Bi-Directional API Routing & Healthcheck Alignment) `[CI]`
 * **准则背景**：彻底解决跨组件探活因路径细微差异（如 `/health` 与 `/healthz`）引发的 404 误判及启动假死。
 * **执行红线 (MUST)**：
   1. **服务端双路由兼容**：所有后台进程（客户端守护进程、边缘节点、商业中台）必须同时挂载 `/healthz`（云原生探活标准）与 `/health`（桌面与第三方适配别名）。
   2. **调用端双向容错回退**：桌面工作台或健康探测器发起探活时，优先请求 `/healthz`，若遇异常自动回退探测 `/health`，杜绝单点路径阻断。
 
-### U9. 跨 VPN/TUN 冲突物理隔离与真实网卡回退 (Cross-VPN Anti-Conflict & Physical Egress) `[CORE]`
+### U9. 跨 VPN/TUN 冲突物理隔离与真实网卡回退 (Cross-VPN Anti-Conflict & Physical Egress) `[CI]`
 * **准则背景**：解决多代理（如用户同时开启 Clash TUN 模式）并存时的网络路由抢占、DNS 污染与回环死锁灾难。
 * **执行红线 (MUST)**：
   1. **宿主 DNS 策略隔离 (NRPT)**：Windows 平台绝对禁止直接篡改宿主物理网卡的系统 DNS，统一采用带有专属标识（`AERO_aero0`）的 Windows NRPT 专用策略；客户端退出时精准清理，不干扰其他 TUN 软件。
   2. **底层探活与订阅拉取物理逃逸**：客户端向中台拉取订阅或进行边缘节点探活时，拨号器必须绑定宿主机物理网卡真实出站 IP/接口，跳过虚拟 TUN 回环，确保在任何第三方 VPN 开启时均能正常拉取订阅和测速。
 
-### U10. 生产级单写者架构与无锁资源回收 (Single-Writer SQLite & Lock-Free Reaping) `[CORE]`
+### U10. 生产级单写者架构与无锁资源回收 (Single-Writer SQLite & Lock-Free Reaping) `[CI]`
 * **准则背景**：彻底消除高并发写导致的 `database is locked (5)` 崩溃及锁内关闭套接字引发的死锁。
 * **执行红线 (MUST)**：
   1. **SQLite 单写者连接池固化**：所有单机 Pure-Go SQLite 数据库启动时必须显式调用 `db.SetMaxOpenConns(1)`。
   2. **连接回收无锁解耦**：清理闲置网络会话（如 UDP 上下文、过期 Session）必须严格遵循“读锁快照收集 -> 释放锁 -> 锁外安全异步关闭”的标准流水线，严禁在临界区内执行阻塞式 I/O。
 
-### U11. 遗漏字段、空值、隐藏边界与盲区深层防范机制 (Deep Defense against Missing Fields, Nil/Zero Values & Boundary Blindspots) `[CORE/CI]`
+### U11. 遗漏字段、空值、隐藏边界与盲区深层防范机制 (Deep Defense against Missing Fields, Nil/Zero Values & Boundary Blindspots) `[CI]`
 * **准则背景**：系统性攻克“序列化未知字段静默丢弃”、“必填字段与零值二义性混淆”、“命名风格漂移致空”、“孤儿协程泄漏死锁”以及“宿主网络状态残留”五大深水区盲疾，实现全链路纵深防御。
 * **执行红线 (MUST)**：
   1. **未知字段严苛拦截 (DisallowUnknownFields Gate)**：
-     - 在关键内部管控接口（如 `/admin/subs`、`/admin/metering` 等）的反序列化逻辑中，显式启用 `decoder.DisallowUnknownFields()`；
+     - 在关键内部管控接口（如 `/admin/subs`、`/admin/metering` 等）的反序列化逻辑中，显式启用 `decoder.DisallowUnknownFields()`（符合 §7.7 严格模式接口例外：公共订阅与前向兼容接口保持向后兼容弹性，仅在专有内部严格管控接口开启，防止配置拼写静默失效）；
      - 凡出现任何拼写笔误（如 `alt_port` 漏写 `s`）或冗余非法 key，必须直接阻断并返回 HTTP 400，杜绝配置静默失效。
   2. **必填不变量断言与指针可空区分 (Required Invariants & Pointer-Nullable Distinction)**：
      - 凡跨进程或跨子系统 DTO，必须在 `ValidateAndNormalize()` 中对必填字段进行硬性校验（如 `Token == ""`、`Address == ""` 直接抛错）；
@@ -267,7 +268,7 @@
      - Windows 客户端编译固化 `-ldflags="-H windowsgui -s -w"` 并由 CI 通过标准库 `debug/pe` 机器断言 `Subsystem == 2`，从物理上杜绝控制台 CMD 窗口弹出；
      - 独立看门狗守护进程（`guard.exe`）以客户端 PID 为锚点进行操作系统级监听，无论客户端正常退出或被系统强杀，均自动执行精准清理专属标识（`AERO_aero0`）的 NRPT 策略与路由，彻底保障宿主网络自愈。
 
-### U12. 零本地宿主订阅与标准 443 协议发布死线 (Zero-Localhost Subscription & Standard 443 HTTPS Mandate) `[CORE/DELIVERY]`
+### U12. 零本地宿主订阅与标准 443 协议发布死线 (Zero-Localhost Subscription & Standard 443 HTTPS Mandate) `[REVIEW]`
 * **准则背景**：彻底杜绝 AI 助手与开发人员混淆“本地管理平面”与“线上订阅分发平面”，坚决消灭将本地宿主机端口（如 `:18080`、`:8080`）当作订阅链接向外暴露的严重违规行为。
 * **执行红线 (MUST)**：
   1. **本地商业中台定位绝对锁死**：本地启动的商业中台（`127.0.0.1:18080` / `localhost:18080`）严格仅作为运维管理面板（Dashboard）与本地服务编排器，只提供后台管理、健康检查（`/healthz`）与内部 API 处理，自身绝非用户消费订阅的端点。
@@ -275,7 +276,7 @@
   3. **标准 443 唯一合法性**：生产与测试订阅链接必须且只能通过已配置有效证书的公网标准 443 HTTPS 域名进行下发（`https://<domain>/sub/superadmin` 或 `https://<domain>/sub/<username><6位随机码>`）。
   4. **前置回复自查过滤**：在每次向用户输出测试地址或接口列表时，必须前置过滤，严禁把中台本地地址与订阅链接拼装在一起；若要提供订阅测试指南，必须明确指引用户通过生产绑定的公网标准 HTTPS 443 域名进行测试。
 
-### U13. 持续版本自增、历史版本绝对保留与变更摘要发布铁律 (Continuous Versioning, Release Archive & Changelog Law) `[RELEASE/CORE]`
+### U13. 持续版本自增、历史版本绝对保留与变更摘要发布铁律 (Continuous Versioning, Release Archive & Changelog Law) `[CI]`
 * **准则背景**：杜绝开发与发布过程中“改了代码不升版本”、“覆盖老版本导致无法比对与回滚”、“发版无更新摘要”等低级发布故障，建立标准化发布生命周期管理。
 * **执行红线 (MUST)**：
   1. **改动必自增版本号 (Strict Version Bump)**：任何涉及协议改动、安全加固、Bug 修复、特性增加或配置调整的工程提交，在推送发布前**必须显式递增 `VERSION` 文件的版本号**（Patch/Minor/Major），严禁沿用旧版本号进行重复提交或静默覆盖。

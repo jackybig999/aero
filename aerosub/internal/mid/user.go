@@ -324,6 +324,7 @@ type UserStore interface {
 	UpdateSubSlug(id uint64, slug string) error
 	Renew(id uint64, planName string, months int32, priceCents int64) (*User, error)
 	CreateOrder(order *Order) error
+	GetOrderByOrderNo(orderNo string) (*Order, error)
 	ListOrders(userID uint64) ([]Order, error)
 	UpdateOrderStatus(orderNo string, status string) error
 	GetTraffic(id uint64) (*TrafficStats, error)
@@ -678,6 +679,17 @@ func (s *FileUserStore) CreateOrder(order *Order) error {
 	s.orders[order.OrderNo] = order
 	s.mu.Unlock()
 	return s.save()
+}
+
+func (s *FileUserStore) GetOrderByOrderNo(orderNo string) (*Order, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	o, ok := s.orders[orderNo]
+	if !ok {
+		return nil, errors.New("order not found")
+	}
+	cp := *o
+	return &cp, nil
 }
 
 func (s *FileUserStore) ListOrders(userID uint64) ([]Order, error) {
@@ -1065,6 +1077,17 @@ func (m *MemoryUserStore) CreateOrder(order *Order) error {
 	defer m.mu.Unlock()
 	m.orders[order.OrderNo] = order
 	return nil
+}
+
+func (m *MemoryUserStore) GetOrderByOrderNo(orderNo string) (*Order, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	o, ok := m.orders[orderNo]
+	if !ok {
+		return nil, errors.New("order not found")
+	}
+	cp := *o
+	return &cp, nil
 }
 
 func (m *MemoryUserStore) ListOrders(userID uint64) ([]Order, error) {

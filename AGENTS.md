@@ -1,8 +1,8 @@
 # AERO Subagent & Tool Operational Guidelines (AGENTS.md)
 
-All subagents and background tools working on this codebase must strictly follow [PROJECT_RULES.md](file:///D:/jacky/gemini/aisysnew/PROJECT_RULES.md) (aligned with GLOBAL MASTER RULES v1.0.0 and newplan.md):
+All subagents and background tools working on this codebase must strictly follow [PROJECT_RULES.md](file:///D:/jacky/gemini/AIsys/PROJECT_RULES.md) (aligned with GLOBAL MASTER RULES v1.0.0 and engineering-profile.yaml):
 
-1. **Go Only (Solidified)**: Production code must be standard Go 1.24+ single module (`github.com/aero-protocol/aero`) flat layout. Frontends are native HTML5/CSS/JS embedded in Go binaries without `node_modules` (gzip < 150KB, 0 runtime deps).
+1. **Go Only (Solidified)**: Production code must be standard Go 1.26+ single module (`github.com/aero-protocol/aero`) flat layout per GLOBAL MASTER RULES v1.0.0 §1.1. Frontends are native HTML5/CSS/JS embedded in Go binaries without `node_modules` (gzip < 150KB, 0 runtime deps).
 2. **Frontend Zero-Trust**: Frontend holds no business facts, secrets, tokens, or pricing constants. All state is authoritatively computed and validated by the backend.
 3. **Directory Conventions & Flat 3-Tier Layout**: `cmd/<bin>/main.go` for thin entries, `internal/<pkg>/` for packages. Ban on vague container directories (`common/`, `utils/`, `core/`, `domain/`, `infra/`, `service/`).
 4. **Zero Cross-System Imports**: `internal/client`, `internal/edge`, `internal/mid`, `internal/desk` must NOT import each other in Go code! Shared boundaries are strictly limited to HTTP REST /admin/subs, subscription JSON aero/3.0, and local 127.0.0.1:19877.
@@ -20,7 +20,7 @@ All subagents and background tools working on this codebase must strictly follow
 11. **Native AERO Sub Only & Zero-Port URL Mandate**: Strict ban on third-party formats. Only `https://domain.com/sub/superadmin` and `https://domain.com/sub/username{六位随机码}` via standard 443 HTTPS. 绝对严禁输出任何形如 localhost:18080 或携带端口的订阅链接！
 12. **Pre-Flight Git Alignment & Zero Untracked**: Before any commit/push, `git status --porcelain` must have 0 untracked files (`??` == 0) and 0 unstaged deletions. All new files and embeds must be staged.
 13. **Non-Destructive Cleanup & Rollback Contract**: No hard `rm -rf`. All cleanup must archive to gitignored `backup/` + external mirror, accompanied by `BACKUP_MANIFEST.md` and executable rollback script.
-14. **Dedicated Tmp Sandbox & Zero Source Pollution**: `D:\jacky\gemini\AIsysnew\tmp` is the sole authorized local sandbox for all tests, build artifacts (`-o tmp/...`), and runtime caches. Writing, dropping, or generating any temporary file in source directories is strictly prohibited.
+14. **Dedicated Tmp Sandbox & Zero Source Pollution**: `D:\jacky\gemini\AIsys\tmp` is the sole authorized local sandbox for all tests, build artifacts (`-o tmp/...`), and runtime caches. Writing, dropping, or generating any temporary file in source directories is strictly prohibited.
 15. **反假大空与真实交付铁律**: 绝对禁止使用“完美”、“终极”等浮夸词汇；禁止以单测全绿替代真实可用；严格执行数据链路逐行 5 步穿透追踪；每次执行前主代理与子代理必须强制自检，杜绝字段丢弃与空值盲目上线。
 16. **权威线缆契约与零遗漏零空值工程防线**: 跨系统结构体测试强制采用原始 JSON 报文字符流（Wire-Contract-First，如 `TestWireContract_Strict`），禁止纯内存 struct mock；反序列化后强制执行 `ValidateAndNormalize()` 契约归一化，自动回填物理 IP 与备用跳频端口；跨边界 JSON 结构体强制实现双驼峰/下划线兼容（`snake_case` 与 `camelCase`）；Windows GUI 客户端构建必须固化 `-H windowsgui` 并通过标准库 `debug/pe` 门禁（`TestClientSubsystem`）断言 `Subsystem == 2`。
 17. **零静默吞咽与强输入校验门禁**: 全仓 HTTP 接口反序列化严禁 `_ = json.NewDecoder...`，一旦解码失败必须直接返回 400 Bad Request；时延等数值字段强制声明为有符号 `int64`，绝对严禁使用 `uint32` 防止负值崩溃；错误传递统一采用 `fmt.Errorf("%w", err)` 保留上下文。

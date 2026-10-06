@@ -119,6 +119,16 @@ func TestBandwidthLimiter(t *testing.T) {
 	if time.Since(start) > 100*time.Millisecond {
 		t.Fatal("take within burst should not sleep significantly")
 	}
+
+	// TakeContext with canceled context on large byte count should exit immediately
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	// exhaust burst first
+	bl.Take("user_exhaust", 20000)
+	err := bl.TakeContext(ctx, "user_exhaust", 50000)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
 }
 
 func TestDialGuardBlockedTargets(t *testing.T) {

@@ -191,7 +191,7 @@ jobs:
 
       - name: Resolve Release Tag and Version
         run: |
-          VER=$(cat VERSION 2>/dev/null || echo "1.0.6")
+          VER=$(cat VERSION 2>/dev/null || echo "1.0.0")
           VER=$(echo "$VER" | tr -d '[:space:]' | sed 's/^v//')
           echo "RELEASE_VER=$VER" >> $GITHUB_ENV
           echo "RELEASE_TAG=v$VER" >> $GITHUB_ENV

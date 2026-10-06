@@ -1,9 +1,9 @@
 # AERO Project Execution Rules (GEMINI.md)
 
-This project strictly enforces the Two-Tier Engineering Rules defined in [PROJECT_RULES.md](file:///D:/jacky/gemini/aisysnew/PROJECT_RULES.md) (aligned with GLOBAL MASTER RULES v1.0.0 and newplan.md):
+This project strictly enforces the Two-Tier Engineering Rules defined in [PROJECT_RULES.md](file:///D:/jacky/gemini/AIsys/PROJECT_RULES.md) (aligned with GLOBAL MASTER RULES v1.0.0 and engineering-profile.yaml):
 
-## Level 1: Global Master Baseline (v1.0.0)
-1. **Pure Go Standards**: Single module `github.com/aero-protocol/aero` flat layout. Native HTML5/CSS/JS embedded via `//go:embed` (runtime deps == 0, gzip < 150KB). Zero `node_modules` committed.
+## Level 1: Global Master Baseline (v1.0.0 & §0.6 Project Profile)
+1. **Pure Go Standards**: Single module `github.com/aero-protocol/aero` flat layout per GLOBAL MASTER RULES v1.0.0 §1.1 (Go 1.26+). Native HTML5/CSS/JS embedded via `//go:embed` (runtime deps == 0, gzip < 150KB). Zero `node_modules` committed.
 2. **Frontend Zero-Trust & Thin Client**: Frontend holds no business facts, secrets, tokens, or pricing constants. All state is authoritatively computed and validated by the backend.
 3. **Standard Layout**: Standard Go conventions, `internal/` for private packages, `cmd/<bin>/main.go` for multi-binary thin entries. Ban on vague container dirs (`common/`, `utils/`, `core/`, `domain/`, `infra/`, `service/`).
 4. **Zero Cross-System Imports**: `internal/client`, `internal/edge`, `internal/mid`, `internal/desk` must NOT import each other.
@@ -24,7 +24,7 @@ This project strictly enforces the Two-Tier Engineering Rules defined in [PROJEC
 - **P9. Pre-Flight Git Alignment & Zero Untracked**: `git status --porcelain` untracked files must strictly be 0 (`??` == 0); all embed assets and new code staged; clean clone simulation mandatory before push.
 - **P10. Reversible Cleanup & Rollback**: No hard `rm -rf`. All cleanups archive to gitignored `backup/` with `BACKUP_MANIFEST.md` and executable `rollback.ps1`/`rollback.sh`.
 - **P11. Anti-DPI & Network Defense Patterns**: `crypto/rand` dynamic packet jitter [1280, 1380]; two-stage atomic WebRTC state machine; zero-DNS short circuit for probe.aero; atomic configuration file writes with `.bak` rollback; lock-free `close()` UDP context reaping.
-- **P12. Dedicated Tmp Sandbox & Zero Source Pollution**: All tests, temporary databases, test artifacts, build binaries (`-o tmp/...`), and caches are strictly confined to `D:\jacky\gemini\AIsysnew\tmp`. Absolute zero file generation in source trees.
+- **P12. Dedicated Tmp Sandbox & Zero Source Pollution**: All tests, temporary databases, test artifacts, build binaries (`-o tmp/...`), and caches are strictly confined to `D:\jacky\gemini\AIsys\tmp`. Absolute zero file generation in source trees.
 - **P13. 反假大空与真实交付铁律**: 绝对禁止使用“完美”、“终极”等浮夸词汇；禁止以单测全绿替代真实可用；严格执行数据链路逐行 5 步穿透追踪（生成端 -> 序列化 -> 结构体 -> 引擎提取 -> 底层调用）；前置自检严防字段丢弃与空值盲目上线。
 - **P14. 权威线缆契约与零遗漏零空值工程防线**: 跨系统结构体测试强制采用原始 JSON 报文字符流（Wire-Contract-First，如 `TestWireContract_Strict`），禁止纯内存 struct mock；反序列化后强制执行 `ValidateAndNormalize()` 契约归一化，自动回填物理 IP 与备用跳频端口；跨边界 JSON 结构体强制实现双驼峰/下划线兼容（`snake_case` 与 `camelCase`）；Windows GUI 客户端构建必须固化 `-H windowsgui` 并通过标准库 `debug/pe` 门禁（`TestClientSubsystem`）断言 `Subsystem == 2`。
 - **P15. 零静默吞咽与强输入校验门禁**: 全仓 HTTP 接口反序列化严禁 `_ = json.NewDecoder...`，一旦解码失败必须直接返回 400 Bad Request；时延等数值字段强制声明为有符号 `int64`，绝对严禁使用 `uint32` 防止负值崩溃；错误传递统一采用 `fmt.Errorf("%w", err)` 保留上下文。
