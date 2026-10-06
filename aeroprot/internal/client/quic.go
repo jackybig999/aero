@@ -15,6 +15,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -240,7 +241,16 @@ func defaultTLSConfig(serverName string) *tls.Config {
 type Client struct {
 	conn       *quic.Conn
 	config     *TransportConfig
+	actualPort int
 	lastActive atomic.Int64
+}
+
+// ActualPort 返回当前连接实际建立的物理端口
+func (c *Client) ActualPort() int {
+	if c == nil {
+		return 0
+	}
+	return c.actualPort
 }
 
 // Dial 建立 QUIC 连接
@@ -295,18 +305,45 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 		pconn = NewSalamanderPacketConn(pconn, cfg.ObfsPassword, cfg.PaddingJitter)
 	}
 
+	actualPort := 0
+	if udpAddr != nil {
+		actualPort = udpAddr.Port
+	}
+
 	quicDialHookMu.RLock()
 	hook := quicDialHook
 	quicDialHookMu.RUnlock()
 	if hook != nil {
 		conn, err := hook(ctx, pconn, udpAddr, cfg.TLSConfig, quicConfig)
+		if err != nil && len(cfg.AltPorts) > 0 && udpAddr != nil {
+			for _, altPort := range cfg.AltPorts {
+				if altPort <= 0 || altPort == udpAddr.Port {
+					continue
+				}
+				altAddr := &net.UDPAddr{IP: udpAddr.IP, Port: altPort, Zone: udpAddr.Zone}
+				altConn, aerr := hook(ctx, pconn, altAddr, cfg.TLSConfig, quicConfig)
+				if aerr == nil {
+					conn = altConn
+					err = nil
+					actualPort = altPort
+					log.Printf("[QUIC] Multi-port hopping (hook): primary port %d failed, connected via alt port %d", udpAddr.Port, altPort)
+					cfg.RemoteUDPAddr.Port = altPort
+					host, _, splitErr := net.SplitHostPort(cfg.Address)
+					if splitErr == nil {
+						cfg.Address = net.JoinHostPort(host, strconv.Itoa(altPort))
+					}
+					break
+				}
+			}
+		}
 		if err != nil {
 			_ = pconn.Close()
 			return nil, fmt.Errorf("quic dial %s: %w", cfg.Address, err)
 		}
 		client := &Client{
-			conn:   conn,
-			config: cfg,
+			conn:       conn,
+			config:     cfg,
+			actualPort: actualPort,
 		}
 		client.lastActive.Store(time.Now().UnixMilli())
 		return client, nil
@@ -335,7 +372,13 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 			if aerr == nil {
 				conn = altConn
 				err = nil
+				actualPort = altPort
 				log.Printf("[QUIC] Multi-port hopping: primary port %d failed, connected via alt port %d", udpAddr.Port, altPort)
+				cfg.RemoteUDPAddr.Port = altPort
+				host, _, splitErr := net.SplitHostPort(cfg.Address)
+				if splitErr == nil {
+					cfg.Address = net.JoinHostPort(host, strconv.Itoa(altPort))
+				}
 				break
 			}
 		}
@@ -346,8 +389,9 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 	}
 
 	client := &Client{
-		conn:   conn,
-		config: cfg,
+		conn:       conn,
+		config:     cfg,
+		actualPort: actualPort,
 	}
 	client.lastActive.Store(time.Now().UnixMilli())
 	return client, nil
@@ -494,6 +538,7 @@ func (p *SessionPool) Get(ctx context.Context, cfg *TransportConfig) (*Client, e
 	}
 	p.mu.Unlock()
 
+	origAddr := cfg.Address
 	newClient, err := Dial(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -501,6 +546,9 @@ func (p *SessionPool) Get(ctx context.Context, cfg *TransportConfig) (*Client, e
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if origAddr != cfg.Address {
+		delete(p.clients, origAddr)
+	}
 	if existing, ok := p.clients[cfg.Address]; ok && existing != nil && existing.conn != nil && existing.conn.Context().Err() == nil {
 		_ = newClient.Close()
 		return existing, nil

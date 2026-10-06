@@ -274,9 +274,35 @@ func (s *nodeSentinel) failover(ctx context.Context) bool {
 		cancel()
 
 		if err == nil && client != nil {
+			targetAddr := srv.Address
+			if actualPort := client.ActualPort(); actualPort > 0 && actualPort != candPort {
+				targetAddr = net.JoinHostPort(candHost, strconv.Itoa(actualPort))
+				s.engine.mu.Lock()
+				if s.engine.appliedSub != nil {
+					if s.engine.appliedSub.IPs != nil {
+						s.engine.appliedSub.IPs[targetAddr] = candIP.String()
+					}
+					if s.engine.appliedSub.Tokens != nil {
+						s.engine.appliedSub.Tokens[targetAddr] = srv.Token
+					}
+					if s.engine.appliedSub.SNIs != nil {
+						s.engine.appliedSub.SNIs[targetAddr] = srv.SNI
+					}
+					if s.engine.appliedSub.AltPorts != nil && len(srv.AltPorts) > 0 {
+						s.engine.appliedSub.AltPorts[targetAddr] = srv.AltPorts
+					}
+					for i := range s.engine.appliedSub.Servers {
+						if s.engine.appliedSub.Servers[i].Address == srv.Address {
+							s.engine.appliedSub.Servers[i].Address = targetAddr
+							break
+						}
+					}
+				}
+				s.engine.mu.Unlock()
+			}
 			_ = client.Close()
-			// 首个可达节点调用 e.SwitchActiveNode(srv.Address)
-			if switchErr := s.engine.SwitchActiveNode(srv.Address); switchErr == nil {
+			// 首个可达节点调用 e.SwitchActiveNode(targetAddr)
+			if switchErr := s.engine.SwitchActiveNode(targetAddr); switchErr == nil {
 				s.mu.Lock()
 				s.failureCount = 0
 				s.backoffIdx = 0

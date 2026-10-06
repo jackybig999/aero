@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,7 +131,6 @@ func (s *Subscription) ValidateAndNormalize() error {
 	if s == nil || len(s.Servers) == 0 {
 		return fmt.Errorf("empty subscription: no servers configured")
 	}
-	defaultAltPorts := []int{2083, 8443, 2087}
 	for i := range s.Servers {
 		srv := &s.Servers[i]
 		if strings.TrimSpace(srv.Address) == "" && strings.TrimSpace(srv.Host) == "" {
@@ -155,9 +155,35 @@ func (s *Subscription) ValidateAndNormalize() error {
 		if strings.TrimSpace(srv.Token) == "" {
 			return fmt.Errorf("server[%d] (%s) missing token", i, srv.Name)
 		}
-		// 若服务端未下发备用端口，主动注入高防备用端口池，保障自愈避障能力
+		// 若服务端未下发备用端口，主动注入高防备用端口池，保障自愈避障能力；同时过滤掉主端口与重复端口
+		var mainPort int
+		if _, pStr, err := net.SplitHostPort(srv.Address); err == nil {
+			mainPort, _ = strconv.Atoi(pStr)
+		}
+		if mainPort <= 0 {
+			mainPort = 443
+		}
 		if len(srv.AltPorts) == 0 {
-			srv.AltPorts = append([]int(nil), defaultAltPorts...)
+			if mainPort == 443 {
+				srv.AltPorts = []int{2083, 2087, 8443}
+			} else {
+				srv.AltPorts = []int{443}
+				for _, cp := range []int{2083, 2087, 8443} {
+					if cp != mainPort {
+						srv.AltPorts = append(srv.AltPorts, cp)
+					}
+				}
+			}
+		} else {
+			filtered := make([]int, 0, len(srv.AltPorts))
+			seen := make(map[int]bool)
+			for _, cp := range srv.AltPorts {
+				if cp > 0 && cp != mainPort && !seen[cp] {
+					seen[cp] = true
+					filtered = append(filtered, cp)
+				}
+			}
+			srv.AltPorts = filtered
 		}
 		// 若 IP 为空，尝试从 Host 或 Address 中提取有效 IPv4 自动补齐，杜绝空值
 		if srv.IP == "" {

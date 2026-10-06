@@ -10,9 +10,15 @@ let camStream = null
 let camTimer = 0
 let isImporting = false
 
-function t(key) {
+function t(key, params) {
   const pack = I18N[lang] || I18N['zh-CN']
-  return pack[key] || I18N['zh-CN'][key] || key
+  let str = pack[key] || (I18N['zh-CN'] && I18N['zh-CN'][key]) || key
+  if (params && typeof params === 'object') {
+    Object.keys(params).forEach((k) => {
+      str = str.replace(new RegExp('\\{' + k + '\\}', 'g'), params[k])
+    })
+  }
+  return str
 }
 
 function applyI18n() {
@@ -26,6 +32,9 @@ function applyI18n() {
   const lb = $('btnLang')
   if (lb) lb.textContent = t('langName')
   paintModeCards()
+  if (typeof filterAndRenderNodes === 'function') {
+    filterAndRenderNodes()
+  }
 }
 
 function productMode(mode) {
@@ -35,8 +44,8 @@ function productMode(mode) {
 
 function modeLabel(mode) {
   const m = productMode(mode)
-  if (m === 'sysproxy') return '系统代理模式'
-  return 'TUN 全局模式'
+  if (m === 'sysproxy') return t('modeSys')
+  return t('modeTun')
 }
 
 function selectedMode() {
@@ -51,8 +60,8 @@ function paintModeCards() {
   })
   const tip = $('modeTip')
   if (!tip) return
-  if (cur === 'tun') tip.textContent = t('tipTun') || 'TUN 虚拟网卡驱动接管全局流量 (零改动系统注册表)'
-  else if (cur === 'sysproxy') tip.textContent = t('tipSys') || '本地 55555，供指纹浏览器填写，不改宿主机'
+  if (cur === 'tun') tip.textContent = t('tipTun')
+  else if (cur === 'sysproxy') tip.textContent = t('tipSys')
 }
 
 function setModeUI(mode) {
@@ -139,6 +148,15 @@ async function doProbe() {
   }
 }
 
+function getLocalIspName(isp) {
+  if (!isp) return '—'
+  const u = isp.toUpperCase()
+  if (u === 'CT' || u.includes('电信')) return t('ispCTName')
+  if (u === 'CU' || u.includes('联通')) return t('ispCUName')
+  if (u === 'CM' || u.includes('移动')) return t('ispCMName')
+  return t('ispBGPName')
+}
+
 async function refreshStatus() {
   if (busy) return
   try {
@@ -154,7 +172,7 @@ async function refreshStatus() {
       else tag.textContent = t('tagline')
     }
     if ($('stNode')) $('stNode').textContent = st.node || '—'
-    if ($('stISP')) $('stISP').textContent = st.isp_name || st.isp || '—'
+    if ($('stISP')) $('stISP').textContent = getLocalIspName(st.isp)
     if ($('stSNI')) $('stSNI').textContent = st.sni || '—'
     if ($('stListen')) $('stListen').textContent = st.listen || DEFAULT_LISTEN
     let rtt = st.rtt_ms
@@ -164,7 +182,7 @@ async function refreshStatus() {
     }
     if ($('stRtt')) $('stRtt').textContent = rtt ? rtt + ' ms' : on ? '…' : '—'
     if ($('geoRuleCount') && st.geo_rule_count) {
-      $('geoRuleCount').textContent = st.geo_rule_count.toLocaleString() + ' 条 (已就绪)'
+      $('geoRuleCount').textContent = t('rulesReady', { count: st.geo_rule_count.toLocaleString() })
     }
     if (st.sub_url && !$('subUrl').value) $('subUrl').value = st.sub_url
     if (st.probe_ok === true || st.probe_ok === false) {
@@ -198,15 +216,15 @@ async function ensureImported(strict = false) {
     const sub = ($('subUrl').value || '').trim()
     if (!sub) {
       if (strict) {
-        msg('请先粘贴或输入专属订阅链接，输入不能为空！', 'err')
-        throw new Error('请先粘贴或输入专属订阅链接，输入不能为空！')
+        msg(t('subEmptyErr'), 'err')
+        throw new Error(t('subEmptyErr'))
       }
       return
     }
     if (!sub.startsWith('http://') && !sub.startsWith('https://')) {
       if (strict) {
-        msg('订阅链接格式错误，必须以 http:// 或 https:// 开头！', 'err')
-        throw new Error('订阅链接格式错误，必须以 http:// 或 https:// 开头！')
+        msg(t('subFormatErr'), 'err')
+        throw new Error(t('subFormatErr'))
       }
       return
     }
@@ -262,7 +280,7 @@ async function onConnect() {
       return
     }
     if (md && (md.status === 'error' || md.error)) {
-      throw new Error(md.error || 'mode')
+      throw new Error(md.error || md.msg || t('modeSwitchFailed'))
     }
 
     // 3. 建立秒级快速隧道连接
@@ -275,8 +293,11 @@ async function onConnect() {
       handleUDPUnavailable(c.msg || '')
       return
     }
+    if (c && c.code === 'RATE_LIMITED') {
+      throw new Error(t('connRateLimited'))
+    }
     if (c && (c.status === 'error' || c.error)) {
-      throw new Error(c.error || 'connect')
+      throw new Error(c.error || c.msg || t('connFailed'))
     }
 
     // 4. 异步快速探测探针
@@ -292,7 +313,8 @@ async function onConnect() {
       handleUDPUnavailable(e.message)
     } else {
       setState('err', t('ready'))
-      msg(e.message || String(e), 'err')
+      const em = e.message || String(e)
+      msg(em === 'connect' ? t('connFailed') : em, 'err')
     }
   } finally {
     busy = false
@@ -318,8 +340,8 @@ async function onDisconnect() {
 }
 
 function handleUDPUnavailable(customMsg) {
-  setState('off', 'UDP 不可用')
-  msg(customMsg || 'UDP/443 (QUIC) 不可用，已降级防御：未开启全局 TUN，55555 代理监听中', 'err')
+  setState('off', 'UDP')
+  msg(customMsg || t('udpUnavailableFallback'), 'err')
 }
 
 function handleTUNConflict(vpnName) {
@@ -330,7 +352,7 @@ function handleTUNConflict(vpnName) {
     box.hidden = false
     const desc = $('conflictDesc')
     if (desc) {
-      desc.textContent = (t('conflictDesc') || '检测到正在运行其他 VPN 的 TUN 模式【{name}】。两款 TUN 无法同时生效。').replace('{name}', vpnName || '第三方 VPN')
+      desc.textContent = t('conflictDesc', { name: vpnName || t('thirdPartyVPN') })
     }
   }
 }
@@ -502,14 +524,14 @@ async function doClientLogin() {
   const username = ($('loginUsername').value || '').trim()
   const password = ($('loginPassword').value || '').trim()
   if (!server) {
-    msg('请填写中台服务地址 (如 https://myconsun.de5.net)', 'err')
+    msg(t('loginMissingServer'), 'err')
     return
   }
   if (!username || !password) {
-    msg('请填写中台用户名和密码', 'err')
+    msg(t('loginMissingCreds'), 'err')
     return
   }
-  msg('正在向中台登录并同步专属订阅...', 'wait')
+  msg(t('loginLoggingIn'), 'wait')
   try {
     try { localStorage.setItem('aero_mid_server', server) } catch {}
     const res = await fetch(`${server}/api/v1/auth/login/`, {
@@ -519,25 +541,25 @@ async function doClientLogin() {
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || data.code !== 0) {
-      throw new Error(data.message || '登录鉴权失败，请检查账号密码')
+      throw new Error(data.message || t('loginAuthFailed'))
     }
     const u = data.data || data
     try {
       localStorage.setItem('aero_client_user', JSON.stringify({ server, username, user: u }))
     } catch {}
     renderLoggedInUser(server, u)
-    msg('登录成功！已自动同步并就绪专属订阅', 'ok')
+    msg(t('loginOk'), 'ok')
   } catch (e) {
-    msg(`登录失败: ${e.message}`, 'err')
+    msg(t('loginFail', { err: e.message }), 'err')
   }
 }
 
 function renderLoggedInUser(server, user) {
   if ($('loginFormWrap')) $('loginFormWrap').style.display = 'none'
   if ($('loggedInWrap')) $('loggedInWrap').style.display = 'block'
-  if ($('userDisplayName')) $('userDisplayName').textContent = user.username || '用户'
+  if ($('userDisplayName')) $('userDisplayName').textContent = user.username || t('userDefault')
   if ($('userAvatar')) $('userAvatar').textContent = (user.username || 'A')[0].toUpperCase()
-  if ($('userPlanBadge')) $('userPlanBadge').textContent = user.is_staff ? '系统管理' : (user.plan_name || '月度套餐')
+  if ($('userPlanBadge')) $('userPlanBadge').textContent = user.is_staff ? t('sysAdmin') : (user.plan_name || t('monthlyPlan'))
   if ($('userServerHost')) $('userServerHost').textContent = server.replace(/^https?:\/\//, '')
 
   const sel = $('userSubSelect')
@@ -549,19 +571,19 @@ function renderLoggedInUser(server, user) {
     const slug = user.sub_slug || 'superadmin'
     const opt = document.createElement('option')
     opt.value = `${server}/sub/${slug}`
-    opt.textContent = `默认专属订阅 (${slug})`
+    opt.textContent = `${t('defaultSub')} (${slug})`
     sel.appendChild(opt)
   } else {
     subs.forEach((s) => {
       const opt = document.createElement('option')
       opt.value = `${server}/sub/${s.sub_slug}`
-      opt.textContent = `${s.plan_name || '套餐'} (${s.sub_slug})`
+      opt.textContent = `${s.plan_name || t('userPlan')} (${s.sub_slug})`
       sel.appendChild(opt)
     })
   }
 
   if ($('subCountBadge')) {
-    $('subCountBadge').textContent = `${sel.options.length} 个可用`
+    $('subCountBadge').textContent = t('subsAvailable', { count: sel.options.length })
   }
 
   if (sel.options.length > 0) {
@@ -578,7 +600,7 @@ function renderLoggedInUser(server, user) {
       localStorage.setItem(SUB_KEY, sel.value)
     } catch {}
     api('POST', '/api/v1/import', { sub: sel.value }).then(() => {
-      msg(`已切换专属订阅: ${sel.options[sel.selectedIndex].text}`, 'ok')
+      msg(t('subSwitched', { name: sel.options[sel.selectedIndex].text }), 'ok')
     }).catch(() => null)
   }
 }
@@ -590,7 +612,7 @@ function doClientLogout() {
   if ($('loginFormWrap')) $('loginFormWrap').style.display = 'block'
   if ($('loggedInWrap')) $('loggedInWrap').style.display = 'none'
   if ($('loginPassword')) $('loginPassword').value = ''
-  msg('已退出账号登录')
+  msg(t('loggedOut'))
 }
 
 let currentNodes = []
@@ -619,10 +641,10 @@ function getIspTagClass(isp) {
 function getIspLabel(isp) {
   if (!isp) return ''
   const upper = isp.toUpperCase()
-  if (upper === 'CT' || upper.includes('电信')) return '电信优选'
-  if (upper === 'CU' || upper.includes('联通')) return '联通优选'
-  if (upper === 'CM' || upper.includes('移动')) return '移动优选'
-  if (upper === 'BGP') return 'BGP骨干'
+  if (upper === 'CT' || upper.includes('电信')) return t('ispCTOpt')
+  if (upper === 'CU' || upper.includes('联通')) return t('ispCUOpt')
+  if (upper === 'CM' || upper.includes('移动')) return t('ispCMOpt')
+  if (upper === 'BGP') return t('ispBGPOpt')
   return isp
 }
 
@@ -654,11 +676,11 @@ function renderNodes(nodes) {
   const badge = $('nodesCountBadge')
   if (!container) return
   if (!nodes || nodes.length === 0) {
-    container.innerHTML = '<div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">' + (currentNodes.length > 0 ? '无匹配线路' : '暂无线路数据，请先载入订阅') + '</div>'
-    if (badge) badge.textContent = (currentNodes ? currentNodes.length : 0) + ' 节点'
+    container.innerHTML = '<div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">' + (currentNodes.length > 0 ? t('noMatchNodes') : t('emptyNodes')) + '</div>'
+    if (badge) badge.textContent = t('nodesCount', { count: currentNodes ? currentNodes.length : 0 })
     return
   }
-  if (badge) badge.textContent = currentNodes.length + ' 节点'
+  if (badge) badge.textContent = t('nodesCount', { count: currentNodes.length })
   container.innerHTML = ''
 
   nodes.forEach((n) => {
@@ -710,10 +732,10 @@ function renderNodes(nodes) {
       const activeTag = document.createElement('span')
       if (n.connected) {
         activeTag.className = 'badge-connected'
-        activeTag.textContent = '已连接'
+        activeTag.textContent = t('nodeConnectedBadge')
       } else {
         activeTag.className = 'badge-preferred'
-        activeTag.textContent = '当前首选'
+        activeTag.textContent = t('nodePreferredBadge')
       }
       badgeWrap.appendChild(activeTag)
     }
@@ -724,7 +746,7 @@ function renderNodes(nodes) {
     if (!probed) {
       latBadge.textContent = '—'
     } else if (!n.reachable || n.latency_ms < 0) {
-      latBadge.textContent = '超时'
+      latBadge.textContent = t('timeout')
     } else {
       latBadge.textContent = n.latency_ms + 'ms'
     }
@@ -743,17 +765,17 @@ function renderNodes(nodes) {
 
 async function selectNode(addr) {
   try {
-    msg('正在切换节点至 ' + addr + '...', 'info')
+    msg(t('switchingNode', { addr }), 'wait')
     const res = await api('POST', '/api/v1/nodes/select', { address: addr })
     if (res && res.status === 'ok') {
-      msg('已平滑切换至节点: ' + addr, 'ok')
+      msg(t('switchNodeOk', { addr }), 'ok')
       await fetchNodes()
       await refreshStatus()
     } else {
-      msg('切换节点失败: ' + (res.error || '未知错误'), 'err')
+      msg(t('switchNodeFail', { err: res.error || t('unknownErr') }), 'err')
     }
   } catch (e) {
-    msg('切换节点请求异常: ' + (e.message || String(e)), 'err')
+    msg(t('switchNodeFail', { err: e.message || String(e) }), 'err')
   }
 }
 
@@ -774,27 +796,27 @@ async function probeAllNodes() {
   if (btn) {
     btn.classList.add('probing-pulse')
     btn.disabled = true
-    btn.textContent = '⚡ 测速中...'
+    btn.textContent = t('speedTesting')
   }
-  msg('正在并发测速全部线路...', 'info')
+  msg(t('probingAll'), 'wait')
   try {
     const res = await api('POST', '/api/v1/nodes/probe')
     if (res && res.status === 'ok' && Array.isArray(res.nodes)) {
       currentNodes = res.nodes
       filterAndRenderNodes()
-      msg('全部线路测速完成', 'ok')
+      msg(t('probeAllDone'), 'ok')
     } else if (res && res.code === 'RATE_LIMITED') {
-      msg('测速请求过于频繁，请稍候再试', 'err')
+      msg(t('probeTooFast'), 'err')
     } else {
-      msg('测速返回异常: ' + (res.error || '未知错误'), 'err')
+      msg(t('probeFail', { err: res.error || t('unknownErr') }), 'err')
     }
   } catch (e) {
-    msg('测速执行失败: ' + (e.message || String(e)), 'err')
+    msg(t('probeFail', { err: e.message || String(e) }), 'err')
   } finally {
     if (btn) {
       btn.classList.remove('probing-pulse')
       btn.disabled = false
-      btn.textContent = '⚡ 测速全部线路'
+      btn.textContent = t('probeAllNodes')
     }
     isProbingNodes = false
   }
@@ -828,15 +850,15 @@ function init() {
   // 3. 手动载入专属订阅 (严格前置校验，空值抛错，载入后立即全量刷新节点列表与状态)
   $('btnApplyManualSub')?.addEventListener('click', async () => {
     const btn = $('btnApplyManualSub')
-    const origText = btn ? btn.textContent : '载入'
+    const origText = btn ? btn.textContent : t('load')
     if (btn) {
       btn.disabled = true
-      btn.textContent = '载入中...'
+      btn.textContent = t('loading')
     }
     try {
       await ensureImported(true)
       await refreshStatus()
-      msg('专属订阅已成功载入！节点已就绪', 'ok')
+      msg(t('subLoadedOk'), 'ok')
     } catch (e) {
       msg(e.message, 'err')
     } finally {
@@ -957,7 +979,7 @@ function init() {
   if ($('btnPing')) {
     $('btnPing').onclick = async () => {
       $('btnPing').disabled = true
-      $('btnPing').textContent = '⚡ 测速中'
+      $('btnPing').textContent = t('speedTesting')
       try {
         const res = await api('POST', '/api/v1/ping')
         if (res && res.status === 'ok') {
@@ -965,22 +987,22 @@ function init() {
         }
       } catch {}
       $('btnPing').disabled = false
-      $('btnPing').textContent = '⚡ 测速'
+      $('btnPing').textContent = t('speedTest')
     }
   }
 
   if ($('btnSyncGeo')) {
     $('btnSyncGeo').onclick = async () => {
       $('btnSyncGeo').disabled = true
-      $('btnSyncGeo').textContent = '🔄 同步中'
+      $('btnSyncGeo').textContent = t('syncing')
       try {
         const res = await api('POST', '/api/v1/geodata/sync')
         if (res && res.status === 'ok') {
-          if ($('geoRuleCount')) $('geoRuleCount').textContent = res.count.toLocaleString() + ' 条 (已同步)'
+          if ($('geoRuleCount')) $('geoRuleCount').textContent = t('rulesSynced', { count: res.count.toLocaleString() })
         }
       } catch {}
       $('btnSyncGeo').disabled = false
-      $('btnSyncGeo').textContent = '🔄 同步'
+      $('btnSyncGeo').textContent = t('sync')
     }
   }
 
@@ -993,16 +1015,18 @@ function init() {
       msg(t('connecting'))
       try {
         const md = await api('POST', '/api/v1/mode', { mode: 'sysproxy' })
-        if (md && (md.status === 'error' || md.error)) throw new Error(md.error || 'mode')
+        if (md && (md.status === 'error' || md.error)) throw new Error(md.error || md.msg || t('modeSwitchFailed'))
         const c = await api('POST', '/api/v1/connect')
-        if (c && (c.status === 'error' || c.error)) throw new Error(c.error || 'connect')
+        if (c && c.code === 'RATE_LIMITED') throw new Error(t('connRateLimited'))
+        if (c && (c.status === 'error' || c.error)) throw new Error(c.error || c.msg || t('connFailed'))
         doProbe()
         await refreshStatus()
         setState('on', t('connected'))
         msg(t('connectedAs') + ' · ' + modeLabel('sysproxy'), 'ok')
       } catch (e) {
         setState('err', t('ready'))
-        msg(e.message || String(e), 'err')
+        const em = e.message || String(e)
+        msg(em === 'connect' ? t('connFailed') : em, 'err')
       } finally {
         busy = false
       }

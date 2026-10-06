@@ -242,7 +242,11 @@ func main() {
 		}
 		st := eng.GetState()
 		UpdateTrayIcon(st.Mode, st.Connected)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":      "ok",
+			"active_node": st.ActiveNode,
+			"actual_port": st.ActualPort,
+		})
 	})
 
 	// 6. 断开隧道连接

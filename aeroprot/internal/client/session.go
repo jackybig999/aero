@@ -368,19 +368,29 @@ func (m *SessionManager) GetSession(ctx context.Context) (*Session, error) {
 	if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
 		cfg.AltPorts = altPorts
 	}
-	if ip != nil {
-		port := 443
-		if _, portStr, err := net.SplitHostPort(addr); err == nil {
-			if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
-				port = p
-			}
+	port := 443
+	if _, portStr, err := net.SplitHostPort(addr); err == nil {
+		if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
+			port = p
 		}
+	}
+	if ip != nil {
 		cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
 	}
 
 	client, err := Dial(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("dial edge session: %w", err)
+	}
+
+	if client.ActualPort() > 0 && client.ActualPort() != port {
+		h, _, _ := net.SplitHostPort(addr)
+		addr = net.JoinHostPort(h, strconv.Itoa(client.ActualPort()))
+		if len(cfg.ECHConfigList) > 0 {
+			SetActiveEdge(addr, tok, sni, ip, cfg.ECHConfigList)
+		} else {
+			SetActiveEdge(addr, tok, sni, ip)
+		}
 	}
 
 	sess, err := NewSession(client, tok, addr, sni)

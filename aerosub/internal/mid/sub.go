@@ -297,6 +297,19 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				}
 			}
 
+			// 候选备选端口池 (覆盖常见的标准 443 及高防备选端口 2083, 2087, 8443)
+			var altPorts []int
+			if port == 443 {
+				altPorts = []int{2083, 2087, 8443}
+			} else {
+				altPorts = []int{443}
+				for _, cp := range []int{2083, 2087, 8443} {
+					if cp != port {
+						altPorts = append(altPorts, cp)
+					}
+				}
+			}
+
 			// 方案 A 物理域名锁死: ServerName 始终等于物理节点域名
 			srv := map[string]any{
 				"name":         name,
@@ -311,7 +324,7 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				"isp_affinity": ispAffinity,
 				"protocol":     "connect-ip",
 				"ech":          ep.ECH(),
-				"alt_ports":    []int{2083, 2087, 8443},
+				"alt_ports":    altPorts,
 			}
 			if vps != nil {
 				srv["purityScore"] = vps.PurityScore

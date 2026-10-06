@@ -236,24 +236,40 @@ func (tc *TunnelClient) getActiveQUICClient(ctx context.Context) (*Client, error
 		return nil, fmt.Errorf("no active edge address configured")
 	}
 	cfg := DefaultTransportConfig(addr, sni)
-	if ech := getActiveEdgeECH(); len(ech) > 0 {
+	ech := getActiveEdgeECH()
+	if len(ech) > 0 {
 		cfg.ECHConfigList = ech
 	}
 	if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
 		cfg.AltPorts = altPorts
 	}
-	if ip != nil {
-		port := 443
-		if _, portStr, err := net.SplitHostPort(addr); err == nil {
-			if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
-				port = p
-			}
+	port := 443
+	if _, portStr, err := net.SplitHostPort(addr); err == nil {
+		if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
+			port = p
 		}
+	}
+	if ip != nil {
 		cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
 	}
 	client, err := tc.pool.Get(ctx, cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	if client.ActualPort() > 0 && client.ActualPort() != port {
+		h, _, _ := net.SplitHostPort(addr)
+		alignedAddr := net.JoinHostPort(h, strconv.Itoa(client.ActualPort()))
+		tokP := activeEdgeToken.Load()
+		tok := ""
+		if tokP != nil {
+			tok = *tokP
+		}
+		if len(ech) > 0 {
+			SetActiveEdge(alignedAddr, tok, sni, ip, ech)
+		} else {
+			SetActiveEdge(alignedAddr, tok, sni, ip)
+		}
 	}
 
 	// 确保该 Client 启动了数据报接收监听

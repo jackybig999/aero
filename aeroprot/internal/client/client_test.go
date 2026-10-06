@@ -3616,3 +3616,181 @@ func TestWireContract_Strict(t *testing.T) {
 		t.Errorf("n1.ISPAffinity = %q, want CT", n1.ISPAffinity)
 	}
 }
+
+// TestMultiPortHopping_And_PortAlignment 验证多端口跳频与端口对齐契约
+func TestMultiPortHopping_And_PortAlignment(t *testing.T) {
+	eng := NewEngine()
+
+	// 构造初始配置：主端口 443，备选端口 [2083, 2087, 8443]
+	sub := &Subscription{
+		Version:  "aero/3.0",
+		UserID:   "usr_test",
+		ExpireAt: time.Now().Add(24 * time.Hour).Unix(),
+		Servers: []ServerConfig{
+			{
+				Name:        "colo",
+				Host:        "myconsun.de5.net",
+				Address:     "myconsun.de5.net:443",
+				IP:          "154.213.18.99",
+				Token:       "tok_test_hop",
+				SNI:         "myconsun.de5.net",
+				AltPorts:    []int{2083, 2087, 8443},
+				LineType:    "direct",
+				ISPAffinity: "BGP",
+			},
+		},
+	}
+	if err := sub.ValidateAndNormalize(); err != nil {
+		t.Fatalf("ValidateAndNormalize failed: %v", err)
+	}
+
+	applied, err := ApplySubscription(sub)
+	if err != nil {
+		t.Fatalf("ApplySubscription failed: %v", err)
+	}
+	if err := eng.Apply(applied); err != nil {
+		t.Fatalf("eng.Apply failed: %v", err)
+	}
+
+	// 模拟 Hook：443 拨号失败，但 2083 成功！
+	var dialedPorts []int
+	var dialMu sync.Mutex
+	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
+		if tlsCfg == nil || tlsCfg.ServerName != "myconsun.de5.net" {
+			return nil, fmt.Errorf("unrelated test dial ignored")
+		}
+		dialMu.Lock()
+		defer dialMu.Unlock()
+		if udp, ok := remoteAddr.(*net.UDPAddr); ok {
+			dialedPorts = append(dialedPorts, udp.Port)
+			if udp.Port == 443 {
+				return nil, fmt.Errorf("connection refused on port 443")
+			}
+			if udp.Port == 2083 {
+				return nil, nil // 模拟 2083 连通！
+			}
+		}
+		return nil, fmt.Errorf("unexpected port")
+	})
+	defer SetQUICDialHook(nil)
+
+	// Mock TUN
+	origDetect := detectThirdPartyTUN
+	origOpenTun := openTunDeviceFn
+	origSetupRoutes := setupRoutesFn
+	origTeardownRoutes := teardownRoutesFn
+	defer func() {
+		detectThirdPartyTUN = origDetect
+		openTunDeviceFn = origOpenTun
+		setupRoutesFn = origSetupRoutes
+		teardownRoutesFn = origTeardownRoutes
+	}()
+
+	detectThirdPartyTUN = func() (bool, string, error) { return false, "", nil }
+	mockDev := newMockTunDevice()
+	openTunDeviceFn = func(name string, mtu int) (TunDevice, error) { return mockDev, nil }
+	setupRoutesFn = func(devName, ipv4 string) error { return nil }
+	teardownRoutesFn = func(devName string) {}
+
+	// 启动引擎
+	if err := eng.Start(); err != nil {
+		t.Fatalf("engine.Start() failed: %v", err)
+	}
+	defer eng.Stop()
+
+	// 验证：
+	// 1. 尝试了 443 和 2083
+	dialMu.Lock()
+	if len(dialedPorts) < 2 || dialedPorts[0] != 443 || dialedPorts[1] != 2083 {
+		t.Errorf("expected dialed ports [443, 2083], got %v", dialedPorts)
+	}
+	dialMu.Unlock()
+
+	// 2. 状态与端口已平滑对齐至 2083
+	st := eng.GetState()
+	if st.ActualPort != 2083 {
+		t.Errorf("st.ActualPort = %d, want 2083", st.ActualPort)
+	}
+	if st.ActiveNode != "myconsun.de5.net:2083" {
+		t.Errorf("st.ActiveNode = %q, want myconsun.de5.net:2083", st.ActiveNode)
+	}
+	activeEdgeAddr, _, _, _ := getActiveEdge()
+	if activeEdgeAddr != "myconsun.de5.net:2083" {
+		t.Errorf("activeEdgeAddr = %q, want myconsun.de5.net:2083", activeEdgeAddr)
+	}
+}
+
+// TestI18n_SymmetricalDictionary 验证三种语言字典 1:1 绝对对称无遗漏
+func TestI18n_SymmetricalDictionary(t *testing.T) {
+	data, err := os.ReadFile("../../cmd/client/ui/i18n.js")
+	if err != nil {
+		t.Fatalf("read i18n.js failed: %v", err)
+	}
+	content := string(data)
+
+	extractKeys := func(langTag string) []string {
+		idx := strings.Index(content, "'"+langTag+"': {")
+		if idx == -1 {
+			t.Fatalf("language %s not found", langTag)
+		}
+		end := strings.Index(content[idx:], "},")
+		if end == -1 {
+			t.Fatalf("language %s block closing not found", langTag)
+		}
+		block := content[idx : idx+end]
+		lines := strings.Split(block, "\n")
+		var keys []string
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			if colon := strings.Index(l, ":"); colon > 0 && !strings.HasPrefix(l, "//") {
+				k := strings.TrimSpace(l[:colon])
+				if k != "" && !strings.Contains(k, " ") && !strings.Contains(k, "'") {
+					keys = append(keys, k)
+				}
+			}
+		}
+		return keys
+	}
+
+	keysCN := extractKeys("zh-CN")
+	keysTW := extractKeys("zh-TW")
+	keysEN := extractKeys("en")
+
+	if len(keysCN) == 0 {
+		t.Fatalf("no keys found in zh-CN")
+	}
+
+	keySetCN := make(map[string]bool)
+	for _, k := range keysCN {
+		keySetCN[k] = true
+	}
+	keySetTW := make(map[string]bool)
+	for _, k := range keysTW {
+		keySetTW[k] = true
+	}
+	keySetEN := make(map[string]bool)
+	for _, k := range keysEN {
+		keySetEN[k] = true
+	}
+
+	// 验证 zh-TW 与 zh-CN 对称
+	for k := range keySetCN {
+		if !keySetTW[k] {
+			t.Errorf("missing key in zh-TW: %s", k)
+		}
+		if !keySetEN[k] {
+			t.Errorf("missing key in en: %s", k)
+		}
+	}
+	for k := range keySetTW {
+		if !keySetCN[k] {
+			t.Errorf("extra key in zh-TW not in zh-CN: %s", k)
+		}
+	}
+	for k := range keySetEN {
+		if !keySetCN[k] {
+			t.Errorf("extra key in en not in zh-CN: %s", k)
+		}
+	}
+}
+

@@ -151,15 +151,48 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 	if host == "" {
 		host = p.Address
 	}
+	var primaryPort int
 	if h, portStr, err := net.SplitHostPort(host); err == nil {
+		if pNum, err := strconv.Atoi(portStr); err == nil && pNum > 0 {
+			primaryPort = pNum
+		}
 		if portStr == "443" || portStr == "" {
 			host = h
 		}
 	}
+	if primaryPort <= 0 && p.Address != "" {
+		if _, portStr, err := net.SplitHostPort(p.Address); err == nil {
+			if pNum, err := strconv.Atoi(portStr); err == nil && pNum > 0 {
+				primaryPort = pNum
+			}
+		}
+	}
+	if primaryPort <= 0 {
+		primaryPort = 443
+	}
 
 	altPorts := p.AltPorts
 	if len(altPorts) == 0 {
-		altPorts = []int{2083, 2087, 8443}
+		if primaryPort == 443 {
+			altPorts = []int{2083, 2087, 8443}
+		} else {
+			altPorts = []int{443}
+			for _, cp := range []int{2083, 2087, 8443} {
+				if cp != primaryPort {
+					altPorts = append(altPorts, cp)
+				}
+			}
+		}
+	} else {
+		filtered := make([]int, 0, len(altPorts))
+		seen := make(map[int]bool)
+		for _, cp := range altPorts {
+			if cp > 0 && cp != primaryPort && !seen[cp] {
+				seen[cp] = true
+				filtered = append(filtered, cp)
+			}
+		}
+		altPorts = filtered
 	}
 
 	ip := p.IP

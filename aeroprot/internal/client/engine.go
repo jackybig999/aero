@@ -53,6 +53,7 @@ type AppState struct {
 	Listen     string `json:"listen"`
 	ActiveNode string `json:"active_node"`
 	ActiveSNI  string `json:"active_sni"`
+	ActualPort int    `json:"actual_port,omitempty"`
 	SubURL     string `json:"sub_url,omitempty"`
 	NodesCount int    `json:"nodes_count"`
 	Version    string `json:"version"`
@@ -321,6 +322,20 @@ func (e *Engine) SwitchActiveNode(addr string) error {
 	if e.appliedSub != nil {
 		tok = e.appliedSub.Tokens[addr]
 		sni = e.appliedSub.SNIs[addr]
+		if tok == "" || sni == "" {
+			host, _, _ := net.SplitHostPort(addr)
+			for a, t := range e.appliedSub.Tokens {
+				if h, _, _ := net.SplitHostPort(a); h == host {
+					if tok == "" {
+						tok = t
+					}
+					if sni == "" {
+						sni = e.appliedSub.SNIs[a]
+					}
+					break
+				}
+			}
+		}
 	}
 
 	return e.switchActiveNodeLocked(addr, tok, sni)
@@ -415,6 +430,16 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 				newIP = parsed.To4()
 			}
 		}
+		if newIP == nil {
+			for a, ipStr := range e.appliedSub.IPs {
+				if h, _, _ := net.SplitHostPort(a); h == newHost && ipStr != "" {
+					if parsed := net.ParseIP(ipStr); parsed != nil {
+						newIP = parsed.To4()
+						break
+					}
+				}
+			}
+		}
 	}
 	if newIP == nil && newHost != "" {
 		ip, rerr := resolvePhysicalIPv4(newHost)
@@ -431,6 +456,13 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	if e.appliedSub != nil && e.appliedSub.AltPorts != nil {
 		if ap, ok := e.appliedSub.AltPorts[addr]; ok && len(ap) > 0 {
 			altPorts = ap
+		} else {
+			for a, ap := range e.appliedSub.AltPorts {
+				if h, _, _ := net.SplitHostPort(a); h == newHost && len(ap) > 0 {
+					altPorts = ap
+					break
+				}
+			}
 		}
 	}
 	SetActiveEdgeAltPorts(altPorts)
@@ -442,6 +474,13 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	if e.appliedSub != nil && e.appliedSub.ECHConfigs != nil {
 		if c, ok := e.appliedSub.ECHConfigs[addr]; ok && len(c) > 0 {
 			ech = c
+		} else {
+			for a, c := range e.appliedSub.ECHConfigs {
+				if h, _, _ := net.SplitHostPort(a); h == newHost && len(c) > 0 {
+					ech = c
+					break
+				}
+			}
 		}
 	}
 	if len(ech) > 0 {
@@ -563,6 +602,14 @@ func (e *Engine) Start() error {
 			ech = c
 		}
 	}
+	var altPorts []int
+	if e.appliedSub != nil && e.appliedSub.AltPorts != nil {
+		if ap, ok := e.appliedSub.AltPorts[activeAddr]; ok && len(ap) > 0 {
+			altPorts = ap
+		}
+	}
+	SetActiveEdgeAltPorts(altPorts)
+
 	if len(ech) > 0 {
 		SetActiveEdge(activeAddr, activeToken, activeSNI, ip, ech)
 	} else {
@@ -588,6 +635,9 @@ func (e *Engine) Start() error {
 	if len(ech) > 0 {
 		cfg.ECHConfigList = ech
 	}
+	if len(altPorts) > 0 {
+		cfg.AltPorts = altPorts
+	}
 	cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
 	cfg.ConnectTimeout = 8 * time.Second
 	e.mu.RLock()
@@ -607,8 +657,49 @@ func (e *Engine) Start() error {
 		}
 		return rollback(fmt.Errorf("connect to %s failed: %w", activeAddr, err))
 	}
+	actualPort := cl.ActualPort()
 	_ = cl.Close()
 	rtt := time.Since(start)
+
+	// 多端口跳频动态对齐 (Port Hopping Alignment Contract)
+	if actualPort > 0 && actualPort != port {
+		log.Printf("[ENGINE] Multi-port hopping aligned: probe primary port %d hopped to alt port %d", port, actualPort)
+		alignedAddr := net.JoinHostPort(host, strconv.Itoa(actualPort))
+		e.mu.Lock()
+		if e.appliedSub != nil {
+			if e.appliedSub.IPs != nil {
+				e.appliedSub.IPs[alignedAddr] = ip.String()
+			}
+			if e.appliedSub.Tokens != nil {
+				e.appliedSub.Tokens[alignedAddr] = activeToken
+			}
+			if e.appliedSub.SNIs != nil {
+				e.appliedSub.SNIs[alignedAddr] = activeSNI
+			}
+			if e.appliedSub.ECHConfigs != nil && len(ech) > 0 {
+				e.appliedSub.ECHConfigs[alignedAddr] = ech
+			}
+			if e.appliedSub.AltPorts != nil && len(altPorts) > 0 {
+				e.appliedSub.AltPorts[alignedAddr] = altPorts
+			}
+			for i := range e.appliedSub.Servers {
+				if e.appliedSub.Servers[i].Address == activeAddr {
+					e.appliedSub.Servers[i].Address = alignedAddr
+					break
+				}
+			}
+		}
+		_ = e.switchActiveNodeLocked(alignedAddr, activeToken, activeSNI)
+		e.mu.Unlock()
+
+		if len(ech) > 0 {
+			SetActiveEdge(alignedAddr, activeToken, activeSNI, ip, ech)
+		} else {
+			SetActiveEdge(alignedAddr, activeToken, activeSNI, ip)
+		}
+		activeAddr = alignedAddr
+		port = actualPort
+	}
 
 	select {
 	case <-startCtx.Done():
@@ -923,6 +1014,12 @@ func (e *Engine) GetState() AppState {
 	if isp == "" {
 		isp = "DEFAULT"
 	}
+	actualPort := 0
+	if _, pStr, err := net.SplitHostPort(e.activeAddr); err == nil {
+		if pNum, err := strconv.Atoi(pStr); err == nil {
+			actualPort = pNum
+		}
+	}
 
 	return AppState{
 		Connected:    e.running.Load(),
@@ -930,6 +1027,7 @@ func (e *Engine) GetState() AppState {
 		Listen:       e.listenAddr,
 		ActiveNode:   e.activeAddr,
 		ActiveSNI:    e.activeSNI,
+		ActualPort:   actualPort,
 		SubURL:       subURL,
 		NodesCount:   nodesCount,
 		Version:      "aero/3.0",
