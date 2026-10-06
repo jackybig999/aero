@@ -3909,4 +3909,103 @@ func TestChainProxy_HTTPHandshake(t *testing.T) {
 	}
 }
 
+type recordingMockTunDevice struct {
+	*mockTunDevice
+	writeCh chan []byte
+}
 
+func (r *recordingMockTunDevice) Write(b []byte) (int, error) {
+	if r.closed.Load() {
+		return 0, io.EOF
+	}
+	cp := append([]byte(nil), b...)
+	select {
+	case r.writeCh <- cp:
+	default:
+	}
+	return len(b), nil
+}
+
+func TestDNSVirtualGatewayInterception(t *testing.T) {
+	split := NewSplitEngine()
+	dnsHandler := NewDNSHandler(split)
+	fakeTable := NewFakeIPTable("198.18.0.0/15", 100)
+	dnsHandler.SetFakeIP(fakeTable)
+
+	mockBase := newMockTunDevice()
+	mockDev := &recordingMockTunDevice{
+		mockTunDevice: mockBase,
+		writeCh:       make(chan []byte, 100),
+	}
+
+	stackEng := NewStackEngine(mockDev, nil, dnsHandler)
+	if err := stackEng.Start(); err != nil {
+		t.Fatalf("stackEng.Start() failed: %v", err)
+	}
+	defer stackEng.Stop()
+
+	// 构造标准 DNS 查询报文: google.com (Type A, Class IN, ID=0x1234)
+	dnsReq := []byte{
+		0x12, 0x34, // ID
+		0x01, 0x00, // Flags: Standard query, recursion desired
+		0x00, 0x01, // Questions: 1
+		0x00, 0x00, // Answers: 0
+		0x00, 0x00, // Authority: 0
+		0x00, 0x00, // Additional: 0
+	}
+	dnsReq = append(dnsReq, encodeDNSName("google.com")...)
+	dnsReq = append(dnsReq, 0x00, 0x01) // Type A
+	dnsReq = append(dnsReq, 0x00, 0x01) // Class IN
+
+	srcIP := net.ParseIP("10.88.0.2")
+	gwDNSIP := net.ParseIP("10.88.0.1") // 虚拟网关 DNS 地址
+
+	// 注入发往 10.88.0.1:53 的 DNS 查询数据包
+	udpPkt := buildIPv4UDPPacket(srcIP, gwDNSIP, 53535, 53, dnsReq)
+	mockDev.injectPacket(udpPkt)
+
+	// 监听是否有 DNS 响应包被写回虚拟网卡
+	var respPacket []byte
+	select {
+	case p := <-mockDev.writeCh:
+		respPacket = p
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for DNS response on virtual NIC from gateway 10.88.0.1:53")
+	}
+
+	if len(respPacket) < header.IPv4MinimumSize+header.UDPMinimumSize+12 {
+		t.Fatalf("response packet too short: %d bytes", len(respPacket))
+	}
+
+	ipHdr := header.IPv4(respPacket[:header.IPv4MinimumSize])
+	if ipHdr.SourceAddress().String() != "10.88.0.1" {
+		t.Errorf("expected response from 10.88.0.1, got %s", ipHdr.SourceAddress())
+	}
+	if ipHdr.DestinationAddress().String() != "10.88.0.2" {
+		t.Errorf("expected response destined to 10.88.0.2, got %s", ipHdr.DestinationAddress())
+	}
+
+	udpHdr := header.UDP(respPacket[header.IPv4MinimumSize : header.IPv4MinimumSize+header.UDPMinimumSize])
+	if udpHdr.SourcePort() != 53 {
+		t.Errorf("expected source port 53, got %d", udpHdr.SourcePort())
+	}
+	if udpHdr.DestinationPort() != 53535 {
+		t.Errorf("expected dest port 53535, got %d", udpHdr.DestinationPort())
+	}
+
+	dnsPayload := respPacket[header.IPv4MinimumSize+header.UDPMinimumSize:]
+	// 校验 Transaction ID
+	if dnsPayload[0] != 0x12 || dnsPayload[1] != 0x34 {
+		t.Errorf("mismatched transaction ID: got 0x%02x%02x, want 0x1234", dnsPayload[0], dnsPayload[1])
+	}
+
+	// 校验返回的 IP 地址落在 198.18.0.0/15 Fake-IP 网段
+	if len(dnsPayload) < 4 {
+		t.Fatalf("DNS payload too short")
+	}
+	// 尾部 4 字节为 Answer A 记录 IP
+	ansIP := net.IP(dnsPayload[len(dnsPayload)-4:])
+	if !fakeTable.Contains(ansIP) {
+		t.Errorf("expected Fake-IP in 198.18.0.0/15, got %s", ansIP)
+	}
+}

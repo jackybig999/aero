@@ -387,24 +387,8 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 	}
 	id := r.ID()
 	dst := joinHostPort(id.LocalAddress, id.LocalPort)
-	if isPrivateOrLoopbackAddr(id.LocalAddress) {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
-		}
-		return true
-	}
 
-	// 1. WebRTC STUN 物理防泄露：阶段一未激活时静默丢弃 3478 / 19302 / 5349
-	if id.LocalPort == 3478 || id.LocalPort == 19302 || id.LocalPort == 5349 {
-		if !e.webrtcRelayEnabled.Load() {
-			if r.Packet() != nil {
-				r.Packet().DecRef()
-			}
-			return true
-		}
-	}
-
-	// 2. 拦截端口 53 DNS 查询：
+	// 1. 优先拦截端口 53 DNS 查询（包括发往虚拟网关 10.88.0.1:53 等任何 DNS 目的地址）
 	// 规则：彻底删除端口 53 返回 nil 后的 DialUDP 兜底（直接栈内 DecRef() 丢弃）！
 	if id.LocalPort == 53 && e.dns != nil {
 		wq := waiter.Queue{}
@@ -427,6 +411,24 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 				}
 				// 核心铁律：返回 nil 时绝对不触发 DialUDP！直接静默退出
 			}()
+			return true
+		}
+	}
+
+	// 2. 局域网/私有地址防泄露拦截 (DNS 端口 53 已在前置优先捕获并处理)
+	if isPrivateOrLoopbackAddr(id.LocalAddress) {
+		if r.Packet() != nil {
+			r.Packet().DecRef()
+		}
+		return true
+	}
+
+	// 3. WebRTC STUN 物理防泄露：阶段一未激活时静默丢弃 3478 / 19302 / 5349
+	if id.LocalPort == 3478 || id.LocalPort == 19302 || id.LocalPort == 5349 {
+		if !e.webrtcRelayEnabled.Load() {
+			if r.Packet() != nil {
+				r.Packet().DecRef()
+			}
 			return true
 		}
 	}
@@ -575,7 +577,7 @@ func isPrivateOrLoopbackAddr(addr tcpip.Address) bool {
 	}
 	v4 := ip.To4()
 	if v4 != nil {
-		if ip.IsPrivate() && !v4.Equal(net.IPv4(10, 88, 0, 2)) {
+		if ip.IsPrivate() && !v4.Equal(net.IPv4(10, 88, 0, 2)) && !v4.Equal(net.IPv4(10, 88, 0, 1)) {
 			return true
 		}
 		return false

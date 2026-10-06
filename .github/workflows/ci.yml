@@ -108,7 +108,7 @@ jobs:
           mkdir -p dist/client-windows
           mkdir -p dist/aeroprot-win-bundle
           go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/aeroprot.exe ./aeroprot/cmd/client
-          go build -v -ldflags="-s -w" -o dist/aeroprot-win-bundle/guard.exe ./aeroprot/cmd/guard
+          go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/guard.exe ./aeroprot/cmd/guard
           curl.exe -fsSL "https://www.wintun.net/builds/wintun-0.14.1.zip" -o wintun.zip
           tar.exe -xf wintun.zip
           Copy-Item wintun/bin/amd64/wintun.dll dist/aeroprot-win-bundle/wintun.dll

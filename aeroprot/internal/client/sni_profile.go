@@ -26,9 +26,9 @@ type SNIProfile struct {
 }
 
 var (
-	sniProfileMu      sync.RWMutex
-	cachedSNIProfile  *SNIProfile
-	sniProberStarted  sync.Once
+	sniProfileMu     sync.RWMutex
+	cachedSNIProfile *SNIProfile
+	sniProberStarted sync.Once
 
 	builtinSNIMatrix = map[string][]string{
 		"telecom": {"edge.microsoft.com", "gateway.icloud.com", "live.azure.com"},

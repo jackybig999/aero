@@ -8,7 +8,6 @@ package client
 
 import (
 	"context"
-	_ "embed"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -28,9 +27,6 @@ import (
 	"golang.zx2c4.com/wintun"
 )
 
-//go:embed wintun.dll
-var embeddedWintunDLL []byte
-
 func ensureWintunDLL() error {
 	exe, err := os.Executable()
 	if err == nil {
@@ -38,12 +34,6 @@ func ensureWintunDLL() error {
 		target := filepath.Join(exeDir, "wintun.dll")
 		if _, err := os.Stat(target); err == nil {
 			return nil
-		}
-		if len(embeddedWintunDLL) > 0 {
-			if werr := os.WriteFile(target, embeddedWintunDLL, 0755); werr == nil {
-				log.Printf("[TUN] auto-extracted wintun.dll to %s", target)
-				return nil
-			}
 		}
 	}
 
@@ -55,13 +45,7 @@ func ensureWintunDLL() error {
 	if _, err := os.Stat("wintun.dll"); err == nil {
 		return nil
 	}
-	if len(embeddedWintunDLL) > 0 {
-		if err := os.WriteFile("wintun.dll", embeddedWintunDLL, 0755); err == nil {
-			log.Printf("[TUN] auto-extracted wintun.dll to current directory")
-			return nil
-		}
-	}
-	return nil
+	return fmt.Errorf("wintun.dll not found in executable directory, System32, or current working directory")
 }
 
 var (
@@ -99,9 +83,6 @@ func startCrashGuardOnce() {
 	cmd := exec.Command(guardPath, "-pid", strconv.Itoa(os.Getpid()))
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow: true,
-		CreationFlags: windows.DETACHED_PROCESS |
-			windows.CREATE_NEW_PROCESS_GROUP |
-			windows.CREATE_NO_WINDOW,
 	}
 	if err := cmd.Start(); err != nil {
 		log.Printf("[GUARD] failed to start watchdog: %v", err)
@@ -299,6 +280,7 @@ func SetupRoutes(devName, ipv4 string) error {
 		devName = "aero0"
 	}
 	tunIP := "10.88.0.2"
+	gwIP := "10.88.0.1"
 	mask := "255.255.255.0"
 	if ipv4 != "" {
 		parts := strings.Split(ipv4, "/")
@@ -323,6 +305,9 @@ func SetupRoutes(devName, ipv4 string) error {
 		return SetInterfaceMTU(devName, mtu)
 	})
 
+	// 设置虚拟网卡跃点数优先级置顶 (metric=1)
+	_ = runCmd("netsh", "interface", "ipv4", "set", "interface", devName, "metric=1")
+
 	// 2. 清理旧 split 路由（严格限定仅当前网卡）并添加 0.0.0.0/1 和 128.0.0.0/1
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
@@ -343,15 +328,14 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "::/1", devName)
 	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "8000::/1", devName)
 
-	// 4. 为虚拟网卡绑定纯净 DNS，使系统将 DNS 流量送入虚拟网卡，被 gVisor 端口 53 拦截处理
-	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=static", "address=1.1.1.1", "validate=no")
-	_ = runCmd("netsh", "interface", "ip", "add", "dnsservers", "name="+devName, "address=8.8.8.8", "index=2", "validate=no")
+	// 4. 为虚拟网卡绑定纯净虚拟网关 DNS (gwIP = 10.88.0.1)，使系统将 DNS 流量送入虚拟网卡，被 gVisor 端口 53 拦截处理
+	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=static", "address="+gwIP, "validate=no")
 
-	// 5. NRPT 策略配置：配置所有域名（Namespace "."）指向 TUN 网卡 DNS（tunIP），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！
+	// 5. NRPT 策略配置：所有域名（Namespace "."）指向虚拟网关 DNS（gwIP = 10.88.0.1，绝对严禁指向网卡自身 tunIP！），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！
 	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
-		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s' -Comment 'AERO_%s'", tunIP, devName))
+		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s' -Comment 'AERO_%s'", gwIP, devName))
 
-	log.Printf("[TUN] Routes and DNS configured on %s via %s if=%s (MTU=1360)", devName, tunIP, idx)
+	log.Printf("[TUN] Routes and DNS configured on %s via tunIP=%s gwIP=%s if=%s (MTU=1360)", devName, tunIP, gwIP, idx)
 	return nil
 }
 
