@@ -916,67 +916,6 @@
     </div>
   </div>
 
-  <!-- AERO 安装 / 升级 弹窗面板 -->
-  <div class="modal-backdrop" id="aeroInstallModal">
-    <div class="modal-content" style="max-width:480px;width:90%">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid var(--line);padding-bottom:10px">
-        <h3 style="font-size:15px;display:flex;align-items:center;gap:8px">
-          <span>🚀 安装 / 升级 AERO Edge 节点</span>
-        </h3>
-        <button class="btn btn-sm" id="btnCancelInstallModal">✕</button>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:12px">
-        <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">目标 VPS 主机</label>
-          <input type="text" id="installModalVpsName" class="input-text" style="width:100%" readonly disabled />
-        </div>
-        <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">部署监听端口 (标准 HTTPS 为 443，可自定义)</label>
-          <input type="number" id="installModalPort" class="input-text" style="width:100%" value="443" min="1" max="65535" />
-          <p style="font-size:11px;color:var(--muted);margin-top:4px">提示：优先使用 443 标准端口；若运营商阻断 UDP 443，可配多路端口复用。</p>
-        </div>
-        <div style="background:var(--bg);padding:10px;border-radius:6px;border:1px solid var(--line);font-size:11px;color:var(--muted)">
-          <div style="color:var(--blue);font-weight:600;margin-bottom:4px">📦 官方源极速流水线：</div>
-          1. 自动校验 GitHub Release 官方发布包<br/>
-          2. SSH 安全注入组件并配置 systemd 进程守护<br/>
-          3. 自动向中台同步节点并生成默认订阅
-        </div>
-      </div>
-      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
-        <button class="btn btn-sm" id="btnCloseInstallModal">取消</button>
-        <button class="btn btn-blue btn-sm" id="btnConfirmInstallModal">开始安装部署</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- AERO 深度卸载 弹窗面板 -->
-  <div class="modal-backdrop" id="aeroUninstallModal">
-    <div class="modal-content" style="max-width:480px;width:90%">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid var(--line);padding-bottom:10px">
-        <h3 style="font-size:15px;color:var(--red);display:flex;align-items:center;gap:8px">
-          <span>⚠️ 深度卸载 AERO Edge 节点</span>
-        </h3>
-        <button class="btn btn-sm" id="btnCancelUninstallModal">✕</button>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:12px">
-        <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">目标 VPS 主机</label>
-          <input type="text" id="uninstallModalVpsName" class="input-text" style="width:100%" readonly disabled />
-        </div>
-        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:12px;font-size:12px;color:#fca5a5">
-          <p style="font-weight:700;margin-bottom:6px">⚠️ 危险操作警告：</p>
-          1. 停止并禁用远端 <code>aero-edge.service</code><br/>
-          2. 终结运行中的 aero-edge 进程并释放端口<br/>
-          3. 清理 <code>/usr/local/bin/aero-edge</code> 及配置文件<br/>
-          4. 联动彻底从中台节点池中注销该节点
-        </div>
-      </div>
-      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
-        <button class="btn btn-sm" id="btnCloseUninstallModal">取消</button>
-        <button class="btn btn-danger btn-sm" id="btnConfirmUninstallModal">确认彻底卸载</button>
-      </div>
-    </div>
-  </div>
 
   <!-- Modal: 超级管理员全节点详细订阅 -->
   <div class="modal-backdrop" id="adminMultiSubModal">

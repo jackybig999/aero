@@ -1640,9 +1640,10 @@ function openAeroTaskDrawer(taskId, action = 'task') {
   activeAeroTaskId = taskId;
   $('aeroTaskModalTitle').innerHTML = `<span>🚀 调度流水线详情 #${taskId}</span> <span class="tag tag-blue" id="aeroTaskModalStatusTag">RUNNING</span>`;
   const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : `${action.toUpperCase()} Edge`);
-  $('aeroTaskModalSub').textContent = `任务 #${taskId} · ${actName}`;
+  const vpsLabel = getSelectedAeroVpsLabel();
+  $('aeroTaskModalSub').textContent = `任务 #${taskId} · ${actName} · ${vpsLabel}`;
 
-  // 抽屉面板内嵌警示/说明提示框（彻底替代弹窗确认）
+  // 抽屉面板内嵌警示/说明提示框（彻底替代弹窗确认，单步直达明细面板）
   const noticeBox = $('aeroTaskNoticeBox');
   if (noticeBox) {
     if (action === 'uninstall') {
@@ -1651,13 +1652,13 @@ function openAeroTaskDrawer(taskId, action = 'task') {
       noticeBox.style.border = '1px solid rgba(239, 68, 68, 0.35)';
       noticeBox.style.color = '#fca5a5';
       noticeBox.innerHTML = `
-        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px">
-          <span>⚠️</span> 危险操作执行警告：
+        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#ef4444">
+          <span>⚠️</span> 危险操作执行警告（彻底清理与注销节点）：
         </div>
         <div style="font-size:12px;line-height:1.6">
-          1. 停止并禁用远端 <code>aero-edge.service</code><br/>
-          2. 终结运行中的 aero-edge 进程并释放端口<br/>
-          3. 清理 <code>/usr/local/bin/aero-edge</code> 及配置文件<br/>
+          1. 停止并禁用远端系统服务 <code>aero-edge.service</code><br/>
+          2. 终结运行中的 aero-edge 进程并释放网络端口<br/>
+          3. 清理 <code>/usr/local/bin/aero-edge</code> 二进制与全部配置文件<br/>
           4. 联动彻底从中台节点池中注销该节点并恢复网络规则
         </div>
       `;
@@ -1667,13 +1668,14 @@ function openAeroTaskDrawer(taskId, action = 'task') {
       noticeBox.style.border = '1px solid rgba(59, 130, 246, 0.35)';
       noticeBox.style.color = '#93c5fd';
       noticeBox.innerHTML = `
-        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px">
-          <span>🚀</span> 官方源极速流水线：
+        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#3b82f6">
+          <span>🚀</span> 官方源极速流水线（最新版本校验中）：
         </div>
         <div style="font-size:12px;line-height:1.6">
-          1. 自动比对远端版本（若已是最新版本则智能跳过重复构建）<br/>
-          2. 若非最新版则彻底清理旧版并从官方公开源拉取新版<br/>
-          3. 自动适配宿主机环境，配置 UDP 2083 透明重定向与证书
+          1. 自动请求 GitHub Release 官方源校验并比对最新版本号<br/>
+          2. 若远端 Edge 内核已是最新版本，将智能跳过重复构建与多余传输，瞬间就绪<br/>
+          3. 若非最新版，将彻底拉取最新官方包执行无缝热升级并重载守护进程<br/>
+          4. 自动检测宿主网络环境，配置 UDP 443 标准监听与 2083 端口复用
         </div>
       `;
     } else {
@@ -1825,31 +1827,15 @@ function initAeroEvents() {
   });
   $('btnAeroRestart')?.addEventListener('click', () => deployAero('restart'));
 
-  // 安装 / 升级 独立弹窗面板
+  // 安装 / 升级 Edge 节点（单步直达任务抽屉流水线，自带版本与环境前置提示）
   $('btnAeroInstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    $('installModalVpsName').value = getSelectedAeroVpsLabel();
-    $('installModalPort').value = '443';
-    $('aeroInstallModal').classList.add('active');
-  });
-  $('btnCancelInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
-  $('btnCloseInstallModal')?.addEventListener('click', () => $('aeroInstallModal').classList.remove('active'));
-  $('btnConfirmInstallModal')?.addEventListener('click', () => {
-    $('aeroInstallModal').classList.remove('active');
-    const port = parseInt($('installModalPort').value.trim(), 10) || 443;
-    deployAero('install', port);
+    deployAero('install', 443);
   });
 
-  // 深度卸载 独立弹窗面板
+  // 深度卸载 Edge 节点（单步直达任务抽屉流水线，抽屉内嵌高危删除红色提示）
   $('btnAeroUninstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    $('uninstallModalVpsName').value = getSelectedAeroVpsLabel();
-    $('aeroUninstallModal').classList.add('active');
-  });
-  $('btnCancelUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
-  $('btnCloseUninstallModal')?.addEventListener('click', () => $('aeroUninstallModal').classList.remove('active'));
-  $('btnConfirmUninstallModal')?.addEventListener('click', () => {
-    $('aeroUninstallModal').classList.remove('active');
     deployAero('uninstall');
   });
   
