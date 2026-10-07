@@ -462,6 +462,25 @@ func builtinChinaDomains() []string {
 		"citicbank.com", "ecitic.com", "cebbank.com", "hxb.com.cn", "psbc.com",
 		"cgbchina.com.cn", "unionpay.com", "95516.com", "pbc.gov.cn",
 		"sse.com.cn", "szse.cn", "bse.cn", "chinaclear.cn",
+		// 视频、直播与媒体 CDN
+		"bilivideo.com", "biliapi.net", "biliapi.com", "bilibili.tv",
+		"iqiyi.com", "qiyi.com", "youku.com", "mgtv.com",
+		"douyu.com", "huya.com", "kuaishou.com", "gifshow.com", "ixigua.com",
+		// 云服务与骨干分发网络 CDN
+		"aliyuncdn.com", "kunlungr.com", "tbcdn.cn", "tanx.com",
+		"tencent-cloud.com", "baidubce.com", "bcebos.com",
+		"upaiyun.com", "qiniu.com", "qiniucdn.com", "volces.com",
+		"bytedns.net", "bytegoofy.com",
+		// 开发者与技术社区
+		"csdn.net", "csdnimg.cn", "v2ex.com", "segmentfault.com",
+		"oschina.net", "gitee.com", "juejin.cn", "cnblogs.com", "runoob.com", "infoq.cn",
+		// 门户、资讯与生活消费
+		"toutiao.com", "toutiaocdn.com", "douyinpic.com", "snssdk.com", "pstatp.com",
+		"sohu.com", "sina.com.cn", "163yun.com", "netease.im", "tieba.com",
+		"meituan.com", "dianping.com", "ele.me", "alipayobjects.com", "suning.com",
+		"pinduoduo.com", "yangkeduo.com", "jdcache.com",
+		// 公共 DNS、测速与诊断工具
+		"alidns.com", "dnspod.cn", "114dns.com", "speedtest.cn", "ip138.com", "ip.cn", "chinaz.com",
 	}
 }
 

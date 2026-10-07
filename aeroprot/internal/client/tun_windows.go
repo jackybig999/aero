@@ -636,6 +636,10 @@ func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, er
 						var buf [4]byte
 						binary.BigEndian.PutUint32(buf[:], uint32(idx))
 						opErr = syscall.Setsockopt(syscall.Handle(fd), syscall.IPPROTO_IP, 31, (*byte)(unsafe.Pointer(&buf[0])), 4)
+						if opErr == nil {
+							_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 2*1024*1024)
+							_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 2*1024*1024)
+						}
 					})
 					return opErr
 				}
@@ -665,6 +669,10 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 			var buf [4]byte
 			binary.BigEndian.PutUint32(buf[:], uint32(idx))
 			opErr = syscall.Setsockopt(syscall.Handle(fd), syscall.IPPROTO_IP, 31, (*byte)(unsafe.Pointer(&buf[0])), 4)
+			if opErr == nil {
+				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
+				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
+			}
 		})
 		return opErr
 	}

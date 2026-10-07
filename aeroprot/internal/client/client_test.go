@@ -1494,7 +1494,12 @@ func TestEngineStartTUNConflictAborts(t *testing.T) {
 
 func TestEngineStartSysproxyWithThirdPartyTUN(t *testing.T) {
 	origDetect := detectThirdPartyTUN
-	defer func() { detectThirdPartyTUN = origDetect }()
+	origCleanRoutes := cleanAero0StaleRoutesFn
+	defer func() {
+		detectThirdPartyTUN = origDetect
+		cleanAero0StaleRoutesFn = origCleanRoutes
+	}()
+	cleanAero0StaleRoutesFn = func() {}
 	detectThirdPartyTUN = func() (bool, string, error) {
 		return true, "Meta", nil
 	}
@@ -2273,12 +2278,15 @@ func TestStage1_StartEnablesWebRTCActive(t *testing.T) {
 	origOpenTun := openTunDeviceFn
 	origSetupRoutes := setupRoutesFn
 	origTeardownRoutes := teardownRoutesFn
+	origCleanRoutes := cleanAero0StaleRoutesFn
 	defer func() {
 		detectThirdPartyTUN = origDetect
 		openTunDeviceFn = origOpenTun
 		setupRoutesFn = origSetupRoutes
 		teardownRoutesFn = origTeardownRoutes
+		cleanAero0StaleRoutesFn = origCleanRoutes
 	}()
+	cleanAero0StaleRoutesFn = func() {}
 
 	detectThirdPartyTUN = func() (bool, string, error) {
 		return false, "", nil
@@ -2482,12 +2490,15 @@ func TestStage1_DesktopStartNoDialIPAndFixedPrefix(t *testing.T) {
 	origOpenTun := openTunDeviceFn
 	origSetupRoutes := setupRoutesFn
 	origTeardownRoutes := teardownRoutesFn
+	origCleanRoutes := cleanAero0StaleRoutesFn
 	defer func() {
 		detectThirdPartyTUN = origDetect
 		openTunDeviceFn = origOpenTun
 		setupRoutesFn = origSetupRoutes
 		teardownRoutesFn = origTeardownRoutes
+		cleanAero0StaleRoutesFn = origCleanRoutes
 	}()
+	cleanAero0StaleRoutesFn = func() {}
 
 	detectThirdPartyTUN = func() (bool, string, error) {
 		return false, "", nil
@@ -3679,12 +3690,15 @@ func TestMultiPortHopping_And_PortAlignment(t *testing.T) {
 	origOpenTun := openTunDeviceFn
 	origSetupRoutes := setupRoutesFn
 	origTeardownRoutes := teardownRoutesFn
+	origCleanRoutes := cleanAero0StaleRoutesFn
 	defer func() {
 		detectThirdPartyTUN = origDetect
 		openTunDeviceFn = origOpenTun
 		setupRoutesFn = origSetupRoutes
 		teardownRoutesFn = origTeardownRoutes
+		cleanAero0StaleRoutesFn = origCleanRoutes
 	}()
+	cleanAero0StaleRoutesFn = func() {}
 
 	detectThirdPartyTUN = func() (bool, string, error) { return false, "", nil }
 	mockDev := newMockTunDevice()
@@ -4009,3 +4023,120 @@ func TestDNSVirtualGatewayInterception(t *testing.T) {
 		t.Errorf("expected Fake-IP in 198.18.0.0/15, got %s", ansIP)
 	}
 }
+
+// 验证 Type 65 (HTTPS RR) 与非 A 查询返回纯净空应答，绝不塞入 Fake-IP Type A 造成报文畸变
+func TestDNS_Type65_And_NonA_CleanResponse(t *testing.T) {
+	split := NewSplitEngine()
+	dnsHandler := NewDNSHandler(split)
+
+	// 1. 境外域名 Type 65 (0x0041) 查询：必须返回标准空应答 (NOERROR, 0 答案)
+	reqType65 := buildDNSQuery("google.com", 0x0041)
+	respType65 := dnsHandler.HandleQuery(reqType65, net.ParseIP("10.88.0.2"), 53)
+	if respType65 == nil {
+		t.Fatalf("expected non-nil response for Type 65 query")
+	}
+	if ansCount := binary.BigEndian.Uint16(respType65[6:8]); ansCount != 0 {
+		t.Fatalf("expected 0 answers for Type 65 query, got %d", ansCount)
+	}
+	// RCODE 必须是 0 (NOERROR)
+	if respType65[3]&0x0F != 0 {
+		t.Fatalf("expected RCODE 0 for Type 65 query, got %d", respType65[3]&0x0F)
+	}
+
+	// 2. 境外域名 TXT (0x0010) 查询：必须返回标准空应答
+	reqTXT := buildDNSQuery("google.com", 0x0010)
+	respTXT := dnsHandler.HandleQuery(reqTXT, net.ParseIP("10.88.0.2"), 53)
+	if respTXT == nil || binary.BigEndian.Uint16(respTXT[6:8]) != 0 {
+		t.Fatalf("expected empty answer for TXT query")
+	}
+
+	// 3. 境外域名 Type A (0x0001) 查询：必须正常返回 198.18.0.0/15 Fake-IP
+	reqA := buildDNSQuery("google.com", 0x0001)
+	respA := dnsHandler.HandleQuery(reqA, net.ParseIP("10.88.0.2"), 53)
+	if respA == nil {
+		t.Fatalf("expected non-nil response for Type A query")
+	}
+	if ansCount := binary.BigEndian.Uint16(respA[6:8]); ansCount != 1 {
+		t.Fatalf("expected 1 answer for Type A query, got %d", ansCount)
+	}
+	fakeIP := extractFirstAAnswer(respA)
+	if fakeIP == nil || !dnsHandler.fakeIP.Contains(fakeIP) {
+		t.Fatalf("expected Fake-IP in 198.18.0.0/15 for Type A, got %v", fakeIP)
+	}
+}
+
+// 验证系统连通性探针与本地保留域名放行机制
+func TestDNS_SystemProbeAndLocalDomains(t *testing.T) {
+	split := NewSplitEngine()
+	dnsHandler := NewDNSHandler(split)
+
+	// 1. 探针域名判定
+	if !isSystemProbeDomain("msftconnecttest.com") {
+		t.Errorf("msftconnecttest.com should be probe domain")
+	}
+	if !isSystemProbeDomain("ipv6.msftconnecttest.com") {
+		t.Errorf("ipv6.msftconnecttest.com should be probe domain")
+	}
+	if !isSystemProbeDomain("www.msftncsi.com") {
+		t.Errorf("www.msftncsi.com should be probe domain")
+	}
+	if !isSystemProbeDomain("captive.apple.com") {
+		t.Errorf("captive.apple.com should be probe domain")
+	}
+
+	// 2. 探针域名 AAAA 查询：返回标准空应答，绝不卡死
+	reqProbeAAAA := buildDNSQuery("msftconnecttest.com", 0x001C)
+	respProbeAAAA := dnsHandler.HandleQuery(reqProbeAAAA, net.ParseIP("10.88.0.2"), 53)
+	if respProbeAAAA == nil || binary.BigEndian.Uint16(respProbeAAAA[6:8]) != 0 {
+		t.Fatalf("expected empty answer for probe AAAA query")
+	}
+
+	// 3. 本地保留域名判定与安全应答
+	if !isLocalDomain("wpad.local") {
+		t.Errorf("wpad.local should be local domain")
+	}
+	if !isLocalDomain("myrouter.lan") {
+		t.Errorf("myrouter.lan should be local domain")
+	}
+	reqLocal := buildDNSQuery("wpad.local", 0x0001)
+	respLocal := dnsHandler.HandleQuery(reqLocal, net.ParseIP("10.88.0.2"), 53)
+	if respLocal == nil || binary.BigEndian.Uint16(respLocal[6:8]) != 0 {
+		t.Fatalf("expected empty answer for local domain query")
+	}
+}
+
+// 验证国内主流流媒体/CDN/开发社区域名的直连分流规则完备性
+func TestSplitRouting_DomesticCDNs(t *testing.T) {
+	split := NewSplitEngine()
+
+	directDomains := []string{
+		"v.bilivideo.com",
+		"api.biliapi.net",
+		"img.aliyuncdn.com",
+		"blog.csdn.net",
+		"www.v2ex.com",
+		"cdn.volces.com",
+		"p1-dy-ipv6.byteimg.com",
+		"web.sogou.com",
+		"dl.hdslb.com",
+	}
+
+	for _, d := range directDomains {
+		action := split.Decide(d)
+		if action != "direct" {
+			t.Errorf("expected direct for domain %s, got %s", d, action)
+		}
+	}
+
+	// 验证境外域名与 AI 域名正确分流为 proxy / ai (非 direct)
+	if action := split.Decide("www.google.com"); action != "proxy" {
+		t.Errorf("expected proxy for www.google.com, got %s", action)
+	}
+	if action := split.Decide("api.openai.com"); action != "ai" {
+		t.Errorf("expected ai for api.openai.com, got %s", action)
+	}
+	if action := split.Decide("youtube.com"); action != "proxy" {
+		t.Errorf("expected proxy for youtube.com, got %s", action)
+	}
+}
+

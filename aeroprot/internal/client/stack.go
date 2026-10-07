@@ -433,7 +433,16 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		}
 	}
 
-	// 3. 普通 UDP 业务数据报（第一包登记 Context，后续包排队写入同一 Context）
+	// 4. QUIC (UDP 443) 拦截：阻断发往 443 端口的普通 UDP 数据报
+	// 强制客户端浏览器 HTTP/3 在 0ms 内即刻回退至稳定高速的 TCP (HTTP/2)，彻底消除 Chromium 60 秒超时假死挂起
+	if id.LocalPort == 443 {
+		if r.Packet() != nil {
+			r.Packet().DecRef()
+		}
+		return true
+	}
+
+	// 5. 普通 UDP 业务数据报（第一包登记 Context，后续包排队写入同一 Context）
 	key := joinHostPort(id.RemoteAddress, id.RemotePort) + ">" + dst
 	if _, loaded := e.udpSess.LoadOrStore(key, true); loaded {
 		if r.Packet() != nil {

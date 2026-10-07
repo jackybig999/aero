@@ -342,9 +342,18 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 	}
 	qnameLower := strings.ToLower(qname)
 
-	// 本地/局域网探针放行
-	if isLocalOrSystemDomain(qnameLower) {
-		return nil
+	// 本地保留域：直接返回标准空应答，绝不黑洞丢弃导致系统 DNS 挂起超时
+	if isLocalDomain(qnameLower) {
+		return buildEmptyResponse(pkt, qname, qtype)
+	}
+
+	// 操作系统网络连通性探针放行 (Windows NCSI / Apple Captive / Android Probe)
+	// A 记录走直连物理 DNS 快速校验，AAAA 记录返回纯净空应答
+	if isSystemProbeDomain(qnameLower) {
+		if qtype == 0x001C {
+			return buildEmptyResponse(pkt, qname, qtype)
+		}
+		return h.queryFastUDP(pkt)
 	}
 
 	// 节点自身域名：返回真实 IP
@@ -376,17 +385,21 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return buildEmptyResponse(pkt, qname, qtype)
 	}
 
-	// 境外 A 记录查询：0ms 立即返回 198.18.0.0/15 Fake-IP（耗时 < 100ms），绝不先行同步等待 2.5 秒 DoH 往返！
+	// 境外 IPv4 A 记录查询：0ms 立即返回 198.18.0.0/15 Fake-IP（耗时 < 100ms），绝不先行同步等待 2.5 秒 DoH 往返！
 	// 真实域名保留在 Fake-IP 表，由后续 CONNECT 统一送交边缘解析。
-	if h.fakeIP != nil {
-		resp := h.fakeIP.FormatDNSResponse(qname)
-		if len(pkt) >= 2 && len(resp) >= 2 {
-			resp[0], resp[1] = pkt[0], pkt[1]
+	if qtype == 0x0001 {
+		if h.fakeIP != nil {
+			resp := h.fakeIP.FormatDNSResponse(qname)
+			if len(pkt) >= 2 && len(resp) >= 2 {
+				resp[0], resp[1] = pkt[0], pkt[1]
+			}
+			return resp
 		}
-		return resp
 	}
 
-	return nil
+	// 其余查询类型 (Type 65 HTTPS RR, TXT, MX 等)：返回标准空应答 (NOERROR, 0 答案)
+	// 严禁塞入 Type A 答案，彻底消除报文畸变导致浏览器重试！
+	return buildEmptyResponse(pkt, qname, qtype)
 }
 
 // queryFastUDP 仅用于 .cn 及国内直连域名向物理解析器发包
@@ -424,16 +437,17 @@ func (h *DNSHandler) queryFastUDP(pkt []byte) []byte {
 	return buf[:n]
 }
 
-func isLocalOrSystemDomain(host string) bool {
+func isSystemProbeDomain(host string) bool {
 	h := strings.ToLower(strings.TrimSpace(host))
-	if h == "" || h == "localhost" || strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".lan") ||
-		strings.HasSuffix(h, ".internal") || strings.HasSuffix(h, ".home.arpa") ||
-		strings.HasSuffix(h, "msftconnecttest.com") || strings.HasSuffix(h, "msftncsi.com") ||
+	return strings.HasSuffix(h, "msftconnecttest.com") || strings.HasSuffix(h, "msftncsi.com") ||
 		strings.HasSuffix(h, "ipv6.msftncsi.com") || strings.HasSuffix(h, "captive.apple.com") ||
-		strings.HasSuffix(h, "connectivitycheck.gstatic.com") {
-		return true
-	}
-	return false
+		strings.HasSuffix(h, "connectivitycheck.gstatic.com")
+}
+
+func isLocalDomain(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == "" || h == "localhost" || strings.HasSuffix(h, ".local") || strings.HasSuffix(h, ".lan") ||
+		strings.HasSuffix(h, ".internal") || strings.HasSuffix(h, ".home.arpa")
 }
 
 func extractDNSQuestionAndType(pkt []byte) (string, uint16) {

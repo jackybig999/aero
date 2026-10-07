@@ -43,8 +43,9 @@ var (
 	subSingleFlight     singleflight.Group
 	detectThirdPartyTUN = DetectThirdPartyTUN
 	openTunDeviceFn     = OpenTunDevice
-	setupRoutesFn       = SetupRoutes
-	teardownRoutesFn    = TeardownRoutes
+	setupRoutesFn           = SetupRoutes
+	teardownRoutesFn        = TeardownRoutes
+	cleanAero0StaleRoutesFn = CleanAero0StaleRoutes
 )
 
 // AppState 描述客户端当前运行状态
@@ -610,7 +611,7 @@ func (e *Engine) Start() error {
 	// 绝对不调用 DetectThirdPartyTUN()，绝对不调完整 TeardownRoutes；
 	// 但清理上次崩溃可能残留在 aero0 上的 /1 路由（仅通过 interface aero0 指定删除，绝不碰 Clash）
 	if mode == "sysproxy" {
-		CleanAero0StaleRoutes()
+		cleanAero0StaleRoutesFn()
 	} else {
 		// 2. 全局 TUN 模式：
 		// 第一行执行无死角第三方 TUN 冲突检测
@@ -623,7 +624,7 @@ func (e *Engine) Start() error {
 			return rollback(&ErrConflictingTUN{VPNName: vpnName})
 		}
 
-		CleanAero0StaleRoutes()
+		cleanAero0StaleRoutesFn()
 		invalidateGatewayCache()
 	}
 

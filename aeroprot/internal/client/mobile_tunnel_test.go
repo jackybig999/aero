@@ -118,7 +118,12 @@ func TestUDPUnavailableFallback_NoTUN_Port55555Listening(t *testing.T) {
 
 	// 拦截并模拟 UDP 拨号失败（模拟目标 UDP 443 被防火墙静默丢包或阻断）
 	origHook := quicDialHook
-	defer func() { SetQUICDialHook(origHook) }()
+	origCleanRoutes := cleanAero0StaleRoutesFn
+	defer func() {
+		SetQUICDialHook(origHook)
+		cleanAero0StaleRoutesFn = origCleanRoutes
+	}()
+	cleanAero0StaleRoutesFn = func() {}
 	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
 		return nil, errors.New("UDP port 443 blocked by DPI / connection refused")
 	})
