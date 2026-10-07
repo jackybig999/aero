@@ -933,7 +933,8 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 				"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "edge-admin-api",
 				"ok":        true,
 				"installed": true,
-				"service":   map[string]any{"status": "active", "active": true, "main_pid": "active"},
+				"version":   edgeData["version"],
+				"service":   map[string]any{"status": "active", "active": true, "main_pid": "active", "version": edgeData["version"]},
 				"ports": []map[string]any{
 					{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": true},
 					{"port": 80, "proto": "tcp", "role": "http/acme", "listen": true},

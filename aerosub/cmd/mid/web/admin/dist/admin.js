@@ -1420,6 +1420,10 @@ let currentAeroVpsId = '';
 let activeAeroTaskId = null;
 let aeroTaskPollTimer = null;
 let aeroEventsInitialized = false;
+let latestAeroDiagnose = null;
+let latestAeroSourceStatus = null;
+let preflightPendingAction = null;
+let preflightCustomPort = 443;
 
 async function loadAERO() {
   if (!aeroEventsInitialized) {
@@ -1437,6 +1441,7 @@ async function loadAERO() {
 async function loadAeroSourceStatus() {
   try {
     const st = await apiCall('/aero/source-status/');
+    latestAeroSourceStatus = st;
     const alertBox = $('aeroSourceAlert');
     if (alertBox) {
       if (st && st.status === 'warning') {
@@ -1497,6 +1502,7 @@ async function loadAeroDiagnose(vpsId) {
 
   try {
     const diag = await apiCall(`/aero/vps/${vpsId}/diagnose/`);
+    latestAeroDiagnose = diag;
     if (statusEl) statusEl.textContent = `探测响应完成 (${diag.via || '本地'})`;
 
     // 1. Overall & Service KPI
@@ -1633,11 +1639,308 @@ async function deployAero(action, customPort = 0) {
     }
   } catch (e) {
     alert(`调度指令下发失败: ${e.message}`);
+    const confirmBtn = $('btnConfirmAeroTaskPreflight');
+    const cancelBtn = $('btnCancelAeroTaskPreflight');
+    if (confirmBtn) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = '重试操作';
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = false;
+    }
+  }
+}
+
+async function openAeroPreflightDrawer(action, customPort = 443) {
+  if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
+
+  preflightPendingAction = action;
+  preflightCustomPort = customPort;
+  activeAeroTaskId = null;
+  if (aeroTaskPollTimer) {
+    clearInterval(aeroTaskPollTimer);
+    aeroTaskPollTimer = null;
+  }
+
+  // 保证具备最新诊断数据
+  if (!latestAeroDiagnose && currentAeroVpsId) {
+    try {
+      await loadAeroDiagnose(currentAeroVpsId);
+    } catch (_) {}
+  }
+
+  const vpsLabel = getSelectedAeroVpsLabel();
+  const noticeBox = $('aeroTaskNoticeBox');
+  const actionBar = $('aeroTaskPreflightActionBar');
+  const tipEl = $('aeroTaskPreflightTip');
+  const confirmBtn = $('btnConfirmAeroTaskPreflight');
+  const cancelBtn = $('btnCancelAeroTaskPreflight');
+
+  $('aeroTaskProgressBar').style.width = '0%';
+  $('aeroTaskProgressPercent').textContent = '0%';
+  $('aeroTaskDrawerModal').classList.add('active');
+
+  if (actionBar) actionBar.style.display = 'flex';
+  if (confirmBtn) {
+    confirmBtn.disabled = false;
+  }
+  if (cancelBtn) {
+    cancelBtn.disabled = false;
+  }
+
+  if (action === 'uninstall') {
+    // ------------------------------------------------------------------------
+    // 卸载操作：红色高危警告与显式二次确认按钮
+    // ------------------------------------------------------------------------
+    $('aeroTaskModalTitle').innerHTML = `<span>⚠️ 深度卸载 AERO Edge 节点</span> <span class="tag tag-red" id="aeroTaskModalStatusTag">高危待确认</span>`;
+    $('aeroTaskModalSub').textContent = `目标主机: ${vpsLabel} · 待管理员二次确认`;
+
+    if (noticeBox) {
+      noticeBox.style.display = 'block';
+      noticeBox.style.background = 'rgba(239, 68, 68, 0.12)';
+      noticeBox.style.border = '1px solid rgba(239, 68, 68, 0.35)';
+      noticeBox.style.color = '#fca5a5';
+      noticeBox.innerHTML = `
+        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#ef4444">
+          <span>⚠️</span> 危险操作执行警告（彻底清理与注销节点）：
+        </div>
+        <div style="font-size:12px;line-height:1.6">
+          1. 停止并禁用远端系统服务 <code>aero-edge.service</code><br/>
+          2. 终结运行中的 aero-edge 进程并释放网络端口<br/>
+          3. 清理 <code>/usr/local/bin/aero-edge</code> 二进制与全部配置文件<br/>
+          4. 联动彻底从中台节点池中注销该节点并恢复网络规则
+        </div>
+      `;
+    }
+
+    if (tipEl) {
+      tipEl.innerHTML = `<span style="color:#ef4444;font-weight:700">高危警告：</span> 卸载将停止服务并删除所有二进制与配置，不可逆！`;
+    }
+    if (confirmBtn) {
+      confirmBtn.className = 'btn btn-sm btn-danger';
+      confirmBtn.textContent = '🔥 确认彻底卸载该节点';
+    }
+    if (cancelBtn) {
+      cancelBtn.className = 'btn btn-sm';
+      cancelBtn.textContent = '取消 / 返回';
+    }
+
+    $('aeroTaskProgressStage').textContent = '阶段：等待用户确认卸载操作';
+    $('aeroTaskLogBox').textContent = `[待确认] 目标主机: ${vpsLabel}\n[风险警告] 深度卸载将停止远端守护进程并注销节点！\n[等待确认] 请在上方操作栏点击【🔥 确认彻底卸载该节点】以执行，或点击【取消 / 返回】安全退出。`;
+
+    const stepper = $('aeroTaskStepper');
+    if (stepper) {
+      stepper.innerHTML = `
+        <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+          <span>1. SSH 连通目标节点</span>
+          <span class="tag tag-muted">等待确认</span>
+        </div>
+        <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+          <span>2. 停止并禁用服务 (aero-edge.service)</span>
+          <span class="tag tag-muted">等待确认</span>
+        </div>
+        <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+          <span>3. 清理二进制与配置 (/usr/local/bin/aero-edge)</span>
+          <span class="tag tag-muted">等待确认</span>
+        </div>
+        <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+          <span>4. 卸载验收与节点注销</span>
+          <span class="tag tag-muted">等待确认</span>
+        </div>
+      `;
+    }
+  } else if (action === 'install') {
+    // ------------------------------------------------------------------------
+    // 安装 / 升级：前置检测已安装状态与最新版本比对
+    // ------------------------------------------------------------------------
+    const diag = latestAeroDiagnose;
+    const isInstalled = diag && diag.installed;
+    const isOk = diag && diag.ok;
+    const installedVer = (diag && (diag.version || (diag.service && diag.service.version))) || '';
+    const src = latestAeroSourceStatus;
+    const releaseTag = (src && src.release_tag) || 'v1.0.0';
+
+    if (isInstalled && isOk) {
+      // 场景 1：目标主机已安装且正常在线（防重复安装拦截）
+      $('aeroTaskModalTitle').innerHTML = `<span>💡 AERO Edge 节点安装检测</span> <span class="tag tag-amber" id="aeroTaskModalStatusTag">已安装·无需重复</span>`;
+      $('aeroTaskModalSub').textContent = `目标主机: ${vpsLabel} · 服务正常运行中`;
+
+      if (noticeBox) {
+        noticeBox.style.display = 'block';
+        noticeBox.style.background = 'rgba(245, 158, 11, 0.12)';
+        noticeBox.style.border = '1px solid rgba(245, 158, 11, 0.35)';
+        noticeBox.style.color = '#fcd34d';
+        noticeBox.innerHTML = `
+          <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#f59e0b">
+            <span>💡</span> 节点已安装检测提醒（无需重复安装）：
+          </div>
+          <div style="font-size:12px;line-height:1.6">
+            1. 目标主机当前<strong>已安装 AERO Edge 且服务正常运行中</strong>（状态: 正常在线 · 监听端口: 443）<br/>
+            2. 当前节点已处于就绪状态，<strong>无需重复安装</strong>！建议直接通过中台订阅链接分发使用。<br/>
+            3. 若因网络规则被封或组件异常需要重建，可点击下方【强制覆盖安装】进行重构。
+          </div>
+        `;
+      }
+
+      if (tipEl) {
+        tipEl.innerHTML = `<span style="color:#f59e0b;font-weight:700">检测提醒：</span> 该节点已正常运行，建议直接使用，请勿重复安装。`;
+      }
+      if (confirmBtn) {
+        confirmBtn.className = 'btn btn-sm btn-amber';
+        confirmBtn.textContent = '⚠️ 强制覆盖安装 / 重建';
+      }
+      if (cancelBtn) {
+        cancelBtn.className = 'btn btn-sm btn-blue';
+        cancelBtn.textContent = '无需重复安装 (取消返回)';
+      }
+
+      $('aeroTaskProgressStage').textContent = '阶段：检测到服务正常在线 (无需重复安装)';
+      $('aeroTaskLogBox').textContent = `[检测结果] 目标主机 ${vpsLabel} 已经安装 AERO Edge 并且正在健康运行中。\n[建议] 无需重复安装，建议点击【无需重复安装 (取消返回)】退出。\n[特殊场景] 仅在远端文件损坏或网络规则失效时，才使用【强制覆盖安装】。`;
+
+      const stepper = $('aeroTaskStepper');
+      if (stepper) {
+        stepper.innerHTML = `
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>1. 目标主机状态检测</span>
+            <span class="tag tag-green">已安装在线</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>2. 官方 Release 资产比对</span>
+            <span class="tag tag-green">${releaseTag} (最新版)</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>3. 重复安装防护检查</span>
+            <span class="tag tag-amber">已拦截防重复</span>
+          </div>
+        `;
+      }
+    } else if (isInstalled && installedVer && releaseTag && installedVer !== releaseTag) {
+      // 场景 2：已安装但有新版本（升级提醒）
+      $('aeroTaskModalTitle').innerHTML = `<span>🚀 AERO Edge 版本升级检测</span> <span class="tag tag-green" id="aeroTaskModalStatusTag">检测到新版本</span>`;
+      $('aeroTaskModalSub').textContent = `目标主机: ${vpsLabel} · 可升级至 ${releaseTag}`;
+
+      if (noticeBox) {
+        noticeBox.style.display = 'block';
+        noticeBox.style.background = 'rgba(16, 185, 129, 0.12)';
+        noticeBox.style.border = '1px solid rgba(16, 185, 129, 0.35)';
+        noticeBox.style.color = '#6ee7b7';
+        noticeBox.innerHTML = `
+          <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#10b981">
+            <span>🚀</span> 官方源最新版本升级检测：
+          </div>
+          <div style="font-size:12px;line-height:1.6">
+            1. 当前运行版本: <code>${installedVer}</code> -> 官方最新发布: <code>${releaseTag}</code><br/>
+            2. 升级将无缝热重载边缘服务，<strong>绝不丢失已配置的 Token 凭据与用户订阅</strong><br/>
+            3. 点击下方【确认升级至最新版本】开始执行热重载流水线。
+          </div>
+        `;
+      }
+
+      if (tipEl) {
+        tipEl.innerHTML = `<span style="color:#10b981;font-weight:700">可升级：</span> 官方源有新版本 (${releaseTag})，是否立即执行无感热升级？`;
+      }
+      if (confirmBtn) {
+        confirmBtn.className = 'btn btn-sm btn-green';
+        confirmBtn.textContent = `🚀 确认升级至最新版 (${releaseTag})`;
+      }
+      if (cancelBtn) {
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.textContent = '暂不升级';
+      }
+
+      $('aeroTaskProgressStage').textContent = '阶段：等待用户确认升级操作';
+      $('aeroTaskLogBox').textContent = `[版本检测] 目标主机运行版本: ${installedVer}，官方最新版本: ${releaseTag}。\n等待管理员点击确认升级...`;
+
+      const stepper = $('aeroTaskStepper');
+      if (stepper) {
+        stepper.innerHTML = `
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>1. 目标主机当前版本</span>
+            <span class="tag tag-blue">${installedVer || '旧版本'}</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>2. 官方 Release 最新版本</span>
+            <span class="tag tag-green">${releaseTag} (最新)</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>3. 无缝热重载准备</span>
+            <span class="tag tag-muted">等待确认</span>
+          </div>
+        `;
+      }
+    } else {
+      // 场景 3：全新节点未安装
+      $('aeroTaskModalTitle').innerHTML = `<span>📦 安装 AERO Edge 节点</span> <span class="tag tag-blue" id="aeroTaskModalStatusTag">未安装·待部署</span>`;
+      $('aeroTaskModalSub').textContent = `目标主机: ${vpsLabel} · 官方源极速安装`;
+
+      if (noticeBox) {
+        noticeBox.style.display = 'block';
+        noticeBox.style.background = 'rgba(59, 130, 246, 0.12)';
+        noticeBox.style.border = '1px solid rgba(59, 130, 246, 0.35)';
+        noticeBox.style.color = '#93c5fd';
+        noticeBox.innerHTML = `
+          <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#3b82f6">
+            <span>📦</span> 官方源极速安装流水线：
+          </div>
+          <div style="font-size:12px;line-height:1.6">
+            1. 目标主机当前尚未部署 AERO Edge 组件<br/>
+            2. 将从 GitHub Release 官方源拉取最新稳定版 (${releaseTag}) 并校验哈希完整性<br/>
+            3. 自动配置 systemd 进程守护、UDP 443 标准监听与 ACME 自动化证书<br/>
+            4. 自动向中台同步节点并生成默认订阅
+          </div>
+        `;
+      }
+
+      if (tipEl) {
+        tipEl.innerHTML = `<span style="color:#3b82f6;font-weight:700">部署前置确认：</span> 目标主机待部署，是否确认开始官方源极速安装？`;
+      }
+      if (confirmBtn) {
+        confirmBtn.className = 'btn btn-sm btn-blue';
+        confirmBtn.textContent = '🚀 确认开始极速安装';
+      }
+      if (cancelBtn) {
+        cancelBtn.className = 'btn btn-sm';
+        cancelBtn.textContent = '取消';
+      }
+
+      $('aeroTaskProgressStage').textContent = '阶段：等待确认开始部署';
+      $('aeroTaskLogBox').textContent = `[准备就绪] 目标主机待安装。\n点击上方【🚀 确认开始极速安装】按钮开始执行部署流水线...`;
+
+      const stepper = $('aeroTaskStepper');
+      if (stepper) {
+        stepper.innerHTML = `
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>1. 官方源前置检测 (${releaseTag} 资产校验)</span>
+            <span class="tag tag-muted">等待确认</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>2. SSH 连通与 Linux 运行环境探测</span>
+            <span class="tag tag-muted">等待确认</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>3. 远端 VPS 执行官方 Release 组件拉取</span>
+            <span class="tag tag-muted">等待确认</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>4. 配置 systemd 进程守护与 TLS 证书</span>
+            <span class="tag tag-muted">等待确认</span>
+          </div>
+          <div class="step-item" style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg);border-radius:4px;font-size:12px;border:1px solid var(--line)">
+            <span>5. 服务启动与 443 / 订阅健康验收</span>
+            <span class="tag tag-muted">等待确认</span>
+          </div>
+        `;
+      }
+    }
   }
 }
 
 function openAeroTaskDrawer(taskId, action = 'task') {
   activeAeroTaskId = taskId;
+  preflightPendingAction = null;
+  const actionBar = $('aeroTaskPreflightActionBar');
+  if (actionBar) actionBar.style.display = 'none';
+
   $('aeroTaskModalTitle').innerHTML = `<span>🚀 调度流水线详情 #${taskId}</span> <span class="tag tag-blue" id="aeroTaskModalStatusTag">RUNNING</span>`;
   const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : `${action.toUpperCase()} Edge`);
   const vpsLabel = getSelectedAeroVpsLabel();
@@ -1827,20 +2130,44 @@ function initAeroEvents() {
   });
   $('btnAeroRestart')?.addEventListener('click', () => deployAero('restart'));
 
-  // 安装 / 升级 Edge 节点（单步直达任务抽屉流水线，自带版本与环境前置提示）
+  // 安装 / 升级 Edge 节点（单步直达任务抽屉流水线，带已安装检测与防重复提醒）
   $('btnAeroInstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    deployAero('install', 443);
+    openAeroPreflightDrawer('install', 443);
   });
 
-  // 深度卸载 Edge 节点（单步直达任务抽屉流水线，抽屉内嵌高危删除红色提示）
+  // 深度卸载 Edge 节点（单步直达任务抽屉流水线，抽屉内嵌高危删除二次确认）
   $('btnAeroUninstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    deployAero('uninstall');
+    openAeroPreflightDrawer('uninstall');
+  });
+
+  // 抽屉内二次确认按钮
+  $('btnConfirmAeroTaskPreflight')?.addEventListener('click', async () => {
+    if (!preflightPendingAction) return;
+    const action = preflightPendingAction;
+    const port = preflightCustomPort;
+    const confirmBtn = $('btnConfirmAeroTaskPreflight');
+    const cancelBtn = $('btnCancelAeroTaskPreflight');
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = '正在下发指令...';
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = true;
+    }
+    await deployAero(action, port);
+  });
+
+  // 抽屉内取消按钮
+  $('btnCancelAeroTaskPreflight')?.addEventListener('click', () => {
+    $('aeroTaskDrawerModal').classList.remove('active');
+    preflightPendingAction = null;
   });
   
   $('btnCloseAeroTaskDrawer')?.addEventListener('click', () => {
     $('aeroTaskDrawerModal').classList.remove('active');
+    preflightPendingAction = null;
     if (aeroTaskPollTimer) {
       clearInterval(aeroTaskPollTimer);
       aeroTaskPollTimer = null;

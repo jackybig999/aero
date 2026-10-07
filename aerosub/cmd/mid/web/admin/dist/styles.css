@@ -243,6 +243,10 @@ body {
 .btn-blue:hover { background: #2563eb; }
 .btn-danger { background: rgba(239, 68, 68, 0.15); border-color: var(--red); color: #fca5a5; }
 .btn-danger:hover { background: var(--red); color: #fff; }
+.btn-amber { background: rgba(245, 158, 11, 0.18); border-color: #f59e0b; color: #fde68a; }
+.btn-amber:hover { background: #d97706; color: #fff; }
+.btn-green { background: rgba(16, 185, 129, 0.18); border-color: #10b981; color: #a7f3d0; }
+.btn-green:hover { background: #059669; color: #fff; }
 
 .toolbar {
   display: flex;

@@ -855,6 +855,14 @@
 
       <div id="aeroTaskNoticeBox" style="display:none;padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:12px;line-height:1.5"></div>
 
+      <div id="aeroTaskPreflightActionBar" style="display:none;margin-bottom:12px;padding:10px 14px;background:var(--bg);border-radius:6px;border:1px solid var(--line);align-items:center;justify-content:space-between;gap:12px">
+        <div id="aeroTaskPreflightTip" style="font-size:12px;color:var(--text);flex:1;line-height:1.4"></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-shrink:0" id="aeroTaskPreflightBtnGroup">
+          <button class="btn btn-sm" id="btnCancelAeroTaskPreflight">取消</button>
+          <button class="btn btn-sm btn-danger" id="btnConfirmAeroTaskPreflight">确认执行</button>
+        </div>
+      </div>
+
       <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted)">
         <span id="aeroTaskProgressStage">阶段：正在初始化...</span>
         <span id="aeroTaskProgressPercent" style="font-weight:700;color:var(--blue)">0%</span>
