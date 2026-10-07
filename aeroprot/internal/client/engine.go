@@ -50,9 +50,13 @@ var (
 
 // AppState 描述客户端当前运行状态
 type AppState struct {
-	Connected  bool   `json:"connected"`
-	Mode       string `json:"mode"`
-	Listen     string `json:"listen"`
+	Connected   bool   `json:"connected"`
+	Starting    bool   `json:"starting,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	ConflictVPN string `json:"conflict_vpn,omitempty"`
+	Mode        string `json:"mode"`
+	Listen      string `json:"listen"`
 	ActiveNode string `json:"active_node"`
 	ActiveSNI  string `json:"active_sni"`
 	ActualPort int    `json:"actual_port,omitempty"`
@@ -109,6 +113,11 @@ type Engine struct {
 
 	chainProxyMu  sync.RWMutex
 	chainProxyCfg ChainProxyConfig
+
+	lastErrMu          sync.RWMutex
+	lastErr            string
+	lastErrCode        string
+	lastErrConflictVPN string
 }
 
 // NewEngine 创建客户端引擎
@@ -225,6 +234,21 @@ func (e *Engine) SetPacketConnFactory(f PacketConnFactory) {
 // IsRunning 查询引擎当前运行状态
 func (e *Engine) IsRunning() bool {
 	return e.running.Load() && e.state.Load() == stateRunning
+}
+
+// IsStarting 查询引擎是否正在启动中
+func (e *Engine) IsStarting() bool {
+	return e.state.Load() == stateStarting
+}
+
+// CancelStart 取消正在进行的启动连接过程
+func (e *Engine) CancelStart() {
+	e.mu.Lock()
+	cancel := e.startCancel
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // SetTCPDialer 允许在测试中注入自定义 TCP 拨号器
@@ -585,6 +609,12 @@ func (e *Engine) Start() error {
 		return fmt.Errorf("engine is not in stopped state (current: %d)", e.state.Load())
 	}
 
+	e.lastErrMu.Lock()
+	e.lastErr = ""
+	e.lastErrCode = ""
+	e.lastErrConflictVPN = ""
+	e.lastErrMu.Unlock()
+
 	startCtx, startCancel := context.WithCancel(context.Background())
 	e.mu.Lock()
 	e.startCancel = startCancel
@@ -597,6 +627,26 @@ func (e *Engine) Start() error {
 		e.mu.Unlock()
 		e.state.Store(stateStopped)
 		e.running.Store(false)
+
+		e.lastErrMu.Lock()
+		if err != nil {
+			e.lastErr = err.Error()
+			var conflictErr *ErrConflictingTUN
+			if errors.As(err, &conflictErr) {
+				e.lastErrCode = "CONFLICT_TUN"
+				e.lastErrConflictVPN = conflictErr.VPNName
+			} else if errors.Is(err, ErrUDPUnavailable) || strings.Contains(err.Error(), "UDP_UNAVAILABLE") {
+				e.lastErrCode = "UDP_UNAVAILABLE"
+			} else {
+				e.lastErrCode = "CONNECT_ERROR"
+			}
+		} else {
+			e.lastErr = ""
+			e.lastErrCode = ""
+			e.lastErrConflictVPN = ""
+		}
+		e.lastErrMu.Unlock()
+
 		return err
 	}
 
@@ -976,10 +1026,20 @@ func (e *Engine) Stop() error {
 			_ = e.mixedListener.Close()
 			e.mixedListener = nil
 		}
+		e.lastErrMu.Lock()
+		e.lastErr = ""
+		e.lastErrCode = ""
+		e.lastErrConflictVPN = ""
+		e.lastErrMu.Unlock()
 		return nil
 	}
 	e.state.Store(stateStopping)
 	e.running.Store(false)
+	e.lastErrMu.Lock()
+	e.lastErr = ""
+	e.lastErrCode = ""
+	e.lastErrConflictVPN = ""
+	e.lastErrMu.Unlock()
 
 	if e.rootCancel != nil {
 		e.rootCancel()
@@ -1076,8 +1136,18 @@ func (e *Engine) GetState() AppState {
 		}
 	}
 
+	e.lastErrMu.RLock()
+	lastErr := e.lastErr
+	lastCode := e.lastErrCode
+	conflictVPN := e.lastErrConflictVPN
+	e.lastErrMu.RUnlock()
+
 	return AppState{
 		Connected:    e.running.Load(),
+		Starting:     e.state.Load() == stateStarting,
+		LastError:    lastErr,
+		ErrorCode:    lastCode,
+		ConflictVPN:  conflictVPN,
 		Mode:         e.mode,
 		Listen:       e.listenAddr,
 		ActiveNode:   e.activeAddr,

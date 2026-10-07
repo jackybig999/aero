@@ -37,8 +37,9 @@ html, body {
 }
 
 .app {
-  padding: 10px 14px 16px;
-  max-width: 410px;
+  padding: 12px 16px 20px;
+  width: 100%;
+  max-width: 480px;
   margin: 0 auto;
 }
 

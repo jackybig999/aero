@@ -215,7 +215,9 @@ async function checkUpfrontTUNConflict() {
     if (res && res.conflict) {
       return res.vpn || t('thirdPartyVPN')
     }
-  } catch {}
+  } catch (err) {
+    console.warn('checkUpfrontTUNConflict err:', err)
+  }
   return null
 }
 
@@ -296,13 +298,31 @@ async function doActualImport(sub) {
 }
 
 async function onPower() {
+  const pwr = $('btnPower')
+  if (pwr && pwr.classList.contains('wait')) {
+    // 正在连接中，点击圆圈即可立即中断/取消连接！
+    await onCancelConnect()
+    return
+  }
   if (busy) return
-  const on = $('btnPower').classList.contains('on')
+  const on = pwr && pwr.classList.contains('on')
   if (on) {
     await onDisconnect()
   } else {
     await onConnect()
   }
+}
+
+async function onCancelConnect() {
+  busy = false
+  msg(t('cancelling'))
+  try {
+    await api('POST', '/api/v1/cancel')
+  } catch (e) {
+    console.error('cancel connect err:', e)
+  }
+  setState('off', t('ready'))
+  msg(t('ready'))
 }
 
 async function onConnect() {
@@ -350,7 +370,7 @@ async function proceedConnect(sub) {
       throw new Error(md.error || md.msg || t('modeSwitchFailed'))
     }
 
-    // 3. 建立秒级快速隧道连接
+    // 3. 建立秒级快速隧道连接 (异步启动，UI 永不假死)
     const c = await api('POST', '/api/v1/connect')
     if (c && c.code === 'CONFLICT_TUN') {
       handleTUNConflict(c.vpn || '')
@@ -367,7 +387,12 @@ async function proceedConnect(sub) {
       throw new Error(c.error || c.msg || t('connFailed'))
     }
 
-    // 4. 异步快速探测探针
+    if (c && c.status === 'starting') {
+      await pollConnectStatus()
+      return
+    }
+
+    // 4. 已连通
     hideConflictBox()
     doProbe()
     await refreshStatus()
@@ -385,6 +410,67 @@ async function proceedConnect(sub) {
     }
   } finally {
     busy = false
+  }
+}
+
+async function pollConnectStatus() {
+  const startTime = Date.now()
+  const timeoutMs = 28000
+  const mode = selectedMode()
+
+  while (busy) {
+    await new Promise((r) => setTimeout(r, 200))
+    if (!busy) return // 用户点击了取消中断
+
+    let st = null
+    try {
+      st = await api('GET', '/api/v1/status')
+    } catch (e) {
+      console.warn('poll status err:', e)
+      continue
+    }
+
+    if (!st) continue
+
+    if (st.connected) {
+      hideConflictBox()
+      doProbe()
+      await refreshStatus()
+      setState('on', t('connected'))
+      msg(t('connectedAs') + ' · ' + modeLabel(mode), 'ok')
+      return
+    }
+
+    if (st.error_code === 'CONFLICT_TUN') {
+      handleTUNConflict(st.conflict_vpn || '')
+      return
+    }
+
+    if (st.error_code === 'UDP_UNAVAILABLE') {
+      handleUDPUnavailable(st.last_error || '')
+      return
+    }
+
+    if (!st.starting && st.last_error) {
+      setState('err', t('ready'))
+      msg(st.last_error, 'err')
+      return
+    }
+
+    if (!st.starting && !st.connected) {
+      setState('off', t('ready'))
+      msg(t('ready'))
+      return
+    }
+
+    if (Date.now() - startTime > timeoutMs) {
+      try {
+        await api('POST', '/api/v1/cancel')
+      } catch {}
+      setState('err', t('ready'))
+      msg(t('connTimeout') || '连接超时，请重试', 'err')
+      return
+    }
   }
 }
 

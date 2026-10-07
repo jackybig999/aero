@@ -85,6 +85,14 @@ var (
 	procShell_NotifyIconW = modShell32.NewProc("Shell_NotifyIconW")
 	procExtractIconW      = modShell32.NewProc("ExtractIconW")
 
+	modGdi32                  = syscall.NewLazyDLL("gdi32.dll")
+	procGetDpiForSystem       = modUser32.NewProc("GetDpiForSystem")
+	procGetDC                 = modUser32.NewProc("GetDC")
+	procReleaseDC             = modUser32.NewProc("ReleaseDC")
+	procGetDeviceCaps         = modGdi32.NewProc("GetDeviceCaps")
+	procSystemParametersInfoW = modUser32.NewProc("SystemParametersInfoW")
+	procGetSystemMetrics      = modUser32.NewProc("GetSystemMetrics")
+
 	origWndProc uintptr
 	trayNID     notifyIconDataW
 	clientHWND  uintptr
@@ -98,6 +106,13 @@ var (
 type point struct {
 	X int32
 	Y int32
+}
+
+type rect struct {
+	Left   int32
+	Top    int32
+	Right  int32
+	Bottom int32
 }
 
 type notifyIconDataW struct {
@@ -172,6 +187,87 @@ func initDPIAwareness() {
 		// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 		_, _, _ = proc.Call(^uintptr(3))
 	}
+}
+
+func getSystemDPI() uint32 {
+	if procGetDpiForSystem.Find() == nil {
+		r, _, _ := procGetDpiForSystem.Call()
+		if r > 0 {
+			return uint32(r)
+		}
+	}
+	if procGetDC.Find() == nil && procGetDeviceCaps.Find() == nil {
+		hdc, _, _ := procGetDC.Call(0)
+		if hdc != 0 {
+			dpi, _, _ := procGetDeviceCaps.Call(hdc, 88) // LOGPIXELSX = 88
+			if procReleaseDC.Find() == nil {
+				procReleaseDC.Call(0, hdc)
+			}
+			if dpi > 0 {
+				return uint32(dpi)
+			}
+		}
+	}
+	return 96
+}
+
+func getWorkArea() (int, int) {
+	if procSystemParametersInfoW.Find() == nil {
+		const spiGetWorkArea = 0x0030
+		var r rect
+		ret, _, _ := procSystemParametersInfoW.Call(spiGetWorkArea, 0, uintptr(unsafe.Pointer(&r)), 0)
+		if ret != 0 {
+			w := int(r.Right - r.Left)
+			h := int(r.Bottom - r.Top)
+			if w > 0 && h > 0 {
+				return w, h
+			}
+		}
+	}
+	if procGetSystemMetrics.Find() == nil {
+		sw, _, _ := procGetSystemMetrics.Call(0) // SM_CXSCREEN
+		sh, _, _ := procGetSystemMetrics.Call(1) // SM_CYSCREEN
+		if sw > 0 && sh > 0 {
+			return int(sw), int(sh) * 9 / 10
+		}
+	}
+	return 1920, 1040
+}
+
+func calculateWindowDimensions() (int, int) {
+	dpi := getSystemDPI()
+	workW, workH := getWorkArea()
+
+	scale := float64(dpi) / 96.0
+	if scale < 1.0 {
+		scale = 1.0
+	}
+
+	// 基准逻辑尺寸 (420 x 680)
+	baseW := 420.0
+	baseH := 680.0
+
+	targetW := int(baseW * scale)
+	targetH := int(baseH * scale)
+
+	// 屏幕保护边界：高度不超过可用工作区的 88%，宽度不超过可用工作区的 88%
+	maxH := int(float64(workH) * 0.88)
+	if targetH > maxH && maxH > 500 {
+		targetH = maxH
+	}
+	maxW := int(float64(workW) * 0.88)
+	if targetW > maxW && maxW > 350 {
+		targetW = maxW
+	}
+
+	if targetW < 400 {
+		targetW = 400
+	}
+	if targetH < 580 {
+		targetH = 580
+	}
+
+	return targetW, targetH
 }
 
 func hideOwnConsole() {
@@ -369,6 +465,9 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 
 	initDPIAwareness()
 
+	winW, winH := calculateWindowDimensions()
+	log.Printf("[UI] adaptive window dimensions: %dx%d (system DPI: %d)", winW, winH, getSystemDPI())
+
 	wvData := filepath.Join(os.TempDir(), "aero-client-wv-"+strconv.Itoa(os.Getpid()))
 	_ = os.MkdirAll(wvData, 0700)
 	defer os.RemoveAll(wvData)
@@ -379,8 +478,8 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 		DataPath:  wvData,
 		WindowOptions: webview2.WindowOptions{
 			Title:  "AERO",
-			Width:  390,
-			Height: 580,
+			Width:  uint(winW),
+			Height: uint(winH),
 			Center: true,
 		},
 	})
@@ -392,7 +491,7 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 	}
 	defer w.Destroy()
 
-	w.SetSize(390, 580, webview2.HintNone)
+	w.SetSize(winW, winH, webview2.HintNone)
 
 	// 绑定内存级原生 IPC 通道，彻底切断对 127.0.0.1 网络端口依赖
 	w.Bind("goClientAPI", func(method, path, bodyStr string) (string, error) {

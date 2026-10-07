@@ -257,43 +257,56 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "mode": targetMode})
 	})
 
-	// 5. 启动隧道连接
+	// 5. 启动隧道连接 (非阻塞异步启动，彻底保障 Win32 UI 消息泵 0ms 阻塞)
 	mux.HandleFunc("/api/v1/connect", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if !connectLimiter.Allow() {
 			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
-		if err := eng.Start(); err != nil {
-			var conflictErr *client.ErrConflictingTUN
-			if errors.As(err, &conflictErr) {
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"status": "error",
-					"code":   "CONFLICT_TUN",
-					"vpn":    conflictErr.VPNName,
-					"error":  err.Error(),
-				})
-				return
-			}
-			if errors.Is(err, client.ErrUDPUnavailable) || strings.Contains(err.Error(), "UDP_UNAVAILABLE") {
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"status": "error",
-					"code":   "UDP_UNAVAILABLE",
-					"error":  "UDP_UNAVAILABLE",
-					"msg":    "UDP/443 (QUIC/HTTP/3) 拨号失败，已降级防御：未开启全局 TUN，55555 代理端口照常监听",
-				})
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": err.Error()})
+		if eng.IsRunning() {
+			st := eng.GetState()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":      "ok",
+				"active_node": st.ActiveNode,
+				"actual_port": st.ActualPort,
+			})
 			return
 		}
+		if eng.IsStarting() {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "starting",
+			})
+			return
+		}
+
+		// 异步启动引擎，保证 Win32 UI 消息泵 0ms 阻塞，界面随时可响应拖动与中断
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[CLIENT] recover connect panic: %v", r)
+				}
+			}()
+			if err := eng.Start(); err != nil {
+				log.Printf("[CLIENT] background connect finished with err: %v", err)
+			}
+			st := eng.GetState()
+			UpdateTrayIcon(st.Mode, st.Connected)
+		}()
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "starting",
+		})
+	})
+
+	// 5b. 中断/取消正在进行的启动流程
+	mux.HandleFunc("/api/v1/cancel", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		eng.CancelStart()
+		_ = eng.Stop()
 		st := eng.GetState()
 		UpdateTrayIcon(st.Mode, st.Connected)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":      "ok",
-			"active_node": st.ActiveNode,
-			"actual_port": st.ActualPort,
-		})
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 	})
 
 	// 6. 断开隧道连接
