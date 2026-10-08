@@ -176,6 +176,9 @@ jobs:
       - build-client-macos
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Download All Build Artifacts
         uses: actions/download-artifact@v4
         with:
