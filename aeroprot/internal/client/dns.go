@@ -364,14 +364,28 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return nil
 	}
 
-	// 判定是否属于第一阶段漏斗：.cn 顶级域或分流规则判定的纯国内直连域名
-	isChina := strings.HasSuffix(qnameLower, ".cn") || qnameLower == "cn"
-	if !isChina && h.split != nil {
-		isChina = h.split.Decide(qnameLower) == "direct"
+	// 阶段一：AI 优先通道（即使后缀是 .cn 亦强制进 Fake-IP 专线，绝不走国内物理 DNS 泄露）
+	if h.split != nil && h.split.Decide(qnameLower) == "ai" {
+		if qtype == 0x0001 {
+			if h.fakeIP != nil {
+				resp := h.fakeIP.FormatDNSResponse(qname)
+				if len(pkt) >= 2 && len(resp) >= 2 {
+					resp[0], resp[1] = pkt[0], pkt[1]
+				}
+				return resp
+			}
+		}
+		return buildEmptyResponse(pkt, qname, qtype)
 	}
 
-	if isChina {
-		// 第一阶段：.cn 直连 & 丢弃 AAAA
+	// 阶段二：.cn 顶级域或分流规则判定的纯国内直连域名走直连物理 DNS
+	isDirect := strings.HasSuffix(qnameLower, ".cn") || qnameLower == "cn"
+	if !isDirect && h.split != nil {
+		isDirect = h.split.Decide(qnameLower) == "direct"
+	}
+
+	if isDirect {
+		// .cn 直连 & 丢弃 AAAA
 		if qtype == 0x001C { // AAAA
 			return buildEmptyResponse(pkt, qname, qtype)
 		}
@@ -379,14 +393,8 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return h.queryFastUDP(pkt)
 	}
 
-	// 第二阶段：其余境外站/非直连域名
+	// 阶段三：其余境外站/非直连域名
 	// 绝对不进入 queryFastUDP！杜绝 DNS 泄露
-	if qtype == 0x001C { // AAAA 纯净空应答
-		return buildEmptyResponse(pkt, qname, qtype)
-	}
-
-	// 境外 IPv4 A 记录查询：0ms 立即返回 198.18.0.0/15 Fake-IP（耗时 < 100ms），绝不先行同步等待 2.5 秒 DoH 往返！
-	// 真实域名保留在 Fake-IP 表，由后续 CONNECT 统一送交边缘解析。
 	if qtype == 0x0001 {
 		if h.fakeIP != nil {
 			resp := h.fakeIP.FormatDNSResponse(qname)
@@ -397,7 +405,7 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		}
 	}
 
-	// 其余查询类型 (Type 65 HTTPS RR, TXT, MX 等)：返回标准空应答 (NOERROR, 0 答案)
+	// AAAA 和其余查询类型 (Type 65 HTTPS RR, TXT, MX 等)：返回标准空应答 (NOERROR, 0 答案)
 	// 严禁塞入 Type A 答案，彻底消除报文畸变导致浏览器重试！
 	return buildEmptyResponse(pkt, qname, qtype)
 }

@@ -431,12 +431,15 @@ func builtinAIDomains() []string {
 		"openai.com", "chatgpt.com", "api.openai.com",
 		"anthropic.com", "claude.ai",
 		"gemini.google.com", "aistudio.google.com", "generativelanguage.googleapis.com",
-		"api.groq.com", "api.perplexity.ai", "api.cohere.ai",
+		"api.groq.com", "api.perplexity.ai", "perplexity.ai", "api.cohere.ai",
 		"api.together.xyz", "api.mistral.ai", "api.replicate.com",
 		"api.deepseek.com", "platform.moonshot.cn", "api.siliconflow.cn",
 		"api.qwen.ai", "api.baichuan-ai.com", "api.minimax.chat", "api.sparkdesk.cn",
 		"huggingface.co", "api-inference.huggingface.co",
 		"openrouter.ai", "api.fireworks.ai",
+		"grok.com", "x.ai", "api.x.ai",
+		"tavily.com", "api.tavily.com",
+		"cursor.sh", "cursorapi.com", "anysphere.co",
 	}
 }
 
