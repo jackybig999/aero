@@ -233,7 +233,7 @@
           </label>
           <label class="mode" data-mode="sysproxy">
             <input type="radio" name="mode" value="sysproxy" />
-            <b data-i18n="modeSys">系统代理模式</b>
+            <b data-i18n="modeSys">本地专线代理 (127.0.0.1:55555)</b>
           </label>
         </div>
         <p id="modeTip" class="muted" data-i18n="tipTun">TUN 虚拟网卡驱动接管全局流量 (零改动系统注册表)</p>
@@ -361,7 +361,7 @@
         </div>
         <p id="tunConflictModalDesc" class="muted" style="font-size:11px;line-height:1.5;margin-bottom:12px;" data-i18n="tunConflictDesc">检测到宿主机已运行其他虚拟网卡或 TUN 模式。同时开启两款 TUN 可能会导致系统全局路由冲突或死锁。</p>
         <div style="display:flex;flex-direction:column;gap:6px;">
-          <button type="button" id="btnTunConflictSysproxy" class="btn-conflict-primary" style="width:100%;padding:8px;font-size:11px;" data-i18n="tunConflictSysproxy">切换为系统代理模式载入 (推荐)</button>
+          <button type="button" id="btnTunConflictSysproxy" class="btn-conflict-primary" style="width:100%;padding:8px;font-size:11px;" data-i18n="tunConflictSysproxy">切换为本地专线代理 (127.0.0.1:55555) 载入 (推荐)</button>
           <button type="button" id="btnTunConflictIgnore" class="sheet-btn" style="width:100%;padding:8px;font-size:11px;" data-i18n="tunConflictIgnore">忽略并继续当前操作</button>
           <button type="button" id="btnTunConflictCancel" class="sheet-cancel" style="width:100%;padding:6px;font-size:11px;" data-i18n="tunConflictCancel">暂不载入 / 取消</button>
         </div>

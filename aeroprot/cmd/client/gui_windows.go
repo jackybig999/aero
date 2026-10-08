@@ -277,14 +277,14 @@ func hideOwnConsole() {
 	}
 }
 
-func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
-	if msg == msgAeroRestore && msgAeroRestore != 0 {
+func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+	if msg == uintptr(msgAeroRestore) && msgAeroRestore != 0 {
 		procShowWindow.Call(hwnd, uintptr(SW_SHOW))
 		procShowWindow.Call(hwnd, uintptr(SW_RESTORE))
 		procSetForegroundWindow.Call(hwnd)
 		return 0
 	}
-	switch msg {
+	switch uint32(msg) {
 	case WM_CLOSE:
 		procShowWindow.Call(hwnd, uintptr(SW_HIDE))
 		return 0
@@ -332,7 +332,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		procShell_NotifyIconW.Call(uintptr(NIM_DELETE), uintptr(unsafe.Pointer(&trayNID)))
 	}
 
-	r, _, _ := procCallWindowProcW.Call(origWndProc, hwnd, uintptr(msg), wParam, lParam)
+	r, _, _ := procCallWindowProcW.Call(origWndProc, hwnd, msg, wParam, lParam)
 	return r
 }
 
@@ -379,7 +379,7 @@ func UpdateTrayIcon(mode string, connected bool) {
 		tip = "AERO · TUN 全局模式 (已连接)"
 	} else {
 		targetIcon = hIconYellow
-		tip = "AERO · 系统代理模式 (已连接)"
+		tip = "AERO · 本地专线代理 (已连接)"
 	}
 
 	if targetIcon != 0 {
