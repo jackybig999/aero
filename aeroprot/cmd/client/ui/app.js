@@ -235,9 +235,15 @@ function showTunConflictModal(vpnName, onProceed) {
 
   $('btnTunConflictSysproxy').onclick = async () => {
     modal.hidden = true
+    hideConflictBox()
     setModeUI('sysproxy')
     await api('POST', '/api/v1/mode', { mode: 'sysproxy' }).catch(() => null)
-    if (onProceed) onProceed()
+    const sub = ($('subUrl').value || '').trim()
+    if (sub) {
+      await proceedConnect(sub)
+    } else if (onProceed) {
+      onProceed()
+    }
   }
 
   $('btnTunConflictIgnore').onclick = () => {
@@ -451,13 +457,13 @@ async function pollConnectStatus() {
       return
     }
 
-    if (!st.starting && st.last_error) {
+    if (!st.starting && !st.stopping && st.last_error) {
       setState('err', t('ready'))
       msg(st.last_error, 'err')
       return
     }
 
-    if (!st.starting && !st.connected) {
+    if (!st.starting && !st.stopping && !st.connected) {
       setState('off', t('ready'))
       msg(t('ready'))
       return
@@ -498,6 +504,7 @@ function handleUDPUnavailable(customMsg) {
 }
 
 function handleTUNConflict(vpnName) {
+  busy = false
   msg('') // 彻底清空「连接中…」残留
   setState('off', t('ready'))
   const box = $('conflictBox')
@@ -508,6 +515,10 @@ function handleTUNConflict(vpnName) {
       desc.textContent = t('conflictDesc', { name: vpnName || t('thirdPartyVPN') })
     }
   }
+  const sub = ($('subUrl').value || '').trim()
+  showTunConflictModal(vpnName, () => {
+    if (sub) proceedConnect(sub)
+  })
 }
 
 function hideConflictBox() {
@@ -1112,7 +1123,15 @@ function init() {
           await refreshStatus()
           return
         }
-        msg(t('connectedAs') + ' · ' + modeLabel(targetMode), 'ok')
+        if (r && r.status === 'switching') {
+          busy = true
+          await pollConnectStatus()
+          return
+        }
+        if (r && r.status === 'ok') {
+          await refreshStatus()
+          return
+        }
         await refreshStatus()
       } catch (err) {
         setModeUI(prevMode)
@@ -1173,25 +1192,12 @@ function init() {
     $('btnSwitchSysproxy').onclick = async () => {
       hideConflictBox()
       setModeUI('sysproxy')
-      busy = true
-      setState('wait', t('connecting'))
-      msg(t('connecting'))
-      try {
-        const md = await api('POST', '/api/v1/mode', { mode: 'sysproxy' })
-        if (md && (md.status === 'error' || md.error)) throw new Error(md.error || md.msg || t('modeSwitchFailed'))
-        const c = await api('POST', '/api/v1/connect')
-        if (c && c.code === 'RATE_LIMITED') throw new Error(t('connRateLimited'))
-        if (c && (c.status === 'error' || c.error)) throw new Error(c.error || c.msg || t('connFailed'))
-        doProbe()
-        await refreshStatus()
-        setState('on', t('connected'))
-        msg(t('connectedAs') + ' · ' + modeLabel('sysproxy'), 'ok')
-      } catch (e) {
-        setState('err', t('ready'))
-        const em = e.message || String(e)
-        msg(em === 'connect' ? t('connFailed') : em, 'err')
-      } finally {
-        busy = false
+      const sub = ($('subUrl').value || '').trim()
+      await api('POST', '/api/v1/mode', { mode: 'sysproxy' }).catch(() => null)
+      if (sub) {
+        await proceedConnect(sub)
+      } else {
+        await onConnect()
       }
     }
   }

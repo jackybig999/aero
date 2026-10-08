@@ -493,6 +493,17 @@ button.ghost:hover {
   padding: 14px 12px 18px;
   border-top: 1px solid var(--line);
 }
+#tunConflictModal {
+  align-items: center;
+  justify-items: center;
+  padding: 16px;
+}
+#tunConflictModal .sheet-card {
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  max-width: 360px;
+  width: 100%;
+}
 .sheet-card h2 { margin: 0 0 4px; font-size: 15px; }
 #cam {
   width: 100%;

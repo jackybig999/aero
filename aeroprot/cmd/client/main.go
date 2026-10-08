@@ -183,10 +183,8 @@ func main() {
 			return
 		}
 
-		wasRunning := eng.IsRunning()
-
-		// 若当前已连通且目标为 TUN 模式，先做探测，命中绝不停掉当前 sysproxy！
-		if wasRunning && targetMode == "tun" {
+		curSt := eng.GetState()
+		if (curSt.Connected || curSt.Starting) && targetMode == "tun" {
 			conflict, vpnName, err := client.DetectThirdPartyTUN()
 			if err != nil {
 				_ = json.NewEncoder(w).Encode(map[string]any{
@@ -208,53 +206,29 @@ func main() {
 			}
 		}
 
-		if wasRunning {
-			_ = eng.Stop()
+		needRestart, ticket := eng.PrepareModeSwitch(targetMode)
+		if !needRestart {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "mode": targetMode})
+			return
 		}
-		eng.SetMode(targetMode)
 
-		if wasRunning {
-			if err := eng.Start(); err != nil {
-				// 切换后启动新模式失败：必须回滚模式，并尝试把原模式重新拉起来！
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "switching", "mode": targetMode})
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[CLIENT] recover mode switch panic: %v", rec)
+				}
+			}()
+			err := eng.Restart(ticket)
+			if err != nil && !errors.Is(err, client.ErrStartAborted) && !errors.Is(err, context.Canceled) {
+				log.Printf("[CLIENT] mode switch failed: %v, rolling back to %s", err, prevMode)
 				eng.SetMode(prevMode)
-				_ = eng.Start()
-
-				st := eng.GetState()
-				UpdateTrayIcon(st.Mode, st.Connected)
-
-				var conflictErr *client.ErrConflictingTUN
-				if errors.As(err, &conflictErr) {
-					_ = json.NewEncoder(w).Encode(map[string]any{
-						"status": "error",
-						"code":   "CONFLICT_TUN",
-						"vpn":    conflictErr.VPNName,
-						"error":  err.Error(),
-						"mode":   prevMode,
-					})
-					return
-				}
-				if errors.Is(err, client.ErrUDPUnavailable) || strings.Contains(err.Error(), "UDP_UNAVAILABLE") {
-					_ = json.NewEncoder(w).Encode(map[string]any{
-						"status": "error",
-						"code":   "UDP_UNAVAILABLE",
-						"error":  "UDP_UNAVAILABLE",
-						"msg":    "UDP/443 (QUIC/HTTP/3) 拨号失败，已降级防御：未开启全局 TUN，55555 代理端口照常监听",
-						"mode":   prevMode,
-					})
-					return
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"status": "error",
-					"error":  err.Error(),
-					"mode":   prevMode,
-				})
-				return
+				t2 := eng.RequestStart()
+				_ = eng.StartWith(t2)
 			}
-		}
-
-		st := eng.GetState()
-		UpdateTrayIcon(st.Mode, st.Connected)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "mode": targetMode})
+			st := eng.GetState()
+			UpdateTrayIcon(st.Mode, st.Connected)
+		}()
 	})
 
 	// 5. 启动隧道连接 (非阻塞异步启动，彻底保障 Win32 UI 消息泵 0ms 阻塞)
@@ -264,8 +238,8 @@ func main() {
 			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
-		if eng.IsRunning() {
-			st := eng.GetState()
+		st := eng.GetState()
+		if st.Connected {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status":      "ok",
 				"active_node": st.ActiveNode,
@@ -273,12 +247,17 @@ func main() {
 			})
 			return
 		}
-		if eng.IsStarting() {
+		if st.Starting {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status": "starting",
 			})
 			return
 		}
+
+		ticket := eng.RequestStart()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "starting",
+		})
 
 		// 异步启动引擎，保证 Win32 UI 消息泵 0ms 阻塞，界面随时可响应拖动与中断
 		go func() {
@@ -287,39 +266,67 @@ func main() {
 					log.Printf("[CLIENT] recover connect panic: %v", r)
 				}
 			}()
-			if err := eng.Start(); err != nil {
+
+			if eng.IsStopping() {
+				deadline := time.Now().Add(28 * time.Second)
+				for eng.IsStopping() {
+					if time.Now().After(deadline) {
+						eng.ClearStartPending(ticket)
+						eng.SetLastError("timeout waiting for previous stop to finish")
+						return
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+
+			if err := eng.StartWith(ticket); err != nil && !errors.Is(err, client.ErrStartAborted) && !errors.Is(err, context.Canceled) {
 				log.Printf("[CLIENT] background connect finished with err: %v", err)
 			}
-			st := eng.GetState()
-			UpdateTrayIcon(st.Mode, st.Connected)
+			curSt := eng.GetState()
+			UpdateTrayIcon(curSt.Mode, curSt.Connected)
 		}()
-
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status": "starting",
-		})
 	})
 
 	// 5b. 中断/取消正在进行的启动流程
 	mux.HandleFunc("/api/v1/cancel", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		eng.CancelStart()
-		_ = eng.Stop()
-		st := eng.GetState()
-		UpdateTrayIcon(st.Mode, st.Connected)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		wasActive := eng.BeginStop()
+		if wasActive || eng.IsStopping() {
+			go func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("[CLIENT] recover cancel panic: %v", rec)
+					}
+				}()
+				_ = eng.Stop()
+				st := eng.GetState()
+				UpdateTrayIcon(st.Mode, st.Connected)
+			}()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "state": "stopping"})
 	})
 
-	// 6. 断开隧道连接
+	// 6. 断开隧道连接 (非阻塞异步停止，Win32 UI 消息泵 0ms 阻塞)
 	mux.HandleFunc("/api/v1/disconnect", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if !connectLimiter.Allow() {
 			http.Error(w, `{"status":"error","code":"RATE_LIMITED","msg":"too many requests"}`, http.StatusTooManyRequests)
 			return
 		}
-		_ = eng.Stop()
-		st := eng.GetState()
-		UpdateTrayIcon(st.Mode, st.Connected)
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		wasActive := eng.BeginStop()
+		if wasActive || eng.IsStopping() {
+			go func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("[CLIENT] recover disconnect panic: %v", rec)
+					}
+				}()
+				_ = eng.Stop()
+				st := eng.GetState()
+				UpdateTrayIcon(st.Mode, st.Connected)
+			}()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "state": "stopping"})
 	})
 
 	// 7. 快速连通性探针 (真实度量，消灭假数据)

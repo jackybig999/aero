@@ -40,6 +40,7 @@ const (
 var (
 	// ErrUDPUnavailable 标识 TUN 模式下 UDP/443 (QUIC/HTTP/3) 拨号失败，降级防御阻止整机伪装
 	ErrUDPUnavailable   = errors.New("UDP_UNAVAILABLE")
+	ErrStartAborted      = errors.New("start aborted by stop request")
 	subSingleFlight     singleflight.Group
 	detectThirdPartyTUN = DetectThirdPartyTUN
 	openTunDeviceFn     = OpenTunDevice
@@ -52,6 +53,7 @@ var (
 type AppState struct {
 	Connected   bool   `json:"connected"`
 	Starting    bool   `json:"starting,omitempty"`
+	Stopping    bool   `json:"stopping,omitempty"`
 	LastError   string `json:"last_error,omitempty"`
 	ErrorCode   string `json:"error_code,omitempty"`
 	ConflictVPN string `json:"conflict_vpn,omitempty"`
@@ -99,6 +101,9 @@ type Engine struct {
 
 	running           atomic.Bool
 	state             atomic.Int32
+	startEpoch        uint64
+	startPending      atomic.Bool
+	pendingMode       string
 	lifecycleMu       sync.Mutex
 	startCancel       context.CancelFunc
 	tcpDialer         func(ctx context.Context, target string) (net.Conn, error)
@@ -238,7 +243,81 @@ func (e *Engine) IsRunning() bool {
 
 // IsStarting 查询引擎是否正在启动中
 func (e *Engine) IsStarting() bool {
-	return e.state.Load() == stateStarting
+	return e.state.Load() == stateStarting || e.startPending.Load()
+}
+
+// IsStopping 查询引擎是否正在停止中
+func (e *Engine) IsStopping() bool {
+	return e.state.Load() == stateStopping
+}
+
+// PrepareModeSwitch 准备模式切换：停着时仅改模式；运行或启动中时标记 stateStopping 并签发递增票据
+func (e *Engine) PrepareModeSwitch(targetMode string) (needRestart bool, ticket uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cur := e.state.Load()
+	if cur != stateRunning && cur != stateStarting {
+		// 已经停着：只改下次要启动的模式，不签发 ticket，不动 epoch
+		e.mode = targetMode
+		return false, 0
+	}
+
+	if e.startCancel != nil {
+		e.startCancel()
+	}
+	e.state.Store(stateStopping)
+	e.running.Store(false)
+	e.startEpoch++
+	e.startPending.Store(true)
+	e.pendingMode = targetMode
+	return true, e.startEpoch
+}
+
+// RequestStart 请求启动：递增票据并设置 startPending
+func (e *Engine) RequestStart() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.startEpoch++
+	e.startPending.Store(true)
+	e.pendingMode = ""
+	return e.startEpoch
+}
+
+// BeginStop 标记停止意图：清理 startPending、使待处理票据失效、取消正在进行的探测，若处于活跃态则返回 true
+func (e *Engine) BeginStop() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.startPending.Store(false)
+	e.startEpoch++
+	e.pendingMode = ""
+	if e.startCancel != nil {
+		e.startCancel()
+	}
+	cur := e.state.Load()
+	if cur != stateRunning && cur != stateStarting {
+		return false
+	}
+	e.state.Store(stateStopping)
+	e.running.Store(false)
+	return true
+}
+
+// ClearStartPending 清除指定票据的挂起状态
+func (e *Engine) ClearStartPending(ticket uint64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ticket != 0 && e.startEpoch == ticket {
+		e.startPending.Store(false)
+	}
+}
+
+// SetLastError 设置最后错误信息
+func (e *Engine) SetLastError(msg string) {
+	e.lastErrMu.Lock()
+	e.lastErr = msg
+	e.lastErrCode = "CONNECT_ERROR"
+	e.lastErrMu.Unlock()
 }
 
 // CancelStart 取消正在进行的启动连接过程
@@ -597,17 +676,42 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	return nil
 }
 
-// Start 启动客户端数据面（TUN 虚拟网卡 + gVisor 协议栈 + 物理网络监控 + 混合代理端口）
+// Start 启动客户端数据面（给测试及外部旧调用兼容，自动申请票据）
 func (e *Engine) Start() error {
+	ticket := e.RequestStart()
+	return e.StartWith(ticket)
+}
+
+// StartWith 使用指定票据在 lifecycleMu 锁保护下启动引擎
+func (e *Engine) StartWith(ticket uint64) error {
 	e.lifecycleMu.Lock()
 	defer e.lifecycleMu.Unlock()
+	return e.startLocked(ticket)
+}
 
+func (e *Engine) startLocked(ticket uint64) error {
+	var dev TunDevice
+	var nm NetworkMonitor
+	var ip net.IP
+
+	e.mu.Lock()
+	if ticket == 0 || e.startEpoch != ticket || !e.startPending.Load() {
+		e.mu.Unlock()
+		return ErrStartAborted
+	}
 	if e.state.Load() == stateRunning {
+		e.startPending.Store(false)
+		e.mu.Unlock()
 		return nil
 	}
-	if !e.state.CompareAndSwap(stateStopped, stateStarting) {
+	if e.state.Load() != stateStopped {
+		e.mu.Unlock()
 		return fmt.Errorf("engine is not in stopped state (current: %d)", e.state.Load())
 	}
+	if e.pendingMode != "" {
+		e.mode = e.pendingMode
+	}
+	e.state.Store(stateStarting)
 
 	e.lastErrMu.Lock()
 	e.lastErr = ""
@@ -616,14 +720,18 @@ func (e *Engine) Start() error {
 	e.lastErrMu.Unlock()
 
 	startCtx, startCancel := context.WithCancel(context.Background())
-	e.mu.Lock()
 	e.startCancel = startCancel
 	e.mu.Unlock()
 
-	rollback := func(err error) error {
-		startCancel()
+	rollbackLocked := func(ticket uint64, startCancel context.CancelFunc, err error) error {
+		if startCancel != nil {
+			startCancel()
+		}
 		e.mu.Lock()
 		e.startCancel = nil
+		if e.startEpoch == ticket {
+			e.startPending.Store(false)
+		}
 		e.mu.Unlock()
 		e.state.Store(stateStopped)
 		e.running.Store(false)
@@ -650,6 +758,13 @@ func (e *Engine) Start() error {
 		return err
 	}
 
+	failStart := func(err error) error {
+		if errors.Is(err, context.Canceled) || e.state.Load() == stateStopping {
+			return e.abortStartLocked(startCancel, dev, nm, ip)
+		}
+		return rollbackLocked(ticket, startCancel, err)
+	}
+
 	e.mu.RLock()
 	activeAddr := e.activeAddr
 	activeToken := e.activeToken
@@ -667,11 +782,11 @@ func (e *Engine) Start() error {
 		// 第一行执行无死角第三方 TUN 冲突检测
 		conflict, vpnName, err := detectThirdPartyTUN()
 		if err != nil {
-			return rollback(fmt.Errorf("detect third-party tun: %w", err))
+			return failStart(fmt.Errorf("detect third-party tun: %w", err))
 		}
 		if conflict {
 			// 命中冲突：绝不创建 aero0，绝不调用 TeardownRoutes，绝不写 /32，绝不写两条 /1，running 保持 false
-			return rollback(&ErrConflictingTUN{VPNName: vpnName})
+			return failStart(&ErrConflictingTUN{VPNName: vpnName})
 		}
 
 		cleanAero0StaleRoutesFn()
@@ -679,7 +794,7 @@ func (e *Engine) Start() error {
 	}
 
 	if activeAddr == "" {
-		return rollback(fmt.Errorf("no active node configured"))
+		return failStart(fmt.Errorf("no active node configured"))
 	}
 
 	host, portStr, err := net.SplitHostPort(activeAddr)
@@ -692,9 +807,9 @@ func (e *Engine) Start() error {
 		port = p
 	}
 
-	ip, err := resolvePhysicalIPv4(host)
+	ip, err = resolvePhysicalIPv4(host)
 	if err != nil {
-		return rollback(fmt.Errorf("resolve active node %s: %w", host, err))
+		return failStart(fmt.Errorf("resolve active node %s: %w", host, err))
 	}
 
 	// 规则：仅在 tun 模式下保护节点路由；sysproxy 严格执行零主机篡改
@@ -729,7 +844,7 @@ func (e *Engine) Start() error {
 		if mode == "tun" {
 			UnprotectHostRoute(ip.String())
 		}
-		return rollback(startCtx.Err())
+		return failStart(startCtx.Err())
 	default:
 	}
 
@@ -758,9 +873,9 @@ func (e *Engine) Start() error {
 			// 不调用 OpenTunDevice，不装 /1 路由，55555 照常监听，向 UI 返回固定错误码 UDP_UNAVAILABLE。
 			// 严禁将整机流量降级走 TCP 再宣称全局隧道仍在。
 			_ = e.startMixedProxy()
-			return rollback(fmt.Errorf("%w: connect to %s failed: %v", ErrUDPUnavailable, activeAddr, err))
+			return failStart(fmt.Errorf("%w: connect to %s failed: %v", ErrUDPUnavailable, activeAddr, err))
 		}
-		return rollback(fmt.Errorf("connect to %s failed: %w", activeAddr, err))
+		return failStart(fmt.Errorf("connect to %s failed: %w", activeAddr, err))
 	}
 	actualPort := cl.ActualPort()
 	_ = cl.Close()
@@ -811,7 +926,7 @@ func (e *Engine) Start() error {
 		if mode == "tun" {
 			UnprotectHostRoute(ip.String())
 		}
-		return rollback(startCtx.Err())
+		return failStart(startCtx.Err())
 	default:
 	}
 
@@ -824,7 +939,7 @@ func (e *Engine) Start() error {
 	if e.netMon == nil {
 		e.netMon = NewNetworkMonitor()
 	}
-	nm := e.netMon
+	nm = e.netMon
 	e.mu.Unlock()
 
 	e.rootCtx, e.rootCancel = context.WithCancel(context.Background())
@@ -843,22 +958,28 @@ func (e *Engine) Start() error {
 			e.onNetworkChange(newGW, ifName)
 		})
 		_ = e.startMixedProxy()
-		e.running.Store(true)
-		e.state.Store(stateRunning)
+
 		e.mu.Lock()
+		if e.startEpoch != ticket || !e.startPending.Load() || e.state.Load() != stateStarting {
+			e.mu.Unlock()
+			return e.abortStartLocked(startCancel, dev, nm, ip)
+		}
+		e.state.Store(stateRunning)
+		e.running.Store(true)
+		e.startPending.Store(false)
 		e.startCancel = nil
 		e.mu.Unlock()
 		log.Printf("[ENGINE] data plane started in local sysproxy mode (mixed proxy %s)", e.listenAddr)
 		return nil
 	}
 
-	dev, err := openTunDeviceFn("aero0", 1360)
+	dev, err = openTunDeviceFn("aero0", 1360)
 	if err != nil {
 		UnprotectHostRoute(ip.String())
 		if e.rootCancel != nil {
 			e.rootCancel()
 		}
-		return rollback(fmt.Errorf("open tun device: %w", err))
+		return failStart(fmt.Errorf("open tun device: %w", err))
 	}
 	e.tunDevice = dev
 
@@ -872,7 +993,7 @@ func (e *Engine) Start() error {
 		if e.rootCancel != nil {
 			e.rootCancel()
 		}
-		return rollback(fmt.Errorf("start stack: %w", err))
+		return failStart(fmt.Errorf("start stack: %w", err))
 	}
 
 	// WebRTC 生产激活：探测成功且 stackEngine 启动后，显式激活 WebRTC
@@ -893,7 +1014,7 @@ func (e *Engine) Start() error {
 		if e.rootCancel != nil {
 			e.rootCancel()
 		}
-		return rollback(fmt.Errorf("setup routes: %w", err))
+		return failStart(fmt.Errorf("setup routes: %w", err))
 	}
 
 	go func() {
@@ -911,13 +1032,57 @@ func (e *Engine) Start() error {
 
 	_ = e.startMixedProxy()
 
-	e.running.Store(true)
-	e.state.Store(stateRunning)
 	e.mu.Lock()
+	if e.startEpoch != ticket || !e.startPending.Load() || e.state.Load() != stateStarting {
+		e.mu.Unlock()
+		return e.abortStartLocked(startCancel, dev, nm, ip)
+	}
+	e.state.Store(stateRunning)
+	e.running.Store(true)
+	e.startPending.Store(false)
 	e.startCancel = nil
 	e.mu.Unlock()
 	log.Printf("[ENGINE] data plane started successfully (TUN aero0, mixed proxy %s)", e.listenAddr)
 	return nil
+}
+
+// abortStartLocked 清理本次启动申请的临时资源，不置空全局基础设施，不修改状态
+func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice, nm NetworkMonitor, ip net.IP) error {
+	if startCancel != nil {
+		startCancel()
+	}
+	e.mu.Lock()
+	e.startCancel = nil
+	e.mu.Unlock()
+
+	if e.stackEngine != nil {
+		e.stackEngine.SetWebRTCActive(false)
+		e.stackEngine.Stop()
+		e.stackEngine = nil
+	}
+	if dev != nil {
+		if name := dev.Name(); name != "" {
+			teardownRoutesFn(name)
+		}
+		_ = dev.Close()
+		e.tunDevice = nil
+	}
+	if ip != nil {
+		UnprotectHostRoute(ip.String())
+	}
+	if e.mixedListener != nil {
+		_ = e.mixedListener.Close()
+		e.mixedListener = nil
+	}
+	if e.rootCancel != nil {
+		e.rootCancel()
+		e.rootCancel = nil
+	}
+	if nm != nil {
+		nm.Stop()
+	}
+
+	return ErrStartAborted
 }
 
 // onNetworkChange 响应底层物理网络切换事件
@@ -1013,14 +1178,18 @@ func (e *Engine) Stop() error {
 
 	// 快速取消正在进行的 Start()
 	e.mu.Lock()
-	if cancel := e.startCancel; cancel != nil {
+	cancel := e.startCancel
+	e.mu.Unlock()
+	if cancel != nil {
 		cancel()
 	}
-	e.mu.Unlock()
 
 	e.lifecycleMu.Lock()
 	defer e.lifecycleMu.Unlock()
+	return e.stopLocked()
+}
 
+func (e *Engine) stopLocked() error {
 	if e.state.Load() == stateStopped && !e.running.Load() {
 		if e.mixedListener != nil {
 			_ = e.mixedListener.Close()
@@ -1077,7 +1246,7 @@ func (e *Engine) Stop() error {
 	if e.tunDevice != nil {
 		devName := e.tunDevice.Name()
 		if devName != "" {
-			TeardownRoutes(devName)
+			teardownRoutesFn(devName)
 		}
 		_ = os.Remove(utunRecordPath())
 		_ = e.tunDevice.Close()
@@ -1094,9 +1263,33 @@ func (e *Engine) Stop() error {
 		e.sessionMgr.Reset()
 	}
 	invalidateGatewayCache()
+
+	e.mu.Lock()
 	e.state.Store(stateStopped)
+	e.running.Store(false)
+	e.mu.Unlock()
+
 	log.Printf("[ENGINE] data plane stopped")
 	return nil
+}
+
+// Restart 在同一把 lifecycleMu 锁内依次执行停止与使用特定票据重新启动
+func (e *Engine) Restart(ticket uint64) error {
+	invalidateGatewayCache()
+
+	e.mu.Lock()
+	cancel := e.startCancel
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	if err := e.stopLocked(); err != nil {
+		return err
+	}
+	return e.startLocked(ticket)
 }
 
 // GetState 获取运行状态快照
@@ -1143,8 +1336,9 @@ func (e *Engine) GetState() AppState {
 	e.lastErrMu.RUnlock()
 
 	return AppState{
-		Connected:    e.running.Load(),
-		Starting:     e.state.Load() == stateStarting,
+		Connected:    e.state.Load() == stateRunning,
+		Starting:     e.state.Load() == stateStarting || e.startPending.Load(),
+		Stopping:     e.state.Load() == stateStopping,
 		LastError:    lastErr,
 		ErrorCode:    lastCode,
 		ConflictVPN:  conflictVPN,
