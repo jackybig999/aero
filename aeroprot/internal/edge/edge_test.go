@@ -539,8 +539,8 @@ func TestServerCoverAndHealth(t *testing.T) {
 	if recHz.Header().Get("Server") != "" {
 		t.Fatalf("expected empty Server header, got %q", recHz.Header().Get("Server"))
 	}
-	if recHz.Header().Get("Alt-Svc") != `h3=":443"; ma=86400` {
-		t.Fatalf("expected Alt-Svc 'h3=\":443\"; ma=86400', got %q", recHz.Header().Get("Alt-Svc"))
+	if recHz.Header().Get("Alt-Svc") != "" {
+		t.Fatalf("expected empty Alt-Svc header, got %q", recHz.Header().Get("Alt-Svc"))
 	}
 
 	// 2. Health endpoint test (管理面 JSON，脱敏鉴权：未鉴权 404，带密钥 200)
@@ -570,8 +570,8 @@ func TestServerCoverAndHealth(t *testing.T) {
 	if recH.Header().Get("Server") != "" {
 		t.Fatalf("expected empty Server header, got %q", recH.Header().Get("Server"))
 	}
-	if recH.Header().Get("Alt-Svc") != `h3=":443"; ma=86400` {
-		t.Fatalf("expected Alt-Svc 'h3=\":443\"; ma=86400', got %q", recH.Header().Get("Alt-Svc"))
+	if recH.Header().Get("Alt-Svc") != "" {
+		t.Fatalf("expected empty Alt-Svc header, got %q", recH.Header().Get("Alt-Svc"))
 	}
 
 	// 3. Cover site endpoint test (返回嵌入的 cover.html)
@@ -590,8 +590,8 @@ func TestServerCoverAndHealth(t *testing.T) {
 	if recC.Header().Get("Server") != "" {
 		t.Fatalf("expected empty Server header, got %q", recC.Header().Get("Server"))
 	}
-	if recC.Header().Get("Alt-Svc") != `h3=":443"; ma=86400` {
-		t.Fatalf("expected Alt-Svc 'h3=\":443\"; ma=86400', got %q", recC.Header().Get("Alt-Svc"))
+	if recC.Header().Get("Alt-Svc") != "" {
+		t.Fatalf("expected empty Alt-Svc header, got %q", recC.Header().Get("Alt-Svc"))
 	}
 	if !strings.Contains(recC.Body.String(), "AERO Edge Cloud") {
 		t.Fatalf("cover page missing expected text 'AERO Edge Cloud'")
@@ -658,7 +658,7 @@ func TestServerHTTPHeadersAndNextProtos(t *testing.T) {
 		t.Fatalf("expected NextProtos to contain h2 and http/1.1, got %v", nextProtos)
 	}
 
-	// 2. Verify all HTTP endpoints do not return hardcoded Server: nginx and retain Alt-Svc
+	// 2. Verify all HTTP endpoints do not return hardcoded Server: nginx and do not return Alt-Svc
 	endpoints := []string{"/", "/healthz", "/health", "/assets/style.css", "/admin/version", "/sub/nonexistent"}
 	for _, ep := range endpoints {
 		req := httptest.NewRequest(http.MethodGet, ep, nil)
@@ -671,9 +671,8 @@ func TestServerHTTPHeadersAndNextProtos(t *testing.T) {
 		}
 
 		altSvcHeader := rec.Header().Get("Alt-Svc")
-		expectedAltSvc := `h3=":443"; ma=86400`
-		if altSvcHeader != expectedAltSvc {
-			t.Fatalf("endpoint %s expected Alt-Svc header %q, got %q", ep, expectedAltSvc, altSvcHeader)
+		if altSvcHeader != "" {
+			t.Fatalf("endpoint %s expected empty Alt-Svc header, got %q", ep, altSvcHeader)
 		}
 	}
 }

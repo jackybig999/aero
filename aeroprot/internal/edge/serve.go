@@ -358,8 +358,6 @@ func (s *Server) Start() error {
 
 // ServeHTTP routes HTTP requests to /admin, /sub, /health, /healthz, /assets/*, or Cover page
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Alt-Svc", `h3=":443"; ma=86400`)
-
 	// 纯正 HTTP/3 门禁：TCP/443 仅作 Web 伪装站点，坚决禁用任何 TCP 代理或回退
 	isQUIC := r.Context().Value(quicConnKey{}) != nil
 	if r.Method == http.MethodConnect {
