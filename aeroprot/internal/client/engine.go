@@ -807,10 +807,35 @@ func (e *Engine) startLocked(ticket uint64) error {
 		port = p
 	}
 
-	ip, err = resolvePhysicalIPv4(host)
-	if err != nil {
-		return failStart(fmt.Errorf("resolve active node %s: %w", host, err))
+	var nodeIP net.IP
+	if curAddr, _, _, curIP := getActiveEdge(); curAddr == activeAddr && curIP != nil {
+		nodeIP = curIP
 	}
+	if nodeIP == nil && e.appliedSub != nil && e.appliedSub.IPs != nil {
+		if ipStr, ok := e.appliedSub.IPs[activeAddr]; ok && ipStr != "" {
+			if parsed := net.ParseIP(ipStr); parsed != nil {
+				nodeIP = parsed.To4()
+			}
+		}
+		if nodeIP == nil {
+			for a, ipStr := range e.appliedSub.IPs {
+				if h, _, _ := net.SplitHostPort(a); h == host && ipStr != "" {
+					if parsed := net.ParseIP(ipStr); parsed != nil {
+						nodeIP = parsed.To4()
+						break
+					}
+				}
+			}
+		}
+	}
+	if nodeIP == nil {
+		var rerr error
+		nodeIP, rerr = resolvePhysicalIPv4(host)
+		if rerr != nil {
+			return failStart(fmt.Errorf("resolve active node %s: %w", host, rerr))
+		}
+	}
+	ip = nodeIP
 
 	// 规则：仅在 tun 模式下保护节点路由；sysproxy 严格执行零主机篡改
 	if mode == "tun" {
