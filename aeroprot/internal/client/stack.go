@@ -433,11 +433,25 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		}
 	}
 
-	// 4. QUIC (UDP 443) 拦截：阻断发往 443 端口的普通 UDP 数据报
+	// 4. QUIC (UDP 443) 拦截：阻断发往 443 端口的普通 UDP 数据报并回送 ICMP 端口不可达
 	// 强制客户端浏览器 HTTP/3 在 0ms 内即刻回退至稳定高速的 TCP (HTTP/2)，彻底消除 Chromium 60 秒超时假死挂起
 	if id.LocalPort == 443 {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
+		pkt := r.Packet()
+		if pkt != nil {
+			var orig []byte
+			v := pkt.ToView()
+			if v != nil {
+				orig = append([]byte(nil), v.AsSlice()...)
+				v.Release()
+			}
+			pkt.DecRef()
+
+			if len(orig) > 0 {
+				icmpReply := buildICMPPortUnreachable(orig)
+				if len(icmpReply) > 0 && e.device != nil {
+					_, _ = e.device.Write(icmpReply)
+				}
+			}
 		}
 		return true
 	}
@@ -723,6 +737,60 @@ func buildICMPFragNeeded(origPkt []byte, gwIP net.IP, nextMTU uint16) []byte {
 
 	// 3. ICMP Payload (Original IPv4 header + 8 bytes of original datagram)
 	copy(icmpData[8:], origPkt[:payloadLen])
+	icmpChecksum := calcChecksum(icmpData)
+	binary.BigEndian.PutUint16(icmpData[2:4], icmpChecksum)
+
+	return pkt
+}
+
+// buildICMPPortUnreachable 构造符合 RFC 792 规范的 ICMP Type 3 Code 3 (Port Unreachable) 数据包
+func buildICMPPortUnreachable(orig []byte) []byte {
+	if len(orig) < 20 || orig[0]>>4 != 4 {
+		return nil
+	}
+	ihl := int(orig[0]&0x0F) * 4
+	if ihl < 20 || len(orig) < ihl+8 {
+		return nil
+	}
+
+	payloadLen := ihl + 8
+	icmpLen := 8 + payloadLen
+	ipTotalLen := 20 + icmpLen
+
+	pkt := make([]byte, ipTotalLen)
+
+	// 1. 外层 IPv4 首部 (20 字节)
+	pkt[0] = 0x45
+	pkt[1] = 0x00
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(ipTotalLen))
+	pkt[4] = 0x00
+	pkt[5] = 0x00
+	pkt[6] = 0x00
+	pkt[7] = 0x00
+	pkt[8] = 64 // TTL
+	pkt[9] = 1  // Protocol: ICMP
+	// Checksum at 10:12 calculated later
+	origSrcIP := orig[12:16]
+	origDstIP := orig[16:20]
+	// ICMP 源 IP 是原包目的 IP，ICMP 目的 IP 是原包源 IP
+	copy(pkt[12:16], origDstIP)
+	copy(pkt[16:20], origSrcIP)
+	ipChecksum := calcChecksum(pkt[:20])
+	binary.BigEndian.PutUint16(pkt[10:12], ipChecksum)
+
+	// 2. ICMP 首部 (8 字节)
+	icmpData := pkt[20:]
+	icmpData[0] = 3 // Type: Destination Unreachable
+	icmpData[1] = 3 // Code: Port Unreachable
+	icmpData[2] = 0x00
+	icmpData[3] = 0x00
+	icmpData[4] = 0x00 // RFC 792: unused, must be zero
+	icmpData[5] = 0x00
+	icmpData[6] = 0x00
+	icmpData[7] = 0x00
+
+	// 3. ICMP 载荷：原 IP 头加其后 8 字节 (RFC 792)
+	copy(icmpData[8:], orig[:payloadLen])
 	icmpChecksum := calcChecksum(icmpData)
 	binary.BigEndian.PutUint16(icmpData[2:4], icmpChecksum)
 

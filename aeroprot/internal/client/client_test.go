@@ -4140,3 +4140,58 @@ func TestSplitRouting_DomesticCDNs(t *testing.T) {
 	}
 }
 
+func TestICMPPortUnreachable_RFC792_Wire(t *testing.T) {
+	// 构造 20 字节 IPv4（源 10.88.0.2，目的 198.18.0.1）加 8 字节 UDP（源端口 54321，目的端口 443）
+	raw := make([]byte, 28)
+	raw[0] = 0x45 // Version 4, IHL 5 (20 字节)
+	raw[1] = 0x00
+	binary.BigEndian.PutUint16(raw[2:4], 28)
+	raw[8] = 64
+	raw[9] = 17 // UDP
+	copy(raw[12:16], net.ParseIP("10.88.0.2").To4())
+	copy(raw[16:20], net.ParseIP("198.18.0.1").To4())
+	binary.BigEndian.PutUint16(raw[20:22], 54321) // Src port
+	binary.BigEndian.PutUint16(raw[22:24], 443)   // Dst port 443
+	binary.BigEndian.PutUint16(raw[24:26], 8)     // Length 8
+
+	reply := buildICMPPortUnreachable(raw)
+	if reply == nil {
+		t.Fatalf("expected non-nil ICMP reply for standard 28-byte UDP packet")
+	}
+
+	// 断言回包长 56、源 198.18.0.1、目的 10.88.0.2、类型 3、代码 3
+	if len(reply) != 56 {
+		t.Fatalf("expected reply length 56, got %d", len(reply))
+	}
+	srcIP := net.IP(reply[12:16])
+	if !srcIP.Equal(net.ParseIP("198.18.0.1")) {
+		t.Fatalf("expected ICMP source IP 198.18.0.1, got %v", srcIP)
+	}
+	dstIP := net.IP(reply[16:20])
+	if !dstIP.Equal(net.ParseIP("10.88.0.2")) {
+		t.Fatalf("expected ICMP destination IP 10.88.0.2, got %v", dstIP)
+	}
+	if reply[20] != 3 {
+		t.Fatalf("expected ICMP Type 3, got %d", reply[20])
+	}
+	if reply[21] != 3 {
+		t.Fatalf("expected ICMP Code 3, got %d", reply[21])
+	}
+
+	// 对前 20 字节和后面的 ICMP 段各跑一次 calcChecksum，结果都是 0
+	if csIP := calcChecksum(reply[:20]); csIP != 0 {
+		t.Fatalf("expected IP checksum verification to yield 0, got 0x%04x", csIP)
+	}
+	if csICMP := calcChecksum(reply[20:]); csICMP != 0 {
+		t.Fatalf("expected ICMP checksum verification to yield 0, got 0x%04x", csICMP)
+	}
+
+	// 再补一条短包：长度小于 ihl+8 时返回 nil
+	short := raw[:25]
+	replyShort := buildICMPPortUnreachable(short)
+	if replyShort != nil {
+		t.Fatalf("expected nil for short packet, got %v", replyShort)
+	}
+}
+
+
