@@ -47,6 +47,20 @@ var (
 	setupRoutesFn           = SetupRoutes
 	teardownRoutesFn        = TeardownRoutes
 	cleanAero0StaleRoutesFn = CleanAero0StaleRoutes
+	dialIPFn                = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
+		if m != nil {
+			conn, prefixes, err := m.DialIP(ctx)
+			if err != nil {
+				return nil, "", err
+			}
+			pStr := "10.88.0.2/24"
+			if len(prefixes) > 0 {
+				pStr = prefixes[0].String()
+			}
+			return conn, pStr, nil
+		}
+		return nil, "", errors.New("session manager is nil")
+	}
 )
 
 // AppState 描述客户端当前运行状态
@@ -86,6 +100,7 @@ type Engine struct {
 	stackEngine  *StackEngine
 	tunDevice    TunDevice
 	sessionMgr   *SessionManager
+	ipPump       *IPDataPump // 新增：CONNECT-IP 数据泵
 
 	appliedSub    *Applied
 	activeAddr    string
@@ -357,6 +372,9 @@ func (e *Engine) SetKillSwitch(active bool) {
 	if e.stackEngine != nil {
 		e.stackEngine.SetKillSwitch(active)
 	}
+	if e.ipPump != nil {
+		e.ipPump.SetKillSwitch(active)
+	}
 }
 
 // KillSwitch 返回当前 Kill Switch 激活状态
@@ -470,9 +488,9 @@ func (e *Engine) LoadAndApplySubscriptionBytes(data []byte) (*Applied, error) {
 // 核心规则：仅比对 host:port（相同则短路返回，严禁 Reset()）
 func (e *Engine) SwitchActiveNode(addr string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	if e.activeAddr == addr {
+		e.mu.Unlock()
 		return nil
 	}
 
@@ -496,7 +514,54 @@ func (e *Engine) SwitchActiveNode(addr string) error {
 		}
 	}
 
-	return e.switchActiveNodeLocked(addr, tok, sni)
+	oldPump := e.ipPump
+	e.ipPump = nil
+	tunDev := e.tunDevice
+	rootCtx := e.rootCtx
+	killSw := &e.killSwitch
+	dnsH := e.dnsHandler
+	isTunRunning := (e.mode == "tun" && e.running.Load() && tunDev != nil)
+	sessMgr := e.sessionMgr
+
+	err := e.switchActiveNodeLocked(addr, tok, sni)
+	e.mu.Unlock()
+
+	if err != nil {
+		if isTunRunning && oldPump != nil {
+			e.mu.Lock()
+			if e.ipPump == nil {
+				e.ipPump = oldPump
+			}
+			e.mu.Unlock()
+		}
+		return err
+	}
+
+	// 锁外异步热重绑 L3 数据泵，彻底杜绝持锁网络 IO 导致引擎死锁
+	if isTunRunning && sessMgr != nil {
+		go func() {
+			if oldPump != nil {
+				_ = oldPump.Close()
+			}
+			newConn, _, dialErr := dialIPFn(rootCtx, sessMgr)
+			if dialErr == nil && newConn != nil {
+				newPump := NewIPDataPump(rootCtx, tunDev, newConn, killSw, dnsH)
+				newPump.Start()
+				e.mu.Lock()
+				if e.running.Load() && e.ipPump == nil {
+					e.ipPump = newPump
+				} else {
+					_ = newPump.Close()
+				}
+				e.mu.Unlock()
+				log.Printf("[ENGINE] L3 IPDataPump successfully rebound to new active node: %s", addr)
+			} else {
+				log.Printf("[ENGINE] failed to dial new connect-ip on switch to %s: %v", addr, dialErr)
+			}
+		}()
+	}
+
+	return nil
 }
 
 func resolvePhysicalIPv4(host string) (net.IP, error) {
@@ -1009,6 +1074,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	e.tunDevice = dev
 
 	e.stackEngine = NewStackEngine(dev, e.tunnelClient, e.dnsHandler)
+	e.stackEngine.SetDNSOnlyMode(true)
 	e.stackEngine.SetKillSwitch(e.killSwitch.Load())
 	if err := e.stackEngine.Start(); err != nil {
 		_ = dev.Close()
@@ -1024,10 +1090,36 @@ func (e *Engine) startLocked(ticket uint64) error {
 	// WebRTC 生产激活：探测成功且 stackEngine 启动后，显式激活 WebRTC
 	e.stackEngine.SetWebRTCActive(true)
 
-	// 路由配置固定使用 10.88.0.2/24，与 gVisor 保持一致；彻底剔除桌面 DialIP 调用
-	prefixStr := "10.88.0.2/24"
+	// 建立 RFC 9484 CONNECT-IP 会话
+	// [Fix I 生效] DialIP 失败时先调 teardownRoutesFn 再调 UnprotectHostRoute，与其他回滚路径对称
+	ipConn, prefixStr, err := dialIPFn(e.rootCtx, e.sessionMgr)
+	if err != nil {
+		if e.stackEngine != nil {
+			e.stackEngine.Stop()
+			e.stackEngine = nil
+		}
+		_ = dev.Close()
+		e.tunDevice = nil
+		teardownRoutesFn(dev.Name())
+		UnprotectHostRoute(ip.String())
+		if e.rootCancel != nil {
+			e.rootCancel()
+		}
+		return failStart(fmt.Errorf("dial connect-ip: %w", err))
+	}
+	if prefixStr == "" {
+		prefixStr = "10.88.0.2/24"
+	}
+
+	// 启动数据泵 (单一权威独占读取 Wintun，内置 DNS 本地旁路与 Fail-Closed 断网)
+	e.ipPump = NewIPDataPump(e.rootCtx, dev, ipConn, &e.killSwitch, e.dnsHandler)
+	e.ipPump.Start()
 
 	if err := setupRoutesFn(dev.Name(), prefixStr); err != nil {
+		if e.ipPump != nil {
+			_ = e.ipPump.Close()
+			e.ipPump = nil
+		}
 		if e.stackEngine != nil {
 			e.stackEngine.Stop()
 			e.stackEngine = nil
@@ -1080,6 +1172,10 @@ func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice,
 	e.startCancel = nil
 	e.mu.Unlock()
 
+	if e.ipPump != nil {
+		_ = e.ipPump.Close()
+		e.ipPump = nil
+	}
 	if e.stackEngine != nil {
 		e.stackEngine.SetWebRTCActive(false)
 		e.stackEngine.Stop()
@@ -1262,6 +1358,11 @@ func (e *Engine) stopLocked() error {
 		e.stackEngine.SetWebRTCActive(false)
 		e.stackEngine.Stop()
 		e.stackEngine = nil
+	}
+
+	if e.ipPump != nil {
+		_ = e.ipPump.Close()
+		e.ipPump = nil
 	}
 
 	if e.tunnelClient != nil {

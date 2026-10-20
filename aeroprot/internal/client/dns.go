@@ -390,19 +390,18 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 			return buildEmptyResponse(pkt, qname, qtype)
 		}
 		// A 记录走直连物理 DNS
-		return h.queryFastUDP(pkt)
+		dnsResp := h.queryFastUDP(pkt)
+		if dnsResp != nil {
+			return dnsResp
+		}
+		// 物理 DNS 超时/失败，回退到 Fake-IP 专线
+		return h.respondFakeIP(pkt, qname)
 	}
 
 	// 阶段三：其余境外站/非直连域名
 	// 绝对不进入 queryFastUDP！杜绝 DNS 泄露
 	if qtype == 0x0001 {
-		if h.fakeIP != nil {
-			resp := h.fakeIP.FormatDNSResponse(qname)
-			if len(pkt) >= 2 && len(resp) >= 2 {
-				resp[0], resp[1] = pkt[0], pkt[1]
-			}
-			return resp
-		}
+		return h.respondFakeIP(pkt, qname)
 	}
 
 	// AAAA 和其余查询类型 (Type 65 HTTPS RR, TXT, MX 等)：返回标准空应答 (NOERROR, 0 答案)
@@ -545,4 +544,92 @@ func encodeDNSName(domain string) []byte {
 	}
 	buf = append(buf, 0x00)
 	return buf
+}
+
+// respondFakeIP 格式化并返回 Fake-IP (198.18.x.x) A 记录应答，并对齐请求 Transaction ID
+func (h *DNSHandler) respondFakeIP(pkt []byte, qname string) []byte {
+	if h.fakeIP == nil {
+		return buildEmptyResponse(pkt, qname, 0x0001)
+	}
+	resp := h.fakeIP.FormatDNSResponse(qname)
+	if len(pkt) >= 2 && len(resp) >= 2 {
+		resp[0], resp[1] = pkt[0], pkt[1]
+	}
+	return resp
+}
+
+// extractFirstIPv4FromResponse 从 DNS wire 响应报文中解析第一条 A 记录的 IPv4 地址
+func extractFirstIPv4FromResponse(resp []byte) net.IP {
+	if len(resp) < 12 {
+		return nil
+	}
+	ancount := binary.BigEndian.Uint16(resp[6:8])
+	if ancount == 0 {
+		return nil
+	}
+	qdcount := binary.BigEndian.Uint16(resp[4:6])
+
+	offset := 12
+	// 跳过 Question Section (qdcount 个 question)
+	for i := 0; i < int(qdcount); i++ {
+		for {
+			if offset >= len(resp) {
+				return nil
+			}
+			length := int(resp[offset])
+			if length == 0 {
+				offset++
+				break
+			}
+			if length >= 0xC0 { // 压缩指针，占 2 字节
+				offset += 2
+				break
+			}
+			offset += 1 + length
+		}
+		offset += 4 // 跳过 QTYPE (2) + QCLASS (2)
+		if offset > len(resp) {
+			return nil
+		}
+	}
+
+	// 遍历 Answer Section
+	for i := 0; i < int(ancount); i++ {
+		if offset >= len(resp) {
+			return nil
+		}
+		// 跳过 NAME
+		for {
+			if offset >= len(resp) {
+				return nil
+			}
+			length := int(resp[offset])
+			if length == 0 {
+				offset++
+				break
+			}
+			if length >= 0xC0 { // 压缩指针
+				offset += 2
+				break
+			}
+			offset += 1 + length
+		}
+		// 读取 TYPE (2), CLASS (2), TTL (4), RDLENGTH (2) = 10 字节
+		if offset+10 > len(resp) {
+			return nil
+		}
+		rtype := binary.BigEndian.Uint16(resp[offset : offset+2])
+		rdlength := int(binary.BigEndian.Uint16(resp[offset+8 : offset+10]))
+		offset += 10
+
+		if offset+rdlength > len(resp) {
+			return nil
+		}
+		// Type A = 0x0001, rdlength 必须为 4
+		if rtype == 0x0001 && rdlength == 4 {
+			return net.IPv4(resp[offset], resp[offset+1], resp[offset+2], resp[offset+3])
+		}
+		offset += rdlength
+	}
+	return nil
 }

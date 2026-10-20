@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -31,8 +32,9 @@ const (
 	NIF_ICON    = 0x00000002
 	NIF_TIP     = 0x00000004
 
-	WM_USER     = 0x0400
-	WM_TRAY_MSG = WM_USER + 102
+	WM_USER             = 0x0400
+	WM_TRAY_MSG         = WM_USER + 102
+	WM_AERO_UPDATE_TRAY = WM_USER + 103 // 新增：托盘异步更新专用安全消息
 
 	WM_CLOSE         = 0x0010
 	WM_DESTROY       = 0x0002
@@ -69,6 +71,7 @@ var (
 	modKernel32 = syscall.NewLazyDLL("kernel32.dll")
 
 	procSendMessageW             = modUser32.NewProc("SendMessageW")
+	procPostMessageW             = modUser32.NewProc("PostMessageW") // 新增：声明纯异步 PostMessageW
 	procShowWindow               = modUser32.NewProc("ShowWindow")
 	procSetForegroundWindow      = modUser32.NewProc("SetForegroundWindow")
 	procSetWindowLongPtrW        = modUser32.NewProc("SetWindowLongPtrW")
@@ -285,6 +288,34 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		return 0
 	}
 	switch uint32(msg) {
+	case WM_AERO_UPDATE_TRAY:
+		trayMu.Lock()
+		m := pendingTrayMode
+		c := pendingTrayConn
+		trayMu.Unlock()
+
+		var targetIcon uintptr
+		var tip string
+		if !c {
+			targetIcon = hIconBlue
+			tip = "AERO · 就绪 (未连接)"
+		} else if m == "tun" {
+			targetIcon = hIconGreen
+			tip = "AERO · TUN 全局模式 (已连接)"
+		} else {
+			targetIcon = hIconYellow
+			tip = "AERO · 本地专线代理 (已连接)"
+		}
+
+		if targetIcon != 0 {
+			trayNID.HIcon = targetIcon
+			procSendMessageW.Call(hwnd, uintptr(WM_SETICON), uintptr(ICON_SMALL), targetIcon)
+		}
+		tipText, _ := syscall.UTF16FromString(tip)
+		copy(trayNID.SzTip[:], tipText)
+		procShell_NotifyIconW.Call(uintptr(NIM_MODIFY), uintptr(unsafe.Pointer(&trayNID)))
+		return 0
+
 	case WM_CLOSE:
 		procShowWindow.Call(hwnd, uintptr(SW_HIDE))
 		return 0
@@ -364,32 +395,24 @@ func loadEmbeddedIcon(filename string) uintptr {
 	return loadEmbeddedIconSize(filename, 16, 16)
 }
 
+var (
+	trayMu          sync.Mutex
+	pendingTrayMode string
+	pendingTrayConn bool
+)
+
+// UpdateTrayIcon 供后台 Goroutine 调用，改用完全异步的 PostMessageW 投递到 UI 消息泵
 func UpdateTrayIcon(mode string, connected bool) {
 	if clientHWND == 0 {
 		return
 	}
-	var targetIcon uintptr
-	var tip string
+	trayMu.Lock()
+	pendingTrayMode = mode
+	pendingTrayConn = connected
+	trayMu.Unlock()
 
-	if !connected {
-		targetIcon = hIconBlue
-		tip = "AERO · 就绪 (未连接)"
-	} else if mode == "tun" {
-		targetIcon = hIconGreen
-		tip = "AERO · TUN 全局模式 (已连接)"
-	} else {
-		targetIcon = hIconYellow
-		tip = "AERO · 本地专线代理 (已连接)"
-	}
-
-	if targetIcon != 0 {
-		trayNID.HIcon = targetIcon
-		procSendMessageW.Call(clientHWND, uintptr(WM_SETICON), uintptr(ICON_SMALL), targetIcon)
-	}
-	tipText, _ := syscall.UTF16FromString(tip)
-	copy(trayNID.SzTip[:], tipText)
-
-	procShell_NotifyIconW.Call(uintptr(NIM_MODIFY), uintptr(unsafe.Pointer(&trayNID)))
+	// 纯异步投递，绝对不跨线程阻塞等待
+	procPostMessageW.Call(clientHWND, uintptr(WM_AERO_UPDATE_TRAY), 0, 0)
 }
 
 func setupSystemTray(w webview2.WebView) {

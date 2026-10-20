@@ -118,8 +118,10 @@ type windowsDevice struct {
 	mtu       int
 	adapter   *wintun.Adapter
 	session   wintun.Session
-	sessionOK atomic.Bool
+	sessionMu sync.RWMutex
 	closed    atomic.Bool
+	sessionOK atomic.Bool
+	readWg    sync.WaitGroup
 	writeMu   sync.Mutex
 }
 
@@ -187,32 +189,39 @@ func (d *windowsDevice) Read(p []byte) (int, error) {
 	if d.closed.Load() || !d.sessionOK.Load() {
 		return 0, fmt.Errorf("device closed")
 	}
+
+	d.readWg.Add(1)
+	defer d.readWg.Done()
+
+	d.sessionMu.RLock()
+	if !d.sessionOK.Load() {
+		d.sessionMu.RUnlock()
+		return 0, fmt.Errorf("device closed")
+	}
+	sess := d.session
+	d.sessionMu.RUnlock()
+
 	for {
-		if d.closed.Load() {
+		if d.closed.Load() || !d.sessionOK.Load() {
 			return 0, fmt.Errorf("device closed")
 		}
-		packet, err := d.session.ReceivePacket()
+		packet, err := sess.ReceivePacket()
 		if err != nil {
 			if err == errorNoMoreItems || strings.Contains(err.Error(), "No more data") {
-				ev := d.session.ReadWaitEvent()
+				ev := sess.ReadWaitEvent()
 				res, _ := windows.WaitForSingleObject(ev, 1000)
+				if d.closed.Load() || !d.sessionOK.Load() {
+					return 0, fmt.Errorf("device closed")
+				}
 				if res == uint32(windows.WAIT_TIMEOUT) {
 					continue
 				}
 				continue
 			}
-			if !d.closed.Load() && d.adapter != nil {
-				d.session.End()
-				time.Sleep(300 * time.Millisecond)
-				if newSess, nerr := d.adapter.StartSession(0x800000); nerr == nil {
-					d.session = newSess
-					continue
-				}
-			}
 			return 0, err
 		}
 		n := copy(p, packet)
-		d.session.ReleaseReceivePacket(packet)
+		sess.ReleaseReceivePacket(packet)
 		if n == 0 {
 			continue
 		}
@@ -229,21 +238,21 @@ func (d *windowsDevice) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	buf, err := d.session.AllocateSendPacket(len(p))
+
+	d.sessionMu.RLock()
+	if !d.sessionOK.Load() {
+		d.sessionMu.RUnlock()
+		return 0, fmt.Errorf("device closed")
+	}
+	sess := d.session
+	d.sessionMu.RUnlock()
+
+	buf, err := sess.AllocateSendPacket(len(p))
 	if err != nil {
-		if !d.closed.Load() && d.adapter != nil {
-			d.session.End()
-			if newSess, nerr := d.adapter.StartSession(0x800000); nerr == nil {
-				d.session = newSess
-				buf, err = d.session.AllocateSendPacket(len(p))
-			}
-		}
-		if err != nil {
-			return 0, err
-		}
+		return 0, err
 	}
 	copy(buf, p)
-	d.session.SendPacket(buf)
+	sess.SendPacket(buf)
 	return len(p), nil
 }
 
@@ -252,14 +261,36 @@ func (d *windowsDevice) Close() error {
 	if !d.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	if d.sessionOK.CompareAndSwap(true, false) {
+	hadSession := d.sessionOK.CompareAndSwap(true, false)
+
+	// Step 1: 内核级显式唤醒，瞬间击破 WaitForSingleObject 阻塞
+	if hadSession {
+		d.sessionMu.RLock()
+		sess := d.session
+		d.sessionMu.RUnlock()
+		if ev := sess.ReadWaitEvent(); ev != 0 {
+			_ = windows.SetEvent(ev)
+		}
+	}
+
+	// Step 2: 严格等待正在进行的读循环完全脱离 Wintun 环形缓冲区
+	d.readWg.Wait()
+
+	// Step 3: 持锁安全终结 session 并关闭 adapter
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+
+	if hadSession {
 		d.session.End()
 	}
 	if d.adapter != nil {
-		d.adapter.Close()
+		_ = d.adapter.Close()
 		d.adapter = nil
 	}
-	log.Printf("[TUN] Windows adapter closed: %s", d.name)
+
+	log.Printf("[TUN] Windows adapter safely closed: %s", d.name)
 	return nil
 }
 

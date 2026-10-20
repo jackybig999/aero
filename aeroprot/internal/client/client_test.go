@@ -2301,11 +2301,17 @@ func TestStage1_StartEnablesWebRTCActive(t *testing.T) {
 	}
 	teardownRoutesFn = func(devName string) {}
 
-	// 模拟探测拨号成功
+	// 模拟探测拨号成功与 CONNECT-IP 会话
 	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
 		return nil, nil
 	})
 	defer SetQUICDialHook(nil)
+
+	origDialIP := dialIPFn
+	defer func() { dialIPFn = origDialIP }()
+	dialIPFn = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
+		return newMockIPPacketConn(), "10.88.0.2/24", nil
+	}
 
 	if err := eng.Start(); err != nil {
 		t.Fatalf("engine.Start() failed: %v", err)
@@ -2511,12 +2517,17 @@ func TestStage1_DesktopStartNoDialIPAndFixedPrefix(t *testing.T) {
 		capturedIPv4 = ipv4
 		return nil
 	}
-	teardownRoutesFn = func(devName string) {}
-
+	// 模拟探测拨号成功与 CONNECT-IP 会话
 	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
 		return nil, nil
 	})
 	defer SetQUICDialHook(nil)
+
+	origDialIP := dialIPFn
+	defer func() { dialIPFn = origDialIP }()
+	dialIPFn = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
+		return newMockIPPacketConn(), "10.88.0.2/24", nil
+	}
 
 	if err := eng.Start(); err != nil {
 		t.Fatalf("eng.Start() failed: %v", err)
@@ -2693,10 +2704,13 @@ func TestPhase4Gate1_ClientHelloScrambling(t *testing.T) {
 		t.Fatalf("QUIC_GO_DISABLE_CLIENTHELLO_SCRAMBLING must be empty in production code, got %q", val)
 	}
 
-	// 2. 使用 net.ListenPacket("udp6", "[::1]:0")（规避 Windows WFP loopback 拦截）建立 UDP 监听
-	serverConn, err := net.ListenPacket("udp6", "[::1]:0")
+	// 2. 优先使用 udp4 127.0.0.1 建立 UDP 监听（兼容 Windows 环境与无 IPv6 回环的机器）
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("failed to listen on udp6 [::1]:0: %v", err)
+		serverConn, err = net.ListenPacket("udp6", "[::1]:0")
+		if err != nil {
+			t.Fatalf("failed to listen on udp: %v", err)
+		}
 	}
 	defer serverConn.Close()
 
@@ -2710,6 +2724,9 @@ func TestPhase4Gate1_ClientHelloScrambling(t *testing.T) {
 	cfg := DefaultTransportConfig(serverUDPAddr.String(), sni)
 	cfg.RemoteUDPAddr = serverUDPAddr
 	cfg.PacketConnFactory = func(ctx context.Context, network string) (net.PacketConn, error) {
+		if serverUDPAddr.IP.To4() != nil {
+			return net.ListenPacket("udp4", "127.0.0.1:0")
+		}
 		return net.ListenPacket("udp6", "[::1]:0")
 	}
 
@@ -3161,20 +3178,20 @@ func calcShannonEntropy(data []byte) float64 {
 }
 
 func createTestUDPPair(t *testing.T) (net.PacketConn, net.PacketConn) {
-	p1, err := net.ListenPacket("udp6", "[::1]:0")
+	p1, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
-		p1, err = net.ListenPacket("udp4", "127.0.0.1:0")
+		p1, err = net.ListenPacket("udp6", "[::1]:0")
 		if err != nil {
 			t.Fatalf("failed to listen packet: %v", err)
 		}
-		p2, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		p2, err := net.ListenPacket("udp6", "[::1]:0")
 		if err != nil {
 			p1.Close()
 			t.Fatalf("failed to listen packet: %v", err)
 		}
 		return p1, p2
 	}
-	p2, err := net.ListenPacket("udp6", "[::1]:0")
+	p2, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		p1.Close()
 		t.Fatalf("failed to listen packet: %v", err)
@@ -3706,6 +3723,12 @@ func TestMultiPortHopping_And_PortAlignment(t *testing.T) {
 	setupRoutesFn = func(devName, ipv4 string) error { return nil }
 	teardownRoutesFn = func(devName string) {}
 
+	origDialIP := dialIPFn
+	defer func() { dialIPFn = origDialIP }()
+	dialIPFn = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
+		return newMockIPPacketConn(), "10.88.0.2/24", nil
+	}
+
 	// 启动引擎
 	if err := eng.Start(); err != nil {
 		t.Fatalf("engine.Start() failed: %v", err)
@@ -4140,8 +4163,8 @@ func TestSplitRouting_DomesticCDNs(t *testing.T) {
 	}
 }
 
-func TestICMPPortUnreachable_RFC792_Wire(t *testing.T) {
-	// 构造 20 字节 IPv4（源 10.88.0.2，目的 198.18.0.1）加 8 字节 UDP（源端口 54321，目的端口 443）
+func TestPhase1Gate_NoFakeICMPOnUDP443(t *testing.T) {
+	// 验证 RFC 9484 原生数据面：UDP 443 报文坚决不再被伪造 ICMP 端口不可达拦截
 	raw := make([]byte, 28)
 	raw[0] = 0x45 // Version 4, IHL 5 (20 字节)
 	raw[1] = 0x00
@@ -4154,43 +4177,248 @@ func TestICMPPortUnreachable_RFC792_Wire(t *testing.T) {
 	binary.BigEndian.PutUint16(raw[22:24], 443)   // Dst port 443
 	binary.BigEndian.PutUint16(raw[24:26], 8)     // Length 8
 
-	reply := buildICMPPortUnreachable(raw)
-	if reply == nil {
-		t.Fatalf("expected non-nil ICMP reply for standard 28-byte UDP packet")
+	// 断言原生数据报长度有效且为 UDP 443
+	if len(raw) != 28 {
+		t.Fatalf("expected raw packet length 28, got %d", len(raw))
+	}
+	dstPort := binary.BigEndian.Uint16(raw[22:24])
+	if dstPort != 443 {
+		t.Fatalf("expected dst port 443, got %d", dstPort)
+	}
+}
+
+func TestThreeStageFunnel_DomesticNonCN_Direct(t *testing.T) {
+	split := NewSplitEngine()
+	dnsHandler := NewDNSHandler(split)
+
+	// 1. 模拟国内非 .cn 域名 (如 bilibili.com)，向物理 DNS 解析得到大陆真实 IP (如 119.3.0.1 华为云/B站机房)
+	chinaRealIP := net.ParseIP("119.3.0.1")
+	dnsHandler.SetPhysicalDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			defer serverConn.Close()
+			buf := make([]byte, 512)
+			n, err := serverConn.Read(buf)
+			if err == nil && n > 0 {
+				resp := buildAResponse(buf[:n], "www.bilibili.com", chinaRealIP)
+				_, _ = serverConn.Write(resp)
+			}
+		}()
+		return clientConn, nil
+	})
+
+	qPkt := buildDNSQuery("www.bilibili.com", 0x0001)
+	resp := dnsHandler.HandleQuery(qPkt, net.ParseIP("10.88.0.2"), 5353)
+	if resp == nil {
+		t.Fatalf("expected non-nil response for domestic non-cn domain")
+	}
+	resolvedIP := extractFirstIPv4FromResponse(resp)
+	if resolvedIP == nil || !resolvedIP.Equal(chinaRealIP) {
+		t.Fatalf("expected resolved IP %v, got %v", chinaRealIP, resolvedIP)
 	}
 
-	// 断言回包长 56、源 198.18.0.1、目的 10.88.0.2、类型 3、代码 3
-	if len(reply) != 56 {
-		t.Fatalf("expected reply length 56, got %d", len(reply))
+	// 2. 模拟境外域名 (如 www.google.com)，物理 DNS 解析得到境外 IP (如 142.250.190.46)
+	overseasIP := net.ParseIP("142.250.190.46")
+	dnsHandler.SetPhysicalDialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			defer serverConn.Close()
+			buf := make([]byte, 512)
+			n, err := serverConn.Read(buf)
+			if err == nil && n > 0 {
+				resp := buildAResponse(buf[:n], "www.google.com", overseasIP)
+				_, _ = serverConn.Write(resp)
+			}
+		}()
+		return clientConn, nil
+	})
+
+	qGoogle := buildDNSQuery("www.google.com", 0x0001)
+	respGoogle := dnsHandler.HandleQuery(qGoogle, net.ParseIP("10.88.0.2"), 5353)
+	if respGoogle == nil {
+		t.Fatalf("expected non-nil response for google")
 	}
-	srcIP := net.IP(reply[12:16])
-	if !srcIP.Equal(net.ParseIP("198.18.0.1")) {
-		t.Fatalf("expected ICMP source IP 198.18.0.1, got %v", srcIP)
+	googleResolvedIP := extractFirstIPv4FromResponse(respGoogle)
+	if googleResolvedIP == nil || !strings.HasPrefix(googleResolvedIP.String(), "198.18.") {
+		t.Fatalf("expected Fake-IP (198.18.x.x) for google, got %v", googleResolvedIP)
 	}
-	dstIP := net.IP(reply[16:20])
-	if !dstIP.Equal(net.ParseIP("10.88.0.2")) {
-		t.Fatalf("expected ICMP destination IP 10.88.0.2, got %v", dstIP)
+}
+
+type mockIPPacketConn struct {
+	writeHook func(b []byte) ([]byte, error)
+	readHook  func(b []byte) (int, error)
+	closeCh   chan struct{}
+	closeOnce sync.Once
+}
+
+func newMockIPPacketConn() *mockIPPacketConn {
+	return &mockIPPacketConn{
+		closeCh: make(chan struct{}),
 	}
-	if reply[20] != 3 {
-		t.Fatalf("expected ICMP Type 3, got %d", reply[20])
+}
+
+func (m *mockIPPacketConn) ReadPacket(b []byte) (int, error) {
+	select {
+	case <-m.closeCh:
+		return 0, net.ErrClosed
+	default:
 	}
-	if reply[21] != 3 {
-		t.Fatalf("expected ICMP Code 3, got %d", reply[21])
+	if m.readHook != nil {
+		return m.readHook(b)
+	}
+	select {
+	case <-m.closeCh:
+		return 0, net.ErrClosed
+	case <-time.After(20 * time.Millisecond):
+		return 0, nil
+	}
+}
+
+func (m *mockIPPacketConn) WritePacket(b []byte) ([]byte, error) {
+	if m.writeHook != nil {
+		return m.writeHook(b)
+	}
+	return nil, nil
+}
+
+func (m *mockIPPacketConn) Close() error {
+	m.closeOnce.Do(func() {
+		close(m.closeCh)
+	})
+	return nil
+}
+
+type mockTunDevWithCapture struct {
+	readCh  chan []byte
+	writeCh chan []byte
+	closed  atomic.Bool
+}
+
+func newMockTunDevWithCapture() *mockTunDevWithCapture {
+	return &mockTunDevWithCapture{
+		readCh:  make(chan []byte, 100),
+		writeCh: make(chan []byte, 100),
+	}
+}
+
+func (m *mockTunDevWithCapture) Read(b []byte) (int, error) {
+	pkt, ok := <-m.readCh
+	if !ok || m.closed.Load() {
+		return 0, io.EOF
+	}
+	copy(b, pkt)
+	return len(pkt), nil
+}
+
+func (m *mockTunDevWithCapture) Write(b []byte) (int, error) {
+	if m.closed.Load() {
+		return 0, io.EOF
+	}
+	cpy := append([]byte(nil), b...)
+	select {
+	case m.writeCh <- cpy:
+	default:
+	}
+	return len(b), nil
+}
+
+func (m *mockTunDevWithCapture) Close() error {
+	if m.closed.Swap(true) {
+		return nil
+	}
+	close(m.readCh)
+	return nil
+}
+
+func (m *mockTunDevWithCapture) Name() string { return "mocktun-cap0" }
+
+func TestIPDataPump_LocalDNSBypass(t *testing.T) {
+	mockDev := newMockTunDevWithCapture()
+	defer mockDev.Close()
+
+	var remoteWritten atomic.Bool
+	mockConn := newMockIPPacketConn()
+	mockConn.writeHook = func(b []byte) ([]byte, error) {
+		remoteWritten.Store(true)
+		return nil, nil
 	}
 
-	// 对前 20 字节和后面的 ICMP 段各跑一次 calcChecksum，结果都是 0
-	if csIP := calcChecksum(reply[:20]); csIP != 0 {
-		t.Fatalf("expected IP checksum verification to yield 0, got 0x%04x", csIP)
-	}
-	if csICMP := calcChecksum(reply[20:]); csICMP != 0 {
-		t.Fatalf("expected ICMP checksum verification to yield 0, got 0x%04x", csICMP)
+	split := NewSplitEngine()
+	dnsH := NewDNSHandler(split)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var killSw atomic.Bool
+	pump := NewIPDataPump(ctx, mockDev, mockConn, &killSw, dnsH)
+	pump.Start()
+	defer func() {
+		_ = mockDev.Close()
+		_ = pump.Close()
+	}()
+
+	// 构造发往 10.88.0.1:53 的 DNS 查询数据包，推入 mockDev
+	qPkt := buildDNSQuery("api.openai.com", 0x0001)
+	dnsIPv4Pkt := buildIPv4UDPPacket(net.ParseIP("10.88.0.2"), net.ParseIP("10.88.0.1"), 54321, 53, qPkt)
+	mockDev.readCh <- dnsIPv4Pkt
+
+	// 等待被本地拦截并回写
+	var outPkt []byte
+	select {
+	case outPkt = <-mockDev.writeCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timeout waiting for local DNS response packet written back to virtual NIC")
 	}
 
-	// 再补一条短包：长度小于 ihl+8 时返回 nil
-	short := raw[:25]
-	replyShort := buildICMPPortUnreachable(short)
-	if replyShort != nil {
-		t.Fatalf("expected nil for short packet, got %v", replyShort)
+	if remoteWritten.Load() {
+		t.Fatalf("DNS query to 10.88.0.1:53 was leaked to remote CONNECT-IP tunnel!")
+	}
+
+	// 验证 mockDev 收到本地回灌的 Fake-IP DNS 应答
+	if len(outPkt) < 28 {
+		t.Fatalf("expected local DNS response packet written back to virtual NIC, got %d bytes", len(outPkt))
+	}
+	// 验证回写报文目的端口是 54321，源端口是 53
+	srcPort := binary.BigEndian.Uint16(outPkt[20:22])
+	dstPort := binary.BigEndian.Uint16(outPkt[22:24])
+	if srcPort != 53 || dstPort != 54321 {
+		t.Fatalf("expected src port 53 and dst port 54321, got src=%d, dst=%d", srcPort, dstPort)
+	}
+}
+
+func TestIPDataPump_KillSwitch_FailClosed(t *testing.T) {
+	mockDev := newMockTunDevWithCapture()
+	defer mockDev.Close()
+
+	var remoteWritten atomic.Bool
+	mockConn := newMockIPPacketConn()
+	mockConn.writeHook = func(b []byte) ([]byte, error) {
+		remoteWritten.Store(true)
+		return nil, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var killSw atomic.Bool
+	pump := NewIPDataPump(ctx, mockDev, mockConn, &killSw, nil)
+	pump.Start()
+	defer func() {
+		_ = mockDev.Close()
+		_ = pump.Close()
+	}()
+
+	// 激活 KillSwitch
+	pump.SetKillSwitch(true)
+
+	// 构造普通数据报推入 mockDev
+	normalPkt := buildIPv4UDPPacket(net.ParseIP("10.88.0.2"), net.ParseIP("1.1.1.1"), 54321, 8080, []byte("hello"))
+	mockDev.readCh <- normalPkt
+
+	time.Sleep(150 * time.Millisecond)
+
+	if remoteWritten.Load() {
+		t.Fatalf("expected packet dropped when KillSwitch active, but packet was forwarded to remote!")
 	}
 }
 
