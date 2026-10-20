@@ -365,6 +365,7 @@ func SetupRoutes(devName, ipv4 string) error {
 	// 5. NRPT 策略配置：所有域名（Namespace "."）指向虚拟网关 DNS（gwIP = 10.88.0.1，绝对严禁指向网卡自身 tunIP！），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！
 	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
 		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s' -Comment 'AERO_%s'", gwIP, devName))
+	_ = runCmd("ipconfig", "/flushdns")
 
 	log.Printf("[TUN] Routes and DNS configured on %s via tunIP=%s gwIP=%s if=%s (MTU=1360)", devName, tunIP, gwIP, idx)
 	return nil
@@ -382,6 +383,7 @@ func TeardownRoutes(devName string) {
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
+	_ = runCmd("ipconfig", "/flushdns")
 	log.Printf("[TUN] Routes and DNS removed for %s", devName)
 }
 
@@ -394,6 +396,7 @@ func CleanAero0StaleRoutes() {
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name=aero0", "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", "aero0")
+	_ = runCmd("ipconfig", "/flushdns")
 }
 
 // getWindowsAdaptersSummary 通过原生 IP Helper API 采集完整的网卡描述与 IfType

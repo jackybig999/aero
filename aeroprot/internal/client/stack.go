@@ -369,23 +369,25 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 		}
 
 		if strat == DIRECT {
-			ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
-			remote, derr := DialPhysicalDirect(ctx, "tcp", target)
-			cancel()
+			dialCtx, dialCancel := context.WithTimeout(e.ctx, 15*time.Second)
+			remote, derr := DialPhysicalDirect(dialCtx, "tcp", target)
 			if derr != nil {
+				dialCancel()
 				return
 			}
+			defer dialCancel()
 			defer remote.Close()
 			relayTraffic(local, remote)
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
-		remote, derr := e.dialer.DialTCP(ctx, target)
-		cancel()
+		dialCtx, dialCancel := context.WithTimeout(e.ctx, 15*time.Second)
+		remote, derr := e.dialer.DialTCP(dialCtx, target)
 		if derr != nil {
+			dialCancel()
 			return
 		}
+		defer dialCancel()
 		defer remote.Close()
 
 		relayTraffic(local, remote)
@@ -519,33 +521,35 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		}
 
 		if strat == DIRECT {
-			ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
-			remote, derr := DialPhysicalDirect(ctx, "udp", target)
-			cancel()
+			dialCtx, dialCancel := context.WithTimeout(e.ctx, 15*time.Second)
+			remote, derr := DialPhysicalDirect(dialCtx, "udp", target)
 			if derr != nil {
+				dialCancel()
 				return
 			}
+			defer dialCancel()
 			defer remote.Close()
 			relayTraffic(activeLocal, remote)
 			return
 		}
 
 		if e.dialer != nil && e.dialer.sessionMgr != nil {
-			ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
-			remote, err := e.dialer.sessionMgr.DialUDP(ctx, target)
-			cancel()
+			dialCtx, dialCancel := context.WithTimeout(e.ctx, 10*time.Second)
+			remote, err := e.dialer.sessionMgr.DialUDP(dialCtx, target)
 			if err != nil {
+				dialCancel()
 				return
 			}
+			defer dialCancel()
 			defer remote.Close()
 			relayTraffic(activeLocal, remote)
 			return
 		}
 
 		contextID := contextIDCounter.Add(1)
-		ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
-		regErr := e.dialer.RegisterUDPContext(ctx, contextID, targetHost, targetPort)
-		cancel()
+		regCtx, regCancel := context.WithTimeout(e.ctx, 5*time.Second)
+		regErr := e.dialer.RegisterUDPContext(regCtx, contextID, targetHost, targetPort)
+		regCancel()
 		if regErr != nil {
 			return
 		}

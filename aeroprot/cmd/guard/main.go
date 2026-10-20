@@ -68,6 +68,7 @@ func cleanAero0Routes() {
 
 	// 禁用并关闭 aero0 网卡
 	quiet("netsh", "interface", "set", "interface", "name=aero0", "admin=DISABLED")
+	quiet("ipconfig", "/flushdns")
 }
 
 func quiet(name string, args ...string) {

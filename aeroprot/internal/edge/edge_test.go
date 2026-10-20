@@ -1461,6 +1461,9 @@ func TestHTTP3BearerAuth(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
@@ -1607,6 +1610,9 @@ func TestHTTP3StandardConnect(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	// 3. Dial HTTP/3 connection
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
@@ -1712,6 +1718,9 @@ func TestMASQUEConnectUDP(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	// 3. Dial HTTP/3 + MASQUE
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
@@ -2039,6 +2048,9 @@ func TestCONNECTIPRoundtrip(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
 	quicConf := DefaultQUICConfig()
@@ -2265,6 +2277,9 @@ func TestDoHResolution(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
 	quicConf := DefaultQUICConfig()
@@ -2375,6 +2390,9 @@ func TestHTTP3Healthz(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
 	quicConf := DefaultQUICConfig()
@@ -3115,6 +3133,9 @@ func TestPhase5Gate_RealICMPForwarding(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	srv.quicServer.SetAllowLoopbackForTest(false) // 严格拦截私网/回环 IP
 
@@ -3395,6 +3416,9 @@ func TestPhase6Gate_SalamanderAndPadding(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	srv.quicServer.SetAllowLoopbackForTest(true)
 
@@ -3866,12 +3890,15 @@ func TestPhase8Gate_EdgeQuotaRevocationAndDisconnect(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	// 1. 搭建模拟商业中台计量服务
 	var reportReceived atomic.Bool
-	midLn, err := net.Listen("tcp", "[::1]:0")
+	midLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		midLn, _ = net.Listen("tcp", "127.0.0.1:0")
+		t.Fatalf("listen 127.0.0.1 failed: %v", err)
 	}
 	midServer := &httptest.Server{
 		Listener: midLn,
@@ -4026,6 +4053,9 @@ func TestFinalGate_SalamanderDualKeyRollover(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	srv.quicServer.SetAllowLoopbackForTest(true)
 
@@ -4177,6 +4207,9 @@ func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	// 1. 验证离线容灾策略默认值 (30m 宽限期, 500MB 突发流量)
 	defPolicy := srv.quicServer.OfflinePolicy()
@@ -4279,9 +4312,9 @@ func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
 
 	// 4. 模拟中台故障恢复，测试批量回补上报 (Bulk Metering Sync)
 	var midReceivedReq atomic.Pointer[meteringReportReq]
-	midLn, err := net.Listen("tcp", "[::1]:0")
+	midLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		midLn, _ = net.Listen("tcp", "127.0.0.1:0")
+		t.Fatalf("listen 127.0.0.1 failed: %v", err)
 	}
 	midServer := &httptest.Server{
 		Listener: midLn,
@@ -4484,6 +4517,9 @@ func TestMultiPortHopping(t *testing.T) {
 		t.Fatalf("srv.Start failed: %v", err)
 	}
 	defer srv.Close()
+	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
+		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
+	})
 
 	altAddrs := srv.AltAddrs()
 	if len(altAddrs) != 1 {
