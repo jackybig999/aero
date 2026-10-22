@@ -1087,6 +1087,3 @@ func TestPayment_ValidateAndNormalize(t *testing.T) {
 		t.Fatalf("expected 400 Bad Request on invalid channel config, got %d: %s", w.Code, w.Body.String())
 	}
 }
-
-
-

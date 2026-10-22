@@ -514,6 +514,9 @@ func (h *AeroHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/restart/", h.RestartEdge)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/subs/sync/", h.SyncSubs)
 	mux.HandleFunc("POST /api/v1/aero/subs/broadcast/", h.BroadcastSubs)
+	mux.HandleFunc("POST /api/v1/aero/vps/{id}/warp/install/", h.InstallWARP)
+	mux.HandleFunc("POST /api/v1/aero/vps/{id}/purity/check/", h.CheckPurity)
+	mux.HandleFunc("GET /api/v1/aero/vps/{id}/purity/", h.GetPurity)
 
 	if h.db != nil {
 		RegisterMeteringRoutes(mux, h.db, h.adminKey)
@@ -843,4 +846,73 @@ func (h *AeroHandler) BroadcastSubs(w http.ResponseWriter, r *http.Request) {
 	}
 	h.svc.BroadcastAllUsersToAllEdges(h.svc.userStore)
 	writeJSON(w, 200, map[string]any{"code": 0, "message": "broadcasted successfully"})
+}
+
+func (h *AeroHandler) InstallWARP(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	host, err := h.svc.Get(id)
+	if err != nil || host == nil {
+		writeJSON(w, 404, errResp(1004, "vps not found"))
+		return
+	}
+
+	task := globalTaskManager.CreateTask("warp_install", id, host.Name, DefaultWarpInstallSteps())
+	go RunWarpInstallTask(task.ID, id, h.svc)
+
+	writeJSON(w, 200, map[string]any{
+		"code": 0,
+		"data": task,
+	})
+}
+
+func (h *AeroHandler) CheckPurity(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	res, err := h.svc.ProbePurity(r.Context(), id)
+	if err != nil {
+		writeJSON(w, 502, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"code": 0,
+		"data": res,
+	})
+}
+
+func (h *AeroHandler) GetPurity(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	host, err := h.svc.Get(id)
+	if err != nil || host == nil {
+		writeJSON(w, 404, errResp(1004, "vps not found"))
+		return
+	}
+	data := map[string]any{
+		"vps_id":         id,
+		"purity_score":   host.PurityScore,
+		"ai_blocked":     host.AIBlocked,
+		"google_clean":   host.GoogleClean,
+		"cf_clean":       host.CFClean,
+		"is_warp_egress": host.IsWARPEgress,
+		"youtube_loc":    host.YouTubeLoc,
+		"gemini_ok":      host.GeminiOK,
+		"is_cn_marked":   host.IsCNMarked,
+		"warp_installed": host.WARPInstalled,
+		"warp_running":   host.WARPRunning,
+		"last_probe_at":  host.LastPurityProbeAt,
+	}
+	writeJSON(w, 200, map[string]any{
+		"code": 0,
+		"data": data,
+	})
 }

@@ -190,19 +190,19 @@ func (g *CreemGateway) VerifyAndParseWebhook(r *http.Request) (*WebhookEvent, er
 	}
 
 	var inner struct {
-		ID           string          `json:"id"`
-		RequestID    string          `json:"request_id"`
-		RequestId    string          `json:"requestId"`
-		Status       string          `json:"status"`
-		Amount       int64           `json:"amount"`
-		Currency     string          `json:"currency"`
-		Order        *struct {
+		ID        string `json:"id"`
+		RequestID string `json:"request_id"`
+		RequestId string `json:"requestId"`
+		Status    string `json:"status"`
+		Amount    int64  `json:"amount"`
+		Currency  string `json:"currency"`
+		Order     *struct {
 			ID       string `json:"id"`
 			Amount   int64  `json:"amount"`
 			Currency string `json:"currency"`
 			Status   string `json:"status"`
 		} `json:"order"`
-		Refund       *struct {
+		Refund *struct {
 			ID             string `json:"id"`
 			RefundAmount   int64  `json:"refund_amount"`
 			Amount         int64  `json:"amount"`

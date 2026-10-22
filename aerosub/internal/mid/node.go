@@ -538,6 +538,11 @@ type VPSHost struct {
 	GoogleClean       bool           `json:"google_clean"`
 	CFClean           bool           `json:"cf_clean"`
 	IsWARPEgress      bool           `json:"is_warp_egress"`
+	YouTubeLoc        string         `json:"youtube_loc,omitempty"`
+	GeminiOK          bool           `json:"gemini_ok"`
+	IsCNMarked        bool           `json:"is_cn_marked"`
+	WARPInstalled     bool           `json:"warp_installed"`
+	WARPRunning       bool           `json:"warp_running"`
 	Metrics           *HostMetrics   `json:"metrics,omitempty"`
 	DNSStatus         *DNSStatusInfo `json:"dns_status,omitempty"`
 	LastProbeAt       *time.Time     `json:"last_probe_at,omitempty"`
@@ -557,15 +562,20 @@ type DNSStatusInfo struct {
 }
 
 type PurityResult struct {
-	VPSID        uint64    `json:"vps_id"`
-	PurityScore  int       `json:"purity_score"`
-	AIBlocked    bool      `json:"ai_blocked"`
-	GoogleClean  bool      `json:"google_clean"`
-	CFClean      bool      `json:"cf_clean"`
-	IsWARPEgress bool      `json:"is_warp_egress"`
-	RawOutput    string    `json:"raw_output,omitempty"`
-	ProbeAt      time.Time `json:"probe_at"`
-	ProbeError   string    `json:"probe_error,omitempty"`
+	VPSID         uint64    `json:"vps_id"`
+	PurityScore   int       `json:"purity_score"`
+	AIBlocked     bool      `json:"ai_blocked"`
+	GoogleClean   bool      `json:"google_clean"`
+	CFClean       bool      `json:"cf_clean"`
+	IsWARPEgress  bool      `json:"is_warp_egress"`
+	YouTubeLoc    string    `json:"youtube_loc,omitempty"`
+	GeminiOK      bool      `json:"gemini_ok"`
+	IsCNMarked    bool      `json:"is_cn_marked"`
+	WARPInstalled bool      `json:"warp_installed"`
+	WARPRunning   bool      `json:"warp_running"`
+	RawOutput     string    `json:"raw_output,omitempty"`
+	ProbeAt       time.Time `json:"probe_at"`
+	ProbeError    string    `json:"probe_error,omitempty"`
 }
 
 type UpdateVPSParams struct {
@@ -824,6 +834,11 @@ func (m *MemoryVPSStore) UpdatePurity(id uint64, res *PurityResult) error {
 		h.GoogleClean = res.GoogleClean
 		h.CFClean = res.CFClean
 		h.IsWARPEgress = res.IsWARPEgress
+		h.YouTubeLoc = res.YouTubeLoc
+		h.GeminiOK = res.GeminiOK
+		h.IsCNMarked = res.IsCNMarked
+		h.WARPInstalled = res.WARPInstalled
+		h.WARPRunning = res.WARPRunning
 	}
 	return nil
 }
@@ -1125,6 +1140,11 @@ func (s *FileVPSStore) UpdatePurity(id uint64, res *PurityResult) error {
 		h.GoogleClean = res.GoogleClean
 		h.CFClean = res.CFClean
 		h.IsWARPEgress = res.IsWARPEgress
+		h.YouTubeLoc = res.YouTubeLoc
+		h.GeminiOK = res.GeminiOK
+		h.IsCNMarked = res.IsCNMarked
+		h.WARPInstalled = res.WARPInstalled
+		h.WARPRunning = res.WARPRunning
 	}
 	s.mu.Unlock()
 	return s.save()
@@ -1373,6 +1393,14 @@ func (s *VPSService) Create(p CreateVPSParams) (*VPSHost, error) {
 		}
 		region := ResolveIPRegion(host.IP)
 		_, _ = s.nodeSvc.CreateNode(host.Name, region, targetHost, "aero-quic", 443, 500, false, 100, host.ID)
+	}
+	if host != nil {
+		// 新增 VPS 接入时自动前置触发出口纯净度、YouTube/Gemini 及 WARP 状态异步探针
+		go func(id uint64) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			_, _ = s.ProbePurity(ctx, id)
+		}(host.ID)
 	}
 	return host, nil
 }

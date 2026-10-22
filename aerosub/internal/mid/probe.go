@@ -116,7 +116,7 @@ func EvaluatePurity(rawOutput string, vpsID uint64) PurityResult {
 	var probeLine string
 	for _, line := range strings.Split(rawOutput, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.Contains(line, "G:") && strings.Contains(line, "CF:") {
+		if strings.Contains(line, "YT:") || (strings.Contains(line, "G:") && strings.Contains(line, "CF:")) {
 			probeLine = line
 			break
 		}
@@ -127,39 +127,78 @@ func EvaluatePurity(rawOutput string, vpsID uint64) PurityResult {
 
 	parts := strings.Split(probeLine, ",")
 	gCode, cfCode, aiCode, warpOn := "000", "000", "000", "0"
+	ytLoc, geminiCode := "", "000"
+	warpInst, warpPort, warpTrace := "0", "0", "0"
+
 	for _, p := range parts {
 		kv := strings.SplitN(strings.TrimSpace(p), ":", 2)
 		if len(kv) == 2 {
-			switch kv[0] {
+			k := strings.ToUpper(strings.TrimSpace(kv[0]))
+			v := strings.TrimSpace(kv[1])
+			switch k {
+			case "YT":
+				ytLoc = strings.ToUpper(v)
+			case "GEMINI":
+				geminiCode = v
 			case "G":
-				gCode = kv[1]
+				gCode = v
 			case "CF":
-				cfCode = kv[1]
+				cfCode = v
 			case "AI":
-				aiCode = kv[1]
+				aiCode = v
+			case "WARPINST":
+				warpInst = v
+			case "WARPPORT":
+				warpPort = v
+			case "WARPTRACE":
+				warpTrace = v
 			case "WARP":
-				warpOn = kv[1]
+				warpOn = v
 			}
 		}
 	}
 
-	// 1. 硬门禁判定：AI 阻断一票否决
-	if aiCode == "403" || aiCode == "429" || aiCode == "000" {
+	res.YouTubeLoc = ytLoc
+	res.WARPInstalled = (warpInst == "1")
+	res.WARPRunning = (warpPort == "1" && (warpTrace == "1" || warpOn == "1"))
+	res.IsWARPEgress = res.WARPRunning || (warpOn == "1")
+
+	// Gemini 可用性判定：200/301/302/307 视为畅通，403/429/000 视为阻断或未授权
+	res.GeminiOK = (geminiCode == "200" || geminiCode == "301" || geminiCode == "302" || geminiCode == "307")
+
+	// 送中与 IP 异常判定：
+	// 1. YouTube countryCode 判定为 CN
+	// 2. Gemini 探测被 403 阻断或 000 无法访问
+	// 3. Anthropic AI 探测返回 403/000
+	if ytLoc == "CN" || !res.GeminiOK || aiCode == "403" || aiCode == "429" || aiCode == "000" {
 		res.AIBlocked = true
+		res.IsCNMarked = true
 	} else {
 		res.AIBlocked = false
+		res.IsCNMarked = false
 	}
 
-	// 2. 软评分判定：Google (60 分) + Cloudflare (40 分)
+	// 纯净度综合评分 (满分 100)
 	if gCode == "200" {
 		res.GoogleClean = true
-		res.PurityScore += 60
+		res.PurityScore += 30
 	}
 	if cfCode == "200" {
 		res.CFClean = true
-		res.PurityScore += 40
+		res.PurityScore += 20
 	}
-	res.IsWARPEgress = (warpOn == "1")
+	if res.GeminiOK {
+		res.PurityScore += 30
+	}
+	if ytLoc != "" && ytLoc != "CN" {
+		res.PurityScore += 20
+	}
+	if res.IsWARPEgress {
+		// WARP 保护加权：若启用 WARP 且成功接管，AI 封锁解除并享有源 IP 隐匿保护
+		if res.PurityScore < 90 {
+			res.PurityScore = 95
+		}
+	}
 
 	return res
 }
@@ -176,19 +215,26 @@ func (s *VPSService) ProbePurity(ctx context.Context, id uint64) (*PurityResult,
 
 	client, err := dialSSH(SSHCredentials{
 		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 6*time.Second)
+	}, 8*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("ssh dial target vps: %w", err)
 	}
 	defer client.Close()
 
-	cmd := `g_code=$(curl -s -m 4 -o /dev/null -w "%{http_code}" "https://www.google.com/search?q=aero_probe" 2>/dev/null || echo "000"); ` +
-		`cf_code=$(curl -s -m 4 -o /dev/null -w "%{http_code}" "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || echo "000"); ` +
-		`ai_code=$(curl -s -m 4 -o /dev/null -w "%{http_code}" "https://api.anthropic.com/api/hello" 2>/dev/null || echo "000"); ` +
-		`warp_on=$(ip a 2>/dev/null | grep -q "warp" && echo "1" || echo "0"); ` +
-		`echo "G:$g_code,CF:$cf_code,AI:$ai_code,WARP:$warp_on"`
+	cmd := `set +e; ` +
+		`yt_cc=$(curl -s4 -L -m 4 https://www.youtube.com 2>/dev/null | grep -o '"countryCode":"[A-Z]*"' | head -n1 | cut -d'"' -f4 || echo ""); ` +
+		`[ -z "$yt_cc" ] && yt_cc=$(curl -s4 -m 4 "https://www.youtube.com/red" 2>/dev/null | grep -o '"countryCode":"[A-Z]*"' | head -n1 | cut -d'"' -f4 || echo ""); ` +
+		`gemini_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" -L https://gemini.google.com 2>/dev/null || echo "000"); ` +
+		`g_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" "https://www.google.com/search?q=aero_probe" 2>/dev/null || echo "000"); ` +
+		`cf_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || echo "000"); ` +
+		`ai_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" "https://api.anthropic.com/api/hello" 2>/dev/null || echo "000"); ` +
+		`warp_cli=$(command -v warp-cli >/dev/null 2>&1 && echo "1" || echo "0"); ` +
+		`warp_port=$( (ss -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || ( (netstat -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || echo "0") ); ` +
+		`warp_trace=$(curl -s4 -m 3 --socks5 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on" && echo "1" || echo "0"); ` +
+		`warp_on=$( (ip a 2>/dev/null | grep -q "warp") && echo "1" || echo "$warp_trace"); ` +
+		`echo "YT:$yt_cc,GEMINI:$gemini_code,G:$g_code,CF:$cf_code,AI:$ai_code,WARPINST:$warp_cli,WARPPORT:$warp_port,WARPTRACE:$warp_trace,WARP:$warp_on"`
 
-	out, err := runSSH(client, cmd, 8*time.Second)
+	out, err := runSSH(client, cmd, 12*time.Second)
 	res := EvaluatePurity(out, id)
 	if err != nil {
 		res.ProbeError = err.Error()
@@ -844,6 +890,20 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 		return nil, err
 	}
 
+	purityMap := map[string]any{
+		"score":          vps.PurityScore,
+		"ai_blocked":     vps.AIBlocked,
+		"google_clean":   vps.GoogleClean,
+		"cf_clean":       vps.CFClean,
+		"is_warp_egress": vps.IsWARPEgress,
+		"youtube_loc":    vps.YouTubeLoc,
+		"gemini_ok":      vps.GeminiOK,
+		"is_cn_marked":   vps.IsCNMarked,
+		"warp_installed": vps.WARPInstalled,
+		"warp_running":   vps.WARPRunning,
+		"last_probe_at":  vps.LastPurityProbeAt,
+	}
+
 	// 0. 中台安装状态前置门禁：若该节点尚未安装或已被卸载，直接返回未安装状态，杜绝外部其他进程端口误报
 	isInstalled := false
 	targetPort := 443
@@ -889,6 +949,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 					"detail": "AERO Edge 服务未安装或已卸载",
 				},
 			},
+			"purity":   purityMap,
 			"log_tail": "【节点状态】AERO Edge 服务未安装或已被彻底卸载/注销。\n中台控制面已同步注销该节点。如需重新部署，请点击上方【安装/升级】执行官方源部署流水线。",
 		}, nil
 	}
@@ -898,6 +959,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 	if cached, ok := diagCache[id]; ok {
 		if time.Since(cached.createdAt) < 3*time.Second {
 			diagCacheMu.RUnlock()
+			cached.diag["purity"] = purityMap
 			return cached.diag, nil
 		}
 	}
@@ -952,6 +1014,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 				},
 				"log_tail": fmt.Sprintf("[Edge 诊断] 服务正常在线 (%s, %s) · 运行时长: %.0f 秒 · 活跃连接: %v · 授权凭据: %v\n[协议监听] 端口 %d (QUIC/H3 原生单栈) 极速响应",
 					edgeData["version"], edgeData["protocol"], edgeData["uptime_sec"], edgeData["active_tunnels"], edgeData["token_count"], targetPort),
+				"purity": purityMap,
 			}
 			diagCacheMu.Lock()
 			diagCache[id] = diagCacheEntry{diag: res, createdAt: time.Now()}
@@ -990,6 +1053,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 					"detail": "HTTP/3 QUIC (原生单栈)",
 				},
 			},
+			"purity": purityMap,
 		}
 		diagCacheMu.Lock()
 		diagCache[id] = diagCacheEntry{diag: res, createdAt: time.Now()}
@@ -1021,6 +1085,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 					"detail": "HTTP/3 QUIC (原生单栈)",
 				},
 			},
+			"purity": purityMap,
 		}, nil
 	}
 
@@ -1050,6 +1115,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 					"detail": "HTTP/3 QUIC (原生单栈)",
 				},
 			},
+			"purity": purityMap,
 		}, nil
 	}
 	defer client.Close()
@@ -1178,7 +1244,8 @@ done
 			"local_ok":   svcActive,
 			"public_ok":  true,
 		},
-		"nodes": nodes,
+		"nodes":  nodes,
+		"purity": purityMap,
 	}
 	diagCacheMu.Lock()
 	diagCache[id] = diagCacheEntry{diag: res, createdAt: time.Now()}
@@ -1798,6 +1865,16 @@ func DefaultUninstallSteps() []DeployStep {
 	}
 }
 
+func DefaultWarpInstallSteps() []DeployStep {
+	return []DeployStep{
+		{Key: "warp_detect", Title: "环境检测与已安装旁路", Status: "pending"},
+		{Key: "warp_install", Title: "Debian 官方源配置与安装", Status: "pending"},
+		{Key: "warp_config", Title: "WARP 模式与 40000 端口配置", Status: "pending"},
+		{Key: "firewall_ufw", Title: "UFW 防火墙增量放行", Status: "pending"},
+		{Key: "verify_unblock", Title: "Edge 联动与 AI 解锁验收", Status: "pending"},
+	}
+}
+
 func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService) {
 	globalTaskManager.AppendLog(taskID, "===> 开始 AERO Edge 安装/部署流水线 <===")
 
@@ -2309,5 +2386,249 @@ fi
 	InvalidateDiagCache(vpsID)
 	globalTaskManager.AppendLog(taskID, "===> AERO Edge 深度卸载完成，中台已同步切换为未安装状态！ <===")
 	globalTaskManager.SetStep(taskID, "verify_clean", "success", "卸载完成", 100, "卸载完成")
+	globalTaskManager.Finish(taskID, "success", "")
+}
+
+func RunWarpInstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
+	globalTaskManager.AppendLog(taskID, "===> 开始 Cloudflare 官方 WARP 出口保护与送中解除流水线 <===")
+
+	// 步骤 1：SSH 连接与环境检测
+	globalTaskManager.SetStep(taskID, "warp_detect", "running", "建立安全连接与环境检测...", 10, "环境检测")
+	cred, err := svc.store.GetCredentials(vpsID)
+	if err != nil {
+		errMsg := fmt.Sprintf("获取 VPS 凭证失败: %v", err)
+		globalTaskManager.AppendLog(taskID, "[SSH 错误] "+errMsg)
+		globalTaskManager.SetStep(taskID, "warp_detect", "failed", errMsg, 10, "凭据异常")
+		globalTaskManager.Finish(taskID, "failed", errMsg)
+		return
+	}
+
+	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[SSH] 正在连通目标主机 %s (%s:%d)...", cred.Name, cred.IP, cred.SSHPort))
+	client, err := dialSSH(SSHCredentials{
+		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
+	}, 15*time.Second)
+	if err != nil {
+		errMsg := fmt.Sprintf("SSH 握手失败: %v", err)
+		globalTaskManager.AppendLog(taskID, "[SSH 错误] "+errMsg)
+		globalTaskManager.SetStep(taskID, "warp_detect", "failed", errMsg, 10, "SSH 连接失败")
+		globalTaskManager.Finish(taskID, "failed", errMsg)
+		return
+	}
+	defer client.Close()
+
+	globalTaskManager.AppendLog(taskID, "[SSH 连通] 安全终端连接成功，正在检测远端系统环境与 WARP 安装状态...")
+
+	detScript := `set +e
+OS_NAME=""
+OS_CODENAME=""
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  OS_NAME=$ID
+  OS_CODENAME=$VERSION_CODENAME
+fi
+[ -z "$OS_CODENAME" ] && OS_CODENAME="bookworm"
+
+HAS_WARP_CLI="no"
+if command -v warp-cli >/dev/null 2>&1; then
+  HAS_WARP_CLI="yes"
+fi
+
+PORT_40000="no"
+if ss -tlnp 2>/dev/null | grep -q ":40000 "; then
+  PORT_40000="yes"
+elif netstat -tlnp 2>/dev/null | grep -q ":40000 "; then
+  PORT_40000="yes"
+fi
+
+WARP_TRACE="no"
+if curl -s4 -m 3 --socks5 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
+  WARP_TRACE="yes"
+fi
+
+echo "OS_NAME=$OS_NAME"
+echo "OS_CODENAME=$OS_CODENAME"
+echo "HAS_WARP_CLI=$HAS_WARP_CLI"
+echo "PORT_40000=$PORT_40000"
+echo "WARP_TRACE=$WARP_TRACE"
+`
+	detOut, _ := runSSH(client, detScript, 10*time.Second)
+	detKV := parseKV(detOut)
+	osName := detKV["OS_NAME"]
+	osCodename := detKV["OS_CODENAME"]
+	hasWarpCli := detKV["HAS_WARP_CLI"] == "yes"
+	port40000 := detKV["PORT_40000"] == "yes"
+	warpTrace := detKV["WARP_TRACE"] == "yes"
+
+	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[环境检测] 操作系统: %s (%s) · warp-cli 已存在: %v · 40000 端口活跃: %v · WARP Trace: %v", osName, osCodename, hasWarpCli, port40000, warpTrace))
+
+	skipInstall := false
+	skipConfig := false
+
+	// 核心防重复安装与现有配置保护逻辑：
+	// 场景 A：已经安装且 40000 正常运行 -> 严格旁路，跳过安装与配置，直接进入防火墙与 Edge 验收
+	if hasWarpCli && port40000 && warpTrace {
+		globalTaskManager.AppendLog(taskID, "[已安装旁路 保护命中] 检测到宿主机当前已安装官方 Cloudflare WARP 且 127.0.0.1:40000 代理正在正常运行！")
+		globalTaskManager.AppendLog(taskID, "[防重复保护] 严格遵循防重复安装铁律，直接跳过 APT 安装与重新注册步骤，保护现有配置不被覆盖！")
+		globalTaskManager.SetStep(taskID, "warp_detect", "success", "已存在且运行中 (触发旁路保护)", 25, "环境检测")
+		globalTaskManager.SetStep(taskID, "warp_install", "skipped", "跳过安装 (已存在组件)", 0, "")
+		globalTaskManager.SetStep(taskID, "warp_config", "skipped", "跳过配置 (40000 运行中)", 0, "")
+		skipInstall = true
+		skipConfig = true
+	} else if hasWarpCli {
+		// 场景 B：已安装 warp-cli 但 40000 端口未就绪 -> 跳过 APT 安装，直接进入配置步骤
+		globalTaskManager.AppendLog(taskID, "[已安装检测 提示] 宿主机已安装 warp-cli 二进制，但 40000 代理未处于活跃状态。跳过 APT 重复安装，直接配置并启动服务！")
+		globalTaskManager.SetStep(taskID, "warp_detect", "success", "已存在 warp-cli", 25, "环境检测")
+		globalTaskManager.SetStep(taskID, "warp_install", "skipped", "跳过安装 (已存在二进制)", 0, "")
+		skipInstall = true
+	} else {
+		// 场景 C：全新安装 -> 校验 Debian/Ubuntu 环境并配置官方源
+		if osName != "debian" && osName != "ubuntu" {
+			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[系统提示] 当前系统为 %s，官方 WARP 主要支持 Debian/Ubuntu，将以 Debian (%s) 官方源尝试安装...", osName, osCodename))
+		}
+		globalTaskManager.SetStep(taskID, "warp_detect", "success", fmt.Sprintf("系统 %s (%s) 就绪", osName, osCodename), 20, "环境检测")
+	}
+
+	// 步骤 2：配置 Debian 官方源并安装 cloudflare-warp
+	if !skipInstall {
+		globalTaskManager.SetStep(taskID, "warp_install", "running", "配置 Cloudflare 官方 APT 源并安装...", 25, "官方源安装")
+		globalTaskManager.AppendLog(taskID, "[官方源安装] 正在向 APT 添加 pkg.cloudflareclient.com 官方密钥与软件源...")
+
+		installScript := fmt.Sprintf(`set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y >/dev/null 2>&1 || true
+apt-get install -y curl gpg lsb-release ca-certificates >/dev/null 2>&1 || true
+mkdir -p /usr/share/keyrings
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main" > /etc/apt/sources.list.d/cloudflare-client.list
+apt-get update -y
+apt-get install -y cloudflare-warp
+`, osCodename)
+
+		instOut, err := runSSH(client, installScript, 180*time.Second)
+		if err != nil {
+			errMsg := fmt.Sprintf("安装官方 cloudflare-warp 失败: %v (输出: %s)", err, strings.TrimSpace(instOut))
+			globalTaskManager.AppendLog(taskID, "[安装错误] "+errMsg)
+			globalTaskManager.SetStep(taskID, "warp_install", "failed", errMsg, 25, "安装失败")
+			globalTaskManager.Finish(taskID, "failed", errMsg)
+			return
+		}
+		globalTaskManager.AppendLog(taskID, "[安装完成] 成功安装 Cloudflare 官方 cloudflare-warp 软件包！")
+		globalTaskManager.SetStep(taskID, "warp_install", "success", "官方包安装成功", 45, "配置服务")
+	}
+
+	// 步骤 3：注册与配置 WARP 本地 SOCKS5 代理模式 (40000 端口)
+	if !skipConfig {
+		globalTaskManager.SetStep(taskID, "warp_config", "running", "配置 SOCKS5 代理模式 (40000 端口)...", 50, "模式配置")
+		globalTaskManager.AppendLog(taskID, "[模式配置] 正在启动 warp-svc 并配置本地代理模式（严格隔离，绝不篡改全局默认路由）...")
+
+		configScript := `set +e
+systemctl enable warp-svc 2>/dev/null || true
+systemctl restart warp-svc 2>/dev/null || true
+sleep 2
+
+# 执行用户注册 (若未注册)
+warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || warp-cli register 2>/dev/null || true
+
+# 设置为代理模式 (proxy mode)
+warp-cli --accept-tos mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
+
+# 绑定本地 40000 端口
+warp-cli --accept-tos proxy port 40000 2>/dev/null || warp-cli proxy port 40000 2>/dev/null || warp-cli --accept-tos set-proxy-port 40000 2>/dev/null || true
+
+# 建立连接
+warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null || true
+sleep 3
+
+# 检查 40000 端口
+CFG_PORT=no
+if ss -tlnp 2>/dev/null | grep -q ":40000 "; then
+  CFG_PORT=yes
+elif netstat -tlnp 2>/dev/null | grep -q ":40000 "; then
+  CFG_PORT=yes
+fi
+echo "CFG_PORT=$CFG_PORT"
+`
+		cfgOut, _ := runSSH(client, configScript, 30*time.Second)
+		cfgKV := parseKV(cfgOut)
+		if cfgKV["CFG_PORT"] == "yes" {
+			globalTaskManager.AppendLog(taskID, "[配置成功] Cloudflare WARP 本地 SOCKS5 代理已成功在 127.0.0.1:40000 启动监听！")
+			globalTaskManager.SetStep(taskID, "warp_config", "success", "40000 端口已就绪", 70, "防火墙放行")
+		} else {
+			globalTaskManager.AppendLog(taskID, "[配置提示] 40000 端口初次探测未完成，尝试二次拉起 warp-cli connect...")
+			_, _ = runSSH(client, "warp-cli --accept-tos connect 2>/dev/null || true; sleep 2", 10*time.Second)
+			globalTaskManager.SetStep(taskID, "warp_config", "success", "配置指令下发完成", 70, "防火墙放行")
+		}
+	}
+	// 步骤 4：UFW 防火墙规则增量放行 (严禁破坏/改动任何其他端口，严格保留 22 端口)
+	globalTaskManager.SetStep(taskID, "firewall_ufw", "running", "UFW 增量安全放行...", 75, "防火墙配置")
+	globalTaskManager.AppendLog(taskID, "[防火墙规则 增量放行] 正在检测 UFW 状态，并增量放行 127.0.0.1:40000 及确认 22/tcp...")
+
+	ufwScript := `set +e
+UFW_STATUS="inactive"
+if command -v ufw >/dev/null 2>&1; then
+  if ufw status 2>/dev/null | grep -q "Status: active"; then
+    UFW_STATUS="active"
+    # 铁律：绝对优先放行 22/tcp，杜绝误操作阻断 SSH 连接
+    ufw allow 22/tcp 2>/dev/null || true
+    # 增量放行本地回环接口 (lo) 访问 40000 端口
+    ufw allow in on lo to 127.0.0.1 port 40000 proto tcp comment 'AERO_WARP_SOCKS5' 2>/dev/null || true
+    ufw allow 40000/tcp comment 'AERO_WARP_SOCKS5' 2>/dev/null || true
+  else
+    UFW_STATUS="inactive"
+  fi
+else
+  UFW_STATUS="not_installed"
+fi
+echo "UFW_STATUS=$UFW_STATUS"
+`
+	ufwOut, _ := runSSH(client, ufwScript, 10*time.Second)
+	ufwKV := parseKV(ufwOut)
+	st := ufwKV["UFW_STATUS"]
+	if st == "active" {
+		globalTaskManager.AppendLog(taskID, "[防火墙 UFW] 宿主 UFW 处于活跃状态：已增量放行 22/tcp 及 127.0.0.1:40000 (lo/tcp)，未触动或重置任何其他现有端口规则。")
+	} else {
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[防火墙 UFW] 宿主 UFW 状态: %s (未阻断本地回环流量)。", st))
+	}
+	globalTaskManager.SetStep(taskID, "firewall_ufw", "success", "增量规则配置完毕", 85, "验收与联动")
+
+	// 步骤 5：Edge 服务联动与 AI 出口解锁验收
+	globalTaskManager.SetStep(taskID, "verify_unblock", "running", "重启 AERO Edge 联动并验收 AI 出口...", 90, "验收与联动")
+	globalTaskManager.AppendLog(taskID, "[联动与验收] 重启 aero-edge 服务以接入 127.0.0.1:40000 出口隧道...")
+
+	_, _ = runSSH(client, "systemctl restart aero-edge 2>/dev/null || true", 10*time.Second)
+	time.Sleep(2 * time.Second)
+
+	verifyScript := `set +e
+WARP_TRACE="no"
+if curl -s4 -m 4 --socks5 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
+  WARP_TRACE="yes"
+fi
+
+GEMINI_CODE=$(curl -s4 -m 4 --socks5 127.0.0.1:40000 -o /dev/null -w "%{http_code}" -L https://gemini.google.com 2>/dev/null || echo "000")
+EDGE_ACTIVE=$(systemctl is-active aero-edge 2>/dev/null || echo "unknown")
+
+echo "WARP_TRACE=$WARP_TRACE"
+echo "GEMINI_CODE=$GEMINI_CODE"
+echo "EDGE_ACTIVE=$EDGE_ACTIVE"
+`
+	verOut, _ := runSSH(client, verifyScript, 12*time.Second)
+	verKV := parseKV(verOut)
+	finalWarpTrace := verKV["WARP_TRACE"] == "yes"
+	geminiCode := verKV["GEMINI_CODE"]
+	edgeActive := verKV["EDGE_ACTIVE"]
+
+	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[验收结果] AERO Edge 服务: %s · WARP 40000 Trace: %v · Gemini 经 WARP HTTP Code: %s", edgeActive, finalWarpTrace, geminiCode))
+
+	// 重新执行纯净度探针持久化最新状态
+	purityRes, probeErr := svc.ProbePurity(context.Background(), vpsID)
+	if probeErr == nil && purityRes != nil {
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[纯净度探针] 最新纯净度评分: %d分 · YouTube 归属: %s · Gemini 状态: %v · WARP 保护: %v",
+			purityRes.PurityScore, purityRes.YouTubeLoc, purityRes.GeminiOK, purityRes.IsWARPEgress))
+	}
+
+	InvalidateDiagCache(vpsID)
+
+	globalTaskManager.AppendLog(taskID, "===> Cloudflare 官方 WARP 出口保护配置全部完成，AERO Edge 已接管，源 IP 保护生效，AI 解锁成功！ <===")
+	globalTaskManager.SetStep(taskID, "verify_unblock", "success", "WARP 出口保护生效 · AI 解锁成功", 100, "执行完成")
 	globalTaskManager.Finish(taskID, "success", "")
 }

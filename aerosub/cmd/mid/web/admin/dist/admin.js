@@ -1596,7 +1596,10 @@ async function loadAeroDiagnose(vpsId) {
     $('aeroSubPublicStatus').innerHTML = `<span class="tag ${sub.public_ok ? 'tag-green' : 'tag-amber'}">${sub.public_ok ? 'OK (直连畅通)' : '不可达'}</span>`;
     $('aeroSubPreview').textContent = subUrl;
 
-    // 9. Load Tokens
+    // 9. IP Purity & WARP Protection
+    renderPurityInfo(diag.purity);
+
+    // 10. Load Tokens
     await loadAeroTokens(vpsId);
   } catch (e) {
     if (statusEl) statusEl.textContent = `诊断失败: ${e.message}`;
@@ -1623,6 +1626,81 @@ async function loadAeroTokens(vpsId) {
     `).join('');
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--red)">加载 Token 失败: ${e.message}</td></tr>`;
+  }
+}
+
+function renderPurityInfo(purity) {
+  const pTag = $('aeroPurityTag');
+  const wTag = $('aeroWarpTag');
+  const pDetails = $('aeroPurityDetails');
+  if (!pTag || !wTag || !pDetails) return;
+
+  if (!purity) {
+    pTag.innerHTML = '<span class="tag tag-muted">未探测</span>';
+    wTag.innerHTML = '<span class="tag tag-muted">WARP 状态未知</span>';
+    pDetails.textContent = '点击右侧【🔄 IP 送中检测】开始';
+    return;
+  }
+
+  // 1. WARP 状态
+  if (purity.warp_running) {
+    wTag.innerHTML = '<span class="tag tag-green">🛡️ 官方 WARP :40000 活跃 (SOCKS5 接管)</span>';
+  } else if (purity.warp_installed) {
+    wTag.innerHTML = '<span class="tag tag-amber">⚠️ WARP 已安装未启动 (端口 40000 离线)</span>';
+  } else {
+    wTag.innerHTML = '<span class="tag tag-muted">WARP 未安装</span>';
+  }
+
+  // 2. 出口与送中状态
+  if (purity.is_warp_egress && purity.warp_running) {
+    pTag.innerHTML = '<span class="tag tag-green">🟢 源IP已保护 · WARP已解锁 (AI正常)</span>';
+  } else if (purity.is_cn_marked) {
+    pTag.innerHTML = '<span class="tag tag-red">🔴 IP送中 / AI受限 (Google/YouTube 标记 CN)</span>';
+  } else if (purity.gemini_ok) {
+    pTag.innerHTML = '<span class="tag tag-green">🟢 纯净原生出口 (未送中 · AI正常)</span>';
+  } else {
+    pTag.innerHTML = '<span class="tag tag-amber">🟡 IP纯净度待评估</span>';
+  }
+
+  // 3. 详细明细
+  const ytStr = purity.youtube_loc ? `YouTube: ${escapeHtml(purity.youtube_loc)}` : 'YouTube: 未知';
+  const geminiStr = purity.gemini_ok ? 'Gemini: 畅通' : 'Gemini: 阻断/不可达';
+  const scoreStr = purity.score ? `评分: ${purity.score}分` : '';
+  pDetails.textContent = `${ytStr} · ${geminiStr} ${scoreStr ? '· ' + scoreStr : ''}`;
+}
+
+async function deployAeroWarp() {
+  if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
+  try {
+    const res = await apiCall(`/aero/vps/${currentAeroVpsId}/warp/install/`, {
+      method: 'POST'
+    });
+    const task = res.data || res;
+    const taskId = task.id || task.task_id;
+    if (taskId) {
+      openAeroTaskDrawer(taskId, 'warp_install');
+    } else {
+      alert('官方 WARP 配置指令已下发！');
+      loadAeroDiagnose(currentAeroVpsId);
+    }
+  } catch (e) {
+    alert(`下发失败: ${e.message}`);
+  }
+}
+
+async function checkAeroPurity() {
+  if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
+  const pTag = $('aeroPurityTag');
+  if (pTag) pTag.innerHTML = '<span class="tag tag-blue">正在远程探测 YouTube 与 Gemini 出口...</span>';
+  try {
+    const res = await apiCall(`/aero/vps/${currentAeroVpsId}/purity/check/`, {
+      method: 'POST'
+    });
+    const data = res.data || res;
+    renderPurityInfo(data);
+  } catch (e) {
+    alert(`探测失败: ${e.message}`);
+    loadAeroDiagnose(currentAeroVpsId);
   }
 }
 
@@ -1949,7 +2027,7 @@ function openAeroTaskDrawer(taskId, action = 'task') {
   if (actionBar) actionBar.style.display = 'none';
 
   $('aeroTaskModalTitle').innerHTML = `<span>🚀 调度流水线详情 #${taskId}</span> <span class="tag tag-blue" id="aeroTaskModalStatusTag">RUNNING</span>`;
-  const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : `${action.toUpperCase()} Edge`);
+  const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : (action === 'warp_install' ? '官方 WARP 出口保护与送中解除' : `${action.toUpperCase()} Edge`));
   const vpsLabel = getSelectedAeroVpsLabel();
   $('aeroTaskModalSub').textContent = `任务 #${taskId} · ${actName} · ${vpsLabel}`;
 
@@ -1986,6 +2064,23 @@ function openAeroTaskDrawer(taskId, action = 'task') {
           2. 若远端 Edge 内核已是最新版本，将智能跳过重复构建与多余传输，瞬间就绪<br/>
           3. 若非最新版，将彻底拉取最新官方包执行无缝热升级并重载守护进程<br/>
           4. 自动检测宿主网络环境，配置 UDP 443 标准监听与 2083 端口复用
+        </div>
+      `;
+    } else if (action === 'warp_install') {
+      noticeBox.style.display = 'block';
+      noticeBox.style.background = 'rgba(16, 185, 129, 0.12)';
+      noticeBox.style.border = '1px solid rgba(16, 185, 129, 0.35)';
+      noticeBox.style.color = '#6ee7b7';
+      noticeBox.innerHTML = `
+        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#10b981">
+          <span>🛡️</span> Cloudflare 官方 WARP 出口保护流水线（核心防重复旁路门禁）：
+        </div>
+        <div style="font-size:12px;line-height:1.6">
+          1. <strong>防重复安装检测</strong>：若已安装且 40000 正常运行，严格触发旁路保护跳过安装配置，杜绝覆盖破坏存量环境<br/>
+          2. <strong>官方 APT 软件源</strong>：基于 Debian 系统标准 <code>pkg.cloudflareclient.com</code> 官方仓库安全安装<br/>
+          3. <strong>SOCKS5 本地代理</strong>：严格以 proxy 模式监听 <code>127.0.0.1:40000</code>，绝不修改宿主全局默认路由，确保 SSH 安全<br/>
+          4. <strong>UFW 增量安全放行</strong>：优先保护 22/tcp，仅增量放行 40000 端口，绝不重置或修改其他业务端口<br/>
+          5. <strong>AERO Edge 自动接管</strong>：重载 Edge 服务，自动将 Google、Gemini、OpenAI、Anthropic 出口重定向至 WARP 隧道
         </div>
       `;
     } else {
@@ -2148,6 +2243,12 @@ function initAeroEvents() {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
     openAeroPreflightDrawer('uninstall');
   });
+
+  // 一键安装/配置官方 Cloudflare WARP 保护源 IP 与送中解锁
+  $('btnAeroInstallWarp')?.addEventListener('click', () => deployAeroWarp());
+
+  // 重新检测 VPS 出口纯净度与 YouTube/Gemini 送中状态
+  $('btnAeroCheckPurity')?.addEventListener('click', () => checkAeroPurity());
 
   // 抽屉内二次确认按钮
   $('btnConfirmAeroTaskPreflight')?.addEventListener('click', async () => {

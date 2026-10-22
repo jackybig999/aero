@@ -39,11 +39,11 @@ const (
 
 var (
 	// ErrUDPUnavailable 标识 TUN 模式下 UDP/443 (QUIC/HTTP/3) 拨号失败，降级防御阻止整机伪装
-	ErrUDPUnavailable   = errors.New("UDP_UNAVAILABLE")
-	ErrStartAborted      = errors.New("start aborted by stop request")
-	subSingleFlight     singleflight.Group
-	detectThirdPartyTUN = DetectThirdPartyTUN
-	openTunDeviceFn     = OpenTunDevice
+	ErrUDPUnavailable       = errors.New("UDP_UNAVAILABLE")
+	ErrStartAborted         = errors.New("start aborted by stop request")
+	subSingleFlight         singleflight.Group
+	detectThirdPartyTUN     = DetectThirdPartyTUN
+	openTunDeviceFn         = OpenTunDevice
 	setupRoutesFn           = SetupRoutes
 	teardownRoutesFn        = TeardownRoutes
 	cleanAero0StaleRoutesFn = CleanAero0StaleRoutes
@@ -73,12 +73,12 @@ type AppState struct {
 	ConflictVPN string `json:"conflict_vpn,omitempty"`
 	Mode        string `json:"mode"`
 	Listen      string `json:"listen"`
-	ActiveNode string `json:"active_node"`
-	ActiveSNI  string `json:"active_sni"`
-	ActualPort int    `json:"actual_port,omitempty"`
-	SubURL     string `json:"sub_url,omitempty"`
-	NodesCount int    `json:"nodes_count"`
-	Version    string `json:"version"`
+	ActiveNode  string `json:"active_node"`
+	ActiveSNI   string `json:"active_sni"`
+	ActualPort  int    `json:"actual_port,omitempty"`
+	SubURL      string `json:"sub_url,omitempty"`
+	NodesCount  int    `json:"nodes_count"`
+	Version     string `json:"version"`
 
 	Node         string `json:"node,omitempty"`
 	SNI          string `json:"sni,omitempty"`

@@ -73,18 +73,18 @@ type PaymentGateway interface {
 
 // PayChannelConfig represents a payment account configuration in aeropay.db.
 type PayChannelConfig struct {
-	ID               int64             `json:"id"`
-	Channel          string            `json:"channel"`           // "creem" | "lemonsqueezy"
-	DisplayName      string            `json:"display_name"`      // User-facing title
-	Icon             string            `json:"icon"`              // "card" | "paypal"
-	APIKey           string            `json:"api_key,omitempty"` // Masked when serializing to UI
-	WebhookSecret    string            `json:"webhook_secret,omitempty"`
-	StoreID          string            `json:"store_id,omitempty"` // For Lemon Squeezy
-	PlanMapping      map[uint64]string `json:"plan_mapping"`       // PlanID -> External Product/Variant ID
-	IsTest           bool              `json:"is_test"`            // Sandbox/Test mode flag
-	Priority         int               `json:"priority"`           // Display order (1 is highest priority)
-	Enabled          bool              `json:"enabled"`            // Active status
-	UpdatedAt        time.Time         `json:"updated_at"`
+	ID            int64             `json:"id"`
+	Channel       string            `json:"channel"`           // "creem" | "lemonsqueezy"
+	DisplayName   string            `json:"display_name"`      // User-facing title
+	Icon          string            `json:"icon"`              // "card" | "paypal"
+	APIKey        string            `json:"api_key,omitempty"` // Masked when serializing to UI
+	WebhookSecret string            `json:"webhook_secret,omitempty"`
+	StoreID       string            `json:"store_id,omitempty"` // For Lemon Squeezy
+	PlanMapping   map[uint64]string `json:"plan_mapping"`       // PlanID -> External Product/Variant ID
+	IsTest        bool              `json:"is_test"`            // Sandbox/Test mode flag
+	Priority      int               `json:"priority"`           // Display order (1 is highest priority)
+	Enabled       bool              `json:"enabled"`            // Active status
+	UpdatedAt     time.Time         `json:"updated_at"`
 }
 
 // Masked returns a safe copy of the config suitable for UI display.
