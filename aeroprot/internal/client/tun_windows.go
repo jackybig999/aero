@@ -322,7 +322,7 @@ func SetupRoutes(devName, ipv4 string) error {
 	}
 
 	_ = runCmd("netsh", "interface", "ip", "set", "address",
-		"name="+devName, "source=static", "addr="+tunIP, "mask="+mask, "gateway=none")
+		"name="+devName, "source=static", "address="+tunIP, "mask="+mask, "gateway="+gwIP, "gwmetric=1")
 	_ = runCmd("netsh", "interface", "set", "interface", "name="+devName, "admin=ENABLED")
 	time.Sleep(300 * time.Millisecond)
 
@@ -344,7 +344,7 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
 
 	addSplitDefault := func(dst, m string) {
-		args := []string{"add", dst, "mask", m, tunIP, "metric", "1"}
+		args := []string{"add", dst, "mask", m, gwIP, "metric", "1"}
 		if idx != "" {
 			args = append(args, "if", idx)
 		}

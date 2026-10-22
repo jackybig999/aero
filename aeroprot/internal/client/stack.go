@@ -482,7 +482,7 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		var activeLocal net.Conn = local
 		if !e.webrtcRelayEnabled.Load() && id.LocalPort != 3478 && id.LocalPort != 19302 && id.LocalPort != 5349 {
 			peekBuf := make([]byte, 65535)
-			_ = local.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
+			_ = local.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 			n, _ := local.Read(peekBuf)
 			_ = local.SetReadDeadline(time.Time{})
 
@@ -648,6 +648,10 @@ func isUDPConn(c net.Conn) bool {
 	return false
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func relayTraffic(a, b net.Conn) {
 	isUDP := isUDPConn(a) || isUDPConn(b)
 	var wg sync.WaitGroup
@@ -657,10 +661,10 @@ func relayTraffic(a, b net.Conn) {
 		if isUDP {
 			buf := make([]byte, 65535)
 			for {
-				_ = src.SetReadDeadline(time.Now().Add(45 * time.Second))
+				_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
 				n, err := src.Read(buf)
 				if n > 0 {
-					_ = src.SetReadDeadline(time.Now().Add(45 * time.Second))
+					_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
 					if _, werr := dst.Write(buf[:n]); werr != nil {
 						break
 					}
@@ -672,7 +676,11 @@ func relayTraffic(a, b net.Conn) {
 		} else {
 			_, _ = io.Copy(dst, src)
 		}
-		_ = dst.SetDeadline(time.Now())
+		if cw, ok := dst.(closeWriter); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = dst.SetDeadline(time.Now().Add(30 * time.Second))
+		}
 	}
 	go pipe(a, b)
 	go pipe(b, a)
