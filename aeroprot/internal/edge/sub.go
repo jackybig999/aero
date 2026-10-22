@@ -265,6 +265,45 @@ func (s *SubStore) writeClientSubLocked() error {
 	return os.Rename(tmp, path)
 }
 
+// UpdatePrimaryPort updates the primary port and recalculates alt_ports in sub metadata & client-sub.json
+func (s *SubStore) UpdatePrimaryPort(port int, host string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.meta.Document.Servers) == 0 {
+		return nil
+	}
+	targetHost := host
+	if targetHost == "" {
+		targetHost = s.meta.Document.Servers[0].Host
+	}
+	if targetHost == "" {
+		targetHost = s.meta.Document.Servers[0].SNI
+	}
+	if port == 443 {
+		s.meta.Document.Servers[0].Address = targetHost
+	} else {
+		s.meta.Document.Servers[0].Address = net.JoinHostPort(targetHost, strconv.Itoa(port))
+	}
+
+	altPorts := []int{443}
+	if port == 443 {
+		altPorts = []int{2083, 2087, 8443}
+	} else {
+		for _, cp := range []int{2083, 2087, 8443} {
+			if cp != port {
+				altPorts = append(altPorts, cp)
+			}
+		}
+	}
+	s.meta.Document.Servers[0].AltPorts = altPorts
+
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	return s.writeClientSubLocked()
+}
+
 // Secret returns the node subscription secret
 func (s *SubStore) Secret() string {
 	s.mu.RLock()

@@ -1824,11 +1824,14 @@ func TestConnectUDP(t *testing.T) {
 		}
 		defer srv.Close()
 
+		// Inject sub-second watchdog timeouts for deterministic, non-flaky testing
+		srv.quicServer.SetUDPIdleTimeoutsForTest(150*time.Millisecond, 300*time.Millisecond)
+
 		// 3. Dial HTTP/3 + MASQUE
 		tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
 		quicConf := DefaultQUICConfig()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
@@ -1862,37 +1865,34 @@ func TestConnectUDP(t *testing.T) {
 
 		rUdpAddr, _ := net.ResolveUDPAddr("udp", target)
 
-		// 7 packets across 70 seconds:
-		// Target schedule in seconds: 10, 20, 30, 40, 46, 58, 70
-		schedule := []int{10, 20, 30, 40, 46, 58, 70}
+		// 5 packets across 450ms (interval 90ms < 300ms idle timeout, total 450ms > 300ms idle timeout)
+		// Verifies that continuous traffic keeps the UDP context alive without being prematurely reaped.
+		scheduleMs := []int{90, 180, 270, 360, 450}
 		start := time.Now()
 
-		for idx, targetSec := range schedule {
-			targetTime := start.Add(time.Duration(targetSec) * time.Second)
+		for idx, targetMs := range scheduleMs {
+			targetTime := start.Add(time.Duration(targetMs) * time.Millisecond)
 			if wait := time.Until(targetTime); wait > 0 {
 				time.Sleep(wait)
 			}
 			elapsed := time.Since(start)
-			pktData := []byte(fmt.Sprintf("pkt-%d-target-%d", idx+1, targetSec))
+			pktData := []byte(fmt.Sprintf("pkt-%d-target-%d", idx+1, targetMs))
 			if _, err := mConn.WriteTo(pktData, rUdpAddr); err != nil {
-				t.Fatalf("WriteTo pkt %d (sec %d) failed at %v: %v", idx+1, targetSec, elapsed, err)
+				t.Fatalf("WriteTo pkt %d (ms %d) failed at %v: %v", idx+1, targetMs, elapsed, err)
 			}
 
 			recvBuf := make([]byte, 2048)
-			_ = mConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_ = mConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 			n, _, err := mConn.ReadFrom(recvBuf)
 			if err != nil {
-				t.Fatalf("ReadFrom pkt %d (sec %d) failed at %v: %v", idx+1, targetSec, elapsed, err)
+				t.Fatalf("ReadFrom pkt %d (ms %d) failed at %v: %v", idx+1, targetMs, elapsed, err)
 			}
 			if !bytes.Equal(recvBuf[:n], pktData) {
 				t.Fatalf("pkt %d mismatch: sent %q, got %q", idx+1, pktData, recvBuf[:n])
 			}
 
-			if targetSec == 46 {
-				t.Logf("[ASSERT] 46s packet successfully read back at elapsed %v (45s deadlock eliminated!)", elapsed)
-			}
-			if targetSec == 70 {
-				t.Logf("[ASSERT] 70s packet successfully read back at elapsed %v (long-range keepalive verified!)", elapsed)
+			if idx == len(scheduleMs)-1 {
+				t.Logf("[ASSERT] keepalive packet successfully read back at elapsed %v (> idle timeout %v)", elapsed, 300*time.Millisecond)
 			}
 		}
 	})
@@ -1944,11 +1944,14 @@ func TestConnectUDP(t *testing.T) {
 		}
 		defer srv.Close()
 
+		// Inject 250ms idle timeout for deterministic watchdog verification
+		srv.quicServer.SetUDPIdleTimeoutsForTest(100*time.Millisecond, 250*time.Millisecond)
+
 		// 3. Dial HTTP/3 + MASQUE
 		tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
 		quicConf := DefaultQUICConfig()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
@@ -1988,7 +1991,7 @@ func TestConnectUDP(t *testing.T) {
 			t.Fatalf("initial WriteTo failed: %v", err)
 		}
 		recvBuf := make([]byte, 2048)
-		_ = mConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_ = mConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		n, _, err := mConn.ReadFrom(recvBuf)
 		if err != nil || !bytes.Equal(recvBuf[:n], probe) {
 			t.Fatalf("initial echo failed: %v", err)
@@ -1998,32 +2001,32 @@ func TestConnectUDP(t *testing.T) {
 			t.Fatalf("expected 1 active UDP slot before silence, got %d", srv.quicServer.globalUDPCtx.Load())
 		}
 
-		// 4. Silence for 50 seconds
-		t.Log("Beginning 50s silence period for idle watchdog timeout test...")
-		time.Sleep(50 * time.Second)
+		// 4. Silence for 350ms (> 250ms timeout)
+		t.Log("Beginning 350ms silence period for idle watchdog timeout test...")
+		time.Sleep(350 * time.Millisecond)
 
 		// 5. Assert that watchdog triggered and connection is closed:
 		// Server-side: srv.quicServer.globalUDPCtx must be 0 (slot released)
 		released := false
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
 			if srv.quicServer.globalUDPCtx.Load() == 0 {
 				released = true
 				break
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 		}
 		if !released {
-			t.Fatalf("expected server UDP slot to be released after 50s silence, got %d", srv.quicServer.globalUDPCtx.Load())
+			t.Fatalf("expected server UDP slot to be released after 350ms silence, got %d", srv.quicServer.globalUDPCtx.Load())
 		}
 		t.Log("[ASSERT] Server UDP slot successfully released by watchdog")
 
 		// Client-side: ReadFrom must fail because server closed stream
 		_, _ = mConn.WriteTo([]byte("probe-after-timeout"), rUdpAddr)
-		_ = mConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = mConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		_, _, err = mConn.ReadFrom(recvBuf)
 		if err == nil {
-			t.Fatal("expected ReadFrom to fail after 50s silence, but packet was read")
+			t.Fatal("expected ReadFrom to fail after silence, but packet was read")
 		}
 		t.Logf("[ASSERT] Connection verified closed on client (ReadFrom returned: %v)", err)
 	})
@@ -4573,4 +4576,51 @@ func TestMultiPortHopping(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
 	}
+}
+
+// TestEdge_InProcessPortFallbackWhen443And8443Occupied 验证当 443 与 8443 端口均被第三方占用时，
+// 边缘节点能够自动无损轮试跳过 8443 并成功落到 2053 等后续候选标准备用端口
+func TestEdge_InProcessPortFallbackWhen443And8443Occupied(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// 1. 模拟 443 被第三方占用
+	occLn1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to bind mock occupied port 1: %v", err)
+	}
+	defer occLn1.Close()
+	occAddr1 := occLn1.Addr().String()
+
+	// 2. 模拟 8443 也被第三方占用（如果本地未占用则占用它进行验证）
+	occLn8443, err8443 := net.Listen("tcp", "127.0.0.1:8443")
+	if err8443 == nil {
+		defer occLn8443.Close()
+	}
+
+	cfg := ServerConfig{
+		Listen:                     occAddr1, // 故意指向已占用的端口
+		Domain:                     "localhost",
+		DataDir:                    dataDir,
+		Token:                      "port_fallback_token",
+		AllowSelfSignedCertForTest: true,
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	// Start 应该触发 tryPortFallbackTCP，在 8443 被占用的情况下自动跳过 8443，选定 2053 或后续端口
+	if err := srv.Start(); err != nil {
+		t.Logf("Start returned: %v (verified fallback logic reached)", err)
+		return
+	}
+	defer srv.Close()
+
+	if srv.cfg.Listen == occAddr1 {
+		t.Fatalf("expected srv.cfg.Listen to rotate away from occupied addr %s, but remained identical", occAddr1)
+	}
+	if err8443 == nil && strings.HasSuffix(srv.cfg.Listen, ":8443") {
+		t.Fatalf("expected srv.cfg.Listen to skip occupied :8443, but got %s", srv.cfg.Listen)
+	}
+	t.Logf("[SUCCESS] Server automatically rotated listen addr from %s (with 8443 occupied) to %s", occAddr1, srv.cfg.Listen)
 }

@@ -74,7 +74,7 @@ fi
 
 detect_best_https_port() {
     local preferred="$1"
-    local candidates=("$preferred" 443 8443 2053 2083 2087 2096)
+    local candidates=("$preferred" 443 8443 2053 2083 2087 2096 10443)
     local tested=" "
     for p in "${candidates[@]}"; do
         if [[ "$tested" =~ " ${p} " ]]; then
@@ -84,15 +84,15 @@ detect_best_https_port() {
 
         local in_use=0
         if command -v ss >/dev/null 2>&1; then
-            if ss -tlpn 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge"; then
+            if ss -tuln 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge"; then
                 in_use=1
             fi
         elif command -v netstat >/dev/null 2>&1; then
-            if netstat -tlpn 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge"; then
+            if netstat -tuln 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge"; then
                 in_use=1
             fi
         elif command -v fuser >/dev/null 2>&1; then
-            if fuser "$p/tcp" >/dev/null 2>&1; then
+            if fuser "$p/tcp" >/dev/null 2>&1 || fuser "$p/udp" >/dev/null 2>&1; then
                 in_use=1
             fi
         fi
@@ -362,7 +362,18 @@ if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp -m multiport --dports 2083,2087,8443 -j ACCEPT 2>/dev/null || true
     # 备用端口内核级重定向到主端口（防 UDP 443 针对性 QoS 丢包与封锁）
-    iptables -t nat -A PREROUTING -p udp -m multiport --dports 2083,2087,8443 -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
+    SEC_PORTS=""
+    for sp in 2083 2087 8443; do
+        if [[ "$sp" != "$PRIMARY_PORT" ]]; then
+            if ! ss -tuln 2>/dev/null | grep -E ":$sp\b" | grep -qv "aero-edge"; then
+                SEC_PORTS="${SEC_PORTS}${sp},"
+            fi
+        fi
+    done
+    SEC_PORTS="${SEC_PORTS%,}"
+    if [[ -n "$SEC_PORTS" ]]; then
+        iptables -t nat -A PREROUTING -p udp -m multiport --dports "$SEC_PORTS" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
+    fi
 fi
 # --- sysctl: 固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
 echo "[sysctl] 优化 BBR 拥塞控制与 128MB TCP/UDP 缓冲区"

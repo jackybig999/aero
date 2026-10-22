@@ -1936,17 +1936,31 @@ fi
 		portDetectScript := `set +e
 OCCUPIED_BY=""
 SELECTED_PORT=443
-LINE_443=$(ss -lntp 2>/dev/null | grep -E ':(443)\b' | head -1)
+LINE_443=""
+if command -v ss >/dev/null 2>&1; then
+  LINE_443=$(ss -lnutp 2>/dev/null | grep -E ':(443)\b' | head -1)
+elif command -v netstat >/dev/null 2>&1; then
+  LINE_443=$(netstat -lnutp 2>/dev/null | grep -E ':(443)\b' | head -1)
+fi
 if [ -n "$LINE_443" ]; then
   PNAME=$(echo "$LINE_443" | grep -o 'users:(("[^"]*"' | tr -d 'users:(("' | head -1)
   [ -z "$PNAME" ] && PNAME=$(echo "$LINE_443" | awk '{print $NF}')
   PID=$(echo "$LINE_443" | grep -o 'pid=[0-9]*' | tr -d 'pid=' | head -1)
   if [ "$PNAME" != "aero-edge" ] && [ "$PNAME" != "aero" ]; then
     echo "OCCUPIED_BY=${PNAME:-unknown}(${PID:-0})"
-    for CANDIDATE in 8443 2053 2083 2087 2096; do
-      if ! ss -lnt 2>/dev/null | grep -qE ":$CANDIDATE\b"; then
+    # 443 端口被占用，按规范顺序轮试标准 HTTPS 候选备用端口 (8443, 2053, 2083, 2087, 2096, 10443)
+    for CANDIDATE in 8443 2053 2083 2087 2096 10443; do
+      IN_USE=0
+      if command -v ss >/dev/null 2>&1; then
+        ss -lnut 2>/dev/null | grep -qE ":$CANDIDATE\b" && IN_USE=1
+      elif command -v netstat >/dev/null 2>&1; then
+        netstat -lnut 2>/dev/null | grep -qE ":$CANDIDATE\b" && IN_USE=1
+      fi
+      if [ "$IN_USE" -eq 0 ]; then
         echo "SELECTED_PORT=$CANDIDATE"
         break
+      else
+        echo "CANDIDATE_${CANDIDATE}_OCCUPIED=yes"
       fi
     done
   fi
@@ -1958,7 +1972,11 @@ fi
 			if selP, ok2 := detKV["SELECTED_PORT"]; ok2 && selP != "" {
 				if pNum, err := strconv.Atoi(selP); err == nil && pNum > 0 {
 					targetPort = pNum
-					globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口冲突预警] 443 端口已被第三方进程 [%s] 占用！自动轮试选定备用标准 HTTPS 端口: %d", occ, targetPort))
+					if detKV["CANDIDATE_8443_OCCUPIED"] == "yes" {
+						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口冲突自愈] 443 与 8443 备用端口均已被第三方进程 [%s] 占用！自动跳过已占用端口，选定空闲标准 HTTPS 端口: %d", occ, targetPort))
+					} else {
+						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口冲突自愈] 443 端口已被第三方进程 [%s] 占用！自动轮试选定备用标准 HTTPS 端口: %d", occ, targetPort))
+					}
 				}
 			} else {
 				globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口提示] 443 端口占用者: [%s]，尝试共用或接管", occ))
@@ -2052,63 +2070,68 @@ WantedBy=multi-user.target
 
 	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[配置 成功] /etc/systemd/system/aero-edge.service 及运行环境写入完毕 (端口: %d)。", targetPort))
 
-	// === 全陌生环境自适应网络与 UDP/TCP 2083 透明重定向保障 ===
-	redirScript := `set +e
+	// === 全陌生环境自适应网络与 UDP/TCP 透明重定向保障 ===
+	redirScript := fmt.Sprintf(`set +e
+TARGET_PORT=%d
 REDIR_ACTIVE="no"
 REDIR_METHOD="none"
 
-# 1. 检查 2083 端口占用状况 (杜绝破坏第三方业务)
-OCC_2083=$(ss -lntup 2>/dev/null | grep -E ':(2083)\b' | head -1)
-if [ -n "$OCC_2083" ] && ! echo "$OCC_2083" | grep -qE "aero|nft|iptables"; then
-  echo "OCCUPIED_2083=yes"
-else
-  # 2. 首选 nftables
-  if command -v nft >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y nftables >/dev/null 2>&1) || (yum install -y nftables >/dev/null 2>&1); then
-    if nft add table inet aero_nat 2>/dev/null; then
-      nft 'add chain inet aero_nat prerouting { type nat hook prerouting priority dstnat; }' 2>/dev/null || true
-      nft add rule inet aero_nat prerouting udp dport 2083 redirect to :443 2>/dev/null || true
-      nft add rule inet aero_nat prerouting tcp dport 2083 redirect to :443 2>/dev/null || true
-      nft add rule inet aero_nat prerouting udp dport 2087 redirect to :443 2>/dev/null || true
-      nft add rule inet aero_nat prerouting tcp dport 2087 redirect to :443 2>/dev/null || true
-      nft list ruleset > /etc/nftables.conf 2>/dev/null || true
-      systemctl enable nftables 2>/dev/null || true
-      systemctl restart nftables 2>/dev/null || true
-      REDIR_ACTIVE="yes"
-      REDIR_METHOD="nftables"
+# 1. 检查候选重定向端口占用状况 (杜绝破坏第三方业务)
+# 若 TARGET_PORT 为标准 443，尝试开启 2083/2087 -> 443 透明重定向规避运营商 UDP 443 封锁；
+# 若 TARGET_PORT 不为 443 (443 已被第三方占用)，则坚决禁止向 443 重定向，避免将流量转发给非 AERO 进程！
+if [ "$TARGET_PORT" -eq 443 ]; then
+  OCC_2083=$(ss -lnutp 2>/dev/null | grep -E ':(2083)\b' | head -1)
+  if [ -n "$OCC_2083" ] && ! echo "$OCC_2083" | grep -qE "aero|nft|iptables"; then
+    echo "OCCUPIED_2083=yes"
+  else
+    # 2. 首选 nftables
+    if command -v nft >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y nftables >/dev/null 2>&1) || (yum install -y nftables >/dev/null 2>&1); then
+      if nft add table inet aero_nat 2>/dev/null; then
+        nft 'add chain inet aero_nat prerouting { type nat hook prerouting priority dstnat; }' 2>/dev/null || true
+        nft add rule inet aero_nat prerouting udp dport 2083 redirect to :443 2>/dev/null || true
+        nft add rule inet aero_nat prerouting tcp dport 2083 redirect to :443 2>/dev/null || true
+        nft add rule inet aero_nat prerouting udp dport 2087 redirect to :443 2>/dev/null || true
+        nft add rule inet aero_nat prerouting tcp dport 2087 redirect to :443 2>/dev/null || true
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+        systemctl enable nftables 2>/dev/null || true
+        systemctl restart nftables 2>/dev/null || true
+        REDIR_ACTIVE="yes"
+        REDIR_METHOD="nftables"
+      fi
+    fi
+
+    # 3. 若 nftables 不可用，回退至 iptables
+    if [ "$REDIR_ACTIVE" != "yes" ]; then
+      if iptables -t nat -L -n >/dev/null 2>&1; then
+        iptables -t nat -C PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
+        iptables -t nat -C PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
+        iptables -t nat -C PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
+        iptables -t nat -C PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
+        which iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
+        REDIR_ACTIVE="yes"
+        REDIR_METHOD="iptables"
+      fi
     fi
   fi
+fi
 
-  # 3. 若 nftables 不可用，回退至 iptables
-  if [ "$REDIR_ACTIVE" != "yes" ]; then
-    if iptables -t nat -L -n >/dev/null 2>&1; then
-      iptables -t nat -C PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
-      iptables -t nat -C PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
-      iptables -t nat -C PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
-      iptables -t nat -C PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
-      which iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
-      REDIR_ACTIVE="yes"
-      REDIR_METHOD="iptables"
-    fi
-  fi
-
-  # 4. 全环境防火墙放行 (UFW / Firewalld)
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow 443/tcp 2>/dev/null || true
-    ufw allow 443/udp 2>/dev/null || true
-    ufw allow 2083/tcp 2>/dev/null || true
-    ufw allow 2083/udp 2>/dev/null || true
-    ufw allow 2087/tcp 2>/dev/null || true
-    ufw allow 2087/udp 2>/dev/null || true
-  fi
-  if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-    firewall-cmd --add-port=443/tcp --add-port=443/udp --add-port=2083/tcp --add-port=2083/udp --add-port=2087/tcp --add-port=2087/udp --permanent 2>/dev/null || true
-    firewall-cmd --reload 2>/dev/null || true
-  fi
+# 4. 全环境防火墙放行 (UFW / Firewalld) - 必须放行实际业务端口 TARGET_PORT 以及备用端口
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow ${TARGET_PORT}/tcp 2>/dev/null || true
+  ufw allow ${TARGET_PORT}/udp 2>/dev/null || true
+  ufw allow 2083/tcp 2>/dev/null || true
+  ufw allow 2083/udp 2>/dev/null || true
+  ufw allow 2087/tcp 2>/dev/null || true
+  ufw allow 2087/udp 2>/dev/null || true
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+  firewall-cmd --add-port=${TARGET_PORT}/tcp --add-port=${TARGET_PORT}/udp --add-port=2083/tcp --add-port=2083/udp --add-port=2087/tcp --add-port=2087/udp --permanent 2>/dev/null || true
+  firewall-cmd --reload 2>/dev/null || true
 fi
 
 echo "REDIR_ACTIVE=$REDIR_ACTIVE"
 echo "REDIR_METHOD=$REDIR_METHOD"
-`
+`, targetPort)
 	redirOut, _ := runSSH(client, redirScript, 15*time.Second)
 	redirKV := parseKV(redirOut)
 	redirActive := redirKV["REDIR_ACTIVE"] == "yes"

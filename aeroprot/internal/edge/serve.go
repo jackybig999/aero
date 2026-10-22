@@ -16,6 +16,7 @@ import (
 	"crypto/x509/pkix"
 	_ "embed"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -300,10 +301,26 @@ func (s *Server) Start() error {
 		log.Printf("[EDGE] ECH enabled for domain %s (keys count: %d)", s.cfg.Domain, len(s.cfg.EncryptedClientHelloKeys))
 	}
 
-	// 1. TCP/TLS Listener
+	// 1. TCP/TLS Listener (支持 443/8443 端口被第三方业务占用时进程内无损智能轮试自愈)
 	ln, err := tls.Listen("tcp", s.cfg.Listen, tlsCfg)
 	if err != nil {
-		return fmt.Errorf("tcp listen %s: %w", s.cfg.Listen, err)
+		if isAddrInUse(err) {
+			rotatedLn, newAddr, rerr := tryPortFallbackTCP(s.cfg.Listen, tlsCfg)
+			if rerr == nil {
+				log.Printf("[EDGE] [WARN] Listen address %s already in use (e.g. 443/8443 occupied), in-process auto-fallback switched to %s", s.cfg.Listen, newAddr)
+				ln = rotatedLn
+				s.cfg.Listen = newAddr
+				if h, pStr, herr := net.SplitHostPort(newAddr); herr == nil {
+					if pNum, perr := strconv.Atoi(pStr); perr == nil && s.subStore != nil {
+						_ = s.subStore.UpdatePrimaryPort(pNum, h)
+					}
+				}
+			} else {
+				return fmt.Errorf("tcp listen %s: %w", s.cfg.Listen, err)
+			}
+		} else {
+			return fmt.Errorf("tcp listen %s: %w", s.cfg.Listen, err)
+		}
 	}
 	s.tcpListener = ln
 
@@ -674,4 +691,54 @@ func isGo126OrLater(ver string) bool {
 		return false
 	}
 	return minor >= 26
+}
+
+func isAddrInUse(err error) bool {
+	if err == nil {
+		return false
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var sysErr *os.SyscallError
+		if errors.As(opErr.Err, &sysErr) {
+			if errors.Is(sysErr.Err, syscall.EADDRINUSE) {
+				return true
+			}
+		}
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "address already in use") ||
+		strings.Contains(errStr, "only one usage of each socket address")
+}
+
+// tryPortFallbackTCP probes standard HTTPS candidate ports sequentially (8443, 2053, 2083, 2087, 2096, 10443)
+// and returns the first available listener whose TCP and UDP ports are both free.
+func tryPortFallbackTCP(initialListen string, tlsCfg *tls.Config) (net.Listener, string, error) {
+	host, portStr, err := net.SplitHostPort(initialListen)
+	if err != nil {
+		host = ""
+		portStr = strings.TrimPrefix(initialListen, ":")
+	}
+	initPort, _ := strconv.Atoi(portStr)
+
+	candidates := []int{8443, 2053, 2083, 2087, 2096, 10443}
+	for _, cand := range candidates {
+		if cand == initPort {
+			continue
+		}
+		candAddr := net.JoinHostPort(host, strconv.Itoa(cand))
+
+		// Pre-flight check: ensure UDP port is also unbound for QUIC
+		uconn, uerr := net.ListenPacket("udp", candAddr)
+		if uerr != nil {
+			continue
+		}
+		_ = uconn.Close()
+
+		ln, terr := tls.Listen("tcp", candAddr, tlsCfg)
+		if terr == nil {
+			return ln, candAddr, nil
+		}
+	}
+	return nil, "", fmt.Errorf("all fallback candidate ports %v are in use", candidates)
 }
