@@ -344,7 +344,7 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		}
 		for _, candPort := range []int{2083, 8443, 2053, 2087, 2096, 10443} {
 			altURL := fmt.Sprintf("%s://%s:%d%s", scheme, hostOnly, candPort, u.RequestURI())
-			candCtx, candCancel := context.WithTimeout(ctx, 4*time.Second)
+			candCtx, candCancel := context.WithTimeout(ctx, 8*time.Second)
 			altSub, altBody, altErr := fetchSingleSubURL(candCtx, altURL, opt)
 			candCancel()
 			if altErr == nil && altSub != nil && len(altSub.Servers) > 0 {

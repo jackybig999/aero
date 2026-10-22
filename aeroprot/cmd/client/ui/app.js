@@ -122,8 +122,8 @@ async function api(method, path, body) {
       console.error('IPC bridge error:', e)
     }
   }
-  const slow = path.indexOf('/connect') >= 0 || path.indexOf('/disconnect') >= 0 || path.indexOf('/mode') >= 0
-  const opt = { method, headers: {}, signal: AbortSignal.timeout(slow ? 10000 : 5000) }
+  const slow = path.indexOf('/connect') >= 0 || path.indexOf('/disconnect') >= 0 || path.indexOf('/mode') >= 0 || path.indexOf('/import') >= 0
+  const opt = { method, headers: {}, signal: AbortSignal.timeout(slow ? 15000 : 5000) }
   if (body != null) {
     opt.headers['Content-Type'] = 'application/json'
     opt.body = JSON.stringify(body)
