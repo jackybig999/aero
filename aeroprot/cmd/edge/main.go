@@ -32,6 +32,8 @@ func main() {
 	coverName := flag.String("cover-name", "CloudEdge CDN", "cover site title")
 	allowSelfSigned := flag.Bool("allow-self-signed-test", false, "allow self-signed certs and loopback targets for testing")
 	configPath := flag.String("config", "", "path to JSON configuration file")
+	warpProxy := flag.String("warp-proxy", "", "upstream Cloudflare WARP SOCKS5 proxy e.g. 127.0.0.1:40000 (auto-detected if empty)")
+	warpAll := flag.Bool("warp-all", false, "route all outbound traffic via WARP proxy instead of only AI & Google domains")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "AERO edge v%s — high-performance protocol edge node\n\n", edge.Version)
@@ -61,6 +63,8 @@ func main() {
 		AdvertiseHost:              *advHost,
 		CoverName:                  *coverName,
 		AllowSelfSignedCertForTest: *allowSelfSigned,
+		WarpProxy:                  *warpProxy,
+		WarpAll:                    *warpAll,
 	}
 
 	if *configPath != "" {

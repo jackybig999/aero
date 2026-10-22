@@ -281,6 +281,11 @@ func hideOwnConsole() {
 }
 
 func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WNDPROC] panic recovered: %v", r)
+		}
+	}()
 	if msg == uintptr(msgAeroRestore) && msgAeroRestore != 0 {
 		procShowWindow.Call(hwnd, uintptr(SW_SHOW))
 		procShowWindow.Call(hwnd, uintptr(SW_RESTORE))
@@ -309,7 +314,6 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 
 		if targetIcon != 0 {
 			trayNID.HIcon = targetIcon
-			procSendMessageW.Call(hwnd, uintptr(WM_SETICON), uintptr(ICON_SMALL), targetIcon)
 		}
 		tipText, _ := syscall.UTF16FromString(tip)
 		copy(trayNID.SzTip[:], tipText)

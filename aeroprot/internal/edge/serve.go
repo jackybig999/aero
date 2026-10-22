@@ -71,6 +71,8 @@ type ServerConfig struct {
 	FallbackObfsPasswords      []string                      `json:"fallback_obfs_passwords,omitempty" yaml:"fallback_obfs_passwords"`
 	PaddingJitter              bool                          `json:"padding_jitter,omitempty" yaml:"padding_jitter"`
 	AltListenPorts             []int                         `json:"alt_listen_ports,omitempty" yaml:"alt_listen_ports"`
+	WarpProxy                  string                        `json:"warp_proxy,omitempty" yaml:"warp_proxy"`
+	WarpAll                    bool                          `json:"warp_all,omitempty" yaml:"warp_all"`
 }
 
 // Server is the unified edge server instance
@@ -235,6 +237,25 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.AllowSelfSignedCertForTest {
 		dialGuard.AllowLocal = true
 	}
+
+	// 4b. 智能探测/配置 Cloudflare WARP SOCKS5 代理
+	warpProxy := strings.TrimSpace(cfg.WarpProxy)
+	if warpProxy == "" {
+		for _, candWarp := range []string{"127.0.0.1:40000", "127.0.0.1:1080"} {
+			if c, err := net.DialTimeout("tcp", candWarp, 150*time.Millisecond); err == nil {
+				_ = c.Close()
+				warpProxy = candWarp
+				log.Printf("[WARP] Auto-detected local Cloudflare WARP SOCKS5 proxy at %s, AI & Google unblocking active!", candWarp)
+				break
+			}
+		}
+	} else {
+		log.Printf("[WARP] Explicit Cloudflare WARP SOCKS5 proxy configured at %s, AI unblocking active (all=%v)", warpProxy, cfg.WarpAll)
+	}
+	if warpProxy != "" {
+		dialGuard.SetWarpProxy(warpProxy, cfg.WarpAll)
+	}
+
 	rateLimit := NewRateLimiter(cfg.RateIP)
 
 	// 5. QUIC Server

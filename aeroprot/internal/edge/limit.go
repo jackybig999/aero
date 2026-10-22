@@ -6,9 +6,12 @@ package edge
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -261,10 +264,12 @@ func IsBlockedIP(ip net.IP) (bool, string) {
 	return false, ""
 }
 
-// DialGuard limits instantaneous dial concurrency and prevents SSRF
+// DialGuard provides concurrency limiting, SSRF protection, and intelligent Cloudflare WARP upstream routing
 type DialGuard struct {
 	sem        chan struct{}
 	AllowLocal bool
+	WarpProxy  string // e.g. "127.0.0.1:40000"
+	WarpAll    bool   // route all outbound traffic through WARP proxy
 }
 
 // NewDialGuard creates a DialGuard; maxConcurrent <= 0 defaults to 256
@@ -275,12 +280,30 @@ func NewDialGuard(maxConcurrent int) *DialGuard {
 	return &DialGuard{sem: make(chan struct{}, maxConcurrent)}
 }
 
-// DialTimeout dials with concurrency limiting and SSRF protection
+// SetWarpProxy configures upstream Cloudflare WARP SOCKS5 proxy
+func (g *DialGuard) SetWarpProxy(proxyAddr string, all bool) {
+	if g != nil {
+		g.WarpProxy = proxyAddr
+		g.WarpAll = all
+	}
+}
+
+// DialTimeout dials with concurrency limiting, SSRF protection, and WARP unblocking
 func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
 	dialFn := safeDial
 	if g != nil && g.AllowLocal {
 		dialFn = net.DialTimeout
 	}
+
+	// 智能 WARP 出口净化：当配置/探测到远端 VPS 运行了 Cloudflare WARP SOCKS5 代理时，
+	// 对 Google、OpenAI、Gemini 等 AI 限制域名（或全量流量）经由 WARP 出口转发，彻底消灭 IP 标记与 403 封锁！
+	if g != nil && g.WarpProxy != "" && (g.WarpAll || isTargetAIDomain(address)) {
+		if c, err := dialViaSOCKS5(g.WarpProxy, address, timeout); err == nil {
+			return c, nil
+		}
+		// 若 WARP 出口临时异常或未就绪，平滑回退直接出站
+	}
+
 	if g == nil || g.sem == nil {
 		return dialFn(network, address, timeout)
 	}
@@ -291,6 +314,151 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 		return nil, fmt.Errorf("dial queue full")
 	}
 	return dialFn(network, address, timeout)
+}
+
+func isTargetAIDomain(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
+	}
+
+	aiSuffixes := []string{
+		"google.com",
+		"googleapis.com",
+		"gstatic.com",
+		"googleusercontent.com",
+		"ggpht.com",
+		"youtube.com",
+		"ytimg.com",
+		"openai.com",
+		"chatgpt.com",
+		"oaistatic.com",
+		"oaiusercontent.com",
+		"anthropic.com",
+		"claude.ai",
+		"ai.google.dev",
+		"makersuite.google.com",
+		"deepmind.google",
+		"bing.com",
+		"copilot.microsoft.com",
+	}
+
+	for _, suffix := range aiSuffixes {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func dialViaSOCKS5(proxyAddr, targetAddr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", proxyAddr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	host, portStr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("invalid target address: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("invalid port in %s", targetAddr)
+	}
+
+	// 1. SOCKS5 握手: 客户端问候 [VER=5, NMETHODS=1, METHOD=0 (No Auth)]
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 greeting failed: %w", err)
+	}
+
+	// 读取服务端选择
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 auth resp failed: %w", err)
+	}
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 auth rejected: 0x%02x", resp[1])
+	}
+
+	// 2. CONNECT 请求 [VER=5, CMD=1 (CONNECT), RSV=0, ATYP=..., DST.ADDR, DST.PORT]
+	var req []byte
+	ip := net.ParseIP(host)
+	if ip4 := ip.To4(); ip4 != nil {
+		req = make([]byte, 4+net.IPv4len+2)
+		req[0] = 0x05
+		req[1] = 0x01
+		req[2] = 0x00
+		req[3] = 0x01 // IPv4
+		copy(req[4:4+net.IPv4len], ip4)
+		binary.BigEndian.PutUint16(req[4+net.IPv4len:], uint16(port))
+	} else if ip6 := ip.To16(); ip6 != nil {
+		req = make([]byte, 4+net.IPv6len+2)
+		req[0] = 0x05
+		req[1] = 0x01
+		req[2] = 0x00
+		req[3] = 0x04 // IPv6
+		copy(req[4:4+net.IPv6len], ip6)
+		binary.BigEndian.PutUint16(req[4+net.IPv6len:], uint16(port))
+	} else {
+		// 域名 (FQDN)
+		if len(host) > 255 {
+			_ = conn.Close()
+			return nil, fmt.Errorf("domain name too long: %s", host)
+		}
+		req = make([]byte, 4+1+len(host)+2)
+		req[0] = 0x05
+		req[1] = 0x01
+		req[2] = 0x00
+		req[3] = 0x03 // Domain name
+		req[4] = byte(len(host))
+		copy(req[5:5+len(host)], host)
+		binary.BigEndian.PutUint16(req[5+len(host):], uint16(port))
+	}
+
+	if _, err := conn.Write(req); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 connect request failed: %w", err)
+	}
+
+	// 3. 读取连接响应 [VER, REP, RSV, ATYP, BND.ADDR, BND.PORT]
+	connResp := make([]byte, 4)
+	if _, err := io.ReadFull(conn, connResp); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 connect resp header failed: %w", err)
+	}
+	if connResp[1] != 0x00 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("socks5 connect rejected by upstream: 0x%02x", connResp[1])
+	}
+
+	// 消费剩余的绑定地址
+	switch connResp[3] {
+	case 0x01: // IPv4
+		bnd := make([]byte, 4+2)
+		_, _ = io.ReadFull(conn, bnd)
+	case 0x04: // IPv6
+		bnd := make([]byte, 16+2)
+		_, _ = io.ReadFull(conn, bnd)
+	case 0x03: // Domain
+		lenBuf := make([]byte, 1)
+		_, _ = io.ReadFull(conn, lenBuf)
+		bnd := make([]byte, int(lenBuf[0])+2)
+		_, _ = io.ReadFull(conn, bnd)
+	}
+
+	// 连接成功后清除滑动 deadline，恢复长连接全双工通信
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
 }
 
 func safeDial(network, address string, timeout time.Duration) (net.Conn, error) {

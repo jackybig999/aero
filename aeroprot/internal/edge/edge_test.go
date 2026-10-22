@@ -160,6 +160,75 @@ func TestDialGuardBlockedTargets(t *testing.T) {
 	}
 }
 
+func TestDialGuard_WarpSOCKS5Routing(t *testing.T) {
+	// 启动本地 mock SOCKS5 代理服务模拟 Cloudflare WARP 127.0.0.1:40000
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen mock socks5: %v", err)
+	}
+	defer socksLn.Close()
+
+	var routedTargets []string
+	var mu sync.Mutex
+
+	go func() {
+		for {
+			c, err := socksLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				// SOCKS5 握手
+				buf := make([]byte, 256)
+				n, err := conn.Read(buf)
+				if err != nil || n < 3 || buf[0] != 0x05 {
+					return
+				}
+				// 响应不需要鉴权
+				_, _ = conn.Write([]byte{0x05, 0x00})
+
+				// 读取 CONNECT 请求
+				n, err = conn.Read(buf)
+				if err != nil || n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
+					return
+				}
+				var target string
+				if buf[3] == 0x03 { // Domain
+					dLen := int(buf[4])
+					domain := string(buf[5 : 5+dLen])
+					port := binary.BigEndian.Uint16(buf[5+dLen : 5+dLen+2])
+					target = fmt.Sprintf("%s:%d", domain, port)
+				}
+				mu.Lock()
+				routedTargets = append(routedTargets, target)
+				mu.Unlock()
+
+				// 响应成功
+				resp := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80}
+				_, _ = conn.Write(resp)
+			}(c)
+		}
+	}()
+
+	dg := NewDialGuard(10)
+	dg.SetWarpProxy(socksLn.Addr().String(), false)
+
+	// 1. 验证 AI 域名通过 WARP SOCKS5 路由出站
+	conn, err := dg.DialTimeout("tcp", "gemini.google.com:443", 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial gemini via warp socks5 failed: %v", err)
+	}
+	_ = conn.Close()
+
+	mu.Lock()
+	if len(routedTargets) != 1 || routedTargets[0] != "gemini.google.com:443" {
+		t.Fatalf("expected gemini.google.com:443 to be routed through warp, got %+v", routedTargets)
+	}
+	mu.Unlock()
+	t.Logf("[SUCCESS] Confirmed gemini.google.com:443 successfully routed through WARP SOCKS5: %s", routedTargets[0])
+}
+
 func TestRateLimiter(t *testing.T) {
 	rl := NewRateLimiter(5)
 	ip := "1.2.3.4"

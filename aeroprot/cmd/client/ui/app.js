@@ -1107,11 +1107,15 @@ function init() {
 
   async function switchModeNow(targetMode, prevMode) {
     setModeUI(targetMode)
-    if ($('btnPower').classList.contains('on')) {
-      busy = true // 置 busy，阻断 2 秒轮询将乐观选择盖掉
-      msg(t('connecting'))
-      try {
-        const r = await api('POST', '/api/v1/mode', { mode: targetMode })
+    if (!$('btnPower').classList.contains('on')) {
+      // 未连接时立即同步模式到底层引擎，防止启动时二义性
+      api('POST', '/api/v1/mode', { mode: targetMode }).catch(() => null)
+      return
+    }
+    busy = true // 置 busy，阻断 2 秒轮询将乐观选择盖掉
+    msg(t('connecting'))
+    try {
+      const r = await api('POST', '/api/v1/mode', { mode: targetMode })
         if (r && r.code === 'CONFLICT_TUN') {
           setModeUI(r.mode || prevMode)
           handleTUNConflict(r.vpn || '')
