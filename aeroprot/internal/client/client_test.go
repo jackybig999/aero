@@ -4423,3 +4423,40 @@ func TestIPDataPump_KillSwitch_FailClosed(t *testing.T) {
 }
 
 
+
+
+// TestFetchSubscription_PortFallbackWhen443Occupied 验证当主域名 443 被第三方业务占用返回 404 时，
+// 客户端能够自动探测 2083 等候选标准备用端口并成功拉取到订阅
+func TestFetchSubscription_PortFallbackWhen443Occupied(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if strings.Contains(host, ":2083") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{
+				"version": "aero/3.0",
+				"userId": "admin",
+				"servers": [
+					{"name": "us-edge", "address": "us.mock.net:2083", "token": "tok_fallback_2083"}
+				]
+			}`)
+			return
+		}
+		// 默认 443 端口模拟第三方服务返回 Google 404 HTML
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "<!DOCTYPE html><html><title>Error 404 (Not Found)</title>The requested URL was not found on this server.</html>")
+	})
+
+	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
+	defer SetPhysicalDialerHook(nil)
+
+	// 请求不带端口的标准订阅 URL (默认 80/443，在测试中使用 http 匹配 newInMemHTTPDialer)
+	sub, err := FetchSubscription(context.Background(), "http://us.mock.net/sub/superadmin", SubFetchOptions{DisableCache: true})
+	if err != nil {
+		t.Fatalf("expected FetchSubscription to automatically probe and recover via 2083, got error: %v", err)
+	}
+	if len(sub.Servers) != 1 || sub.Servers[0].Address != "us.mock.net:2083" {
+		t.Fatalf("expected server us.mock.net:2083, got %+v", sub.Servers)
+	}
+	t.Logf("[SUCCESS] Successfully recovered and loaded subscription via candidate port 2083: %+v", sub.Servers[0])
+}

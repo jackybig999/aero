@@ -695,7 +695,9 @@ function renderUsers() {
               </td>
             `;
           } else if (anyVps.length === 1) {
-            const subUrl = `https://${anyVps[0].domain || anyVps[0].ip}/sub/superadmin`;
+            const vHost0 = anyVps[0].domain || anyVps[0].ip;
+            const vPort0 = anyVps[0].port;
+            const subUrl = `https://${(vPort0 && vPort0 != 443) ? `${vHost0}:${vPort0}` : vHost0}/sub/superadmin`;
             subColHtml = `
               <td>
                 <div style="display:flex;align-items:center;gap:6px">
@@ -717,7 +719,9 @@ function renderUsers() {
             `;
           }
         } else if (liveCount === 1) {
-          const subUrl = `https://${onlineVpsList[0].domain || onlineVpsList[0].ip}/sub/superadmin`;
+          const vHost1 = onlineVpsList[0].domain || onlineVpsList[0].ip;
+          const vPort1 = onlineVpsList[0].port;
+          const subUrl = `https://${(vPort1 && vPort1 != 443) ? `${vHost1}:${vPort1}` : vHost1}/sub/superadmin`;
           subColHtml = `
             <td>
               <div style="display:flex;align-items:center;gap:6px">
@@ -936,7 +940,8 @@ window.openAdminMultiSubModal = () => {
   } else {
     listEl.innerHTML = displayList.map((v, idx) => {
       const host = v.domain || v.ip;
-      const subUrl = `https://${host}/sub/superadmin`;
+      const hostWithPort = (v.port && v.port != 443) ? `${host}:${v.port}` : host;
+      const subUrl = `https://${hostWithPort}/sub/superadmin`;
       const name = v.name || `节点 ${idx + 1}`;
       const isOnline = v.status === 'online' || v.status === true || v.status === 1;
       return `
@@ -1582,7 +1587,9 @@ async function loadAeroDiagnose(vpsId) {
 
     // 8. Sub Box
     const vpsHost = diag.domain || diag.ip || getPrimaryVpsDomain();
-    const subUrl = `https://${vpsHost}/sub/superadmin`;
+    const vpsPort = diag.ports && diag.ports.find(p => p.role && p.role.includes('aero'))?.port || diag.port;
+    const vpsHostWithPort = (vpsPort && vpsPort != 443) ? `${vpsHost}:${vpsPort}` : vpsHost;
+    const subUrl = `https://${vpsHostWithPort}/sub/superadmin`;
     $('aeroSubUrlBox').textContent = subUrl;
     $('aeroSubSecretStatus').textContent = sub.secret_set === 'yes' ? '已配置就绪' : '未配置';
     $('aeroSubLocalStatus').innerHTML = `<span class="tag ${sub.local_ok ? 'tag-green' : 'tag-amber'}">${sub.local_ok ? 'OK' : 'FAIL'}</span>`;

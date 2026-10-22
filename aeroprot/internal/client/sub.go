@@ -331,14 +331,37 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		return sub, nil
 	}
 
-	// 关键判定：403 (订阅到期/停用) 或 404 立即清理本地缓存，严禁降级回退旧节点
+	// 智能候选端口轮试自愈：当主订阅 URL 默认使用 443/80（未显式携带非标端口）时，
+	// 若遭遇 404/连接失败/非订阅 HTML（例如远端 443 被第三方 Xray/Reality/Nginx 占用），
+	// 自动在同域名下探测标准 HTTPS 候选备用端口池 [2083, 8443, 2053, 2087, 2096, 10443]。
+	// 若在备用端口上成功拉取到有效 AERO 订阅，则无缝自愈接管，彻底解决用户免配端口的体验痛点！
+	u, parseErr := url.Parse(rawURL)
+	if parseErr == nil && (u.Port() == "" || u.Port() == "443" || u.Port() == "80") && strings.HasPrefix(u.Path, "/sub/") {
+		hostOnly := u.Hostname()
+		scheme := u.Scheme
+		if scheme == "" {
+			scheme = "https"
+		}
+		for _, candPort := range []int{2083, 8443, 2053, 2087, 2096, 10443} {
+			altURL := fmt.Sprintf("%s://%s:%d%s", scheme, hostOnly, candPort, u.RequestURI())
+			candCtx, candCancel := context.WithTimeout(ctx, 4*time.Second)
+			altSub, altBody, altErr := fetchSingleSubURL(candCtx, altURL, opt)
+			candCancel()
+			if altErr == nil && altSub != nil && len(altSub.Servers) > 0 {
+				SaveLastBody(altBody)
+				return altSub, nil
+			}
+		}
+	}
+
+	// 关键判定：若所有端口均失败，且明确遭遇 403 (订阅到期/停用) 或 404 立即清理本地缓存，严禁降级回退旧节点
 	if err != nil && (strings.Contains(err.Error(), "HTTP 403") || strings.Contains(err.Error(), "HTTP 404")) {
 		ClearLastBody()
 		return nil, fmt.Errorf("subscription revoked or expired: %w", err)
 	}
 
 	// 主 URL 失败时，尝试故障漂移
-	u, parseErr := url.Parse(rawURL)
+	u, parseErr = url.Parse(rawURL)
 	if parseErr == nil && u.Path != "" && strings.HasPrefix(u.Path, "/sub/") {
 		if cached := LoadLastBody(); len(cached) > 0 {
 			if lastSub, perr := ParseSubscriptionBytes(cached); perr == nil && len(lastSub.Servers) > 0 {

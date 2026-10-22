@@ -407,12 +407,18 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 		for _, srv := range servers {
 			if addr, ok := srv["address"].(string); ok && addr != "" {
 				host := addr
-				if h, _, err := net.SplitHostPort(addr); err == nil {
+				portStr := "443"
+				if h, p, err := net.SplitHostPort(addr); err == nil {
 					host = h
+					portStr = p
 				}
 				if host != "" && net.ParseIP(host) == nil {
 					if slugToUse != "" {
-						subUrl = fmt.Sprintf("https://%s/sub/%s", host, slugToUse)
+						if portStr == "443" || portStr == "" {
+							subUrl = fmt.Sprintf("https://%s/sub/%s", host, slugToUse)
+						} else {
+							subUrl = fmt.Sprintf("https://%s:%s/sub/%s", host, portStr, slugToUse)
+						}
 						break
 					}
 				}
