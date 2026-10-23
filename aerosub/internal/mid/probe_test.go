@@ -100,8 +100,8 @@ func TestAdminUnrestrictedSubscription(t *testing.T) {
 
 func TestEvaluatePurity_CNMarkedAndGeminiBlocked(t *testing.T) {
 	// 场景 1: IP 被标记为中国 (送中)，Gemini 返回 403 阻断
-	rawOut := "YT:CN,GEMINI:403,G:200,CF:200,AI:403,WARPINST:0,WARPPORT:0,WARPTRACE:0,WARP:0"
-	res := EvaluatePurity(rawOut, 101)
+	rawOut := "RAW_YT:CN,RAW_GEMINI:403,RAW_G:200,RAW_CF:200,AI:403,WARP_CLI:0,WARP_PORT:0,WARP_TRACE:0,WARP_GEMINI:000"
+	res := EvaluatePurity(rawOut, 101, "US")
 
 	if !res.IsCNMarked {
 		t.Errorf("expected IsCNMarked=true, got false")
@@ -109,11 +109,17 @@ func TestEvaluatePurity_CNMarkedAndGeminiBlocked(t *testing.T) {
 	if !res.AIBlocked {
 		t.Errorf("expected AIBlocked=true, got false")
 	}
+	if res.NativeGeminiOK {
+		t.Errorf("expected NativeGeminiOK=false, got true")
+	}
 	if res.GeminiOK {
 		t.Errorf("expected GeminiOK=false, got true")
 	}
 	if res.YouTubeLoc != "CN" {
 		t.Errorf("expected YouTubeLoc=CN, got %s", res.YouTubeLoc)
+	}
+	if !res.IsRegionMismatched {
+		t.Errorf("expected IsRegionMismatched=true (CN != US), got false")
 	}
 	if res.WARPInstalled {
 		t.Errorf("expected WARPInstalled=false, got true")
@@ -123,16 +129,69 @@ func TestEvaluatePurity_CNMarkedAndGeminiBlocked(t *testing.T) {
 	}
 }
 
+func TestEvaluatePurity_CNMarked_WithWARPRescue(t *testing.T) {
+	// 场景 2: 源 IP 送中且原生 Gemini 阻断，但已安装 WARP 并激活 40000 端口救援解锁
+	rawOut := "RAW_YT:CN,RAW_GEMINI:403,RAW_G:200,RAW_CF:200,WARP_CLI:1,WARP_PORT:1,WARP_TRACE:1,WARP_GEMINI:200"
+	res := EvaluatePurity(rawOut, 102, "US")
+
+	// 核心铁律：WARP 救援不能抹杀源 IP 的送中与地区漂移事实！
+	if !res.IsCNMarked {
+		t.Errorf("expected IsCNMarked=true (native defect must NOT be masked by WARP), got false")
+	}
+	if res.NativeGeminiOK {
+		t.Errorf("expected NativeGeminiOK=false, got true")
+	}
+	if !res.IsRegionMismatched {
+		t.Errorf("expected IsRegionMismatched=true, got false")
+	}
+
+	// 独立救援层状态：WARP 正常运行并成功解锁 Gemini
+	if !res.WARPInstalled {
+		t.Errorf("expected WARPInstalled=true, got false")
+	}
+	if !res.WARPRunning {
+		t.Errorf("expected WARPRunning=true, got false")
+	}
+	if !res.WARPGeminiOK {
+		t.Errorf("expected WARPGeminiOK=true, got false")
+	}
+	if !res.GeminiOK {
+		t.Errorf("expected overall GeminiOK=true (via WARP rescue), got false")
+	}
+}
+
+func TestEvaluatePurity_RegionMismatch(t *testing.T) {
+	// 场景 3: 物理 IP 为 US，但油管识别为 HK（地区漂移）
+	rawOut := "RAW_YT:HK,RAW_GEMINI:200,RAW_G:200,RAW_CF:200,WARP_CLI:0,WARP_PORT:0,WARP_TRACE:0,WARP_GEMINI:000"
+	res := EvaluatePurity(rawOut, 103, "US")
+
+	if !res.IsRegionMismatched {
+		t.Errorf("expected IsRegionMismatched=true for HK vs US, got false")
+	}
+	if res.YouTubeLoc != "HK" {
+		t.Errorf("expected YouTubeLoc=HK, got %s", res.YouTubeLoc)
+	}
+	if res.IPCountry != "US" {
+		t.Errorf("expected IPCountry=US, got %s", res.IPCountry)
+	}
+	if !res.NativeGeminiOK {
+		t.Errorf("expected NativeGeminiOK=true, got false")
+	}
+}
+
 func TestEvaluatePurity_WARPActiveEgress(t *testing.T) {
-	// 场景 2: 已配置并激活官方 WARP 40000 端口，Gemini 解锁且源 IP 保护生效
-	rawOut := "YT:US,GEMINI:200,G:200,CF:200,AI:200,WARPINST:1,WARPPORT:1,WARPTRACE:1,WARP:1"
-	res := EvaluatePurity(rawOut, 102)
+	// 场景 4: 原生 IP 纯净且已配置并激活官方 WARP 40000 端口
+	rawOut := "RAW_YT:US,RAW_GEMINI:200,RAW_G:200,RAW_CF:200,WARP_CLI:1,WARP_PORT:1,WARP_TRACE:1,WARP_GEMINI:200"
+	res := EvaluatePurity(rawOut, 104, "US")
 
 	if res.IsCNMarked {
 		t.Errorf("expected IsCNMarked=false, got true")
 	}
-	if res.AIBlocked {
-		t.Errorf("expected AIBlocked=false, got true")
+	if res.IsRegionMismatched {
+		t.Errorf("expected IsRegionMismatched=false, got true")
+	}
+	if !res.NativeGeminiOK {
+		t.Errorf("expected NativeGeminiOK=true, got false")
 	}
 	if !res.GeminiOK {
 		t.Errorf("expected GeminiOK=true, got false")

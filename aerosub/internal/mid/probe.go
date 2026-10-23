@@ -104,19 +104,22 @@ func runSSH(client *ssh.Client, cmd string, timeout time.Duration) (string, erro
 }
 
 // EvaluatePurity parses probe command output into a PurityResult.
-func EvaluatePurity(rawOutput string, vpsID uint64) PurityResult {
+func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityResult {
 	res := PurityResult{
 		VPSID:       vpsID,
 		RawOutput:   strings.TrimSpace(rawOutput),
 		ProbeAt:     time.Now(),
 		PurityScore: 0,
 	}
+	if len(ipCountry) > 0 {
+		res.IPCountry = strings.ToUpper(strings.TrimSpace(ipCountry[0]))
+	}
 
 	// 智能定位打靶特征行，过滤 remote .bashrc 或 motd 的杂音输出
 	var probeLine string
 	for _, line := range strings.Split(rawOutput, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.Contains(line, "YT:") || (strings.Contains(line, "G:") && strings.Contains(line, "CF:")) {
+		if strings.Contains(line, "RAW_YT:") || strings.Contains(line, "YT:") || (strings.Contains(line, "G:") && strings.Contains(line, "CF:")) {
 			probeLine = line
 			break
 		}
@@ -126,9 +129,9 @@ func EvaluatePurity(rawOutput string, vpsID uint64) PurityResult {
 	}
 
 	parts := strings.Split(probeLine, ",")
-	gCode, cfCode, aiCode, warpOn := "000", "000", "000", "0"
-	ytLoc, geminiCode := "", "000"
-	warpInst, warpPort, warpTrace := "0", "0", "0"
+	rawGCode, rawCFCode, rawAICode := "000", "000", ""
+	rawYTLoc, rawGeminiCode := "", "000"
+	warpCli, warpPort, warpTrace, warpGeminiCode := "0", "0", "0", "000"
 
 	for _, p := range parts {
 		kv := strings.SplitN(strings.TrimSpace(p), ":", 2)
@@ -136,65 +139,82 @@ func EvaluatePurity(rawOutput string, vpsID uint64) PurityResult {
 			k := strings.ToUpper(strings.TrimSpace(kv[0]))
 			v := strings.TrimSpace(kv[1])
 			switch k {
-			case "YT":
-				ytLoc = strings.ToUpper(v)
-			case "GEMINI":
-				geminiCode = v
-			case "G":
-				gCode = v
-			case "CF":
-				cfCode = v
+			case "RAW_YT", "YT":
+				rawYTLoc = strings.ToUpper(v)
+			case "RAW_GEMINI", "GEMINI":
+				rawGeminiCode = v
+			case "RAW_G", "G":
+				rawGCode = v
+			case "RAW_CF", "CF":
+				rawCFCode = v
 			case "AI":
-				aiCode = v
-			case "WARPINST":
-				warpInst = v
-			case "WARPPORT":
+				rawAICode = v
+			case "WARP_CLI", "WARPINST":
+				warpCli = v
+			case "WARP_PORT", "WARPPORT":
 				warpPort = v
-			case "WARPTRACE":
+			case "WARP_TRACE", "WARPTRACE":
 				warpTrace = v
+			case "WARP_GEMINI":
+				warpGeminiCode = v
 			case "WARP":
-				warpOn = v
+				if v == "1" {
+					warpTrace = "1"
+				}
 			}
 		}
 	}
 
-	res.YouTubeLoc = ytLoc
-	res.WARPInstalled = (warpInst == "1")
-	res.WARPRunning = (warpPort == "1" && (warpTrace == "1" || warpOn == "1"))
-	res.IsWARPEgress = res.WARPRunning || (warpOn == "1")
+	// 1. 原生源 IP 体质判定 (绝对直连，不走任何代理)
+	res.YouTubeLoc = rawYTLoc
+	res.NativeGeminiOK = (rawGeminiCode == "200" || rawGeminiCode == "301" || rawGeminiCode == "302" || rawGeminiCode == "307")
 
-	// Gemini 可用性判定：200/301/302/307 视为畅通，403/429/000 视为阻断或未授权
-	res.GeminiOK = (geminiCode == "200" || geminiCode == "301" || geminiCode == "302" || geminiCode == "307")
-
-	// 送中与 IP 异常判定：
-	// 1. YouTube countryCode 判定为 CN
-	// 2. Gemini 探测被 403 阻断或 000 无法访问
-	// 3. Anthropic AI 探测返回 403/000
-	if ytLoc == "CN" || !res.GeminiOK || aiCode == "403" || aiCode == "429" || aiCode == "000" {
-		res.AIBlocked = true
-		res.IsCNMarked = true
+	// 2. 地区漂移判定：YouTube 识别国家与 VPS 源 IP 物理国家是否一致
+	if res.YouTubeLoc != "" && res.IPCountry != "" && res.YouTubeLoc != res.IPCountry {
+		res.IsRegionMismatched = true
 	} else {
-		res.AIBlocked = false
-		res.IsCNMarked = false
+		res.IsRegionMismatched = false
 	}
 
-	// 纯净度综合评分 (满分 100)
-	if gCode == "200" {
+	// 3. 送中判定：
+	// A. YouTube 识别为 CN
+	// B. 原生直连 Gemini 403 阻断或无法连接 (NativeGeminiOK == false)
+	// C. 原生 AI 阻断 (403 或 429)
+	if res.YouTubeLoc == "CN" || !res.NativeGeminiOK || rawAICode == "403" || rawAICode == "429" {
+		res.IsCNMarked = true
+		res.AIBlocked = true
+	} else {
+		res.IsCNMarked = false
+		res.AIBlocked = false
+	}
+
+	// 4. WARP 救援与接管层判定
+	res.WARPInstalled = (warpCli == "1")
+	res.WARPRunning = (warpPort == "1" && warpTrace == "1")
+	res.WARPGeminiOK = (warpGeminiCode == "200" || warpGeminiCode == "301" || warpGeminiCode == "302" || warpGeminiCode == "307")
+	res.IsWARPEgress = res.WARPRunning
+
+	// 5. 综合 Gemini 可用性 (原生或通过 WARP 成功解锁)
+	res.GeminiOK = res.NativeGeminiOK || (res.WARPRunning && res.WARPGeminiOK)
+
+	// 6. 原生源 IP 纯净度基础评分
+	if rawGCode == "200" || rawGCode == "302" {
 		res.GoogleClean = true
 		res.PurityScore += 30
 	}
-	if cfCode == "200" {
+	if rawCFCode == "200" {
 		res.CFClean = true
 		res.PurityScore += 20
 	}
-	if res.GeminiOK {
+	if res.NativeGeminiOK {
 		res.PurityScore += 30
 	}
-	if ytLoc != "" && ytLoc != "CN" {
+	if res.YouTubeLoc != "" && res.YouTubeLoc != "CN" && !res.IsRegionMismatched {
 		res.PurityScore += 20
 	}
-	if res.IsWARPEgress {
-		// WARP 保护加权：若启用 WARP 且成功接管，AI 封锁解除并享有源 IP 隐匿保护
+
+	// 7. 若 WARP 成功接管并解锁 Gemini，加分保护但绝不篡改 IsCNMarked 的真实物理标记
+	if res.WARPRunning && res.WARPGeminiOK {
 		if res.PurityScore < 90 {
 			res.PurityScore = 95
 		}
@@ -213,6 +233,8 @@ func (s *VPSService) ProbePurity(ctx context.Context, id uint64) (*PurityResult,
 		return nil, fmt.Errorf("no password stored for host %d", id)
 	}
 
+	ipCountry := ResolveIPCountryCode(cred.IP)
+
 	client, err := dialSSH(SSHCredentials{
 		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
 	}, 8*time.Second)
@@ -222,20 +244,28 @@ func (s *VPSService) ProbePurity(ctx context.Context, id uint64) (*PurityResult,
 	defer client.Close()
 
 	cmd := `set +e; ` +
-		`yt_cc=$(curl -s4 -L -m 4 https://www.youtube.com 2>/dev/null | grep -o '"countryCode":"[A-Z]*"' | head -n1 | cut -d'"' -f4 || echo ""); ` +
-		`[ -z "$yt_cc" ] && yt_cc=$(curl -s4 -m 4 "https://www.youtube.com/red" 2>/dev/null | grep -o '"countryCode":"[A-Z]*"' | head -n1 | cut -d'"' -f4 || echo ""); ` +
-		`gemini_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" -L https://gemini.google.com 2>/dev/null || echo "000"); ` +
-		`g_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" "https://www.google.com/search?q=aero_probe" 2>/dev/null || echo "000"); ` +
-		`cf_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || echo "000"); ` +
-		`ai_code=$(curl -s4 -m 4 -o /dev/null -w "%{http_code}" "https://api.anthropic.com/api/hello" 2>/dev/null || echo "000"); ` +
+		`yt_raw=$(curl -s4 -L -m 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.youtube.com/premium" 2>/dev/null); ` +
+		`yt_cc=$(echo "$yt_raw" | grep -oE '"countryCode":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
+		`[ -z "$yt_cc" ] && yt_cc=$(echo "$yt_raw" | grep -oE '"gl":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
+		`if [ -z "$yt_cc" ]; then ` +
+		`  yt_red=$(curl -s4 -L -m 4 -A "Mozilla/5.0" "https://www.youtube.com/red" 2>/dev/null); ` +
+		`  yt_cc=$(echo "$yt_red" | grep -oE '"countryCode":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
+		`  [ -z "$yt_cc" ] && yt_cc=$(echo "$yt_red" | grep -oE '"gl":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
+		`fi; ` +
+		`raw_gemini=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" -L "https://gemini.google.com" 2>/dev/null || echo "000"); ` +
+		`raw_g=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" "https://www.google.com/search?q=aero" 2>/dev/null || echo "000"); ` +
+		`raw_cf=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || echo "000"); ` +
 		`warp_cli=$(command -v warp-cli >/dev/null 2>&1 && echo "1" || echo "0"); ` +
-		`warp_port=$( (ss -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || ( (netstat -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || echo "0") ); ` +
-		`warp_trace=$(curl -s4 -m 3 --socks5 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on" && echo "1" || echo "0"); ` +
-		`warp_on=$( (ip a 2>/dev/null | grep -q "warp") && echo "1" || echo "$warp_trace"); ` +
-		`echo "YT:$yt_cc,GEMINI:$gemini_code,G:$g_code,CF:$cf_code,AI:$ai_code,WARPINST:$warp_cli,WARPPORT:$warp_port,WARPTRACE:$warp_trace,WARP:$warp_on"`
+		`warp_port=$( (ss -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || echo "0"); ` +
+		`warp_trace=$(curl -s4 -m 3 --socks5 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | grep -q "warp=on" && echo "1" || echo "0"); ` +
+		`warp_gemini="000"; ` +
+		`if [ "$warp_port" = "1" ]; then ` +
+		`  warp_gemini=$(curl -s4 -m 5 --socks5 127.0.0.1:40000 -o /dev/null -w "%{http_code}" -L "https://gemini.google.com" 2>/dev/null || echo "000"); ` +
+		`fi; ` +
+		`echo "RAW_YT:$yt_cc,RAW_GEMINI:$raw_gemini,RAW_G:$raw_g,RAW_CF:$raw_cf,WARP_CLI:$warp_cli,WARP_PORT:$warp_port,WARP_TRACE:$warp_trace,WARP_GEMINI:$warp_gemini"`
 
-	out, err := runSSH(client, cmd, 12*time.Second)
-	res := EvaluatePurity(out, id)
+	out, err := runSSH(client, cmd, 15*time.Second)
+	res := EvaluatePurity(out, id, ipCountry)
 	if err != nil {
 		res.ProbeError = err.Error()
 	}
@@ -891,17 +921,21 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 	}
 
 	purityMap := map[string]any{
-		"score":          vps.PurityScore,
-		"ai_blocked":     vps.AIBlocked,
-		"google_clean":   vps.GoogleClean,
-		"cf_clean":       vps.CFClean,
-		"is_warp_egress": vps.IsWARPEgress,
-		"youtube_loc":    vps.YouTubeLoc,
-		"gemini_ok":      vps.GeminiOK,
-		"is_cn_marked":   vps.IsCNMarked,
-		"warp_installed": vps.WARPInstalled,
-		"warp_running":   vps.WARPRunning,
-		"last_probe_at":  vps.LastPurityProbeAt,
+		"ip_country":           vps.IPCountry,
+		"score":                vps.PurityScore,
+		"ai_blocked":           vps.AIBlocked,
+		"google_clean":         vps.GoogleClean,
+		"cf_clean":             vps.CFClean,
+		"is_warp_egress":       vps.IsWARPEgress,
+		"youtube_loc":          vps.YouTubeLoc,
+		"gemini_ok":            vps.GeminiOK,
+		"native_gemini_ok":     vps.NativeGeminiOK,
+		"is_cn_marked":         vps.IsCNMarked,
+		"is_region_mismatched": vps.IsRegionMismatched,
+		"warp_installed":       vps.WARPInstalled,
+		"warp_running":         vps.WARPRunning,
+		"warp_gemini_ok":       vps.WARPGeminiOK,
+		"last_probe_at":        vps.LastPurityProbeAt,
 	}
 
 	// 0. 中台安装状态前置门禁：若该节点尚未安装或已被卸载，直接返回未安装状态，杜绝外部其他进程端口误报
@@ -1423,6 +1457,40 @@ var countryCN = map[string]string{
 	"IN": "印度",
 }
 
+var geoCountryCache sync.Map
+
+// ResolveIPCountryCode resolves an IP address to its 2-letter ISO country code (e.g. "US", "HK", "JP").
+func ResolveIPCountryCode(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || ip == "127.0.0.1" || strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "10.") {
+		return "LOCAL"
+	}
+	if val, ok := geoCountryCache.Load(ip); ok {
+		if s, ok := val.(string); ok && s != "" {
+			return s
+		}
+	}
+
+	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode", ip)
+	resp, err := geoClient.Get(url)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		var data struct {
+			Status      string `json:"status"`
+			CountryCode string `json:"countryCode"`
+		}
+		if jsonErr := json.NewDecoder(resp.Body).Decode(&data); jsonErr == nil && data.Status == "success" {
+			_ = resp.Body.Close()
+			cc := strings.ToUpper(strings.TrimSpace(data.CountryCode))
+			if cc != "" {
+				geoCountryCache.Store(ip, cc)
+				return cc
+			}
+		}
+		_ = resp.Body.Close()
+	}
+	return ""
+}
+
 // ResolveIPRegion resolves an IP address to a human-readable Region string e.g. "美国 · 洛杉矶".
 // Results are cached in-memory to prevent redundant external queries.
 func ResolveIPRegion(ip string) string {
@@ -1450,7 +1518,9 @@ func ResolveIPRegion(ip string) string {
 		var data ipAPIResp
 		if jsonErr := json.NewDecoder(resp.Body).Decode(&data); jsonErr == nil && data.Status == "success" {
 			_ = resp.Body.Close()
-			cName := countryCN[strings.ToUpper(data.CountryCode)]
+			cCode := strings.ToUpper(data.CountryCode)
+			geoCountryCache.Store(ip, cCode)
+			cName := countryCN[cCode]
 			if cName == "" {
 				cName = data.Country
 			}

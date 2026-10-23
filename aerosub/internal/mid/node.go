@@ -520,35 +520,39 @@ type HostMetrics struct {
 }
 
 type VPSHost struct {
-	ID                uint64         `json:"id"`
-	Name              string         `json:"name"`
-	Role              string         `json:"role"`
-	IP                string         `json:"ip"`
-	SSHPort           int            `json:"ssh_port"`
-	SSHUsername       string         `json:"ssh_username"`
-	HasPassword       bool           `json:"has_password"`
-	Domain            string         `json:"domain,omitempty"`
-	Remark            string         `json:"remark,omitempty"`
-	Status            string         `json:"status"` // registered | online | offline | error
-	HealthScore       int            `json:"health_score"`
-	Tier              int            `json:"tier"` // 1: Nano/Edge (<=1G), 2: Standard (<=4G), 3: Enterprise (>4G)
-	CapacityState     string         `json:"capacity_state"`
-	PurityScore       int            `json:"purity_score"`
-	AIBlocked         bool           `json:"ai_blocked"`
-	GoogleClean       bool           `json:"google_clean"`
-	CFClean           bool           `json:"cf_clean"`
-	IsWARPEgress      bool           `json:"is_warp_egress"`
-	YouTubeLoc        string         `json:"youtube_loc,omitempty"`
-	GeminiOK          bool           `json:"gemini_ok"`
-	IsCNMarked        bool           `json:"is_cn_marked"`
-	WARPInstalled     bool           `json:"warp_installed"`
-	WARPRunning       bool           `json:"warp_running"`
-	Metrics           *HostMetrics   `json:"metrics,omitempty"`
-	DNSStatus         *DNSStatusInfo `json:"dns_status,omitempty"`
-	LastProbeAt       *time.Time     `json:"last_probe_at,omitempty"`
-	LastPurityProbeAt *time.Time     `json:"last_purity_probe_at,omitempty"`
-	CreatedAt         time.Time      `json:"created_at"`
-	UpdatedAt         time.Time      `json:"updated_at"`
+	ID                 uint64         `json:"id"`
+	Name               string         `json:"name"`
+	Role               string         `json:"role"`
+	IP                 string         `json:"ip"`
+	SSHPort            int            `json:"ssh_port"`
+	SSHUsername        string         `json:"ssh_username"`
+	HasPassword        bool           `json:"has_password"`
+	Domain             string         `json:"domain,omitempty"`
+	Remark             string         `json:"remark,omitempty"`
+	Status             string         `json:"status"` // registered | online | offline | error
+	HealthScore        int            `json:"health_score"`
+	Tier               int            `json:"tier"` // 1: Nano/Edge (<=1G), 2: Standard (<=4G), 3: Enterprise (>4G)
+	CapacityState      string         `json:"capacity_state"`
+	IPCountry          string         `json:"ip_country,omitempty"`
+	PurityScore        int            `json:"purity_score"`
+	AIBlocked          bool           `json:"ai_blocked"`
+	GoogleClean        bool           `json:"google_clean"`
+	CFClean            bool           `json:"cf_clean"`
+	IsWARPEgress       bool           `json:"is_warp_egress"`
+	YouTubeLoc         string         `json:"youtube_loc,omitempty"`
+	GeminiOK           bool           `json:"gemini_ok"`
+	NativeGeminiOK     bool           `json:"native_gemini_ok"`
+	IsCNMarked         bool           `json:"is_cn_marked"`
+	IsRegionMismatched bool           `json:"is_region_mismatched"`
+	WARPInstalled      bool           `json:"warp_installed"`
+	WARPRunning        bool           `json:"warp_running"`
+	WARPGeminiOK       bool           `json:"warp_gemini_ok"`
+	Metrics            *HostMetrics   `json:"metrics,omitempty"`
+	DNSStatus          *DNSStatusInfo `json:"dns_status,omitempty"`
+	LastProbeAt        *time.Time     `json:"last_probe_at,omitempty"`
+	LastPurityProbeAt  *time.Time     `json:"last_purity_probe_at,omitempty"`
+	CreatedAt          time.Time      `json:"created_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
 }
 
 type DNSStatusInfo struct {
@@ -562,20 +566,24 @@ type DNSStatusInfo struct {
 }
 
 type PurityResult struct {
-	VPSID         uint64    `json:"vps_id"`
-	PurityScore   int       `json:"purity_score"`
-	AIBlocked     bool      `json:"ai_blocked"`
-	GoogleClean   bool      `json:"google_clean"`
-	CFClean       bool      `json:"cf_clean"`
-	IsWARPEgress  bool      `json:"is_warp_egress"`
-	YouTubeLoc    string    `json:"youtube_loc,omitempty"`
-	GeminiOK      bool      `json:"gemini_ok"`
-	IsCNMarked    bool      `json:"is_cn_marked"`
-	WARPInstalled bool      `json:"warp_installed"`
-	WARPRunning   bool      `json:"warp_running"`
-	RawOutput     string    `json:"raw_output,omitempty"`
-	ProbeAt       time.Time `json:"probe_at"`
-	ProbeError    string    `json:"probe_error,omitempty"`
+	VPSID              uint64    `json:"vps_id"`
+	IPCountry          string    `json:"ip_country,omitempty"`
+	PurityScore        int       `json:"purity_score"`
+	AIBlocked          bool      `json:"ai_blocked"`
+	GoogleClean        bool      `json:"google_clean"`
+	CFClean            bool      `json:"cf_clean"`
+	IsWARPEgress       bool      `json:"is_warp_egress"`
+	YouTubeLoc         string    `json:"youtube_loc,omitempty"`
+	GeminiOK           bool      `json:"gemini_ok"`
+	NativeGeminiOK     bool      `json:"native_gemini_ok"`
+	IsCNMarked         bool      `json:"is_cn_marked"`
+	IsRegionMismatched bool      `json:"is_region_mismatched"`
+	WARPInstalled      bool      `json:"warp_installed"`
+	WARPRunning        bool      `json:"warp_running"`
+	WARPGeminiOK       bool      `json:"warp_gemini_ok"`
+	RawOutput          string    `json:"raw_output,omitempty"`
+	ProbeAt            time.Time `json:"probe_at"`
+	ProbeError         string    `json:"probe_error,omitempty"`
 }
 
 type UpdateVPSParams struct {
@@ -829,6 +837,7 @@ func (m *MemoryVPSStore) UpdatePurity(id uint64, res *PurityResult) error {
 	h.LastPurityProbeAt = &now
 	h.UpdatedAt = now
 	if res != nil {
+		h.IPCountry = res.IPCountry
 		h.PurityScore = res.PurityScore
 		h.AIBlocked = res.AIBlocked
 		h.GoogleClean = res.GoogleClean
@@ -836,9 +845,12 @@ func (m *MemoryVPSStore) UpdatePurity(id uint64, res *PurityResult) error {
 		h.IsWARPEgress = res.IsWARPEgress
 		h.YouTubeLoc = res.YouTubeLoc
 		h.GeminiOK = res.GeminiOK
+		h.NativeGeminiOK = res.NativeGeminiOK
 		h.IsCNMarked = res.IsCNMarked
+		h.IsRegionMismatched = res.IsRegionMismatched
 		h.WARPInstalled = res.WARPInstalled
 		h.WARPRunning = res.WARPRunning
+		h.WARPGeminiOK = res.WARPGeminiOK
 	}
 	return nil
 }
@@ -1135,6 +1147,7 @@ func (s *FileVPSStore) UpdatePurity(id uint64, res *PurityResult) error {
 	h.LastPurityProbeAt = &now
 	h.UpdatedAt = now
 	if res != nil {
+		h.IPCountry = res.IPCountry
 		h.PurityScore = res.PurityScore
 		h.AIBlocked = res.AIBlocked
 		h.GoogleClean = res.GoogleClean
@@ -1142,9 +1155,12 @@ func (s *FileVPSStore) UpdatePurity(id uint64, res *PurityResult) error {
 		h.IsWARPEgress = res.IsWARPEgress
 		h.YouTubeLoc = res.YouTubeLoc
 		h.GeminiOK = res.GeminiOK
+		h.NativeGeminiOK = res.NativeGeminiOK
 		h.IsCNMarked = res.IsCNMarked
+		h.IsRegionMismatched = res.IsRegionMismatched
 		h.WARPInstalled = res.WARPInstalled
 		h.WARPRunning = res.WARPRunning
+		h.WARPGeminiOK = res.WARPGeminiOK
 	}
 	s.mu.Unlock()
 	return s.save()

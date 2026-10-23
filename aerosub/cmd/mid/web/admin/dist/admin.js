@@ -1642,31 +1642,49 @@ function renderPurityInfo(purity) {
     return;
   }
 
-  // 1. WARP 状态
-  if (purity.warp_running) {
-    wTag.innerHTML = '<span class="tag tag-green">🛡️ 官方 WARP :40000 活跃 (SOCKS5 接管)</span>';
+  // 1. 维度一：真实源 IP 原生体质判定 (如实暴露，绝不因套 WARP 而掩盖)
+  const ipCountry = purity.ip_country ? escapeHtml(purity.ip_country) : '';
+  const ytLoc = purity.youtube_loc ? escapeHtml(purity.youtube_loc) : '';
+
+  if (purity.is_cn_marked) {
+    if (purity.youtube_loc === 'CN' && !purity.native_gemini_ok) {
+      pTag.innerHTML = '<span class="tag tag-red">🔴 源 IP 送中 (油管标记 CN · Gemini 阻断)</span>';
+    } else if (purity.youtube_loc === 'CN') {
+      pTag.innerHTML = '<span class="tag tag-red">🔴 源 IP 送中 (YouTube 标记 CN)</span>';
+    } else if (!purity.native_gemini_ok) {
+      pTag.innerHTML = '<span class="tag tag-red">🔴 源 IP 送中 (原生 Gemini 拒绝对话)</span>';
+    } else {
+      pTag.innerHTML = '<span class="tag tag-red">🔴 源 IP 异常 / 送中受限</span>';
+    }
+  } else if (purity.is_region_mismatched) {
+    pTag.innerHTML = `<span class="tag tag-amber">⚠️ 地区漂移 (IP: ${ipCountry || '源'} · 油管: ${ytLoc || '未知'})</span>`;
+  } else if (purity.native_gemini_ok) {
+    pTag.innerHTML = '<span class="tag tag-green">🟢 原生 IP 纯净 (未送中 · 直连正常)</span>';
+  } else {
+    pTag.innerHTML = '<span class="tag tag-amber">🟡 IP 待检测评估</span>';
+  }
+
+  // 2. 维度二：WARP 救援与接管层状态 (清晰标明是否完成挽救)
+  if (purity.warp_running && purity.warp_gemini_ok) {
+    pTag.title = '源 IP 原生状态见标签；经由 WARP 隧道已成功挽救解锁 AI 业务';
+    wTag.innerHTML = '<span class="tag tag-green">🛡️ WARP 已救援接管 (Gemini 已解锁)</span>';
+  } else if (purity.warp_running) {
+    wTag.innerHTML = '<span class="tag tag-green">🛡️ WARP :40000 活跃 (运行中)</span>';
   } else if (purity.warp_installed) {
     wTag.innerHTML = '<span class="tag tag-amber">⚠️ WARP 已安装未启动 (端口 40000 离线)</span>';
+  } else if (purity.is_cn_marked) {
+    wTag.innerHTML = '<span class="tag tag-red">⚠️ 未配置 WARP (源 IP 送中，急需安装救援)</span>';
   } else {
     wTag.innerHTML = '<span class="tag tag-muted">WARP 未安装</span>';
   }
 
-  // 2. 出口与送中状态
-  if (purity.is_warp_egress && purity.warp_running) {
-    pTag.innerHTML = '<span class="tag tag-green">🟢 源IP已保护 · WARP已解锁 (AI正常)</span>';
-  } else if (purity.is_cn_marked) {
-    pTag.innerHTML = '<span class="tag tag-red">🔴 IP送中 / AI受限 (Google/YouTube 标记 CN)</span>';
-  } else if (purity.gemini_ok) {
-    pTag.innerHTML = '<span class="tag tag-green">🟢 纯净原生出口 (未送中 · AI正常)</span>';
-  } else {
-    pTag.innerHTML = '<span class="tag tag-amber">🟡 IP纯净度待评估</span>';
-  }
-
-  // 3. 详细明细
-  const ytStr = purity.youtube_loc ? `YouTube: ${escapeHtml(purity.youtube_loc)}` : 'YouTube: 未知';
-  const geminiStr = purity.gemini_ok ? 'Gemini: 畅通' : 'Gemini: 阻断/不可达';
-  const scoreStr = purity.score ? `评分: ${purity.score}分` : '';
-  pDetails.textContent = `${ytStr} · ${geminiStr} ${scoreStr ? '· ' + scoreStr : ''}`;
+  // 3. 详细明细数据
+  const ytStr = ytLoc ? `油管归属: ${ytLoc}` : '油管: 未知';
+  const ipCountryStr = ipCountry ? `源 IP: ${ipCountry}` : '源 IP: —';
+  const nativeGemStr = purity.native_gemini_ok ? '原生Gemini: 畅通' : '原生Gemini: 403阻断';
+  const warpGemStr = purity.warp_running ? (purity.warp_gemini_ok ? 'WARP出口: 200解锁' : 'WARP出口: 待验证') : 'WARP: 未接管';
+  const mismatchStr = purity.is_region_mismatched ? ' · ⚠️地区不一致' : '';
+  pDetails.textContent = `${ipCountryStr} · ${ytStr}${mismatchStr} · ${nativeGemStr} · ${warpGemStr}`;
 }
 
 async function deployAeroWarp() {
