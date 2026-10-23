@@ -130,8 +130,9 @@ func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityR
 
 	parts := strings.Split(probeLine, ",")
 	rawGCode, rawCFCode, rawAICode := "000", "000", ""
-	rawYTLoc, rawGeminiCode := "", "000"
-	warpCli, warpPort, warpTrace, warpGeminiCode := "0", "0", "0", "000"
+	rawYTLoc, rawGeminiCode, rawGemCC := "", "", ""
+	ytCN, gHK := "0", "0"
+	warpCli, warpPort, warpTrace, warpGeminiCode, warpGemCC := "0", "0", "0", "", ""
 
 	for _, p := range parts {
 		kv := strings.SplitN(strings.TrimSpace(p), ":", 2)
@@ -141,8 +142,14 @@ func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityR
 			switch k {
 			case "RAW_YT", "YT":
 				rawYTLoc = strings.ToUpper(v)
+			case "YT_CN":
+				ytCN = v
+			case "RAW_GEM_CC":
+				rawGemCC = strings.ToUpper(v)
 			case "RAW_GEMINI", "GEMINI":
 				rawGeminiCode = v
+			case "G_HK":
+				gHK = v
 			case "RAW_G", "G":
 				rawGCode = v
 			case "RAW_CF", "CF":
@@ -155,6 +162,8 @@ func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityR
 				warpPort = v
 			case "WARP_TRACE", "WARPTRACE":
 				warpTrace = v
+			case "WARP_GEM_CC":
+				warpGemCC = strings.ToUpper(v)
 			case "WARP_GEMINI":
 				warpGeminiCode = v
 			case "WARP":
@@ -166,8 +175,24 @@ func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityR
 	}
 
 	// 1. 原生源 IP 体质判定 (绝对直连，不走任何代理)
-	res.YouTubeLoc = rawYTLoc
-	res.NativeGeminiOK = (rawGeminiCode == "200" || rawGeminiCode == "301" || rawGeminiCode == "302" || rawGeminiCode == "307")
+	if ytCN == "1" {
+		res.YouTubeLoc = "CN"
+	} else {
+		res.YouTubeLoc = rawYTLoc
+	}
+
+	// 原生 Gemini 状态：
+	// 若抓取到了国家码 rawGemCC:
+	//   若 rawGemCC == "CHN" 或 rawGemCC == "" -> NativeGeminiOK = false
+	//   若 rawGemCC != "CHN" 且 rawGemCC != "" -> NativeGeminiOK = true
+	// 若未抓取到 rawGemCC (单测/旧输出)，回退检查 rawGeminiCode:
+	if rawGemCC != "" {
+		res.NativeGeminiOK = (rawGemCC != "CHN" && rawGemCC != "000")
+	} else if rawGeminiCode != "" {
+		res.NativeGeminiOK = (rawGeminiCode == "200" || rawGeminiCode == "301" || rawGeminiCode == "302" || rawGeminiCode == "307")
+	} else {
+		res.NativeGeminiOK = false
+	}
 
 	// 2. 地区漂移判定：YouTube 识别国家与 VPS 源 IP 物理国家是否一致
 	if res.YouTubeLoc != "" && res.IPCountry != "" && res.YouTubeLoc != res.IPCountry {
@@ -176,11 +201,13 @@ func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityR
 		res.IsRegionMismatched = false
 	}
 
-	// 3. 送中判定：
-	// A. YouTube 识别为 CN
-	// B. 原生直连 Gemini 403 阻断或无法连接 (NativeGeminiOK == false)
-	// C. 原生 AI 阻断 (403 或 429)
-	if res.YouTubeLoc == "CN" || !res.NativeGeminiOK || rawAICode == "403" || rawAICode == "429" {
+	// 3. 送中判定 (不可篡改的源 IP 事实)
+	// 满足以下任一即判定为源 IP 送中：
+	// A. YouTube 页面包含 www.google.cn 或标记为 CN
+	// B. Google 搜索被重定向到 google.com.hk (gHK == "1")
+	// C. Gemini 归属国识别为 CHN (rawGemCC == "CHN") 或原生 Gemini 阻断
+	// D. 显式 AI 阻断 (403 或 429)
+	if ytCN == "1" || res.YouTubeLoc == "CN" || gHK == "1" || rawGemCC == "CHN" || !res.NativeGeminiOK || rawAICode == "403" || rawAICode == "429" {
 		res.IsCNMarked = true
 		res.AIBlocked = true
 	} else {
@@ -191,7 +218,13 @@ func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityR
 	// 4. WARP 救援与接管层判定
 	res.WARPInstalled = (warpCli == "1")
 	res.WARPRunning = (warpPort == "1" && warpTrace == "1")
-	res.WARPGeminiOK = (warpGeminiCode == "200" || warpGeminiCode == "301" || warpGeminiCode == "302" || warpGeminiCode == "307")
+	if warpGemCC != "" {
+		res.WARPGeminiOK = (warpGemCC != "CHN" && warpGemCC != "000")
+	} else if warpGeminiCode != "" {
+		res.WARPGeminiOK = (warpGeminiCode == "200" || warpGeminiCode == "301" || warpGeminiCode == "302" || warpGeminiCode == "307")
+	} else {
+		res.WARPGeminiOK = false
+	}
 	res.IsWARPEgress = res.WARPRunning
 
 	// 5. 综合 Gemini 可用性 (原生或通过 WARP 成功解锁)
@@ -244,25 +277,31 @@ func (s *VPSService) ProbePurity(ctx context.Context, id uint64) (*PurityResult,
 	defer client.Close()
 
 	cmd := `set +e; ` +
-		`yt_raw=$(curl -s4 -L -m 5 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.youtube.com/premium" 2>/dev/null); ` +
-		`yt_cc=$(echo "$yt_raw" | grep -oE '"countryCode":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
-		`[ -z "$yt_cc" ] && yt_cc=$(echo "$yt_raw" | grep -oE '"gl":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
-		`if [ -z "$yt_cc" ]; then ` +
-		`  yt_red=$(curl -s4 -L -m 4 -A "Mozilla/5.0" "https://www.youtube.com/red" 2>/dev/null); ` +
-		`  yt_cc=$(echo "$yt_red" | grep -oE '"countryCode":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
-		`  [ -z "$yt_cc" ] && yt_cc=$(echo "$yt_red" | grep -oE '"gl":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
+		`yt_raw=$(curl -s4 -L -m 6 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.youtube.com/premium" 2>/dev/null); ` +
+		`yt_cn=0; (echo "$yt_raw" | grep -q 'www.google.cn') && yt_cn=1; ` +
+		`yt_cc=""; ` +
+		`if [ "$yt_cn" = "1" ]; then ` +
+		`  yt_cc="CN"; ` +
+		`else ` +
+		`  yt_cc=$(echo "$yt_raw" | grep -woP '"INNERTUBE_CONTEXT_GL"\s{0,}:\s{0,}"\K[^"]+' | head -1); ` +
+		`  [ -z "$yt_cc" ] && yt_cc=$(echo "$yt_raw" | grep -oE '"countryCode":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
+		`  [ -z "$yt_cc" ] && yt_cc=$(echo "$yt_raw" | grep -oE '"gl":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
 		`fi; ` +
-		`raw_gemini=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" -L "https://gemini.google.com" 2>/dev/null || echo "000"); ` +
+		`gem_raw=$(curl -s4 -L -m 6 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://gemini.google.com" 2>/dev/null); ` +
+		`raw_gem_cc=$(echo "$gem_raw" | grep -o ',2,1,200,"[A-Z]\{3\}"' | head -1 | sed 's/,2,1,200,"//;s/"//'); ` +
+		`g_dest=$(curl -s4 -m 5 -o /dev/null -w "%{url_effective}" -L "https://www.google.com/search?q=aero" 2>/dev/null || echo ""); ` +
+		`g_hk=0; (echo "$g_dest" | grep -q 'google.com.hk') && g_hk=1; ` +
 		`raw_g=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" "https://www.google.com/search?q=aero" 2>/dev/null || echo "000"); ` +
 		`raw_cf=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || echo "000"); ` +
 		`warp_cli=$(command -v warp-cli >/dev/null 2>&1 && echo "1" || echo "0"); ` +
 		`warp_port=$( (ss -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || echo "0"); ` +
 		`warp_trace=$(curl -s4 -m 3 --socks5 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | grep -q "warp=on" && echo "1" || echo "0"); ` +
-		`warp_gemini="000"; ` +
+		`warp_gem_cc=""; ` +
 		`if [ "$warp_port" = "1" ]; then ` +
-		`  warp_gemini=$(curl -s4 -m 5 --socks5 127.0.0.1:40000 -o /dev/null -w "%{http_code}" -L "https://gemini.google.com" 2>/dev/null || echo "000"); ` +
+		`  w_gem_raw=$(curl -s4 -m 6 --socks5 127.0.0.1:40000 -L -A "Mozilla/5.0" "https://gemini.google.com" 2>/dev/null); ` +
+		`  warp_gem_cc=$(echo "$w_gem_raw" | grep -o ',2,1,200,"[A-Z]\{3\}"' | head -1 | sed 's/,2,1,200,"//;s/"//'); ` +
 		`fi; ` +
-		`echo "RAW_YT:$yt_cc,RAW_GEMINI:$raw_gemini,RAW_G:$raw_g,RAW_CF:$raw_cf,WARP_CLI:$warp_cli,WARP_PORT:$warp_port,WARP_TRACE:$warp_trace,WARP_GEMINI:$warp_gemini"`
+		`echo "RAW_YT:$yt_cc,YT_CN:$yt_cn,RAW_GEM_CC:$raw_gem_cc,G_HK:$g_hk,RAW_G:$raw_g,RAW_CF:$raw_cf,WARP_CLI:$warp_cli,WARP_PORT:$warp_port,WARP_TRACE:$warp_trace,WARP_GEM_CC:$warp_gem_cc"`
 
 	out, err := runSSH(client, cmd, 15*time.Second)
 	res := EvaluatePurity(out, id, ipCountry)

@@ -213,6 +213,60 @@ func TestEvaluatePurity_WARPActiveEgress(t *testing.T) {
 	}
 }
 
+func TestEvaluatePurity_DeepInspection_VPS13_CHNMarked(t *testing.T) {
+	// 场景 5: VPS 13 实机场景：YouTube 包含 www.google.cn, Gemini 识别 CHN, Google 搜索 302 重定向到香港
+	// 同时 WARP 40000 活跃且 WARP 出口 Gemini 识别为 USA
+	rawOut := "RAW_YT:CN,YT_CN:1,RAW_GEM_CC:CHN,G_HK:1,RAW_G:302,RAW_CF:200,WARP_CLI:1,WARP_PORT:1,WARP_TRACE:1,WARP_GEM_CC:USA"
+	res := EvaluatePurity(rawOut, 13, "US")
+
+	if !res.IsCNMarked {
+		t.Errorf("expected IsCNMarked=true for VPS 13 (CHN, google.cn, g_hk), got false")
+	}
+	if res.NativeGeminiOK {
+		t.Errorf("expected NativeGeminiOK=false (CHN blocked), got true")
+	}
+	if res.YouTubeLoc != "CN" {
+		t.Errorf("expected YouTubeLoc=CN, got %s", res.YouTubeLoc)
+	}
+	if !res.IsRegionMismatched {
+		t.Errorf("expected IsRegionMismatched=true (CN != US), got false")
+	}
+	if !res.WARPRunning {
+		t.Errorf("expected WARPRunning=true, got false")
+	}
+	if !res.WARPGeminiOK {
+		t.Errorf("expected WARPGeminiOK=true (via USA warp egress), got false")
+	}
+	if !res.GeminiOK {
+		t.Errorf("expected overall GeminiOK=true (unblocked by WARP), got false")
+	}
+}
+
+func TestEvaluatePurity_DeepInspection_VPS8_Clean(t *testing.T) {
+	// 场景 6: VPS 8 (192...) 实机场景：原生干净，未包含 google.cn，未重定向，Gemini 识别 USA
+	rawOut := "RAW_YT:US,YT_CN:0,RAW_GEM_CC:USA,G_HK:0,RAW_G:200,RAW_CF:200,WARP_CLI:0,WARP_PORT:0,WARP_TRACE:0,WARP_GEM_CC:"
+	res := EvaluatePurity(rawOut, 8, "US")
+
+	if res.IsCNMarked {
+		t.Errorf("expected IsCNMarked=false for clean VPS 8, got true")
+	}
+	if !res.NativeGeminiOK {
+		t.Errorf("expected NativeGeminiOK=true, got false")
+	}
+	if res.IsRegionMismatched {
+		t.Errorf("expected IsRegionMismatched=false, got true")
+	}
+	if res.YouTubeLoc != "US" {
+		t.Errorf("expected YouTubeLoc=US, got %s", res.YouTubeLoc)
+	}
+	if res.WARPRunning {
+		t.Errorf("expected WARPRunning=false, got true")
+	}
+	if res.PurityScore < 95 {
+		t.Errorf("expected PurityScore >= 95, got %d", res.PurityScore)
+	}
+}
+
 func TestDefaultWarpInstallSteps(t *testing.T) {
 	steps := DefaultWarpInstallSteps()
 	if len(steps) != 5 {
