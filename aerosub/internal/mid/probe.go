@@ -295,11 +295,12 @@ func (s *VPSService) ProbePurity(ctx context.Context, id uint64) (*PurityResult,
 		`raw_cf=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || echo "000"); ` +
 		`warp_cli=$(command -v warp-cli >/dev/null 2>&1 && echo "1" || echo "0"); ` +
 		`warp_port=$( (ss -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || echo "0"); ` +
-		`warp_trace=$(curl -s4 -m 3 --socks5 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | grep -q "warp=on" && echo "1" || echo "0"); ` +
+		`warp_trace=$(curl -s4 -m 3 --socks5-hostname 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | grep -q "warp=on" && echo "1" || (curl -s4 -m 3 --socks5 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | grep -q "warp=on" && echo "1" || echo "0")); ` +
 		`warp_gem_cc=""; ` +
 		`if [ "$warp_port" = "1" ]; then ` +
-		`  w_gem_raw=$(curl -s4 -m 6 --socks5 127.0.0.1:40000 -L -A "Mozilla/5.0" "https://gemini.google.com" 2>/dev/null); ` +
+		`  w_gem_raw=$(curl -s4 -m 6 --socks5-hostname 127.0.0.1:40000 -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "https://gemini.google.com" 2>/dev/null || curl -s4 -m 6 --socks5 127.0.0.1:40000 -L -A "Mozilla/5.0" "https://gemini.google.com" 2>/dev/null); ` +
 		`  warp_gem_cc=$(echo "$w_gem_raw" | grep -o ',2,1,200,"[A-Z]\{3\}"' | head -1 | sed 's/,2,1,200,"//;s/"//'); ` +
+		`  [ -z "$warp_gem_cc" ] && (echo "$w_gem_raw" | grep -q '45631641,null,true') && warp_gem_cc="USA"; ` +
 		`fi; ` +
 		`echo "RAW_YT:$yt_cc,YT_CN:$yt_cn,RAW_GEM_CC:$raw_gem_cc,G_HK:$g_hk,RAW_G:$raw_g,RAW_CF:$raw_cf,WARP_CLI:$warp_cli,WARP_PORT:$warp_port,WARP_TRACE:$warp_trace,WARP_GEM_CC:$warp_gem_cc"`
 

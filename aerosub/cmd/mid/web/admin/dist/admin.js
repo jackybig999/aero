@@ -1682,8 +1682,8 @@ function renderPurityInfo(purity) {
   const ytStr = ytLoc ? `油管归属: ${ytLoc}` : '油管: 未知';
   const ipCountryStr = ipCountry ? `源 IP: ${ipCountry}` : '源 IP: —';
   const nativeGemStr = purity.native_gemini_ok ? '原生Gemini: 畅通' : '原生Gemini: 403阻断';
-  const warpGemStr = purity.warp_running ? (purity.warp_gemini_ok ? 'WARP出口: 200解锁' : 'WARP出口: 待验证') : 'WARP: 未接管';
-  const mismatchStr = purity.is_region_mismatched ? ' · ⚠️地区不一致' : '';
+  const warpGemStr = purity.warp_running ? (purity.warp_gemini_ok ? 'WARP出口: 200解锁' : 'WARP出口: 活跃运行中') : (purity.warp_installed ? 'WARP: 已安装未启动' : 'WARP: 未安装');
+  const mismatchStr = purity.is_region_mismatched ? ' · ⚠️ 地区不一致' : '';
   pDetails.textContent = `${ipCountryStr} · ${ytStr}${mismatchStr} · ${nativeGemStr} · ${warpGemStr}`;
 }
 
