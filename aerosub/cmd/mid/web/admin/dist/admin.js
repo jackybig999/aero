@@ -1861,7 +1861,7 @@ async function openAeroPreflightDrawer(action, customPort = 443) {
     const isOk = diag && diag.ok;
     const installedVer = (diag && (diag.version || (diag.service && diag.service.version))) || '';
     const src = latestAeroSourceStatus;
-    const releaseTag = (src && src.release_tag) || 'v1.0.0';
+    const releaseTag = (src && src.release_tag) || 'v1.2.15';
 
     if (isInstalled && isOk) {
       // 场景 1：目标主机已安装且正常在线（防重复安装拦截）

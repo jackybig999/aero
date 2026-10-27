@@ -38,6 +38,7 @@ var (
 var uiEmbed embed.FS
 
 func main() {
+	showVer := flag.Bool("version", false, "print version and exit")
 	listenAddr := flag.String("listen", "127.0.0.1:55555", "mixed proxy address (SOCKS5/HTTP CONNECT)")
 	apiAddr := flag.String("api", "127.0.0.1:19877", "client control API and UI address")
 	subURL := flag.String("sub", "", "subscription URL or file")
@@ -45,7 +46,12 @@ func main() {
 	headless := flag.Bool("headless", false, "run in headless mode without GUI window")
 	flag.Parse()
 
-	log.Printf("[CLIENT] initializing AERO client (api=%s, listen=%s, mode=%s)...", *apiAddr, *listenAddr, *mode)
+	if *showVer {
+		fmt.Printf("aero-client %s (protocol=%s)\n", client.ClientVersion, client.Protocol)
+		return
+	}
+
+	log.Printf("[CLIENT] initializing AERO client v%s (api=%s, listen=%s, mode=%s)...", client.ClientVersion, *apiAddr, *listenAddr, *mode)
 
 	eng := client.NewEngine()
 	eng.SetListenAddr(*listenAddr)

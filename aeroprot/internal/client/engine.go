@@ -32,6 +32,11 @@ import (
 )
 
 const (
+	ClientVersion = "1.2.15"
+	Protocol      = "aero/3.0"
+)
+
+const (
 	stateStopped  int32 = 0
 	stateStarting int32 = 1
 	stateRunning  int32 = 2
@@ -1425,7 +1430,7 @@ func (e *Engine) GetState() AppState {
 		ActualPort:   actualPort,
 		SubURL:       subURL,
 		NodesCount:   nodesCount,
-		Version:      "aero/3.0",
+		Version:      ClientVersion,
 		Node:         e.activeAddr,
 		SNI:          e.activeSNI,
 		ISP:          isp,

@@ -36,11 +36,19 @@ import (
 //go:embed all:web
 var embeddedWebFS embed.FS
 
+const Version = "1.2.15"
+
 func main() {
+	showVer := flag.Bool("version", false, "print version and exit")
 	hostFlag := flag.String("host", "0.0.0.0", "middle platform listen host")
 	portFlag := flag.String("port", "18080", "middle platform listen port")
 	dataDirFlag := flag.String("data", "", "data directory path")
 	flag.Parse()
+
+	if *showVer {
+		fmt.Printf("aero-mid %s\n", Version)
+		return
+	}
 
 	host := *hostFlag
 	if h := os.Getenv("HOST"); h != "" {
@@ -265,6 +273,7 @@ func main() {
 			"mode":      "single-port",
 			"port":      port,
 			"product":   "vpsserver-aero",
+			"version":   Version,
 			"data_dir":  dataDir,
 			"vps_count": len(hosts),
 			"services":  services,
@@ -328,7 +337,7 @@ func main() {
 	chain := mid.CORSPermissive(mid.Recover(gate))
 
 	fmt.Printf("\n=======================================================\n")
-	fmt.Printf("  AERO VPS Middle Platform -> :%s\n", port)
+	fmt.Printf("  AERO VPS Middle Platform v%s -> :%s\n", Version, port)
 	fmt.Printf("  Data directory: %s\n", dataDir)
 	fmt.Printf("  Health:         /health\n")
 	fmt.Printf("  Native Domain Sub:  https://<domain>/sub/superadmin\n")
