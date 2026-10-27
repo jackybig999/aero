@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
@@ -137,6 +138,15 @@ type Engine struct {
 	lastErr            string
 	lastErrCode        string
 	lastErrConflictVPN string
+
+	socksAuthToken string
+}
+
+// SetSocksAuthToken 配置本地 SOCKS5 可选安全认证令牌 (NEW-08)
+func (e *Engine) SetSocksAuthToken(token string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.socksAuthToken = token
 }
 
 // NewEngine 创建客户端引擎
@@ -393,6 +403,9 @@ func (e *Engine) Apply(applied *Applied) error {
 	}
 
 	primary := applied.Servers[0]
+	if len(primary.PinSPKI) > 0 {
+		SetActiveEdgePinSPKI(primary.PinSPKI)
+	}
 	if e.activeAddr == primary.Address {
 		// host:port 严格一致，短路返回，绝对不调用 Reset()！
 		var ech []byte
@@ -641,6 +654,17 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	}
 	SetActiveEdgeAltPorts(altPorts)
 
+	var nodePins []string
+	if e.appliedSub != nil {
+		for _, s := range e.appliedSub.Servers {
+			if s.Address == addr {
+				nodePins = s.PinSPKI
+				break
+			}
+		}
+	}
+	SetActiveEdgePinSPKI(nodePins)
+
 	e.activeAddr = addr
 	e.activeToken = tok
 	e.activeSNI = sni
@@ -870,6 +894,17 @@ func (e *Engine) startLocked(ticket uint64) error {
 		}
 	}
 	SetActiveEdgeAltPorts(altPorts)
+
+	var activePins []string
+	if e.appliedSub != nil {
+		for _, s := range e.appliedSub.Servers {
+			if s.Address == activeAddr {
+				activePins = s.PinSPKI
+				break
+			}
+		}
+	}
+	SetActiveEdgePinSPKI(activePins)
 
 	if len(ech) > 0 {
 		SetActiveEdge(activeAddr, activeToken, activeSNI, ip, ech)
@@ -1710,6 +1745,13 @@ func (e *Engine) startMixedProxy() error {
 			if err != nil {
 				return
 			}
+			// NEW-08: 本地绑定加固，非回环地址一律拒绝
+			rHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+			if rHost != "127.0.0.1" && rHost != "::1" && !strings.HasPrefix(rHost, "127.") {
+				_ = conn.Close()
+				continue
+			}
+
 			e.activeConns.Store(conn, struct{}{})
 			go func(c net.Conn) {
 				defer func() {
@@ -1751,9 +1793,61 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 		return
 	}
 
-	// 响应无鉴权 (0x05, 0x00)
-	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
-		return
+	e.mu.RLock()
+	authToken := e.socksAuthToken
+	e.mu.RUnlock()
+
+	if authToken != "" {
+		hasUserPass := false
+		for _, m := range methods {
+			if m == 0x02 { // USERNAME/PASSWORD 认证
+				hasUserPass = true
+				break
+			}
+		}
+		if !hasUserPass {
+			_, _ = conn.Write([]byte{0x05, 0xFF}) // No acceptable methods
+			return
+		}
+		// 响应选择 0x02 认证
+		if _, err := conn.Write([]byte{0x05, 0x02}); err != nil {
+			return
+		}
+		// 读取子协商版本与用户名密码
+		ver, err := br.ReadByte()
+		if err != nil || ver != 0x01 {
+			return
+		}
+		ulen, err := br.ReadByte()
+		if err != nil {
+			return
+		}
+		user := make([]byte, ulen)
+		if _, err := io.ReadFull(br, user); err != nil {
+			return
+		}
+		plen, err := br.ReadByte()
+		if err != nil {
+			return
+		}
+		pass := make([]byte, plen)
+		if _, err := io.ReadFull(br, pass); err != nil {
+			return
+		}
+
+		// 密码常数时间核对 (NEW-08)
+		if subtle.ConstantTimeCompare(pass, []byte(authToken)) != 1 {
+			_, _ = conn.Write([]byte{0x01, 0x01}) // 认证失败
+			return
+		}
+		if _, err := conn.Write([]byte{0x01, 0x00}); err != nil { // 认证成功
+			return
+		}
+	} else {
+		// 响应无鉴权 (0x05, 0x00)
+		if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+			return
+		}
 	}
 
 	// 读取请求头

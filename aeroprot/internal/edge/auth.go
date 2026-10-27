@@ -29,6 +29,11 @@ type TokenInfo struct {
 	Label     string    `json:"label"`
 }
 
+type walItem struct {
+	nonceKey string
+	now      time.Time
+}
+
 // Validator validates access tokens, timestamps, and one-time nonces
 type Validator struct {
 	mu     sync.RWMutex
@@ -39,6 +44,8 @@ type Validator struct {
 
 	walPath string
 	stopCh  chan struct{}
+	walChan chan walItem
+	walDone chan struct{}
 }
 
 // NewValidator creates a new Validator with optional WAL persistence file path
@@ -47,12 +54,15 @@ func NewValidator(walPath ...string) *Validator {
 		tokens:     make(map[string]*TokenInfo),
 		nonceStore: make(map[string]time.Time),
 		stopCh:     make(chan struct{}),
+		walChan:    make(chan walItem, 4096),
+		walDone:    make(chan struct{}),
 	}
 	if len(walPath) > 0 && walPath[0] != "" {
 		v.walPath = walPath[0]
 		v.loadWAL()
 	}
 	go v.cleanupLoop()
+	go v.walFlushWorker()
 	return v
 }
 
@@ -112,12 +122,62 @@ func (v *Validator) compactWAL() error {
 	return os.Rename(tmpPath, v.walPath)
 }
 
-// Close gracefully stops the validator cleanup loop
+func (v *Validator) walFlushWorker() {
+	defer close(v.walDone)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	var batch []walItem
+
+	flush := func() {
+		if len(batch) == 0 || v.walPath == "" {
+			return
+		}
+		for _, item := range batch {
+			_ = v.appendWAL(item.nonceKey, item.now)
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case item, ok := <-v.walChan:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, item)
+			if len(batch) >= 50 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func (v *Validator) enqueueWAL(nonceKey string, t time.Time) {
+	if v.walPath == "" || v.walChan == nil {
+		return
+	}
+	item := walItem{nonceKey: nonceKey, now: t}
+	select {
+	case v.walChan <- item:
+	default:
+		// 背压溢出回退：同步写，绝不丢弃 Nonce 造成重放漏洞
+		_ = v.appendWAL(nonceKey, t)
+	}
+}
+
+// Close gracefully stops the validator cleanup loop and flushes pending WAL items
 func (v *Validator) Close() {
 	select {
 	case <-v.stopCh:
 	default:
 		close(v.stopCh)
+	}
+	if v.walChan != nil {
+		close(v.walChan)
+		<-v.walDone
 	}
 }
 
@@ -200,7 +260,7 @@ func (v *Validator) ValidateFull(token string, timestamp uint64, nonce []byte) b
 	}
 	v.nonceStore[nonceKey] = time.Now()
 	if v.walPath != "" {
-		_ = v.appendWAL(nonceKey, time.Now())
+		v.enqueueWAL(nonceKey, time.Now())
 	}
 	return true
 }

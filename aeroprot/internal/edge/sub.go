@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -22,7 +23,35 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
+
+type subIPLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*rate.Limiter
+}
+
+var globalSubIPLimiter = &subIPLimiter{
+	buckets: make(map[string]*rate.Limiter),
+}
+
+func (l *subIPLimiter) allow(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.buckets[ip]
+	if !ok {
+		if len(l.buckets) >= 1024 {
+			for k := range l.buckets {
+				delete(l.buckets, k)
+				break
+			}
+		}
+		lim = rate.NewLimiter(rate.Every(100*time.Millisecond), 60)
+		l.buckets[ip] = lim
+	}
+	return lim.Allow()
+}
 
 // ==========================================
 // 1. Subscription Types & Data Models
@@ -486,6 +515,16 @@ func (h *SubHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 	if !strings.HasPrefix(path, "/sub/") {
 		return false
 	}
+
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	if !globalSubIPLimiter.allow(clientIP) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return true
+	}
+
 	secret := strings.TrimPrefix(path, "/sub/")
 	secret = strings.Trim(secret, "/")
 	if secret == "" || strings.Contains(secret, "/") {
@@ -517,8 +556,8 @@ func (h *SubHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
-	// 2. Check node secret (/sub/{secret})
-	if secret != h.Store.Secret() {
+	// 2. Check node secret (/sub/{secret}) with constant-time comparison (SEC-10)
+	if subtle.ConstantTimeCompare([]byte(secret), []byte(h.Store.Secret())) != 1 {
 		http.NotFound(w, r)
 		return true
 	}

@@ -33,6 +33,8 @@ func NewAuthFailureJail() *AuthFailureJail {
 	return j
 }
 
+const maxJailEntries = 10000
+
 // RecordFailure records an authentication failure for ip.
 // If an IP fails 5 times within 1 minute, it is banned for 15 minutes.
 // Returns true if the IP is currently banned.
@@ -44,6 +46,22 @@ func (j *AuthFailureJail) RecordFailure(ip string) bool {
 	defer j.mu.Unlock()
 
 	now := time.Now()
+
+	// 内存硬顶限制：超过 10000 条强制清理过期条目 (SEC-09)
+	if len(j.records) >= maxJailEntries {
+		for k, v := range j.records {
+			if now.After(v.banUntil) && now.Sub(v.lastActive) > time.Minute {
+				delete(j.records, k)
+			}
+			if len(j.records) < maxJailEntries*3/4 {
+				break
+			}
+		}
+		if len(j.records) >= maxJailEntries {
+			return false
+		}
+	}
+
 	entry, ok := j.records[ip]
 	if !ok {
 		j.records[ip] = &jailEntry{

@@ -28,6 +28,7 @@ var (
 	activeEdgeIP       atomic.Pointer[net.IP]
 	activeEdgeECH      atomic.Pointer[[]byte]
 	activeEdgeAltPorts atomic.Pointer[[]int]
+	activeEdgePinSPKI  atomic.Pointer[[]string]
 
 	inboundDatagramHandlers sync.Map // map[uint32]func(payload []byte)
 )
@@ -67,6 +68,24 @@ func SetActiveEdgeAltPorts(ports []int) {
 	} else {
 		activeEdgeAltPorts.Store(nil)
 	}
+}
+
+// SetActiveEdgePinSPKI 设置当前激活节点的 SPKI 钉扎列表
+func SetActiveEdgePinSPKI(pins []string) {
+	if len(pins) > 0 {
+		pCopy := append([]string(nil), pins...)
+		activeEdgePinSPKI.Store(&pCopy)
+	} else {
+		activeEdgePinSPKI.Store(nil)
+	}
+}
+
+func getActivePinSPKI() []string {
+	p := activeEdgePinSPKI.Load()
+	if p != nil && *p != nil {
+		return append([]string(nil), (*p)...)
+	}
+	return nil
 }
 
 func getActiveEdgeAltPorts() []int {

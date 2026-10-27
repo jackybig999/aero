@@ -78,6 +78,7 @@ func startCrashGuardOnce() {
 		}
 	}
 	if guardPath == "" {
+		log.Printf("[GUARD] WARNING: Watchdog guard binary not found in %s! Crash recovery protection is disabled.", dir)
 		return
 	}
 	cmd := exec.Command(guardPath, "-pid", strconv.Itoa(os.Getpid()))
@@ -362,8 +363,8 @@ func SetupRoutes(devName, ipv4 string) error {
 	// 4. 为虚拟网卡绑定纯净虚拟网关 DNS (gwIP = 10.88.0.1)，使系统将 DNS 流量送入虚拟网卡，被 gVisor 端口 53 拦截处理
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=static", "address="+gwIP, "validate=no")
 
-	// 5. NRPT 策略配置：所有域名（Namespace "."）指向虚拟网关 DNS（gwIP = 10.88.0.1，绝对严禁指向网卡自身 tunIP！），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！
-	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+	// 5. NRPT 策略配置：所有域名（Namespace "."）指向虚拟网关 DNS（gwIP = 10.88.0.1，绝对严禁指向网卡自身 tunIP！），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！ (SEC-11)
+	_ = runCmd("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
 		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s' -Comment 'AERO_%s'", gwIP, devName))
 	_ = runCmd("ipconfig", "/flushdns")
 
@@ -376,7 +377,7 @@ func TeardownRoutes(devName string) {
 	if devName == "" {
 		devName = "aero0"
 	}
-	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+	_ = runCmd("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
 		fmt.Sprintf("Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_%s' } | Remove-DnsClientNrptRule -Force", devName))
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", devName)
@@ -389,7 +390,7 @@ func TeardownRoutes(devName string) {
 
 // CleanAero0StaleRoutes 仅删除归属于 aero0 接口的 0.0.0.0/1 和 128.0.0.0/1 及 DNS，碰不到任何其他网卡
 func CleanAero0StaleRoutes() {
-	_ = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+	_ = runCmd("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
 		"Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_aero0' } | Remove-DnsClientNrptRule -Force")
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", "aero0")

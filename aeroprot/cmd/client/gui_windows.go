@@ -485,6 +485,7 @@ func setupSystemTray(w webview2.WebView) {
 }
 
 func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
+	cleanOrphanWebViewData()
 	hideOwnConsole()
 	if !ensureSingleInstance() {
 		return
@@ -540,4 +541,41 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 
 	procShell_NotifyIconW.Call(uintptr(NIM_DELETE), uintptr(unsafe.Pointer(&trayNID)))
 	shutdown()
+}
+
+var (
+	procOpenProcess = modKernel32.NewProc("OpenProcess")
+	procCloseHandle = modKernel32.NewProc("CloseHandle")
+)
+
+const processQueryLimitedInformation = 0x1000
+
+func isProcessAlive(pid int) bool {
+	h, _, _ := procOpenProcess.Call(processQueryLimitedInformation, 0, uintptr(pid))
+	if h != 0 {
+		procCloseHandle.Call(h)
+		return true
+	}
+	return false
+}
+
+func cleanOrphanWebViewData() {
+	tempDir := os.TempDir()
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		return
+	}
+
+	curPID := os.Getpid()
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "aero-client-wv-") {
+			pidStr := strings.TrimPrefix(e.Name(), "aero-client-wv-")
+			if pid, err := strconv.Atoi(pidStr); err == nil && pid != curPID {
+				// 检查该进程是否还活着
+				if !isProcessAlive(pid) {
+					_ = os.RemoveAll(filepath.Join(tempDir, e.Name()))
+				}
+			}
+		}
+	}
 }

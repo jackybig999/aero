@@ -497,6 +497,9 @@ func (s *Server) Close() {
 	if s.validator != nil {
 		s.validator.Close()
 	}
+	if s.dialGuard != nil {
+		s.dialGuard.Close()
+	}
 	if s.cfg.ObfsPassword != "" {
 		RegisterFallbackPasswords(s.cfg.ObfsPassword, nil)
 	}

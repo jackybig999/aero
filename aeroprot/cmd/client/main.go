@@ -6,7 +6,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +17,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -60,6 +64,10 @@ func main() {
 		log.Fatalf("[CLIENT] failed to extract embedded ui: %v", err)
 	}
 
+	tokenBytes := make([]byte, 16)
+	_, _ = rand.Read(tokenBytes)
+	sessionToken := hex.EncodeToString(tokenBytes)
+
 	mux := http.NewServeMux()
 
 	// 1. 探活与健康检查白名单 (Rule P6 & U8: 双路由兼容)
@@ -70,11 +78,34 @@ func main() {
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/health", healthHandler)
 
-	// 2. 状态查询
+	// 2. 状态查询 (SEC-03: 白名单脱敏输出)
 	mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		st := eng.GetState()
-		_ = json.NewEncoder(w).Encode(st)
+		resp := map[string]any{
+			"connected":      st.Connected,
+			"starting":       st.Starting,
+			"stopping":       st.Stopping,
+			"last_error":     st.LastError,
+			"error_code":     st.ErrorCode,
+			"conflict_vpn":   st.ConflictVPN,
+			"mode":           st.Mode,
+			"listen":         st.Listen,
+			"active_node":    st.ActiveNode,
+			"active_sni":     st.ActiveSNI,
+			"actual_port":    st.ActualPort,
+			"nodes_count":    st.NodesCount,
+			"version":        st.Version,
+			"node":           st.Node,
+			"sni":            st.SNI,
+			"isp":            st.ISP,
+			"isp_name":       st.ISPName,
+			"rtt_ms":         st.RttMs,
+			"probe_ok":       st.ProbeOk,
+			"probe_ms":       st.ProbeMs,
+			"geo_rule_count": st.GeoRuleCount,
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	// 2b. TUN 虚拟网卡冲撞状态检查 (前置防呆与弹窗指引)
@@ -451,9 +482,11 @@ func main() {
 	// 13. 嵌入 Web 前端静态资源
 	mux.Handle("/", http.FileServer(http.FS(uiFS)))
 
+	apiHandler := csrfProtectMiddleware(sessionToken, mux)
+
 	apiServer := &http.Server{
 		Addr:    *apiAddr,
-		Handler: mux,
+		Handler: apiHandler,
 	}
 
 	go func() {
@@ -476,8 +509,60 @@ func main() {
 	if *headless {
 		runHeadless(shutdown)
 	} else {
-		runClientWindow(htmlUI, mux, shutdown)
+		runClientWindow(htmlUI, apiHandler, shutdown)
 	}
+}
+
+// csrfProtectMiddleware 防范跨站 CSRF 攻击与未授权控制
+func csrfProtectMiddleware(sessionToken string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/health" ||
+			(r.Method == http.MethodGet && !strings.HasPrefix(r.URL.Path, "/api/")) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 1. 拦截浏览器内核级跨站标记
+		if sfs := r.Header.Get("Sec-Fetch-Site"); sfs == "cross-site" {
+			http.Error(w, `{"status":"error","code":"CSRF_CROSS_SITE_BLOCKED"}`, http.StatusForbidden)
+			return
+		}
+
+		// 2. 敏感写操作强校验
+		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete {
+			tok := r.Header.Get("X-Aero-Client-Token")
+			if tok != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(sessionToken)) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				ref := r.Header.Get("Referer")
+				if !isAllowedLocalURL(ref) {
+					http.Error(w, `{"status":"error","code":"CSRF_ORIGIN_REQUIRED"}`, http.StatusForbidden)
+					return
+				}
+			} else if !isAllowedLocalURL(origin) {
+				http.Error(w, `{"status":"error","code":"CSRF_INVALID_ORIGIN"}`, http.StatusForbidden)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isAllowedLocalURL(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	h := u.Hostname()
+	return h == "127.0.0.1" || h == "localhost"
 }
 
 func getClientHTMLUI(uiFS fs.FS) string {

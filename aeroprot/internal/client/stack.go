@@ -319,6 +319,13 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 	id := r.ID()
+
+	// SEC-12: 拦截浏览器公共 DoH/DoT 旁路探测 (443/853)，促使浏览器安全回退系统 DNS (Fake-IP 漏斗)
+	if isPublicDoHEndpoint(id.LocalAddress.String(), id.LocalPort) {
+		r.Complete(true)
+		return
+	}
+
 	dst := joinHostPort(id.LocalAddress, id.LocalPort)
 	if isPrivateOrLoopbackAddr(id.LocalAddress) {
 		r.Complete(true)
@@ -402,6 +409,15 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 		return true
 	}
 	id := r.ID()
+
+	// SEC-12: 拦截公共 DoH-UDP/DoQ 旁路探测 (443/853)
+	if isPublicDoHEndpoint(id.LocalAddress.String(), id.LocalPort) {
+		if r.Packet() != nil {
+			r.Packet().DecRef()
+		}
+		return true
+	}
+
 	dst := joinHostPort(id.LocalAddress, id.LocalPort)
 
 	// 1. 优先拦截端口 53 DNS 查询（包括发往虚拟网关 10.88.0.1:53 等任何 DNS 目的地址）
@@ -758,4 +774,20 @@ func calcChecksum(data []byte) uint16 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 	return ^uint16(sum)
+}
+
+func isPublicDoHEndpoint(ipStr string, port uint16) bool {
+	if port != 443 && port != 853 {
+		return false
+	}
+	switch ipStr {
+	case "1.1.1.1", "1.0.0.1",
+		"8.8.8.8", "8.8.4.4",
+		"9.9.9.9", "149.112.112.112",
+		"208.67.222.222", "208.67.220.220",
+		"223.5.5.5", "223.6.6.6",
+		"119.29.29.29", "180.76.76.76":
+		return true
+	}
+	return false
 }

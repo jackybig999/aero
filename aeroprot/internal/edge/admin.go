@@ -62,17 +62,27 @@ func (h *AdminHandler) isLoopback(r *http.Request) bool {
 }
 
 func (h *AdminHandler) adminOK(r *http.Request) bool {
-	if h.isLoopback(r) {
-		return true
+	var key string
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		key = strings.TrimPrefix(auth, "Bearer ")
 	}
-	if h.adminKey == "" {
-		return false
+	if key == "" {
+		key = r.Header.Get("X-Aero-Admin-Key")
 	}
-	key := r.Header.Get("X-Aero-Admin-Key")
 	if key == "" {
 		key = r.URL.Query().Get("key")
 	}
-	return subtle.ConstantTimeCompare([]byte(key), []byte(h.adminKey)) == 1
+
+	// 模式 A：配置了 adminKey，强校验必须匹配（彻底杜绝反代穿透绕过）
+	if h.adminKey != "" {
+		if key == "" {
+			return false
+		}
+		return subtle.ConstantTimeCompare([]byte(key), []byte(h.adminKey)) == 1
+	}
+
+	// 模式 B：未配置 adminKey，仅允许本地回环（保留无 Key 单机部署便利）
+	return h.isLoopback(r)
 }
 
 // TryServe processes /admin/* requests. Returns false if path does not start with /admin.

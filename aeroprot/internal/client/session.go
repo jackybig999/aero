@@ -313,6 +313,8 @@ const maxDrainingSessions = 2
 // SessionManager manages active Session lifecycle, supporting dial, get, and reset.
 type SessionManager struct {
 	mu               sync.Mutex
+	cond             *sync.Cond
+	dialing          bool
 	currentSession   *Session
 	dialHook         func(ctx context.Context) (*Session, error)
 	drainingMu       sync.Mutex
@@ -321,7 +323,9 @@ type SessionManager struct {
 
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager() *SessionManager {
-	return &SessionManager{}
+	m := &SessionManager{}
+	m.cond = sync.NewCond(&m.mu)
+	return m
 }
 
 // SetDialHook sets a custom session dialer (primarily for testing).
@@ -334,73 +338,115 @@ func (m *SessionManager) SetDialHook(hook func(ctx context.Context) (*Session, e
 // GetSession returns the active session or creates a new one.
 func (m *SessionManager) GetSession(ctx context.Context) (*Session, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.currentSession != nil && m.currentSession.IsAlive() && !m.currentSession.IsDraining() {
-		return m.currentSession, nil
-	}
-
-	if m.currentSession != nil {
-		if !m.currentSession.IsDraining() {
-			_ = m.currentSession.Close()
+	for {
+		if m.currentSession != nil && m.currentSession.IsAlive() && !m.currentSession.IsDraining() {
+			sess := m.currentSession
+			m.mu.Unlock()
+			return sess, nil
 		}
-		m.currentSession = nil
+		if m.dialing {
+			if m.cond == nil {
+				m.cond = sync.NewCond(&m.mu)
+			}
+			m.cond.Wait()
+			continue
+		}
+		m.dialing = true
+		break
 	}
 
 	if m.dialHook != nil {
-		sess, err := m.dialHook(ctx)
-		if err != nil {
-			return nil, err
+		hook := m.dialHook
+		m.mu.Unlock()
+		sess, err := hook(ctx)
+		m.mu.Lock()
+		m.dialing = false
+		if err == nil {
+			if m.currentSession != nil && !m.currentSession.IsDraining() {
+				_ = m.currentSession.Close()
+			}
+			m.currentSession = sess
 		}
-		m.currentSession = sess
-		return sess, nil
+		if m.cond != nil {
+			m.cond.Broadcast()
+		}
+		m.mu.Unlock()
+		return sess, err
 	}
+	m.mu.Unlock()
 
 	addr, tok, sni, ip := getActiveEdge()
+	var newSess *Session
+	var dialErr error
+
 	if addr == "" {
-		return nil, errors.New("no active edge address configured")
-	}
-
-	cfg := DefaultTransportConfig(addr, sni)
-	if ech := getActiveEdgeECH(); len(ech) > 0 {
-		cfg.ECHConfigList = ech
-	}
-	if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
-		cfg.AltPorts = altPorts
-	}
-	port := 443
-	if _, portStr, err := net.SplitHostPort(addr); err == nil {
-		if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
-			port = p
+		dialErr = errors.New("no active edge address configured")
+	} else {
+		cfg := DefaultTransportConfig(addr, sni)
+		if ech := getActiveEdgeECH(); len(ech) > 0 {
+			cfg.ECHConfigList = ech
 		}
-	}
-	if ip != nil {
-		cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
-	}
+		if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
+			cfg.AltPorts = altPorts
+		}
+		if pins := getActivePinSPKI(); len(pins) > 0 {
+			if cfg.TLSConfig == nil {
+				nodeHost := addr
+				if h, _, err := net.SplitHostPort(addr); err == nil {
+					nodeHost = h
+				}
+				cfg.TLSConfig = defaultTLSConfig(cfg.TLSServerName, nodeHost)
+			}
+			configureSPKIPinning(cfg.TLSConfig, pins)
+		}
+		port := 443
+		if _, portStr, err := net.SplitHostPort(addr); err == nil {
+			if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
+				port = p
+			}
+		}
+		if ip != nil {
+			cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
+		}
 
-	client, err := Dial(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("dial edge session: %w", err)
-	}
-
-	if client.ActualPort() > 0 && client.ActualPort() != port {
-		h, _, _ := net.SplitHostPort(addr)
-		addr = net.JoinHostPort(h, strconv.Itoa(client.ActualPort()))
-		if len(cfg.ECHConfigList) > 0 {
-			SetActiveEdge(addr, tok, sni, ip, cfg.ECHConfigList)
+		client, err := Dial(ctx, cfg)
+		if err != nil {
+			dialErr = fmt.Errorf("dial edge session: %w", err)
 		} else {
-			SetActiveEdge(addr, tok, sni, ip)
+			if client.ActualPort() > 0 && client.ActualPort() != port {
+				h, _, _ := net.SplitHostPort(addr)
+				addr = net.JoinHostPort(h, strconv.Itoa(client.ActualPort()))
+				if len(cfg.ECHConfigList) > 0 {
+					SetActiveEdge(addr, tok, sni, ip, cfg.ECHConfigList)
+				} else {
+					SetActiveEdge(addr, tok, sni, ip)
+				}
+			}
+
+			newSess, dialErr = NewSession(client, tok, addr, sni)
+			if dialErr != nil {
+				_ = client.Close()
+			}
 		}
 	}
 
-	sess, err := NewSession(client, tok, addr, sni)
-	if err != nil {
-		_ = client.Close()
-		return nil, err
+	m.mu.Lock()
+	m.dialing = false
+	if dialErr == nil && newSess != nil {
+		if m.currentSession != nil && !m.currentSession.IsDraining() {
+			_ = m.currentSession.Close()
+		}
+		m.currentSession = newSess
 	}
+	if m.cond != nil {
+		m.cond.Broadcast()
+	}
+	m.mu.Unlock()
 
-	m.currentSession = sess
-	return sess, nil
+	if dialErr != nil {
+		return nil, dialErr
+	}
+	return newSess, nil
 }
 
 // DialTCP dials an outbound TCP stream using the active session.

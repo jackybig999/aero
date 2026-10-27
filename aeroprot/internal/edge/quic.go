@@ -383,6 +383,38 @@ func (ct *ConnTracker) CloseAll() {
 	}
 }
 
+// StartReaper starts periodic dead connection scanning to prevent lingering pointers. (NEW-02)
+func (ct *ConnTracker) StartReaper(stopCh <-chan struct{}) {
+	ticker := time.NewTicker(5 * time.Minute)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				ct.sweepDeadPointers()
+			}
+		}
+	}()
+}
+
+func (ct *ConnTracker) sweepDeadPointers() {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	for c := range ct.conns {
+		if c == nil {
+			delete(ct.conns, c)
+			continue
+		}
+		select {
+		case <-c.Context().Done():
+			delete(ct.conns, c)
+		default:
+		}
+	}
+}
+
 // ==========================================
 // 4. QUIC Server Instance & UDP Context Management
 // ==========================================
@@ -450,6 +482,9 @@ type QUICServer struct {
 	udpSessions     map[*udpSessionTracker]struct{}
 	stunIdleTimeout time.Duration
 	udpIdleTimeout  time.Duration
+
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // MeteringReportRecord represents an edge traffic usage record to be synced with midplatform.
@@ -944,8 +979,66 @@ func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Co
 	if s.nextHopUDPDialer != nil {
 		return s.nextHopUDPDialer(nextHopAddr, target, hopCred)
 	}
-	return nil, fmt.Errorf("next hop udp relay not configured")
+
+	// 生产真实链路：通过 MASQUE CONNECT-UDP 向上游下一跳中继建立隧道 (NEW-01)
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+	qConn, err := quic.DialAddr(context.Background(), nextHopAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		return nil, fmt.Errorf("dial next hop quic: %w", err)
+	}
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+	masqueClient := masque.NewClientConn(h3Conn)
+
+	tmpl := uritemplate.MustNew("https://" + nextHopAddr + "/.well-known/masque/udp/{target_host}/{target_port}/")
+	mreq, err := masque.NewRequest(context.Background(), tmpl, target)
+	if err != nil {
+		_ = qConn.CloseWithError(0, "req err")
+		return nil, err
+	}
+	if hopCred != "" {
+		mreq.Header().Set("Authorization", "Bearer "+hopCred)
+	}
+
+	mConn, resp, err := masqueClient.Dial(mreq)
+	if err != nil {
+		_ = qConn.CloseWithError(0, "masque err")
+		return nil, fmt.Errorf("next hop masque dial: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = mConn.Close()
+		_ = qConn.CloseWithError(0, "rejected")
+		return nil, fmt.Errorf("next hop rejected: %s", resp.Status)
+	}
+
+	return &nextHopUDPRelayConn{mConn: mConn, qConn: qConn}, nil
 }
+
+type nextHopUDPRelayConn struct {
+	mConn *masque.Conn
+	qConn *quic.Conn
+}
+
+func (c *nextHopUDPRelayConn) Read(p []byte) (int, error) {
+	n, _, err := c.mConn.ReadFrom(p)
+	return n, err
+}
+func (c *nextHopUDPRelayConn) Write(p []byte) (int, error) {
+	return c.mConn.WriteTo(p, nil)
+}
+func (c *nextHopUDPRelayConn) Close() error {
+	_ = c.mConn.Close()
+	if c.qConn != nil {
+		_ = c.qConn.CloseWithError(0, "relay closed")
+	}
+	return nil
+}
+func (c *nextHopUDPRelayConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
+func (c *nextHopUDPRelayConn) RemoteAddr() net.Addr               { return &net.UDPAddr{} }
+func (c *nextHopUDPRelayConn) SetDeadline(t time.Time) error      { return nil }
+func (c *nextHopUDPRelayConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *nextHopUDPRelayConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // NewQUICServer creates a new QUICServer instance
 func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter) *QUICServer {
@@ -973,7 +1066,9 @@ func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		offlineBacklog: make(map[string]*MeteringReportRecord),
 		offlineBurst:   make(map[string]int64),
 		udpSessions:    make(map[*udpSessionTracker]struct{}),
+		stopCh:         make(chan struct{}),
 	}
+	qs.connTracker.StartReaper(qs.stopCh)
 	qs.h3Server = &http3.Server{
 		Handler:         qs,
 		EnableDatagrams: true,
@@ -991,6 +1086,11 @@ func (s *QUICServer) AuthJail() *AuthFailureJail {
 
 // Close closes the QUICServer and its background components
 func (s *QUICServer) Close() {
+	s.closeOnce.Do(func() {
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+	})
 	if s.authJail != nil {
 		s.authJail.Close()
 	}
@@ -1090,6 +1190,22 @@ func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx conte
 	}
 
 	quicCfg := DefaultQUICConfig()
+
+	// 根据部署 Profile 动态收紧接收窗口，防范 512MB VPS 内存撑爆 (SEC-02)
+	if server != nil && server.cfg != nil {
+		switch strings.ToLower(server.cfg.Profile) {
+		case "tiny": // <= 512MB RAM
+			quicCfg.InitialStreamReceiveWindow = 2 * 1024 * 1024     // 2MB
+			quicCfg.MaxStreamReceiveWindow = 4 * 1024 * 1024         // 4MB
+			quicCfg.InitialConnectionReceiveWindow = 4 * 1024 * 1024 // 4MB
+			quicCfg.MaxConnectionReceiveWindow = 8 * 1024 * 1024     // 8MB
+		case "small": // 1GB RAM
+			quicCfg.InitialStreamReceiveWindow = 8 * 1024 * 1024      // 8MB
+			quicCfg.MaxStreamReceiveWindow = 16 * 1024 * 1024         // 16MB
+			quicCfg.InitialConnectionReceiveWindow = 16 * 1024 * 1024 // 16MB
+			quicCfg.MaxConnectionReceiveWindow = 32 * 1024 * 1024     // 32MB
+		}
+	}
 	if qlogDir := os.Getenv("AERO_QLOG_DIR"); qlogDir != "" {
 		_ = os.MkdirAll(qlogDir, 0o755)
 		_ = os.Setenv("QLOGDIR", qlogDir)
@@ -1411,11 +1527,21 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	str := streamer.HTTPStream()
 	defer str.Close()
 
+	relayCtx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// 联动退出协程：任一端结束立即通知另一端释放
+	go func() {
+		<-relayCtx.Done()
+		_ = targetConn.Close()
+		str.CancelRead(quic.StreamErrorCode(0))
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
-		defer wg.Done()
+		defer func() { cancel(); wg.Done() }()
 		bufPtr := relayBufPool.Get().(*[]byte)
 		defer relayBufPool.Put(bufPtr)
 		buf := *bufPtr
@@ -1425,6 +1551,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 				if s.bandwidthLimiter != nil {
 					s.bandwidthLimiter.Take(token, n)
 				}
+				_ = targetConn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 				if _, werr := targetConn.Write(buf[:n]); werr != nil {
 					break
 				}
@@ -1433,15 +1560,15 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 				break
 			}
 		}
-		_ = targetConn.Close()
 	}()
 
 	go func() {
-		defer wg.Done()
+		defer func() { cancel(); wg.Done() }()
 		bufPtr := relayBufPool.Get().(*[]byte)
 		defer relayBufPool.Put(bufPtr)
 		buf := *bufPtr
 		for {
+			_ = targetConn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			n, err := targetConn.Read(buf)
 			if n > 0 {
 				if s.bandwidthLimiter != nil {
@@ -1455,7 +1582,6 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 				break
 			}
 		}
-		_ = str.Close()
 	}()
 
 	wg.Wait()

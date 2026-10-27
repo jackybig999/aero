@@ -263,6 +263,37 @@ func defaultTLSConfig(serverName string, nodeHost ...string) *tls.Config {
 	return cfg
 }
 
+// configureSPKIPinning 动态为 TLSConfig 注入 SPKI 钉扎校验 (NEW-07)
+func configureSPKIPinning(tlsConf *tls.Config, pins []string) {
+	if tlsConf == nil || len(pins) == 0 {
+		return
+	}
+	origVerify := tlsConf.VerifyPeerCertificate
+	tlsConf.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		if origVerify != nil {
+			if err := origVerify(rawCerts, verifiedChains); err != nil {
+				return err
+			}
+		} else if len(rawCerts) == 0 {
+			return errors.New("tls: no certificates presented by peer")
+		}
+		if len(rawCerts) == 0 {
+			return errors.New("tls: no certificates presented by peer")
+		}
+		cert, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("tls: failed to parse certificate: %w", err)
+		}
+		actualPin := CertSPKI(cert)
+		for _, p := range pins {
+			if actualPin == strings.TrimSpace(p) {
+				return nil
+			}
+		}
+		return fmt.Errorf("SPKI_PIN_MISMATCH: server pin %q not in trusted pins", actualPin)
+	}
+}
+
 // Client QUIC 连接客户端
 type Client struct {
 	conn       *quic.Conn

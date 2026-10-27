@@ -6,6 +6,7 @@ package client
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -483,6 +484,79 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 	return sub, body, nil
 }
 
+// 镜像对齐服务端 edge/sub.go 中的 SubServer 结构，绝不携带多余字段
+type subServerForSign struct {
+	Name        string   `json:"name"`
+	Host        string   `json:"host"`
+	Address     string   `json:"address,omitempty"`
+	IP          string   `json:"ip,omitempty"`
+	Token       string   `json:"token"`
+	SNI         string   `json:"sni"`
+	Protocol    string   `json:"protocol"`
+	PinSPKI     []string `json:"pin_spki,omitempty"`
+	LineType    string   `json:"line_type,omitempty"`
+	ISPAffinity string   `json:"isp_affinity,omitempty"`
+	AltPorts    []int    `json:"alt_ports,omitempty"`
+	ECH         string   `json:"ech,omitempty" yaml:"ech"`
+}
+
+type subSignBodyForVerify struct {
+	Version   string             `json:"version"`
+	UserID    string             `json:"userId,omitempty"`
+	ExpireAt  int64              `json:"expireAt,omitempty"`
+	Servers   []subServerForSign `json:"servers"`
+	CreatedAt int64              `json:"createdAt,omitempty"`
+}
+
+func verifySubscriptionSignature(sub *Subscription) error {
+	if sub == nil || sub.Signature == "" {
+		// 向后兼容：无签名旧订阅平滑放行
+		return nil
+	}
+	if len(sub.Servers) == 0 || strings.TrimSpace(sub.Servers[0].Token) == "" {
+		return fmt.Errorf("subscription signature present but primary server token missing")
+	}
+
+	signServers := make([]subServerForSign, len(sub.Servers))
+	for i, s := range sub.Servers {
+		signServers[i] = subServerForSign{
+			Name:        s.Name,
+			Host:        s.Host,
+			Address:     s.Address,
+			IP:          s.IP,
+			Token:       s.Token,
+			SNI:         s.SNI,
+			Protocol:    s.Protocol,
+			PinSPKI:     s.PinSPKI,
+			LineType:    s.LineType,
+			ISPAffinity: s.ISPAffinity,
+			AltPorts:    s.AltPorts,
+			ECH:         s.ECH,
+		}
+	}
+
+	body := subSignBodyForVerify{
+		Version:   sub.Version,
+		UserID:    sub.UserID,
+		ExpireAt:  sub.ExpireAt,
+		Servers:   signServers,
+		CreatedAt: sub.CreatedAt,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("verify: marshal payload failed: %w", err)
+	}
+
+	mac := hmac.New(sha256.New, []byte(sub.Servers[0].Token))
+	mac.Write(data)
+	expected := base64.URLEncoding.EncodeToString(mac.Sum(nil))
+
+	if !hmac.Equal([]byte(expected), []byte(sub.Signature)) {
+		return fmt.Errorf("ERR_SUB_TAMPERED: HMAC signature mismatch, node payload untrusted")
+	}
+	return nil
+}
+
 // ParseSubscriptionBytes 解析 Base64 或原始 JSON 订阅报文
 func ParseSubscriptionBytes(data []byte) (*Subscription, error) {
 	dataStr := strings.TrimSpace(string(data))
@@ -502,6 +576,9 @@ func ParseSubscriptionBytes(data []byte) (*Subscription, error) {
 	}
 	if sub.Version != "aero/3.0" {
 		return nil, fmt.Errorf("unsupported subscription version %q (expected aero/3.0)", sub.Version)
+	}
+	if err := verifySubscriptionSignature(&sub); err != nil {
+		return nil, err
 	}
 	if err := sub.ValidateAndNormalize(); err != nil {
 		return nil, fmt.Errorf("subscription validation failed: %w", err)

@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -266,10 +267,14 @@ func IsBlockedIP(ip net.IP) (bool, string) {
 
 // DialGuard provides concurrency limiting, SSRF protection, and intelligent Cloudflare WARP upstream routing
 type DialGuard struct {
-	sem        chan struct{}
-	AllowLocal bool
-	WarpProxy  string // e.g. "127.0.0.1:40000"
-	WarpAll    bool   // route all outbound traffic through WARP proxy
+	sem          chan struct{}
+	AllowLocal   bool
+	WarpProxy    string // e.g. "127.0.0.1:40000"
+	WarpAll      bool   // route all outbound traffic through WARP proxy
+	warpHealthy  atomic.Bool
+	probeTrigger chan struct{}
+	stopCh       chan struct{}
+	closeOnce    sync.Once
 }
 
 // NewDialGuard creates a DialGuard; maxConcurrent <= 0 defaults to 256
@@ -277,7 +282,23 @@ func NewDialGuard(maxConcurrent int) *DialGuard {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 256
 	}
-	return &DialGuard{sem: make(chan struct{}, maxConcurrent)}
+	dg := &DialGuard{
+		sem:          make(chan struct{}, maxConcurrent),
+		probeTrigger: make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
+	}
+	dg.warpHealthy.Store(true)
+	go dg.backgroundWarpHealthChecker()
+	return dg
+}
+
+// Close gracefully stops the background WARP health checker
+func (g *DialGuard) Close() {
+	if g != nil {
+		g.closeOnce.Do(func() {
+			close(g.stopCh)
+		})
+	}
 }
 
 // SetWarpProxy configures upstream Cloudflare WARP SOCKS5 proxy
@@ -285,6 +306,12 @@ func (g *DialGuard) SetWarpProxy(proxyAddr string, all bool) {
 	if g != nil {
 		g.WarpProxy = proxyAddr
 		g.WarpAll = all
+		if proxyAddr != "" {
+			select {
+			case g.probeTrigger <- struct{}{}:
+			default:
+			}
+		}
 	}
 }
 
@@ -295,13 +322,30 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 		dialFn = net.DialTimeout
 	}
 
+	isAIDomain := isTargetAIDomain(address)
+
 	// 智能 WARP 出口净化：当配置/探测到远端 VPS 运行了 Cloudflare WARP SOCKS5 代理时，
 	// 对 Google、OpenAI、Gemini 等 AI 限制域名（或全量流量）经由 WARP 出口转发，彻底消灭 IP 标记与 403 封锁！
-	if g != nil && g.WarpProxy != "" && (g.WarpAll || isTargetAIDomain(address)) {
-		if c, err := dialViaSOCKS5(g.WarpProxy, address, timeout); err == nil {
-			return c, nil
+	if g != nil && g.WarpProxy != "" && (g.WarpAll || isAIDomain) {
+		if g.warpHealthy.Load() {
+			c, err := dialViaSOCKS5(g.WarpProxy, address, timeout)
+			if err == nil {
+				return c, nil
+			}
+			g.warpHealthy.Store(false)
+			select {
+			case g.probeTrigger <- struct{}{}:
+			default:
+			}
+			log.Printf("[WARP-CIRCUIT-OPEN] Upstream WARP dial failed for %s (%v). Circuit tripped.", address, err)
 		}
-		// 若 WARP 出口临时异常或未就绪，平滑回退直接出站
+
+		// AI 核心资产 Fail-Closed 保护：0ms 立即阻断，绝不直连裸奔！
+		if isAIDomain {
+			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: direct dial refused to prevent AI region leak (target: %s)", address)
+		}
+
+		log.Printf("[WARP-FALLBACK] Non-AI target %s dial via direct due to open circuit.", address)
 	}
 
 	if g == nil || g.sem == nil {
@@ -314,6 +358,32 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 		return nil, fmt.Errorf("dial queue full")
 	}
 	return dialFn(network, address, timeout)
+}
+
+func (g *DialGuard) backgroundWarpHealthChecker() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-g.stopCh:
+			return
+		case <-ticker.C:
+		case <-g.probeTrigger:
+		}
+
+		if g.WarpProxy == "" {
+			continue
+		}
+
+		probeConn, err := net.DialTimeout("tcp", g.WarpProxy, 1500*time.Millisecond)
+		if err == nil {
+			_ = probeConn.Close()
+			if !g.warpHealthy.Load() {
+				log.Printf("[WARP-CIRCUIT-RESET] WARP proxy %s recovered. Normal routing restored.", g.WarpProxy)
+				g.warpHealthy.Store(true)
+			}
+		}
+	}
 }
 
 func isTargetAIDomain(address string) bool {
@@ -493,14 +563,15 @@ func (g *DialGuard) Cap() int {
 
 // RateLimiter limits incoming connection rates per IP and manages temporary bans
 type RateLimiter struct {
-	mu          sync.Mutex
-	buckets     map[string]*rateTokenBucket
-	maxPerIP    float64
-	banAfter    int
-	banDuration time.Duration
-	bans        map[string]time.Time
-	fails       map[string]int
-	lastSweep   time.Time
+	mu            sync.Mutex
+	buckets       map[string]*rateTokenBucket
+	maxPerIP      float64
+	banAfter      int
+	banDuration   time.Duration
+	bans          map[string]time.Time
+	fails         map[string]int
+	lastSweep     time.Time
+	lastSweepUnix atomic.Int64
 }
 
 type rateTokenBucket struct {
@@ -537,9 +608,18 @@ func ClientIP(r *http.Request) string {
 
 // Allow returns true if IP is allowed to connect
 func (l *RateLimiter) Allow(ip string) bool {
+	nowUnix := time.Now().Unix()
+	// 锁外无锁检查：若距上次清理不足 120 秒，绝不进锁全量清扫！ (NEW-04)
+	if nowUnix-l.lastSweepUnix.Load() > 120 {
+		if l.lastSweepUnix.CompareAndSwap(l.lastSweepUnix.Load(), nowUnix) {
+			l.mu.Lock()
+			l.sweepLocked()
+			l.mu.Unlock()
+		}
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.sweepLocked()
 
 	if until, ok := l.bans[ip]; ok {
 		if time.Now().Before(until) {
