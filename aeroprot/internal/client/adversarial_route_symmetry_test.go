@@ -1,6 +1,7 @@
 package client
 
 import (
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +31,9 @@ func newVirtualNetworkState() *virtualNetworkState {
 // TestAdversarial_LinuxRouteTeardownSymmetry empirically executes SetupRoutes
 // followed by TeardownRoutes on Linux, asserting zero lingering routes or addresses.
 func TestAdversarial_LinuxRouteTeardownSymmetry(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping Linux-specific route teardown test on non-Linux OS")
+	}
 	devName := "aero0"
 	tunIP := "10.88.0.2/24"
 
@@ -237,6 +241,9 @@ func TestAdversarial_WindowsRouteModelSymmetry(t *testing.T) {
 // TestAdversarial_LinuxCleanStaleRoutesSymmetry verifies CleanAero0StaleRoutes
 // deletes lingering routes in recovery scenarios.
 func TestAdversarial_LinuxCleanStaleRoutesSymmetry(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping Linux-specific stale routes cleanup test on non-Linux OS")
+	}
 	vState := newVirtualNetworkState()
 	// Stale state left by crashed process
 	vState.routes["0.0.0.0/1"] = "aero0"
