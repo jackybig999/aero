@@ -327,6 +327,8 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runCmd("netsh", "interface", "set", "interface", "name="+devName, "admin=ENABLED")
 	time.Sleep(300 * time.Millisecond)
 
+	_ = runCmd("netsh", "interface", "ipv6", "add", "address", devName, "fd88::2/64")
+
 	idx := interfaceIndex(devName)
 
 	// 1. 设置初始虚拟网卡 MTU 为 1360
@@ -381,6 +383,7 @@ func TeardownRoutes(devName string) {
 		fmt.Sprintf("Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_%s' } | Remove-DnsClientNrptRule -Force", devName))
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", devName)
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "address", devName, "fd88::2")
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
@@ -394,6 +397,7 @@ func CleanAero0StaleRoutes() {
 		"Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_aero0' } | Remove-DnsClientNrptRule -Force")
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", "aero0")
+	_ = runCmd("netsh", "interface", "ipv6", "delete", "address", "aero0", "fd88::2")
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name=aero0", "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", "aero0")

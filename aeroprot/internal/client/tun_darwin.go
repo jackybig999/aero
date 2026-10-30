@@ -227,6 +227,8 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runMac("ifconfig", devName, "inet", tunIP, tunIP)
 	_ = runMac("ifconfig", devName, "up")
 
+	_ = runMac("ifconfig", devName, "inet6", "add", "fd88::2/64")
+
 	_ = SetInterfaceMTU(devName, 1360)
 	RegisterVirtualNICMTUSetter(func(mtu int) error {
 		return SetInterfaceMTU(devName, mtu)
@@ -256,6 +258,7 @@ func TeardownRoutes(devName string) {
 	}
 	_ = runMac("route", "delete", "-inet6", "::/1", "-interface", devName)
 	_ = runMac("route", "delete", "-inet6", "8000::/1", "-interface", devName)
+	_ = runMac("ifconfig", devName, "inet6", "delete", "fd88::2")
 	_ = runMac("route", "delete", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "delete", "-net", "128.0.0.0/1", "-interface", devName)
 	log.Printf("[TUN] Routes removed for %s", devName)

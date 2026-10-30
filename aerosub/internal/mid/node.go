@@ -46,8 +46,30 @@ type Node struct {
 	BandwidthMB   int32      `json:"bandwidth_mb,omitempty"`
 	AgentVersion  string     `json:"agent_version,omitempty"`
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	ECHConfig     string     `json:"ech_config,omitempty" yaml:"ech_config"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+func (n *Node) UnmarshalJSON(data []byte) error {
+	type Alias Node
+	aux := struct {
+		*Alias
+		LegacyECHConfig string `json:"echConfig"`
+		LegacyECH       string `json:"ech"`
+	}{
+		Alias: (*Alias)(n),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if n.ECHConfig == "" && aux.LegacyECHConfig != "" {
+		n.ECHConfig = aux.LegacyECHConfig
+	}
+	if n.ECHConfig == "" && aux.LegacyECH != "" {
+		n.ECHConfig = aux.LegacyECH
+	}
+	return nil
 }
 
 type NodeService struct {
@@ -1255,7 +1277,29 @@ type EndpointInfo struct {
 	SubURL    string    `json:"sub_url"`
 	Installed bool      `json:"installed"`
 	Version   string    `json:"version,omitempty"`
+	ECHConfig string    `json:"ech_config,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (ep *EndpointInfo) UnmarshalJSON(data []byte) error {
+	type Alias EndpointInfo
+	aux := struct {
+		*Alias
+		LegacyECH      string `json:"ech"`
+		LegacyCamelECH string `json:"echConfig"`
+	}{
+		Alias: (*Alias)(ep),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if ep.ECHConfig == "" && aux.LegacyCamelECH != "" {
+		ep.ECHConfig = aux.LegacyCamelECH
+	}
+	if ep.ECHConfig == "" && aux.LegacyECH != "" {
+		ep.ECHConfig = aux.LegacyECH
+	}
+	return nil
 }
 
 type EndpointStore struct {

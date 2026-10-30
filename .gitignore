@@ -66,5 +66,9 @@ D\\:*
 *PLAN*.md
 *MANIFEST*.md
 
+# Subagent directories
+.agents/
+
+
 
 

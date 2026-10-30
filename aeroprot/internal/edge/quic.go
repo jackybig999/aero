@@ -293,6 +293,78 @@ func (p *IPPool) Available() bool {
 	return uint32(len(p.used)) < p.maxHost
 }
 
+// IPv6Pool dynamically allocates client IPv6 prefixes within a ULA pool (fd88::/64).
+type IPv6Pool struct {
+	mu       sync.Mutex
+	baseIP   netip.Addr
+	prefix   int
+	nextHost uint32
+	maxHost  uint32
+	used     map[netip.Addr]struct{}
+}
+
+// NewIPv6Pool creates an IPv6Pool with specified CIDR (default fd88::/64).
+func NewIPv6Pool(cidrStr string) (*IPv6Pool, error) {
+	if cidrStr == "" {
+		cidrStr = "fd88::/64"
+	}
+	prefix, err := netip.ParsePrefix(cidrStr)
+	if err != nil {
+		return nil, err
+	}
+	return &IPv6Pool{
+		baseIP:   prefix.Addr(),
+		prefix:   prefix.Bits(),
+		nextHost: 2,
+		maxHost:  65534,
+		used:     make(map[netip.Addr]struct{}),
+	}, nil
+}
+
+// Allocate returns an unused /128 IPv6 prefix from the pool.
+func (p *IPv6Pool) Allocate() (netip.Prefix, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	base16 := p.baseIP.As16()
+	baseVal := binary.BigEndian.Uint32(base16[12:16])
+
+	for i := uint32(0); i < p.maxHost; i++ {
+		host := p.nextHost
+		p.nextHost++
+		if p.nextHost >= p.maxHost {
+			p.nextHost = 2
+		}
+		val := baseVal + host
+		var cand16 [16]byte
+		copy(cand16[:12], base16[:12])
+		binary.BigEndian.PutUint32(cand16[12:], val)
+		candAddr := netip.AddrFrom16(cand16)
+		if _, exists := p.used[candAddr]; !exists {
+			p.used[candAddr] = struct{}{}
+			return netip.PrefixFrom(candAddr, 128), nil
+		}
+	}
+	return netip.Prefix{}, errors.New("ipv6 pool exhausted")
+}
+
+// Release returns a prefix back to the pool.
+func (p *IPv6Pool) Release(prefix netip.Prefix) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.used, prefix.Addr())
+}
+
+// Available checks if there is any available IPv6 address in the pool.
+func (p *IPv6Pool) Available() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return uint32(len(p.used)) < p.maxHost
+}
+
 // ==========================================
 // 3. Connection Token Tracker
 // ==========================================
@@ -448,6 +520,7 @@ type QUICServer struct {
 	dnsResolver      *DNSResolver
 	connTracker      *ConnTracker
 	ipPool           *IPPool
+	ipv6Pool         *IPv6Pool
 	authJail         *AuthFailureJail
 	masqueProxy      *masque.Proxy
 	connectIPProxy   *connectip.Proxy
@@ -468,6 +541,7 @@ type QUICServer struct {
 	resolveUDPFn         func(network, addr string) (*net.UDPAddr, error)
 	udpDialFn            func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
 	icmpForwardHook      func(target net.IP, echoReq []byte) ([]byte, error)
+	icmpv6ForwardHook    func(target net.IP, echoReq []byte) ([]byte, error)
 	nextHopDialer        func(nextHopAddr, target, hopCred string) (net.Conn, error)
 	nextHopUDPDialer     func(nextHopAddr, target, hopCred string) (net.Conn, error)
 
@@ -795,6 +869,11 @@ func (s *QUICServer) SetICMPForwardHookForTest(hook func(target net.IP, echoReq 
 	s.icmpForwardHook = hook
 }
 
+// SetICMPv6ForwardHookForTest sets custom ICMPv6 forward hook for testing
+func (s *QUICServer) SetICMPv6ForwardHookForTest(hook func(target net.IP, echoReq []byte) ([]byte, error)) {
+	s.icmpv6ForwardHook = hook
+}
+
 // SetAllowLoopbackForTest enables loopback dialing for unit tests.
 func (s *QUICServer) SetAllowLoopbackForTest(allow bool) {
 	s.allowLoopbackForTest = allow
@@ -1043,6 +1122,7 @@ func (c *nextHopUDPRelayConn) SetWriteDeadline(t time.Time) error { return nil }
 // NewQUICServer creates a new QUICServer instance
 func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter) *QUICServer {
 	ipPool, _ := NewIPPool("10.88.0.0/16")
+	ipv6Pool, _ := NewIPv6Pool("fd88::/64")
 	qs := &QUICServer{
 		validator:        v,
 		connLimiter:      cl,
@@ -1052,6 +1132,7 @@ func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		dnsResolver:      NewDNSResolver(),
 		connTracker:      NewConnTracker(),
 		ipPool:           ipPool,
+		ipv6Pool:         ipv6Pool,
 		authJail:         NewAuthFailureJail(),
 		masqueProxy:      &masque.Proxy{},
 		connectIPProxy:   &connectip.Proxy{},
@@ -1833,13 +1914,26 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.ipPool.Release(assignedPrefix)
 
+	var assignedIPv6 netip.Prefix
+	if s.ipv6Pool != nil {
+		if v6Prefix, err := s.ipv6Pool.Allocate(); err == nil {
+			assignedIPv6 = v6Prefix
+			defer s.ipv6Pool.Release(assignedIPv6)
+		}
+	}
+
 	conn, err := s.connectIPProxy.Proxy(w, proxyReq)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
 
-	if err := conn.AssignAddresses([]netip.Prefix{assignedPrefix}); err != nil {
+	assignedPrefixes := []netip.Prefix{assignedPrefix}
+	if assignedIPv6.IsValid() {
+		assignedPrefixes = append(assignedPrefixes, assignedIPv6)
+	}
+
+	if err := conn.AssignAddresses(assignedPrefixes); err != nil {
 		return
 	}
 	if err := conn.AdvertiseRoute([]connectip.IPRoute{
@@ -1848,12 +1942,22 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 			EndIP:      netip.MustParseAddr("255.255.255.255"),
 			IPProtocol: 0,
 		},
+		{
+			StartIP:    netip.MustParseAddr("::"),
+			EndIP:      netip.MustParseAddr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+			IPProtocol: 0,
+		},
 	}); err != nil {
 		return
 	}
 
 	// 启动真实 RFC 9484 用户态 NAT 路由器，绝不使用虚假回显
-	natRouter, err := NewUserSpaceNATRouter(r.Context(), s, token, assignedPrefix.Addr(), conn)
+	var natRouter *UserSpaceNATRouter
+	if assignedIPv6.IsValid() {
+		natRouter, err = NewUserSpaceNATRouter(r.Context(), s, token, assignedPrefix.Addr(), conn, assignedIPv6.Addr())
+	} else {
+		natRouter, err = NewUserSpaceNATRouter(r.Context(), s, token, assignedPrefix.Addr(), conn)
+	}
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return

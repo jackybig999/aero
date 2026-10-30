@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2639,61 +2640,199 @@ func TestPhase3Gate2_RouteCommandsPairing(t *testing.T) {
 		}
 	}
 
-	// 验证 IPv6 黑洞路由添加与删除成对
-	var ipv6Add1, ipv6Add2, ipv6Del1, ipv6Del2 bool
-	// 验证 IPv4 分流路由添加与删除成对
-	var ipv4Del1, ipv4Del2 bool
-	var routeAddCount int
-	// 验证 NRPT 策略添加与删除成对
-	var nrptAdded, nrptDeleted bool
+	switch runtime.GOOS {
+	case "windows":
+		// 验证 IPv6 黑洞路由添加与删除成对
+		var ipv6Add1, ipv6Add2, ipv6Del1, ipv6Del2 bool
+		var ipv6AddrAdd, ipv6AddrDel bool
+		// 验证 IPv4 分流路由添加与删除成对
+		var ipv4Del1, ipv4Del2 bool
+		var routeAddCount int
+		// 验证 NRPT 策略添加与删除成对
+		var nrptAdded, nrptDeleted bool
 
-	for _, cmd := range executedCommands {
-		cmdStr := strings.Join(cmd, " ")
-		// IPv6 检查
-		if strings.Contains(cmdStr, "interface ipv6 add route ::/1") && strings.Contains(cmdStr, devName) {
-			ipv6Add1 = true
-		}
-		if strings.Contains(cmdStr, "interface ipv6 add route 8000::/1") && strings.Contains(cmdStr, devName) {
-			ipv6Add2 = true
-		}
-		if strings.Contains(cmdStr, "interface ipv6 delete route ::/1") && strings.Contains(cmdStr, devName) {
-			ipv6Del1 = true
-		}
-		if strings.Contains(cmdStr, "interface ipv6 delete route 8000::/1") && strings.Contains(cmdStr, devName) {
-			ipv6Del2 = true
+		for _, cmd := range executedCommands {
+			cmdStr := strings.Join(cmd, " ")
+			// IPv6 地址检查
+			if strings.Contains(cmdStr, "interface ipv6 add address") && strings.Contains(cmdStr, devName) && strings.Contains(cmdStr, "fd88::2") {
+				ipv6AddrAdd = true
+			}
+			if strings.Contains(cmdStr, "interface ipv6 delete address") && strings.Contains(cmdStr, devName) && strings.Contains(cmdStr, "fd88::2") {
+				ipv6AddrDel = true
+			}
+
+			// IPv6 检查
+			if strings.Contains(cmdStr, "interface ipv6 add route ::/1") && strings.Contains(cmdStr, devName) {
+				ipv6Add1 = true
+			}
+			if strings.Contains(cmdStr, "interface ipv6 add route 8000::/1") && strings.Contains(cmdStr, devName) {
+				ipv6Add2 = true
+			}
+			if strings.Contains(cmdStr, "interface ipv6 delete route ::/1") && strings.Contains(cmdStr, devName) {
+				ipv6Del1 = true
+			}
+			if strings.Contains(cmdStr, "interface ipv6 delete route 8000::/1") && strings.Contains(cmdStr, devName) {
+				ipv6Del2 = true
+			}
+
+			// IPv4 检查
+			if strings.Contains(cmdStr, "interface ipv4 delete route 0.0.0.0/1") && strings.Contains(cmdStr, devName) {
+				ipv4Del1 = true
+			}
+			if strings.Contains(cmdStr, "interface ipv4 delete route 128.0.0.0/1") && strings.Contains(cmdStr, devName) {
+				ipv4Del2 = true
+			}
+			if cmd[0] == "route" && len(cmd) > 1 && cmd[1] == "add" {
+				routeAddCount++
+			}
+
+			// NRPT 检查
+			if strings.Contains(cmdStr, "Add-DnsClientNrptRule") && strings.Contains(cmdStr, "AERO_"+devName) {
+				nrptAdded = true
+			}
+			if strings.Contains(cmdStr, "Remove-DnsClientNrptRule") && strings.Contains(cmdStr, "AERO_"+devName) {
+				nrptDeleted = true
+			}
 		}
 
-		// IPv4 检查
-		if strings.Contains(cmdStr, "interface ipv4 delete route 0.0.0.0/1") && strings.Contains(cmdStr, devName) {
-			ipv4Del1 = true
+		if !ipv6AddrAdd || !ipv6AddrDel {
+			t.Fatalf("expected Windows IPv6 address fd88::2 paired on %s, got add=%v, del=%v", devName, ipv6AddrAdd, ipv6AddrDel)
 		}
-		if strings.Contains(cmdStr, "interface ipv4 delete route 128.0.0.0/1") && strings.Contains(cmdStr, devName) {
-			ipv4Del2 = true
+		if !ipv6Add1 || !ipv6Add2 {
+			t.Fatalf("expected IPv6 ::/1 and 8000::/1 added on %s, got add1=%v, add2=%v", devName, ipv6Add1, ipv6Add2)
 		}
-		if cmd[0] == "route" && len(cmd) > 1 && cmd[1] == "add" {
-			routeAddCount++
+		if !ipv6Del1 || !ipv6Del2 {
+			t.Fatalf("expected IPv6 ::/1 and 8000::/1 deleted on %s, got del1=%v, del2=%v", devName, ipv6Del1, ipv6Del2)
+		}
+		if !ipv4Del1 || !ipv4Del2 || routeAddCount < 2 {
+			t.Fatalf("expected IPv4 split routes paired on %s", devName)
+		}
+		if !nrptAdded || !nrptDeleted {
+			t.Fatalf("expected NRPT rule paired on %s, got added=%v, deleted=%v", devName, nrptAdded, nrptDeleted)
 		}
 
-		// NRPT 检查
-		if strings.Contains(cmdStr, "Add-DnsClientNrptRule") && strings.Contains(cmdStr, "AERO_"+devName) {
-			nrptAdded = true
-		}
-		if strings.Contains(cmdStr, "Remove-DnsClientNrptRule") && strings.Contains(cmdStr, "AERO_"+devName) {
-			nrptDeleted = true
-		}
-	}
+	case "linux":
+		var ipv6Add1, ipv6Add2, ipv6Del1, ipv6Del2 bool
+		var ipv6AddrAdd, ipv6AddrDel bool
+		var ipv4Add1, ipv4Add2, ipv4Del1, ipv4Del2 bool
 
-	if !ipv6Add1 || !ipv6Add2 {
-		t.Fatalf("expected IPv6 ::/1 and 8000::/1 added on %s, got add1=%v, add2=%v", devName, ipv6Add1, ipv6Add2)
-	}
-	if !ipv6Del1 || !ipv6Del2 {
-		t.Fatalf("expected IPv6 ::/1 and 8000::/1 deleted on %s, got del1=%v, del2=%v", devName, ipv6Del1, ipv6Del2)
-	}
-	if !ipv4Del1 || !ipv4Del2 || routeAddCount < 2 {
-		t.Fatalf("expected IPv4 split routes paired on %s", devName)
-	}
-	if !nrptAdded || !nrptDeleted {
-		t.Fatalf("expected NRPT rule paired on %s, got added=%v, deleted=%v", devName, nrptAdded, nrptDeleted)
+		for _, cmd := range executedCommands {
+			cmdStr := strings.Join(cmd, " ")
+			// IPv6 地址检查
+			if strings.Contains(cmdStr, "-6") && strings.Contains(cmdStr, "addr add fd88::2/64") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv6AddrAdd = true
+			}
+			if strings.Contains(cmdStr, "-6") && strings.Contains(cmdStr, "addr del fd88::2/64") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv6AddrDel = true
+			}
+
+			// IPv6 检查（需包含 ::/1 或 8000::/1 以及设备绑定 dev <devName>）
+			if strings.Contains(cmdStr, "-6") && strings.Contains(cmdStr, "route replace ::/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv6Add1 = true
+			}
+			if strings.Contains(cmdStr, "-6") && strings.Contains(cmdStr, "route replace 8000::/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv6Add2 = true
+			}
+			if strings.Contains(cmdStr, "-6") && strings.Contains(cmdStr, "route del ::/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv6Del1 = true
+			}
+			if strings.Contains(cmdStr, "-6") && strings.Contains(cmdStr, "route del 8000::/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv6Del2 = true
+			}
+
+			// IPv4 分流检查（需包含 0.0.0.0/1 或 128.0.0.0/1 以及设备绑定 dev <devName>）
+			if strings.Contains(cmdStr, "route replace 0.0.0.0/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv4Add1 = true
+			}
+			if strings.Contains(cmdStr, "route replace 128.0.0.0/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv4Add2 = true
+			}
+			if strings.Contains(cmdStr, "route del 0.0.0.0/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv4Del1 = true
+			}
+			if strings.Contains(cmdStr, "route del 128.0.0.0/1") && strings.Contains(cmdStr, "dev "+devName) {
+				ipv4Del2 = true
+			}
+		}
+
+		if !ipv6AddrAdd || !ipv6AddrDel {
+			t.Fatalf("expected Linux IPv6 address fd88::2/64 paired on %s, got add=%v, del=%v", devName, ipv6AddrAdd, ipv6AddrDel)
+		}
+		if !ipv6Add1 || !ipv6Add2 {
+			t.Fatalf("expected Linux IPv6 ::/1 and 8000::/1 replace on %s, got add1=%v, add2=%v", devName, ipv6Add1, ipv6Add2)
+		}
+		if !ipv6Del1 || !ipv6Del2 {
+			t.Fatalf("expected Linux IPv6 ::/1 and 8000::/1 del on %s, got del1=%v, del2=%v", devName, ipv6Del1, ipv6Del2)
+		}
+		if !ipv4Add1 || !ipv4Add2 {
+			t.Fatalf("expected Linux IPv4 split routes replace on %s, got add1=%v, add2=%v", devName, ipv4Add1, ipv4Add2)
+		}
+		if !ipv4Del1 || !ipv4Del2 {
+			t.Fatalf("expected Linux IPv4 split routes del on %s, got del1=%v, del2=%v", devName, ipv4Del1, ipv4Del2)
+		}
+
+	case "darwin":
+		var ipv6Add1, ipv6Add2, ipv6Del1, ipv6Del2 bool
+		var ipv6AddrAdd, ipv6AddrDel bool
+		var ipv4Add1, ipv4Add2, ipv4Del1, ipv4Del2 bool
+
+		for _, cmd := range executedCommands {
+			cmdStr := strings.Join(cmd, " ")
+			// IPv6 地址检查
+			if strings.Contains(cmdStr, "ifconfig "+devName+" inet6 add fd88::2/64") {
+				ipv6AddrAdd = true
+			}
+			if strings.Contains(cmdStr, "ifconfig "+devName+" inet6 delete fd88::2") {
+				ipv6AddrDel = true
+			}
+
+			// IPv6 检查（需包含 -inet6 以及 -interface <devName>）
+			if strings.Contains(cmdStr, "-inet6") && strings.Contains(cmdStr, "add ::/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv6Add1 = true
+			}
+			if strings.Contains(cmdStr, "-inet6") && strings.Contains(cmdStr, "add 8000::/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv6Add2 = true
+			}
+			if strings.Contains(cmdStr, "-inet6") && strings.Contains(cmdStr, "delete ::/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv6Del1 = true
+			}
+			if strings.Contains(cmdStr, "-inet6") && strings.Contains(cmdStr, "delete 8000::/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv6Del2 = true
+			}
+
+			// IPv4 分流检查（需包含 -net 以及 -interface <devName>）
+			if strings.Contains(cmdStr, "-net") && strings.Contains(cmdStr, "add 0.0.0.0/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv4Add1 = true
+			}
+			if strings.Contains(cmdStr, "-net") && strings.Contains(cmdStr, "add 128.0.0.0/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv4Add2 = true
+			}
+			if strings.Contains(cmdStr, "-net") && strings.Contains(cmdStr, "delete 0.0.0.0/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv4Del1 = true
+			}
+			if strings.Contains(cmdStr, "-net") && strings.Contains(cmdStr, "delete 128.0.0.0/1") && strings.Contains(cmdStr, "-interface "+devName) {
+				ipv4Del2 = true
+			}
+		}
+
+		if !ipv6AddrAdd || !ipv6AddrDel {
+			t.Fatalf("expected Darwin IPv6 address fd88::2 paired on %s, got add=%v, del=%v", devName, ipv6AddrAdd, ipv6AddrDel)
+		}
+		if !ipv6Add1 || !ipv6Add2 {
+			t.Fatalf("expected Darwin IPv6 ::/1 and 8000::/1 added on %s, got add1=%v, add2=%v", devName, ipv6Add1, ipv6Add2)
+		}
+		if !ipv6Del1 || !ipv6Del2 {
+			t.Fatalf("expected Darwin IPv6 ::/1 and 8000::/1 deleted on %s, got del1=%v, del2=%v", devName, ipv6Del1, ipv6Del2)
+		}
+		if !ipv4Add1 || !ipv4Add2 {
+			t.Fatalf("expected Darwin IPv4 split routes added on %s, got add1=%v, add2=%v", devName, ipv4Add1, ipv4Add2)
+		}
+		if !ipv4Del1 || !ipv4Del2 {
+			t.Fatalf("expected Darwin IPv4 split routes deleted on %s, got del1=%v, del2=%v", devName, ipv4Del1, ipv4Del2)
+		}
+
+	default:
+		t.Skipf("skipping route pairing test on unsupported platform: %s", runtime.GOOS)
 	}
 }
 

@@ -47,6 +47,7 @@ type ServerConfig struct {
 	ISPAffinity string   `json:"isp_affinity,omitempty" yaml:"isp_affinity"`
 	AltPorts    []int    `json:"alt_ports,omitempty" yaml:"alt_ports"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
+	ECHConfig   string   `json:"ech_config,omitempty" yaml:"ech_config"`
 }
 
 // UnmarshalJSON 兼容 snake_case 与 camelCase，杜绝跨系统命名失配导致的静默丢弃
@@ -57,6 +58,8 @@ func (s *ServerConfig) UnmarshalJSON(data []byte) error {
 		LegacyISPAffinity string `json:"ispAffinity"`
 		LegacyLineType    string `json:"lineType"`
 		LegacyAltPorts    []int  `json:"altPorts"`
+		LegacyECHConfig   string `json:"echConfig"`
+		LegacyServerECH   string `json:"ech"`
 	}{
 		Alias: (*Alias)(s),
 	}
@@ -71,6 +74,18 @@ func (s *ServerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if len(s.AltPorts) == 0 && len(aux.LegacyAltPorts) > 0 {
 		s.AltPorts = aux.LegacyAltPorts
+	}
+	if s.ECHConfig == "" && aux.LegacyECHConfig != "" {
+		s.ECHConfig = aux.LegacyECHConfig
+	}
+	if s.ECH == "" && aux.LegacyServerECH != "" {
+		s.ECH = aux.LegacyServerECH
+	}
+	if s.ECH == "" && s.ECHConfig != "" {
+		s.ECH = s.ECHConfig
+	}
+	if s.ECHConfig == "" && s.ECH != "" {
+		s.ECHConfig = s.ECH
 	}
 	return nil
 }
@@ -201,6 +216,12 @@ func (s *Subscription) ValidateAndNormalize() error {
 					srv.IP = ip.String()
 				}
 			}
+		}
+		// 跨系统 ECH 与 ECHConfig 双向归一化，杜绝跨系统命名失配
+		if srv.ECH != "" && srv.ECHConfig == "" {
+			srv.ECHConfig = srv.ECH
+		} else if srv.ECHConfig != "" && srv.ECH == "" {
+			srv.ECH = srv.ECHConfig
 		}
 	}
 	return nil
@@ -498,6 +519,7 @@ type subServerForSign struct {
 	ISPAffinity string   `json:"isp_affinity,omitempty"`
 	AltPorts    []int    `json:"alt_ports,omitempty"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
+	ECHConfig   string   `json:"ech_config,omitempty" yaml:"ech_config"`
 }
 
 type subSignBodyForVerify struct {
@@ -532,6 +554,7 @@ func verifySubscriptionSignature(sub *Subscription) error {
 			ISPAffinity: s.ISPAffinity,
 			AltPorts:    s.AltPorts,
 			ECH:         s.ECH,
+			ECHConfig:   s.ECHConfig,
 		}
 	}
 

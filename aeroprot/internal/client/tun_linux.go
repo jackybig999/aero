@@ -188,6 +188,8 @@ func SetupRoutes(devName, ipv4 string) error {
 	}
 	_ = runLinux("ip", "addr", "add", ipv4, "dev", devName)
 
+	_ = runLinux("ip", "-6", "addr", "add", "fd88::2/64", "dev", devName)
+
 	_ = SetInterfaceMTU(devName, 1360)
 	RegisterVirtualNICMTUSetter(func(mtu int) error {
 		return SetInterfaceMTU(devName, mtu)
@@ -217,6 +219,7 @@ func TeardownRoutes(devName string) {
 	}
 	_ = runLinux("ip", "-6", "route", "del", "::/1", "dev", devName)
 	_ = runLinux("ip", "-6", "route", "del", "8000::/1", "dev", devName)
+	_ = runLinux("ip", "-6", "addr", "del", "fd88::2/64", "dev", devName)
 	_ = runLinux("ip", "route", "del", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "del", "128.0.0.0/1", "dev", devName)
 	log.Printf("[TUN] Routes removed for %s", devName)

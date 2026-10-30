@@ -324,6 +324,7 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				"isp_affinity": ispAffinity,
 				"protocol":     "connect-ip",
 				"ech":          ep.ECH(),
+				"ech_config":   ep.ECH(),
 				"alt_ports":    altPorts,
 			}
 			if vps != nil {
@@ -792,5 +793,5 @@ func normalizeRegion(raw string) string {
 
 // ECH returns the Encrypted Client Hello configuration if present.
 func (ep EndpointInfo) ECH() string {
-	return ""
+	return ep.ECHConfig
 }

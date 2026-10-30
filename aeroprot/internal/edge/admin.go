@@ -11,17 +11,20 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 var (
-	Version  = "1.2.15"
+	Version  = "1.2.16"
 	Protocol = "aero/3.0"
 	APILevel = 3
 )
 
 // AdminHandler handles /admin/* management endpoints
 type AdminHandler struct {
+	mu         sync.RWMutex
+	echConfig  string
 	adminKey   string
 	validator  *Validator
 	tokenStore *TokenStore
@@ -116,6 +119,10 @@ func (h *AdminHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		h.handleUpsertSubs(w, r)
 	case r.URL.Path == "/admin/subs" && r.Method == http.MethodDelete:
 		h.handleDeleteSub(w, r)
+	case r.URL.Path == "/admin/ech" && r.Method == http.MethodGet:
+		h.handleGetECH(w)
+	case r.URL.Path == "/admin/ech" && (r.Method == http.MethodPost || r.Method == http.MethodPut):
+		h.handleSetECH(w, r)
 	case r.URL.Path == "/admin/reload" && r.Method == http.MethodPost:
 		h.handleReload(w)
 	default:
@@ -353,6 +360,65 @@ func (h *AdminHandler) handleReload(w http.ResponseWriter) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "token_count": n})
+}
+
+func (h *AdminHandler) handleGetECH(w http.ResponseWriter) {
+	h.mu.RLock()
+	ech := h.echConfig
+	h.mu.RUnlock()
+	if ech == "" && h.subStore != nil {
+		ech = h.subStore.GetECH()
+	}
+	writeJSON(w, map[string]any{
+		"ok":         true,
+		"ech":        ech,
+		"ech_config": ech,
+		"enabled":    ech != "",
+	})
+}
+
+func (h *AdminHandler) handleSetECH(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ECH       string `json:"ech"`
+		ECHConfig string `json:"ech_config"`
+		CamelECH  string `json:"echConfig"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid json body: " + err.Error()})
+			return
+		}
+	}
+	val := strings.TrimSpace(req.ECHConfig)
+	if val == "" {
+		val = strings.TrimSpace(req.CamelECH)
+	}
+	if val == "" {
+		val = strings.TrimSpace(req.ECH)
+	}
+
+	h.mu.Lock()
+	h.echConfig = val
+	h.mu.Unlock()
+
+	if h.subStore != nil {
+		if err := h.subStore.SetECH(val); err != nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "update ech failed: " + err.Error()})
+			return
+		}
+	}
+
+	writeJSON(w, map[string]any{
+		"ok":         true,
+		"ech":        val,
+		"ech_config": val,
+		"enabled":    val != "",
+		"message":    "ech config updated",
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

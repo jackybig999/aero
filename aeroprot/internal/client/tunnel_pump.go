@@ -107,36 +107,66 @@ func (p *IPDataPump) pumpTunToRemote() {
 
 		raw := buf[:n]
 
-		// 检查版本：仅转发 IPv4 报文 (版本号 4)
-		if raw[0]>>4 != 4 {
+		// 检查版本：转发 IPv4 (4) 与 IPv6 (6) 报文
+		version := raw[0] >> 4
+		if version != 4 && version != 6 {
 			continue
 		}
 
-		ihl := int(raw[0]&0x0F) * 4
-		if len(raw) < ihl {
-			continue
-		}
-
-		// 2. 本地虚拟网关 DNS 旁路拦截：若目的端口为 53 (如 10.88.0.1:53 或任何发往 DNS 端口的 UDP 报文)
-		if len(raw) >= ihl+8 && raw[9] == 17 {
-			dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
-			if dstPort == 53 && p.dnsHandler != nil {
-				srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
-				srcIP := net.IP(raw[12:16])
-				dstIP := net.IP(raw[16:20])
-				dnsPayload := raw[ihl+8:]
-				if resp := p.dnsHandler.HandleQuery(dnsPayload, srcIP, srcPort); resp != nil {
-					respPkt := buildIPv4UDPResponsePacket(dstIP, srcIP, dstPort, srcPort, resp)
-					if len(respPkt) > 0 {
-						_, _ = p.dev.Write(respPkt)
-					}
-				}
+		if version == 4 {
+			ihl := int(raw[0]&0x0F) * 4
+			if len(raw) < ihl {
 				continue
 			}
 
-			// 3. 阻断 WebRTC STUN 穿透报文 (IPv4 Protocol 17 = UDP)
-			if isSTUNPacket(raw[ihl+8:]) {
+			// 2. 本地虚拟网关 DNS 旁路拦截：若目的端口为 53 (如 10.88.0.1:53 或任何发往 DNS 端口的 UDP 报文)
+			if len(raw) >= ihl+8 && raw[9] == 17 {
+				dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
+				if dstPort == 53 && p.dnsHandler != nil {
+					srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
+					srcIP := net.IP(raw[12:16])
+					dstIP := net.IP(raw[16:20])
+					dnsPayload := raw[ihl+8:]
+					if resp := p.dnsHandler.HandleQuery(dnsPayload, srcIP, srcPort); resp != nil {
+						respPkt := buildIPv4UDPResponsePacket(dstIP, srcIP, dstPort, srcPort, resp)
+						if len(respPkt) > 0 {
+							_, _ = p.dev.Write(respPkt)
+						}
+					}
+					continue
+				}
+
+				// 3. 阻断 WebRTC STUN 穿透报文 (IPv4 Protocol 17 = UDP)
+				if isSTUNPacket(raw[ihl+8:]) {
+					continue
+				}
+			}
+		} else if version == 6 {
+			if len(raw) < 40 {
 				continue
+			}
+
+			// IPv6 Next Header 检查 (raw[6])：17 = UDP
+			if raw[6] == 17 && len(raw) >= 48 {
+				dstPort := binary.BigEndian.Uint16(raw[42:44])
+				if dstPort == 53 && p.dnsHandler != nil {
+					srcPort := binary.BigEndian.Uint16(raw[40:42])
+					srcIP := net.IP(raw[8:24])
+					dstIP := net.IP(raw[24:40])
+					dnsPayload := raw[48:]
+					if resp := p.dnsHandler.HandleQuery(dnsPayload, srcIP, srcPort); resp != nil {
+						respPkt := buildIPv6UDPResponsePacket(dstIP, srcIP, dstPort, srcPort, resp)
+						if len(respPkt) > 0 {
+							_, _ = p.dev.Write(respPkt)
+						}
+					}
+					continue
+				}
+
+				// 阻断 IPv6 WebRTC STUN 穿透报文
+				if isSTUNPacket(raw[48:]) {
+					continue
+				}
 			}
 		}
 
@@ -249,5 +279,65 @@ func buildIPv4UDPResponsePacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, pa
 
 	// 3. 载荷
 	copy(udpData[8:], payload)
+	return pkt
+}
+
+// buildIPv6UDPResponsePacket 原生构造 IPv6/UDP 应答报文（RFC 2460 伪首部强制校验和）
+func buildIPv6UDPResponsePacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) []byte {
+	src16 := srcIP.To16()
+	dst16 := dstIP.To16()
+	if src16 == nil || dst16 == nil {
+		return nil
+	}
+
+	udpLen := 8 + len(payload)
+	ipTotalLen := 40 + udpLen
+	if ipTotalLen > 65535 {
+		return nil
+	}
+	pkt := make([]byte, ipTotalLen)
+
+	// 1. IPv6 首部 (40 字节)
+	pkt[0] = 0x60 // Version=6, Traffic Class=0
+	binary.BigEndian.PutUint16(pkt[4:6], uint16(udpLen))
+	pkt[6] = 17 // Next Header: UDP
+	pkt[7] = 64 // Hop Limit
+	copy(pkt[8:24], src16)
+	copy(pkt[24:40], dst16)
+
+	// 2. UDP 首部 (8 字节)
+	udpData := pkt[40:]
+	binary.BigEndian.PutUint16(udpData[0:2], srcPort)
+	binary.BigEndian.PutUint16(udpData[2:4], dstPort)
+	binary.BigEndian.PutUint16(udpData[4:6], uint16(udpLen))
+	copy(udpData[8:], payload)
+
+	// 3. RFC 2460 IPv6 UDP 伪首部校验和 (IPv6 下 UDP 校验和强制计算)
+	pseudo := make([]byte, 40)
+	copy(pseudo[0:16], src16)
+	copy(pseudo[16:32], dst16)
+	binary.BigEndian.PutUint32(pseudo[32:36], uint32(udpLen))
+	pseudo[39] = 17
+
+	var sum uint32
+	addWords := func(b []byte) {
+		for i := 0; i+1 < len(b); i += 2 {
+			sum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
+		}
+		if len(b)%2 == 1 {
+			sum += uint32(b[len(b)-1]) << 8
+		}
+	}
+	addWords(pseudo)
+	addWords(udpData)
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	csum := ^uint16(sum)
+	if csum == 0 {
+		csum = 0xFFFF
+	}
+	binary.BigEndian.PutUint16(udpData[6:8], csum)
+
 	return pkt
 }

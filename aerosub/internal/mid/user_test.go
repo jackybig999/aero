@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -295,5 +296,110 @@ func TestSuperadminProtection(t *testing.T) {
 
 	if err := svc.DeleteUser(normalUser.ID); err != nil {
 		t.Fatalf("failed to delete normal user: %v", err)
+	}
+}
+
+// 7. 验证 Node 与 EndpointInfo 的 ECHConfig 字段反序列化兼容性及订阅生成
+func TestWireContract_NodeAndEndpointECH(t *testing.T) {
+	// 1. Test Node unmarshaling with snake_case ech_config
+	rawNodeJSON := `{"id":1,"name":"test-node","ech_config":"AERO_ECH_SNAKE"}`
+	var n1 Node
+	if err := json.Unmarshal([]byte(rawNodeJSON), &n1); err != nil {
+		t.Fatalf("unmarshal n1: %v", err)
+	}
+	if n1.ECHConfig != "AERO_ECH_SNAKE" {
+		t.Fatalf("n1.ECHConfig = %q, want AERO_ECH_SNAKE", n1.ECHConfig)
+	}
+
+	// 2. Test Node unmarshaling with camelCase echConfig
+	rawNodeJSON2 := `{"id":2,"name":"test-node-2","echConfig":"AERO_ECH_CAMEL"}`
+	var n2 Node
+	if err := json.Unmarshal([]byte(rawNodeJSON2), &n2); err != nil {
+		t.Fatalf("unmarshal n2: %v", err)
+	}
+	if n2.ECHConfig != "AERO_ECH_CAMEL" {
+		t.Fatalf("n2.ECHConfig = %q, want AERO_ECH_CAMEL", n2.ECHConfig)
+	}
+
+	// 3. Test Node unmarshaling with legacy ech
+	rawNodeJSON3 := `{"id":3,"name":"test-node-3","ech":"AERO_ECH_LEGACY"}`
+	var n3 Node
+	if err := json.Unmarshal([]byte(rawNodeJSON3), &n3); err != nil {
+		t.Fatalf("unmarshal n3: %v", err)
+	}
+	if n3.ECHConfig != "AERO_ECH_LEGACY" {
+		t.Fatalf("n3.ECHConfig = %q, want AERO_ECH_LEGACY", n3.ECHConfig)
+	}
+
+	// 4. Test EndpointInfo unmarshaling with ech_config and camelCase echConfig
+	rawEP1 := `{"vps_id":1,"host":"h1.test","ech_config":"EP_ECH_SNAKE"}`
+	var ep1 EndpointInfo
+	if err := json.Unmarshal([]byte(rawEP1), &ep1); err != nil {
+		t.Fatalf("unmarshal ep1: %v", err)
+	}
+	if ep1.ECHConfig != "EP_ECH_SNAKE" || ep1.ECH() != "EP_ECH_SNAKE" {
+		t.Fatalf("ep1 ECH() = %q, want EP_ECH_SNAKE", ep1.ECH())
+	}
+
+	rawEP2 := `{"vps_id":2,"host":"h2.test","echConfig":"EP_ECH_CAMEL"}`
+	var ep2 EndpointInfo
+	if err := json.Unmarshal([]byte(rawEP2), &ep2); err != nil {
+		t.Fatalf("unmarshal ep2: %v", err)
+	}
+	if ep2.ECHConfig != "EP_ECH_CAMEL" || ep2.ECH() != "EP_ECH_CAMEL" {
+		t.Fatalf("ep2 ECH() = %q, want EP_ECH_CAMEL", ep2.ECH())
+	}
+
+	// 5. Test BuildSubscriptionDoc emitting both ech and ech_config
+	uDB := NewMemoryUserStore()
+	svc := NewUserService(uDB, "test-hmac-secret-wire")
+	user, err := svc.Register(CreateUserParams{
+		Username:   "wireuser",
+		Password:   "WirePass123!",
+		Email:      "wire@example.com",
+		PlanMonths: 1,
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	tempDir, err := os.MkdirTemp("", "mid_wire_ech_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	epPath := filepath.Join(tempDir, "endpoints.json")
+	epStore, err := NewEndpointStore(epPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epStore.Upsert(EndpointInfo{
+		VPSID:     10,
+		Name:      "Wire-Node-01",
+		Region:    "HK",
+		Host:      "hk-wire.aero.test",
+		IP:        "198.51.100.99",
+		Port:      443,
+		Installed: true,
+		ECHConfig: "QUFBQUJCQkNDQ0REREVFRUZGR0dI",
+	})
+
+	sniMgr := NewSNIMatrixManager("")
+	subBuilder := NewSubBuilder(uDB, epStore, nil, sniMgr)
+	doc, status, err := subBuilder.BuildSubscriptionDoc(user, "ANY", "", false)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("BuildSubscriptionDoc failed, status: %d, err: %v", status, err)
+	}
+	servers, ok := doc["servers"].([]map[string]any)
+	if !ok || len(servers) == 0 {
+		t.Fatalf("expected non-empty servers")
+	}
+	srv := servers[0]
+	if srv["ech"] != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" {
+		t.Fatalf("srv['ech'] = %v, want QUFBQUJCQkNDQ0REREVFRUZGR0dI", srv["ech"])
+	}
+	if srv["ech_config"] != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" {
+		t.Fatalf("srv['ech_config'] = %v, want QUFBQUJCQkNDQ0REREVFRUZGR0dI", srv["ech_config"])
 	}
 }

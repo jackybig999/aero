@@ -463,6 +463,164 @@ func TestAdminHandlerAndTokenSync(t *testing.T) {
 	}
 }
 
+func TestAdminECH_GetAndSet(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "aero-admin-ech-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	v := NewValidator()
+	ts, _ := OpenTokenStore(tmpDir, v)
+	ss, _ := NewSubStore(tmpDir)
+
+	admin := NewAdminHandler("my-secret-key", v, ts, ss, nil, nil, nil)
+
+	// 1. Unauthorized GET /admin/ech
+	req := httptest.NewRequest(http.MethodGet, "/admin/ech", nil)
+	req.RemoteAddr = "203.0.113.195:12345"
+	rec := httptest.NewRecorder()
+	admin.TryServe(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 forbidden without key, got %d", rec.Code)
+	}
+
+	// 2. Authorized GET /admin/ech (initially empty)
+	req = httptest.NewRequest(http.MethodGet, "/admin/ech", nil)
+	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	rec = httptest.NewRecorder()
+	admin.TryServe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	var getResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &getResp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if getResp["ok"] != true || getResp["enabled"] != false || getResp["ech"] != "" {
+		t.Fatalf("unexpected initial response: %+v", getResp)
+	}
+
+	// 3. Authorized POST /admin/ech with snake_case ech_config
+	postPayload := `{"ech_config": "QUFBQUJCQkNDQ0REREVFRUZGR0dI"}`
+	req = httptest.NewRequest(http.MethodPost, "/admin/ech", strings.NewReader(postPayload))
+	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	rec = httptest.NewRecorder()
+	admin.TryServe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var postResp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &postResp); err != nil {
+		t.Fatalf("decode post response: %v", err)
+	}
+	if postResp["ok"] != true || postResp["enabled"] != true || postResp["ech_config"] != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" {
+		t.Fatalf("unexpected post response: %+v", postResp)
+	}
+
+	// 4. GET /admin/ech returns updated config
+	req = httptest.NewRequest(http.MethodGet, "/admin/ech", nil)
+	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	rec = httptest.NewRecorder()
+	admin.TryServe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	var getResp2 map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &getResp2); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if getResp2["ech"] != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" || getResp2["enabled"] != true {
+		t.Fatalf("unexpected get response: %+v", getResp2)
+	}
+	if ss.GetECH() != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" {
+		t.Fatalf("subStore.GetECH() = %q, expected QUFBQUJCQkNDQ0REREVFRUZGR0dI", ss.GetECH())
+	}
+
+	// 5. PUT /admin/ech with legacy ech
+	putPayload := `{"ech": "TkVXX0VDSA=="}`
+	req = httptest.NewRequest(http.MethodPut, "/admin/ech", strings.NewReader(putPayload))
+	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	rec = httptest.NewRecorder()
+	admin.TryServe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on PUT, got %d", rec.Code)
+	}
+	if ss.GetECH() != "TkVXX0VDSA==" {
+		t.Fatalf("subStore.GetECH() after PUT = %q, expected TkVXX0VDSA==", ss.GetECH())
+	}
+
+	// 6. POST /admin/ech with camelCase echConfig
+	camelPayload := `{"echConfig": "Q0FNRUxfRUNI"}`
+	req = httptest.NewRequest(http.MethodPost, "/admin/ech", strings.NewReader(camelPayload))
+	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	rec = httptest.NewRecorder()
+	admin.TryServe(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on camelCase POST, got %d", rec.Code)
+	}
+	if ss.GetECH() != "Q0FNRUxfRUNI" {
+		t.Fatalf("subStore.GetECH() after camelCase POST = %q, expected Q0FNRUxfRUNI", ss.GetECH())
+	}
+
+	// 7. POST /admin/ech with malformed JSON returns 400 Bad Request
+	req = httptest.NewRequest(http.MethodPost, "/admin/ech", strings.NewReader("{invalid-json"))
+	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	rec = httptest.NewRecorder()
+	admin.TryServe(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for malformed JSON, got %d", rec.Code)
+	}
+}
+
+func TestWireContract_SubServerECH(t *testing.T) {
+	// 1. SubServer unmarshals snake_case ech_config
+	raw1 := `{"name":"node1","host":"h1","token":"tok1","ech_config":"ECH_VAL_1"}`
+	var s1 SubServer
+	if err := json.Unmarshal([]byte(raw1), &s1); err != nil {
+		t.Fatalf("unmarshal s1: %v", err)
+	}
+	if s1.ECHConfig != "ECH_VAL_1" || s1.ECH != "ECH_VAL_1" {
+		t.Fatalf("s1 ECHConfig=%q ECH=%q, want ECH_VAL_1", s1.ECHConfig, s1.ECH)
+	}
+
+	// 2. SubServer unmarshals camelCase echConfig
+	raw2 := `{"name":"node2","host":"h2","token":"tok2","echConfig":"ECH_VAL_2"}`
+	var s2 SubServer
+	if err := json.Unmarshal([]byte(raw2), &s2); err != nil {
+		t.Fatalf("unmarshal s2: %v", err)
+	}
+	if s2.ECHConfig != "ECH_VAL_2" || s2.ECH != "ECH_VAL_2" {
+		t.Fatalf("s2 ECHConfig=%q ECH=%q, want ECH_VAL_2", s2.ECHConfig, s2.ECH)
+	}
+
+	// 3. SubServer unmarshals legacy ech
+	raw3 := `{"name":"node3","host":"h3","token":"tok3","ech":"ECH_VAL_3"}`
+	var s3 SubServer
+	if err := json.Unmarshal([]byte(raw3), &s3); err != nil {
+		t.Fatalf("unmarshal s3: %v", err)
+	}
+	if s3.ECHConfig != "ECH_VAL_3" || s3.ECH != "ECH_VAL_3" {
+		t.Fatalf("s3 ECHConfig=%q ECH=%q, want ECH_VAL_3", s3.ECHConfig, s3.ECH)
+	}
+
+	// 4. Test SignSub and VerifySub with ECH and ECHConfig populated
+	doc := SubDocument{
+		Version:   "aero/3.0",
+		CreatedAt: 1728000000,
+		Servers:   []SubServer{s1, s2, s3},
+	}
+	token := []byte("secret_token")
+	sig := SignSub(doc, token)
+	if sig == "" {
+		t.Fatal("SignSub generated empty signature")
+	}
+	doc.Signature = sig
+	if !VerifySub(doc, token) {
+		t.Fatal("VerifySub failed on signed document with ECHConfig")
+	}
+}
+
 // ==========================================
 // 5. Tests for DNS Singleflight & Caching (quic.go)
 // ==========================================

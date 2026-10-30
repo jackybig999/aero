@@ -81,6 +81,30 @@ type SubServer struct {
 	ISPAffinity string   `json:"isp_affinity,omitempty"`
 	AltPorts    []int    `json:"alt_ports,omitempty"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
+	ECHConfig   string   `json:"ech_config,omitempty" yaml:"ech_config"`
+}
+
+func (s *SubServer) UnmarshalJSON(data []byte) error {
+	type Alias SubServer
+	aux := struct {
+		*Alias
+		LegacyECHConfig string `json:"echConfig"`
+	}{
+		Alias: (*Alias)(s),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if s.ECHConfig == "" && aux.LegacyECHConfig != "" {
+		s.ECHConfig = aux.LegacyECHConfig
+	}
+	if s.ECH == "" && s.ECHConfig != "" {
+		s.ECH = s.ECHConfig
+	}
+	if s.ECHConfig == "" && s.ECH != "" {
+		s.ECHConfig = s.ECH
+	}
+	return nil
 }
 
 // UserSub represents a user-specific subscription (e.g. /sub/username{6-char-code})
@@ -122,6 +146,7 @@ type EnsureSubParams struct {
 	ISPAffinity string
 	AltPorts    []int
 	ECH         string
+	ECHConfig   string
 }
 
 // ==========================================
@@ -231,6 +256,18 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 		}
 	}
 
+	echVal := strings.TrimSpace(p.ECHConfig)
+	if echVal == "" {
+		echVal = strings.TrimSpace(p.ECH)
+	}
+	if echVal == "" && len(s.meta.Document.Servers) > 0 {
+		if s.meta.Document.Servers[0].ECHConfig != "" {
+			echVal = s.meta.Document.Servers[0].ECHConfig
+		} else {
+			echVal = s.meta.Document.Servers[0].ECH
+		}
+	}
+
 	srv := SubServer{
 		Name:        p.Name,
 		Host:        host,
@@ -243,7 +280,8 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 		LineType:    p.LineType,
 		ISPAffinity: p.ISPAffinity,
 		AltPorts:    altPorts,
-		ECH:         p.ECH,
+		ECH:         echVal,
+		ECHConfig:   echVal,
 	}
 
 	if s.meta.Secret == "" {
@@ -355,6 +393,43 @@ func (s *SubStore) Document() SubDocument {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.meta.Document
+}
+
+// GetECH returns the current ECH configuration from the default server.
+func (s *SubStore) GetECH() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.meta.Document.Servers) > 0 {
+		if s.meta.Document.Servers[0].ECHConfig != "" {
+			return s.meta.Document.Servers[0].ECHConfig
+		}
+		return s.meta.Document.Servers[0].ECH
+	}
+	return ""
+}
+
+// SetECH updates the ECH configuration on the default server, re-signs the document, and persists.
+func (s *SubStore) SetECH(ech string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.meta.Document.Servers) == 0 {
+		s.meta.Document.Servers = []SubServer{{
+			Name:      "default",
+			Protocol:  "connect-ip",
+			ECH:       ech,
+			ECHConfig: ech,
+		}}
+	} else {
+		s.meta.Document.Servers[0].ECH = ech
+		s.meta.Document.Servers[0].ECHConfig = ech
+		if s.meta.Document.Servers[0].Token != "" {
+			s.meta.Document.Signature = SignSub(s.meta.Document, []byte(s.meta.Document.Servers[0].Token))
+		}
+	}
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	return s.writeClientSubLocked()
 }
 
 // UpsertUserSub adds or updates a user-specific subscription
