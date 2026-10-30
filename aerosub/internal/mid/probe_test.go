@@ -2,8 +2,10 @@
 package mid
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -321,4 +323,46 @@ func TestDiagCache_Concurrency(t *testing.T) {
 	}
 	wg.Wait()
 	InvalidateDiagCache(vpsID)
+}
+
+func TestDiag_StatusParsingAndWireContract(t *testing.T) {
+	// 1. 测试 parseKV 对含 JSON 报文的正确解析能力（单行 JSON）
+	rawOutput := "SERVICE=active\nMAIN_PID=2167517\nPORT_2083=yes\nPORT_2083_PROC=aero-edge\nPORT_443=yes\nPORT_443_PROC=xray-linux-amd6\nEDGE_STATUS={\"ok\":true,\"version\":\"1.2.16\",\"uptime_sec\":1234.5}\n"
+	kv := parseKV(rawOutput)
+	if kv["SERVICE"] != "active" {
+		t.Fatalf("expected SERVICE=active, got %s", kv["SERVICE"])
+	}
+	if kv["MAIN_PID"] != "2167517" {
+		t.Fatalf("expected MAIN_PID=2167517, got %s", kv["MAIN_PID"])
+	}
+	if kv["PORT_2083_PROC"] != "aero-edge" {
+		t.Fatalf("expected PORT_2083_PROC=aero-edge, got %s", kv["PORT_2083_PROC"])
+	}
+	if kv["EDGE_STATUS"] == "" {
+		t.Fatalf("expected EDGE_STATUS not empty")
+	}
+
+	var edgeStatus map[string]any
+	if err := json.Unmarshal([]byte(kv["EDGE_STATUS"]), &edgeStatus); err != nil {
+		t.Fatalf("unmarshal EDGE_STATUS failed: %v", err)
+	}
+	if edgeStatus["version"] != "1.2.16" || edgeStatus["ok"] != true {
+		t.Fatalf("unexpected edgeStatus payload: %+v", edgeStatus)
+	}
+
+	// 2. 验证正则匹配：严防 inactive 中包含 active 子串造成的致命误判
+	testLines := []string{"inactive", "active", "unknown"}
+	activeRegex := regexp.MustCompile(`^(active|activating)$`)
+	matchedCount := 0
+	for _, l := range testLines {
+		if activeRegex.MatchString(l) {
+			matchedCount++
+			if l != "active" {
+				t.Fatalf("regex matched non-active line: %s", l)
+			}
+		}
+	}
+	if matchedCount != 1 {
+		t.Fatalf("expected exactly 1 match for active, got %d", matchedCount)
+	}
 }

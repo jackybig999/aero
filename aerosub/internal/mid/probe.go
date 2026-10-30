@@ -883,7 +883,7 @@ func probeEdgeAdminAPI(ctx context.Context, host, ip string, port int, adminKey 
 		req.Header.Set("User-Agent", "AERO-MidPlatform/1.0")
 
 		client := &http.Client{
-			Timeout: 2000 * time.Millisecond,
+			Timeout: 1200 * time.Millisecond,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true,
@@ -1039,10 +1039,10 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 		}, nil
 	}
 
-	// 1. 内存极速诊断缓存：3 秒内免重复打靶，提升中台 Dashboard 与并发探活响应速度至 <1ms
+	// 1. 内存极速诊断缓存：15 秒内免重复打靶，提升中台 Dashboard 与并发探活响应速度至 <1ms
 	diagCacheMu.RLock()
 	if cached, ok := diagCache[id]; ok {
-		if time.Since(cached.createdAt) < 3*time.Second {
+		if time.Since(cached.createdAt) < 15*time.Second {
 			res := cloneDiagMap(cached.diag)
 			diagCacheMu.RUnlock()
 			res["purity"] = purityMap
@@ -1155,8 +1155,10 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 			}
 		}
 		return map[string]any{
-			"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-probe",
-			"service": map[string]any{"status": "unknown", "active": certOK, "main_pid": "0"},
+			"vps_id":    id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-probe",
+			"ok":        certOK,
+			"installed": isInstalled,
+			"service":   map[string]any{"status": "unknown", "active": certOK, "main_pid": "0"},
 			"ports": []map[string]any{
 				{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": certOK},
 			},
@@ -1185,8 +1187,10 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 			}
 		}
 		return map[string]any{
-			"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-direct",
-			"service": map[string]any{"status": "active", "active": certOK, "main_pid": "0"},
+			"vps_id":    id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-direct",
+			"ok":        certOK,
+			"installed": isInstalled,
+			"service":   map[string]any{"status": "active", "active": certOK, "main_pid": "0"},
 			"ports": []map[string]any{
 				{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": certOK},
 			},
@@ -1206,11 +1210,12 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 	}
 	defer client.Close()
 
-	// 极简轻量级 SSH 探针：检查实际端口、服务状态以及远端标准证书目录（涵盖 Let's Encrypt / acme.sh / autocert）
+	// 极简轻量级 SSH 探针：检查实际端口、服务状态、1ms 本地 Edge Admin 回环以及远端标准证书目录
 	script := fmt.Sprintf(`set +e
-ST=$(systemctl is-active aero aero-edge 2>/dev/null | grep active | head -1)
+ST=$(systemctl is-active aero-edge aero 2>/dev/null | grep -E '^(active|activating)$' | head -1)
 [ -z "$ST" ] && ST="inactive"
-PID=$(pgrep -f "aero" 2>/dev/null | head -1)
+PID=$(pgrep -f "aero-edge" 2>/dev/null | head -1)
+[ -z "$PID" ] && PID=$(pgrep -f "aero" 2>/dev/null | head -1)
 [ -z "$PID" ] && PID=0
 echo "SERVICE=$ST"
 echo "MAIN_PID=$PID"
@@ -1226,6 +1231,11 @@ for P in %d 443 80 8443; do
   fi
 done
 
+if [ -n "%s" ]; then
+  EDGE_LOCAL=$(curl -k -s -m 1 "https://127.0.0.1:%d/admin/status?key=%s" 2>/dev/null | tr -d '\r\n')
+  [ -n "$EDGE_LOCAL" ] && echo "EDGE_STATUS=$EDGE_LOCAL"
+fi
+
 DOMAIN="%s"
 for D in "/etc/letsencrypt/live/$DOMAIN" "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/$DOMAIN" "/var/lib/aero/tls" "/var/lib/aero/certs" "/var/lib/aero"; do
   if [ -f "$D/fullchain.pem" ] || [ -f "$D/fullchain.cer" ]; then
@@ -1239,7 +1249,7 @@ for D in "/etc/letsencrypt/live/$DOMAIN" "/root/.acme.sh/${DOMAIN}_ecc" "/root/.
     break
   fi
 done
-`, targetPort, vps.Domain)
+`, targetPort, adminKey, targetPort, adminKey, vps.Domain)
 
 	out, err := runSSH(client, script, 5*time.Second)
 	if err != nil {
@@ -1248,6 +1258,28 @@ done
 
 	kv := parseKV(out)
 	svcActive := kv["SERVICE"] == "active" || certOK
+	edgeVer := ""
+	if edgeStatusRaw := kv["EDGE_STATUS"]; edgeStatusRaw != "" {
+		var edgeStatus map[string]any
+		if err := json.Unmarshal([]byte(edgeStatusRaw), &edgeStatus); err == nil && edgeStatus != nil {
+			if okVal, _ := edgeStatus["ok"].(bool); okVal {
+				svcActive = true
+				if verVal, ok := edgeStatus["version"].(string); ok && verVal != "" {
+					edgeVer = verVal
+				}
+			}
+		}
+	}
+	if !svcActive && kv["MAIN_PID"] != "0" && kv["MAIN_PID"] != "" {
+		for _, p := range []int{targetPort, 443, 8443} {
+			proc := kv[fmt.Sprintf("PORT_%d_PROC", p)]
+			if strings.Contains(proc, "aero") || strings.Contains(proc, "ao-dg") {
+				svcActive = true
+				break
+			}
+		}
+	}
+
 	portTargetListen := kv[fmt.Sprintf("PORT_%d", targetPort)] == "yes" || certOK
 
 	// 解析 SSH 探针获取的真实证书目录和有效期，杜绝写死假路径
@@ -1318,13 +1350,20 @@ done
 	}
 
 	res := map[string]any{
-		"vps_id":  id,
-		"domain":  vps.Domain,
-		"ip":      vps.IP,
-		"via":     "hybrid-fast",
-		"service": map[string]any{"status": kv["SERVICE"], "active": svcActive, "main_pid": kv["MAIN_PID"]},
-		"ports":   ports,
-		"cert":    certMap,
+		"vps_id":    id,
+		"domain":    vps.Domain,
+		"ip":        vps.IP,
+		"via":       "hybrid-fast",
+		"ok":        isInstalled && (svcActive || portTargetListen),
+		"installed": isInstalled,
+		"service": map[string]any{
+			"status":   kv["SERVICE"],
+			"active":   svcActive,
+			"main_pid": kv["MAIN_PID"],
+			"version":  edgeVer,
+		},
+		"ports": ports,
+		"cert":  certMap,
 		"subscription": map[string]any{
 			"secret_set": "yes",
 			"local_ok":   svcActive,
@@ -1332,6 +1371,9 @@ done
 		},
 		"nodes":  nodes,
 		"purity": purityMap,
+	}
+	if edgeVer != "" {
+		res["version"] = edgeVer
 	}
 	diagCacheMu.Lock()
 	diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
@@ -2051,7 +2093,7 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		if verBytes, err := os.ReadFile("VERSION"); err == nil && len(strings.TrimSpace(string(verBytes))) > 0 {
 			targetVer = strings.TrimSpace(string(verBytes))
 		} else {
-			targetVer = "1.2.16"
+			targetVer = "1.2.17"
 		}
 	}
 	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
@@ -2126,9 +2168,9 @@ fi
 	subSec := "sub_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	tok := "tok_" + cred.Name
 
-	// 端口选择与智能轮试：支持管理员显式指定端口；未指定则默认探测 443，遇冲突自动轮试候选标准 HTTPS 端口
+	// 端口选择与智能轮试：支持管理员显式指定端口；未指定或默认 443 则探测 443，遇第三方占用自动轮试候选标准 HTTPS 端口
 	targetPort := 443
-	if customPort > 0 {
+	if customPort > 0 && customPort != 443 {
 		targetPort = customPort
 		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口指定] 管理员显式指定部署监听端口: %d", targetPort))
 	} else {
@@ -2145,21 +2187,25 @@ if [ -n "$LINE_443" ]; then
   PNAME=$(echo "$LINE_443" | grep -o 'users:(("[^"]*"' | tr -d 'users:(("' | head -1)
   [ -z "$PNAME" ] && PNAME=$(echo "$LINE_443" | awk '{print $NF}')
   PID=$(echo "$LINE_443" | grep -o 'pid=[0-9]*' | tr -d 'pid=' | head -1)
-  if [ "$PNAME" != "aero-edge" ] && [ "$PNAME" != "aero" ]; then
+  if [ "$PNAME" != "aero-edge" ] && [ "$PNAME" != "aero" ] && [ "$PNAME" != "ao-dg" ]; then
     echo "OCCUPIED_BY=${PNAME:-unknown}(${PID:-0})"
-    # 443 端口被占用，按规范顺序轮试标准 HTTPS 候选备用端口 (8443, 2053, 2083, 2087, 2096, 10443)
-    for CANDIDATE in 8443 2053 2083 2087 2096 10443; do
+    # 443 端口被第三方占用，轮试标准 HTTPS 候选备用端口 (优先 2083，再试 8443, 2053, 2087, 2096, 10443)
+    for CANDIDATE in 2083 8443 2053 2087 2096 10443; do
       IN_USE=0
-      if command -v ss >/dev/null 2>&1; then
-        ss -lnut 2>/dev/null | grep -qE ":$CANDIDATE\b" && IN_USE=1
-      elif command -v netstat >/dev/null 2>&1; then
-        netstat -lnut 2>/dev/null | grep -qE ":$CANDIDATE\b" && IN_USE=1
+      LINE_CAND=$(ss -lnutp 2>/dev/null | grep -E ":$CANDIDATE\b" | head -1)
+      if [ -n "$LINE_CAND" ]; then
+        if echo "$LINE_CAND" | grep -qE "aero-edge|ao-dg|aero"; then
+          echo "SELECTED_PORT=$CANDIDATE"
+          echo "REUSING_AERO_PORT=yes"
+          break
+        else
+          IN_USE=1
+          echo "CANDIDATE_${CANDIDATE}_OCCUPIED=yes"
+        fi
       fi
       if [ "$IN_USE" -eq 0 ]; then
         echo "SELECTED_PORT=$CANDIDATE"
         break
-      else
-        echo "CANDIDATE_${CANDIDATE}_OCCUPIED=yes"
       fi
     done
   fi
@@ -2171,7 +2217,9 @@ fi
 			if selP, ok2 := detKV["SELECTED_PORT"]; ok2 && selP != "" {
 				if pNum, err := strconv.Atoi(selP); err == nil && pNum > 0 {
 					targetPort = pNum
-					if detKV["CANDIDATE_8443_OCCUPIED"] == "yes" {
+					if detKV["REUSING_AERO_PORT"] == "yes" {
+						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口复用] 443 端口已被第三方进程 [%s] 占用，检测到 AERO Edge 已在备用端口 %d 运行，自动对齐复用！", occ, targetPort))
+					} else if detKV["CANDIDATE_8443_OCCUPIED"] == "yes" {
 						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口冲突自愈] 443 与 8443 备用端口均已被第三方进程 [%s] 占用！自动跳过已占用端口，选定空闲标准 HTTPS 端口: %d", occ, targetPort))
 					} else {
 						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口冲突自愈] 443 端口已被第三方进程 [%s] 占用！自动轮试选定备用标准 HTTPS 端口: %d", occ, targetPort))

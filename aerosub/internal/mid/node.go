@@ -1749,6 +1749,9 @@ func (h *VPSHandler) Probe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 422, errResp(1002, "invalid vps id"))
 		return
 	}
+	if r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1" {
+		InvalidateDiagCache(id)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	m, err := h.svc.Probe(ctx, id)
@@ -1804,6 +1807,9 @@ func (h *VPSHandler) Diagnose(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, 422, errResp(1002, "invalid vps id"))
 		return
+	}
+	if r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1" {
+		InvalidateDiagCache(id)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()

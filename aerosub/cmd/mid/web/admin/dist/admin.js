@@ -1435,9 +1435,11 @@ async function loadAERO() {
     initAeroEvents();
     aeroEventsInitialized = true;
   }
-  await loadAeroSourceStatus();
-  await loadAeroVpsList();
-  await loadAeroTasks();
+  await Promise.all([
+    loadAeroSourceStatus(),
+    loadAeroVpsList(),
+    loadAeroTasks()
+  ]);
   if (currentAeroVpsId) {
     await loadAeroDiagnose(currentAeroVpsId);
   }
@@ -1500,22 +1502,23 @@ async function loadAeroVpsList() {
   }
 }
 
-async function loadAeroDiagnose(vpsId) {
+async function loadAeroDiagnose(vpsId, force = false) {
   if (!vpsId) return;
   const statusEl = $('aeroDeployStatus');
   if (statusEl) statusEl.textContent = `正在全面诊断 VPS #${vpsId}...`;
 
   try {
-    const diag = await apiCall(`/aero/vps/${vpsId}/diagnose/`);
+    const url = `/aero/vps/${vpsId}/diagnose/${force ? '?force=true' : ''}`;
+    const diag = await apiCall(url);
     latestAeroDiagnose = diag;
     if (statusEl) statusEl.textContent = `探测响应完成 (${diag.via || '本地'})`;
 
-    // 1. Overall & Service KPI
-    const isOk = diag.ok;
-    const isInstalled = diag.installed;
+    // 1. Overall & Service KPI（双向防御性容错，彻底消灭 undefined 误判）
+    const isInstalled = diag.installed !== undefined ? diag.installed : (diag.service && diag.service.status !== 'uninstalled');
+    const svcActive = diag.service && (diag.service.active || diag.service.status === 'active');
+    const isOk = diag.ok !== undefined ? diag.ok : (isInstalled && svcActive);
     $('aeroKpiOverall').innerHTML = `<span class="tag ${isOk ? 'tag-green' : (isInstalled ? 'tag-amber' : 'tag-red')}">${isOk ? '正常在线' : (isInstalled ? '异常待排查' : '未安装')}</span>`;
     
-    const svcActive = diag.service && diag.service.active;
     $('aeroKpiService').innerHTML = `<span class="tag ${svcActive ? 'tag-green' : 'tag-red'}">${svcActive ? 'RUNNING' : 'STOPPED'}</span>`;
 
     // 2. Port 443 / Listening Port
@@ -1754,7 +1757,7 @@ async function deployAero(action, customPort = 0) {
   }
 }
 
-async function openAeroPreflightDrawer(action, customPort = 443) {
+async function openAeroPreflightDrawer(action, customPort = 0) {
   if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
 
   preflightPendingAction = action;
@@ -1861,7 +1864,7 @@ async function openAeroPreflightDrawer(action, customPort = 443) {
     const isOk = diag && diag.ok;
     const installedVer = (diag && (diag.version || (diag.service && diag.service.version))) || '';
     const src = latestAeroSourceStatus;
-    const releaseTag = (src && src.release_tag) || 'v1.2.16';
+    const releaseTag = (src && src.release_tag) || 'v1.2.17';
 
     if (isInstalled && isOk) {
       // 场景 1：目标主机已安装且正常在线（防重复安装拦截）
@@ -2239,10 +2242,10 @@ window.delAeroToken = async (tok) => {
 
 function initAeroEvents() {
   $('btnAeroRefresh')?.addEventListener('click', () => {
-    if (currentAeroVpsId) loadAeroDiagnose(currentAeroVpsId);
+    if (currentAeroVpsId) loadAeroDiagnose(currentAeroVpsId, true);
   });
   $('btnAeroTestConn')?.addEventListener('click', () => {
-    if (currentAeroVpsId) loadAeroDiagnose(currentAeroVpsId);
+    if (currentAeroVpsId) loadAeroDiagnose(currentAeroVpsId, true);
   });
   $('aeroVpsSelect')?.addEventListener('change', (e) => {
     currentAeroVpsId = e.target.value;
@@ -2253,7 +2256,7 @@ function initAeroEvents() {
   // 安装 / 升级 Edge 节点（单步直达任务抽屉流水线，带已安装检测与防重复提醒）
   $('btnAeroInstall')?.addEventListener('click', () => {
     if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
-    openAeroPreflightDrawer('install', 443);
+    openAeroPreflightDrawer('install', 0);
   });
 
   // 深度卸载 Edge 节点（单步直达任务抽屉流水线，抽屉内嵌高危删除二次确认）

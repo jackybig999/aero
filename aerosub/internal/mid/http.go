@@ -771,6 +771,9 @@ func (h *AeroHandler) Diagnose(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 422, errResp(1002, "invalid vps id"))
 		return
 	}
+	if r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1" {
+		InvalidateDiagCache(id)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	diag, err := h.svc.Diagnose(ctx, id)
