@@ -57,7 +57,11 @@ data/
 *.db-shm
 *.db-wal
 
-# Internal temporary audit reports, plans and manifests (untracked)
+# Cross-platform IDE path compatibility symlink
+*D:*
+D\\:*
+
+
 *REPORT*.md
 *PLAN*.md
 *MANIFEST*.md
