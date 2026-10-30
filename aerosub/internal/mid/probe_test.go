@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestResolveIPRegionAndASN(t *testing.T) {
@@ -278,4 +280,45 @@ func TestDefaultWarpInstallSteps(t *testing.T) {
 			t.Errorf("step %d expected key %s, got %s", i, key, steps[i].Key)
 		}
 	}
+}
+
+func TestDiagCache_Concurrency(t *testing.T) {
+	vpsID := uint64(9999)
+	InvalidateDiagCache(vpsID)
+
+	baseDiag := map[string]any{
+		"domain": "test.aero",
+		"online": true,
+		"nodes":  []any{"node1", "node2"},
+	}
+	diagCacheMu.Lock()
+	diagCache[vpsID] = diagCacheEntry{
+		diag:      cloneDiagMap(baseDiag),
+		createdAt: time.Now(),
+	}
+	diagCacheMu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			diagCacheMu.RLock()
+			cached, ok := diagCache[vpsID]
+			var res map[string]any
+			if ok && time.Since(cached.createdAt) < 3*time.Second {
+				res = cloneDiagMap(cached.diag)
+			}
+			diagCacheMu.RUnlock()
+
+			if res != nil {
+				res["purity"] = map[string]any{"worker": workerID}
+				if res["domain"] != "test.aero" {
+					t.Errorf("expected domain test.aero, got %v", res["domain"])
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	InvalidateDiagCache(vpsID)
 }

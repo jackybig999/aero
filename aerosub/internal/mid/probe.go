@@ -826,6 +826,17 @@ func ProbeTLSCertificate(domain, ip string, candidatePorts ...int) (map[string]a
 	}, false
 }
 
+func cloneDiagMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	c := make(map[string]any, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
+}
+
 type diagCacheEntry struct {
 	diag      map[string]any
 	createdAt time.Time
@@ -1032,9 +1043,10 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 	diagCacheMu.RLock()
 	if cached, ok := diagCache[id]; ok {
 		if time.Since(cached.createdAt) < 3*time.Second {
+			res := cloneDiagMap(cached.diag)
 			diagCacheMu.RUnlock()
-			cached.diag["purity"] = purityMap
-			return cached.diag, nil
+			res["purity"] = purityMap
+			return res, nil
 		}
 	}
 	diagCacheMu.RUnlock()
@@ -1091,7 +1103,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 				"purity": purityMap,
 			}
 			diagCacheMu.Lock()
-			diagCache[id] = diagCacheEntry{diag: res, createdAt: time.Now()}
+			diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
 			diagCacheMu.Unlock()
 			return res, nil
 		}
@@ -1130,7 +1142,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 			"purity": purityMap,
 		}
 		diagCacheMu.Lock()
-		diagCache[id] = diagCacheEntry{diag: res, createdAt: time.Now()}
+		diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
 		diagCacheMu.Unlock()
 		return res, nil
 	}
@@ -1322,7 +1334,7 @@ done
 		"purity": purityMap,
 	}
 	diagCacheMu.Lock()
-	diagCache[id] = diagCacheEntry{diag: res, createdAt: time.Now()}
+	diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
 	diagCacheMu.Unlock()
 	return res, nil
 }
