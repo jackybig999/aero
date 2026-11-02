@@ -1515,19 +1515,23 @@ func (s *VPSService) UpdatePassword(id uint64, password string) error {
 
 func (s *VPSService) UpdateDomain(id uint64, domain string) error {
 	domain = strings.TrimSpace(domain)
-	err := s.store.UpdateDomain(id, domain)
+	cleanDomain := domain
+	if h, _, err := net.SplitHostPort(domain); err == nil {
+		cleanDomain = h
+	}
+	err := s.store.UpdateDomain(id, cleanDomain)
 	if err == nil {
-		if s.nodeSvc != nil && domain != "" {
-			s.nodeSvc.UpdateHostByVPS(id, domain)
+		if s.nodeSvc != nil && cleanDomain != "" {
+			s.nodeSvc.UpdateHostByVPS(id, cleanDomain)
 		}
-		if s.eps != nil && domain != "" {
+		if s.eps != nil && cleanDomain != "" {
 			if ep, ok := s.eps.Get(id); ok {
-				ep.Host = domain
+				ep.Host = cleanDomain
 				sec := ep.SubSecret
 				if sec == "" {
 					sec = "superadmin"
 				}
-				ep.SubURL = fmt.Sprintf("https://%s/sub/%s", domain, sec)
+				ep.SubURL = fmt.Sprintf("https://%s/sub/%s", cleanDomain, sec)
 				_ = s.eps.Upsert(ep)
 			}
 		}

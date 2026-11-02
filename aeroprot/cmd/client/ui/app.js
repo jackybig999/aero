@@ -1145,7 +1145,6 @@ function init() {
         busy = false
       }
     }
-  }
 
   $('btnPower').onclick = onPower
   $('btnPaste').onclick = pasteSub

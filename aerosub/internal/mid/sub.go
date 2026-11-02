@@ -221,6 +221,9 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				continue
 			}
 			host := strings.TrimSpace(ep.Host)
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
 			if host == "" || net.ParseIP(host) != nil {
 				continue
 			}
@@ -408,18 +411,12 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 		for _, srv := range servers {
 			if addr, ok := srv["address"].(string); ok && addr != "" {
 				host := addr
-				portStr := "443"
-				if h, p, err := net.SplitHostPort(addr); err == nil {
+				if h, _, err := net.SplitHostPort(addr); err == nil {
 					host = h
-					portStr = p
 				}
 				if host != "" && net.ParseIP(host) == nil {
 					if slugToUse != "" {
-						if portStr == "443" || portStr == "" {
-							subUrl = fmt.Sprintf("https://%s/sub/%s", host, slugToUse)
-						} else {
-							subUrl = fmt.Sprintf("https://%s:%s/sub/%s", host, portStr, slugToUse)
-						}
+						subUrl = fmt.Sprintf("https://%s/sub/%s", host, slugToUse)
 						break
 					}
 				}
@@ -477,13 +474,21 @@ func (sb *SubBuilder) writeUserSubscription(w http.ResponseWriter, r *http.Reque
 	// 动态适配请求方的公网访问域名 (过滤非标端口与纯 IP，自适应反代)
 	if r != nil {
 		pubHost := r.Header.Get("X-Forwarded-Host")
+		if idx := strings.Index(pubHost, ","); idx != -1 {
+			pubHost = pubHost[:idx]
+		}
+		pubHost = strings.TrimSpace(pubHost)
 		if pubHost == "" {
 			pubHost = r.Host
+			if idx := strings.Index(pubHost, ","); idx != -1 {
+				pubHost = pubHost[:idx]
+			}
+			pubHost = strings.TrimSpace(pubHost)
 		}
 		if h, _, err := net.SplitHostPort(pubHost); err == nil {
 			pubHost = h
 		}
-		if pubHost != "" && net.ParseIP(pubHost) == nil && pubHost != "localhost" && strings.Contains(pubHost, ".") {
+		if pubHost != "" && net.ParseIP(pubHost) == nil && pubHost != "localhost" && strings.Contains(pubHost, ".") && !strings.Contains(pubHost, ":") && !strings.Contains(pubHost, ",") {
 			slugToUse := user.SubSlug
 			if user.IsStaff {
 				if user.Username != "" && user.Username != "admin" {

@@ -696,8 +696,7 @@ function renderUsers() {
             `;
           } else if (anyVps.length === 1) {
             const vHost0 = anyVps[0].domain || anyVps[0].ip;
-            const vPort0 = anyVps[0].port;
-            const subUrl = `https://${(vPort0 && vPort0 != 443) ? `${vHost0}:${vPort0}` : vHost0}/sub/superadmin`;
+            const subUrl = `https://${vHost0}/sub/superadmin`;
             subColHtml = `
               <td>
                 <div style="display:flex;align-items:center;gap:6px">
@@ -720,8 +719,7 @@ function renderUsers() {
           }
         } else if (liveCount === 1) {
           const vHost1 = onlineVpsList[0].domain || onlineVpsList[0].ip;
-          const vPort1 = onlineVpsList[0].port;
-          const subUrl = `https://${(vPort1 && vPort1 != 443) ? `${vHost1}:${vPort1}` : vHost1}/sub/superadmin`;
+          const subUrl = `https://${vHost1}/sub/superadmin`;
           subColHtml = `
             <td>
               <div style="display:flex;align-items:center;gap:6px">
@@ -940,8 +938,7 @@ window.openAdminMultiSubModal = () => {
   } else {
     listEl.innerHTML = displayList.map((v, idx) => {
       const host = v.domain || v.ip;
-      const hostWithPort = (v.port && v.port != 443) ? `${host}:${v.port}` : host;
-      const subUrl = `https://${hostWithPort}/sub/superadmin`;
+      const subUrl = `https://${host}/sub/superadmin`;
       const name = v.name || `节点 ${idx + 1}`;
       const isOnline = v.status === 'online' || v.status === true || v.status === 1;
       return `
@@ -1590,9 +1587,7 @@ async function loadAeroDiagnose(vpsId, force = false) {
 
     // 8. Sub Box
     const vpsHost = diag.domain || diag.ip || getPrimaryVpsDomain();
-    const vpsPort = diag.ports && diag.ports.find(p => p.role && p.role.includes('aero'))?.port || diag.port;
-    const vpsHostWithPort = (vpsPort && vpsPort != 443) ? `${vpsHost}:${vpsPort}` : vpsHost;
-    const subUrl = `https://${vpsHostWithPort}/sub/superadmin`;
+    const subUrl = `https://${vpsHost}/sub/superadmin`;
     $('aeroSubUrlBox').textContent = subUrl;
     $('aeroSubSecretStatus').textContent = sub.secret_set === 'yes' ? '已配置就绪' : '未配置';
     $('aeroSubLocalStatus').innerHTML = `<span class="tag ${sub.local_ok ? 'tag-green' : 'tag-amber'}">${sub.local_ok ? 'OK' : 'FAIL'}</span>`;
@@ -1864,7 +1859,7 @@ async function openAeroPreflightDrawer(action, customPort = 0) {
     const isOk = diag && diag.ok;
     const installedVer = (diag && (diag.version || (diag.service && diag.service.version))) || '';
     const src = latestAeroSourceStatus;
-    const releaseTag = (src && src.release_tag) || 'v1.2.17';
+    const releaseTag = (src && src.release_tag) || 'v1.2.18';
 
     if (isInstalled && isOk) {
       // 场景 1：目标主机已安装且正常在线（防重复安装拦截）

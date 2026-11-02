@@ -1155,7 +1155,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 			}
 		}
 		return map[string]any{
-			"vps_id":    id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-probe",
+			"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-probe",
 			"ok":        certOK,
 			"installed": isInstalled,
 			"service":   map[string]any{"status": "unknown", "active": certOK, "main_pid": "0"},
@@ -1187,7 +1187,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 			}
 		}
 		return map[string]any{
-			"vps_id":    id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-direct",
+			"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-direct",
 			"ok":        certOK,
 			"installed": isInstalled,
 			"service":   map[string]any{"status": "active", "active": certOK, "main_pid": "0"},
@@ -1464,6 +1464,9 @@ func parseHarvest(out string, cred *Credentials) EndpointInfo {
 	host = strings.TrimPrefix(host, "https://")
 	host = strings.TrimPrefix(host, "http://")
 	host = strings.Split(host, "/")[0]
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
 
 	port := 443
 	if p, err := strconv.Atoi(strings.TrimSpace(kv["PORT"])); err == nil && p > 0 {
@@ -2093,7 +2096,7 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		if verBytes, err := os.ReadFile("VERSION"); err == nil && len(strings.TrimSpace(string(verBytes))) > 0 {
 			targetVer = strings.TrimSpace(string(verBytes))
 		} else {
-			targetVer = "1.2.17"
+			targetVer = "1.2.18"
 		}
 	}
 	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
@@ -2428,13 +2431,11 @@ EOF
 `, subSec, cred.Name, host, host, dataPlanePort, tok, host)
 	_, _ = runSSH(client, edgeSubSetupScript, 10*time.Second)
 
-	// 更新中台 Endpoint 资产状态：443 零端口纯净输出，备用端口带端口
-	var subUrl string
-	if targetPort == 443 {
-		subUrl = fmt.Sprintf("https://%s/sub/%s", host, subSec)
-	} else {
-		subUrl = fmt.Sprintf("https://%s:%d/sub/%s", host, targetPort, subSec)
+	// 更新中台 Endpoint 资产状态：强制统一标准 443 HTTPS 零端口订阅链接
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
+	subUrl := fmt.Sprintf("https://%s/sub/%s", host, subSec)
 	ep := EndpointInfo{
 		VPSID:     vpsID,
 		Name:      cred.Name,

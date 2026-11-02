@@ -524,6 +524,8 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 	// 绑定内存级原生 IPC 通道，彻底切断对 127.0.0.1 网络端口依赖
 	w.Bind("goClientAPI", func(method, path, bodyStr string) (string, error) {
 		req := httptest.NewRequest(method, path, strings.NewReader(bodyStr))
+		req.Header.Set("Origin", "http://127.0.0.1")
+		req.Header.Set("Referer", "http://127.0.0.1/")
 		if bodyStr != "" {
 			req.Header.Set("Content-Type", "application/json")
 		}
