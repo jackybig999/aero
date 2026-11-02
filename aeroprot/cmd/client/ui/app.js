@@ -1015,9 +1015,15 @@ function init() {
   $('btnApplyManualSub')?.addEventListener('click', async () => {
     const btn = $('btnApplyManualSub')
     const origText = btn ? btn.textContent : t('load')
+    let timer = null
     if (btn) {
       btn.disabled = true
       btn.textContent = t('loading')
+      timer = setTimeout(() => {
+        if (btn && btn.disabled) {
+          btn.textContent = '匹配端口中...'
+        }
+      }, 400)
     }
     try {
       await ensureImported(true)
@@ -1026,6 +1032,7 @@ function init() {
     } catch (e) {
       msg(e.message, 'err')
     } finally {
+      if (timer) clearTimeout(timer)
       if (btn) {
         btn.disabled = false
         btn.textContent = origText

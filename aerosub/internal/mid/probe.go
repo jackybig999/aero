@@ -478,7 +478,17 @@ echo "disk_used=$DU"
 
 	vps, _ := s.store.Get(id)
 	if vps != nil && vps.Domain != "" {
-		certMap, _ := ProbeTLSCertificate(vps.Domain, cred.IP)
+		targetPort := 443
+		if s.eps != nil {
+			if ep, ok := s.eps.Get(id); ok && ep.Port > 0 {
+				targetPort = ep.Port
+			}
+		}
+		candidatePorts := []int{targetPort}
+		if targetPort != 443 {
+			candidatePorts = append(candidatePorts, 443)
+		}
+		certMap, _ := ProbeTLSCertificate(vps.Domain, cred.IP, candidatePorts...)
 		met.Cert = certMap
 	}
 
@@ -2096,7 +2106,7 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		if verBytes, err := os.ReadFile("VERSION"); err == nil && len(strings.TrimSpace(string(verBytes))) > 0 {
 			targetVer = strings.TrimSpace(string(verBytes))
 		} else {
-			targetVer = "1.2.18"
+			targetVer = "1.2.19"
 		}
 	}
 	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
@@ -2192,8 +2202,8 @@ if [ -n "$LINE_443" ]; then
   PID=$(echo "$LINE_443" | grep -o 'pid=[0-9]*' | tr -d 'pid=' | head -1)
   if [ "$PNAME" != "aero-edge" ] && [ "$PNAME" != "aero" ] && [ "$PNAME" != "ao-dg" ]; then
     echo "OCCUPIED_BY=${PNAME:-unknown}(${PID:-0})"
-    # 443 端口被第三方占用，轮试标准 HTTPS 候选备用端口 (优先 2083，再试 8443, 2053, 2087, 2096, 10443)
-    for CANDIDATE in 2083 8443 2053 2087 2096 10443; do
+    # 443 端口被第三方占用，轮试标准 HTTPS 候选备用端口与高位自治端口
+    for CANDIDATE in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
       IN_USE=0
       LINE_CAND=$(ss -lnutp 2>/dev/null | grep -E ":$CANDIDATE\b" | head -1)
       if [ -n "$LINE_CAND" ]; then
@@ -2242,19 +2252,30 @@ CERT_MODE="autocert"
 mkdir -p /var/lib/aero/tls /var/lib/aero/certs
 DOMAIN_LOWER=$(echo "%s" | tr '[:upper:]' '[:lower:]')
 
-# 1. 扫描老机器已有证书 (acme.sh, certbot, s-ui/3x-ui, etc.)
-FOUND_CERT=$(find /root/.acme.sh /etc/letsencrypt/live /root/cert /usr/local/s-ui/bin/cert /etc/ssl -type f \( -name "*${DOMAIN_LOWER}*.cer" -o -name "*${DOMAIN_LOWER}*fullchain*.pem" -o -name "fullchain.pem" -o -name "${DOMAIN_LOWER}.crt" \) 2>/dev/null | head -1)
-if [ -n "$FOUND_CERT" ]; then
-  CERT_DIR=$(dirname "$FOUND_CERT")
-  FOUND_KEY=$(find "$CERT_DIR" -type f \( -name "*${DOMAIN_LOWER}*.key" -o -name "privkey.pem" -o -name "${DOMAIN_LOWER}.key" -o -name "*.key" \) 2>/dev/null | head -1)
-  if [ -n "$FOUND_KEY" ]; then
-    cp -f "$FOUND_CERT" /var/lib/aero/tls/fullchain.pem
-    cp -f "$FOUND_KEY" /var/lib/aero/tls/privkey.pem
-    chmod 600 /var/lib/aero/tls/privkey.pem
-    echo "FOUND_EXISTING_CERT=yes"
-    echo "CERT_SOURCE=$FOUND_CERT"
-    CERT_MODE="manual"
+# 1. 严格层级扫描老机器存量证书：顶级优先 /root/.acme.sh/ 域名目录 (ECC/RSA)，次优 certbot，兜底常规目录
+FOUND_CERT=""
+FOUND_KEY=""
+for D in "/root/.acme.sh/${DOMAIN_LOWER}_ecc" "/root/.acme.sh/${DOMAIN_LOWER}" "/etc/letsencrypt/live/${DOMAIN_LOWER}" "/root/cert/${DOMAIN_LOWER}" "/root/certs/${DOMAIN_LOWER}" "/root/cert" "/root/certs" "/usr/local/s-ui/bin/cert" "/etc/ssl"; do
+  if [ -d "$D" ]; then
+    FC=$(find "$D" -maxdepth 2 -type f \( -name "fullchain.cer" -o -name "fullchain.pem" -o -name "*${DOMAIN_LOWER}*.cer" -o -name "*${DOMAIN_LOWER}*fullchain*.pem" -o -name "${DOMAIN_LOWER}.crt" \) 2>/dev/null | head -1)
+    if [ -n "$FC" ]; then
+      KY=$(find "$(dirname "$FC")" -maxdepth 1 -type f \( -name "${DOMAIN_LOWER}.key" -o -name "*${DOMAIN_LOWER}*.key" -o -name "privkey.pem" -o -name "*.key" \) 2>/dev/null | head -1)
+      if [ -n "$KY" ]; then
+        FOUND_CERT="$FC"
+        FOUND_KEY="$KY"
+        break
+      fi
+    fi
   fi
+done
+
+if [ -n "$FOUND_CERT" ] && [ -n "$FOUND_KEY" ]; then
+  cp -f "$FOUND_CERT" /var/lib/aero/tls/fullchain.pem
+  cp -f "$FOUND_KEY" /var/lib/aero/tls/privkey.pem
+  chmod 600 /var/lib/aero/tls/privkey.pem
+  echo "FOUND_EXISTING_CERT=yes"
+  echo "CERT_SOURCE=$FOUND_CERT"
+  CERT_MODE="manual"
 fi
 
 if [ "$CERT_MODE" != "manual" ]; then
@@ -2425,7 +2446,14 @@ echo "REDIR_METHOD=$REDIR_METHOD"
       "isp_affinity": "cmcc"
     }
   ],
-  "user_subs": {}
+  "user_subs": {
+    "superadmin": {
+      "username": "superadmin",
+      "slug": "superadmin",
+      "token": "usr_superadmin",
+      "expire_at": 0
+    }
+  }
 }
 EOF
 `, subSec, cred.Name, host, host, dataPlanePort, tok, host)

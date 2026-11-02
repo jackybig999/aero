@@ -501,12 +501,26 @@ func (s *SubStore) DeleteUserSub(slug string) error {
 
 // UserDocumentJSON formats a UserSub into subscription JSON
 func (s *SubStore) UserDocumentJSON(sub UserSub) ([]byte, error) {
+	servers := sub.Servers
+	if len(servers) == 0 {
+		s.mu.RLock()
+		servers = s.meta.Document.Servers
+		s.mu.RUnlock()
+	}
+	if sub.Token != "" && len(servers) > 0 {
+		userServers := make([]SubServer, len(servers))
+		copy(userServers, servers)
+		for i := range userServers {
+			userServers[i].Token = sub.Token
+		}
+		servers = userServers
+	}
 	doc := SubDocument{
 		Version:   "aero/3.0",
 		UserID:    sub.Username,
 		ExpireAt:  sub.ExpireAt,
 		Signature: sub.Signature,
-		Servers:   sub.Servers,
+		Servers:   servers,
 		CreatedAt: sub.CreatedAt,
 	}
 	return json.Marshal(doc)

@@ -354,8 +354,9 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 	}
 
 	// 智能候选端口轮试自愈：当主订阅 URL 默认使用 443/80（未显式携带非标端口）时，
-	// 若遭遇 404/连接失败/非订阅 HTML（例如远端 443 被第三方 Xray/Reality/Nginx 占用），
-	// 自动在同域名下探测标准 HTTPS 候选备用端口池 [2083, 8443, 2053, 2087, 2096, 10443]。
+	// 若遭遇 404/连接失败/非订阅 HTML/证书冲突（例如远端 443 被第三方 Xray/Reality/Nginx 占用），
+	// 自动在同域名下探测候选备用端口池（Tier 1 标准 HTTPS 端口 + Tier 2 自治高位端口）。
+	// 服务端与客户端端口池保持完全一致的顺位 [2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443]。
 	// 若在备用端口上成功拉取到有效 AERO 订阅，则无缝自愈接管，彻底解决用户免配端口的体验痛点！
 	u, parseErr := url.Parse(rawURL)
 	if parseErr == nil && (u.Port() == "" || u.Port() == "443" || u.Port() == "80") && strings.HasPrefix(u.Path, "/sub/") {
@@ -364,9 +365,11 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		if scheme == "" {
 			scheme = "https"
 		}
-		for _, candPort := range []int{2083, 8443, 2053, 2087, 2096, 10443} {
+		// Tier 1 (标准 HTTPS 候选池) + Tier 2 (自治高位非常用备用池)，两端 100% 对齐
+		candPorts := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
+		for _, candPort := range candPorts {
 			altURL := fmt.Sprintf("%s://%s:%d%s", scheme, hostOnly, candPort, u.RequestURI())
-			candCtx, candCancel := context.WithTimeout(ctx, 8*time.Second)
+			candCtx, candCancel := context.WithTimeout(ctx, 2*time.Second)
 			altSub, altBody, altErr := fetchSingleSubURL(candCtx, altURL, opt)
 			candCancel()
 			if altErr == nil && altSub != nil && len(altSub.Servers) > 0 {

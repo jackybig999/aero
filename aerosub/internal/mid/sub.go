@@ -539,9 +539,13 @@ func (s *VPSService) SyncUsersToEdge(vpsID uint64, users []*User) error {
 	}
 
 	var payloads []EdgeUserSubPayload
+	hasSuperadmin := false
 	for _, u := range users {
 		if u == nil || !u.Status || u.SubSlug == "" {
 			continue
+		}
+		if u.SubSlug == "superadmin" {
+			hasSuperadmin = true
 		}
 		exp := int64(0)
 		if !u.ExpireAt.IsZero() {
@@ -552,6 +556,14 @@ func (s *VPSService) SyncUsersToEdge(vpsID uint64, users []*User) error {
 			Slug:     u.SubSlug,
 			Token:    u.SubToken,
 			ExpireAt: exp,
+		})
+	}
+	if !hasSuperadmin {
+		payloads = append(payloads, EdgeUserSubPayload{
+			Username: "superadmin",
+			Slug:     "superadmin",
+			Token:    "usr_superadmin",
+			ExpireAt: 0,
 		})
 	}
 	if len(payloads) == 0 {

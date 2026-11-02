@@ -29,7 +29,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.2.18"
+VERSION="1.2.19"
 REPO="jackybig999/aero"
 
 usage() {
@@ -74,7 +74,7 @@ fi
 
 detect_best_https_port() {
     local preferred="$1"
-    local candidates=("$preferred" 443 8443 2053 2083 2087 2096 10443)
+    local candidates=("$preferred" 2083 2087 8443 2053 2096 10443 24443 34443 44443)
     local tested=" "
     for p in "${candidates[@]}"; do
         if [[ "$tested" =~ " ${p} " ]]; then
@@ -226,7 +226,7 @@ if [[ -f "$CERT" && -f "$KEY" ]]; then
 fi
 
 if [[ "$need_issue" = "1" ]]; then
-    for d in "/root/cert/${DOMAIN}" "/root/certs/${DOMAIN}" "/root/cert" "/root/certs" "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}" "/etc/letsencrypt/live/${DOMAIN}" "/etc/cert/${DOMAIN}" "/etc/certs/${DOMAIN}"; do
+    for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}" "/etc/letsencrypt/live/${DOMAIN}" "/root/cert/${DOMAIN}" "/root/certs/${DOMAIN}" "/root/cert" "/root/certs" "/etc/cert/${DOMAIN}" "/etc/certs/${DOMAIN}"; do
         FC=""
         [[ -f "$d/fullchain.cer" ]] && FC="$d/fullchain.cer"
         [[ -f "$d/fullchain.pem" ]] && FC="$d/fullchain.pem"

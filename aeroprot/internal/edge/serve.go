@@ -745,7 +745,8 @@ func tryPortFallbackTCP(initialListen string, tlsCfg *tls.Config) (net.Listener,
 	}
 	initPort, _ := strconv.Atoi(portStr)
 
-	candidates := []int{8443, 2053, 2083, 2087, 2096, 10443}
+	// Tier 1 (标准 HTTPS 候选池，优先 2083/2087) + Tier 2 (自治高位避让候选池)
+	candidates := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
 	for _, cand := range candidates {
 		if cand == initPort {
 			continue
