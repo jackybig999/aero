@@ -214,7 +214,7 @@ func TestSubscriptionDocECHAndAltPorts(t *testing.T) {
 	if !ok {
 		t.Fatalf("alt_ports is not []int: %T", altPortsRaw)
 	}
-	if len(altPorts) != 3 || altPorts[0] != 2083 || altPorts[1] != 2087 || altPorts[2] != 8443 {
+	if len(altPorts) < 3 || altPorts[0] != 2083 || altPorts[1] != 2087 || altPorts[2] != 8443 {
 		t.Fatalf("unexpected alt_ports values: %v", altPorts)
 	}
 }

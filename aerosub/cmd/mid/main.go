@@ -36,7 +36,7 @@ import (
 //go:embed all:web
 var embeddedWebFS embed.FS
 
-const Version = "1.2.19"
+const Version = "1.2.20"
 
 func main() {
 	showVer := flag.Bool("version", false, "print version and exit")

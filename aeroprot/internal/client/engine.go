@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.19"
+	ClientVersion = "1.2.20"
 	Protocol      = "aero/3.0"
 )
 

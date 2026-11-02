@@ -29,7 +29,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.2.19"
+VERSION="1.2.20"
 REPO="jackybig999/aero"
 
 usage() {
@@ -157,7 +157,7 @@ chmod 600 "$CONFIG_DIR/edge.conf"
 # --- edge.yaml: 规范化注入跳频备用端口与 ECH 配置 ---
 cat > "$CONFIG_DIR/edge.yaml" << 'EOF'
 {
-  "alt_listen_ports": [2083, 2087, 8443],
+  "alt_listen_ports": [2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443],
   "ech": ""
 }
 EOF
@@ -347,23 +347,24 @@ WantedBy=multi-user.target
 SERVICE
 
 # --- firewall: open PRIMARY_PORT (TCP+UDP), 80, and secondary ports 2083/2087/8443 ---
-echo "[firewall] 放行业务端口 TCP/UDP ${PRIMARY_PORT} 与 ACME TCP 80，及备用端口 2083,2087,8443"
+echo "[firewall] 放行业务端口 TCP/UDP ${PRIMARY_PORT} 与 ACME TCP 80，及备用端口池"
+CANDIDATE_POOL="2083,2087,8443,2053,2096,10443,24443,34443,44443"
 if command -v ufw >/dev/null 2>&1; then
     ufw allow "${PRIMARY_PORT}/tcp" 2>/dev/null || true
     ufw allow "${PRIMARY_PORT}/udp" 2>/dev/null || true
     ufw allow 80/tcp 2>/dev/null || true
-    ufw allow 2083/udp 2>/dev/null || true
-    ufw allow 2087/udp 2>/dev/null || true
-    ufw allow 8443/udp 2>/dev/null || true
+    for cp in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
+        ufw allow "${cp}/udp" 2>/dev/null || true
+    done
 fi
 if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp -m multiport --dports 2083,2087,8443 -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p udp -m multiport --dports "$CANDIDATE_POOL" -j ACCEPT 2>/dev/null || true
     # 备用端口内核级重定向到主端口（防 UDP 443 针对性 QoS 丢包与封锁）
     SEC_PORTS=""
-    for sp in 2083 2087 8443; do
+    for sp in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
         if [[ "$sp" != "$PRIMARY_PORT" ]]; then
             if ! ss -tuln 2>/dev/null | grep -E ":$sp\b" | grep -qv "aero-edge"; then
                 SEC_PORTS="${SEC_PORTS}${sp},"

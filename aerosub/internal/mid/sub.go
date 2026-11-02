@@ -277,7 +277,7 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 					continue
 				}
 				if vps.Metrics != nil && !vps.Metrics.ProbeOK {
-					continue
+					loadScore = 90.0 // 边缘服务在线但底层 SSH 探针遇阻（如 SSH 端口安全限制），降权保留，杜绝商用多节点暴毙
 				}
 			}
 
@@ -300,16 +300,12 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				}
 			}
 
-			// 候选备选端口池 (覆盖常见的标准 443 及高防备选端口 2083, 2087, 8443)
+			// 候选备选端口池 (覆盖常见的标准 443 及完整候选端口池)
 			var altPorts []int
-			if port == 443 {
-				altPorts = []int{2083, 2087, 8443}
-			} else {
-				altPorts = []int{443}
-				for _, cp := range []int{2083, 2087, 8443} {
-					if cp != port {
-						altPorts = append(altPorts, cp)
-					}
+			allCandidates := []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
+			for _, cp := range allCandidates {
+				if cp != port {
+					altPorts = append(altPorts, cp)
 				}
 			}
 
@@ -575,32 +571,59 @@ func (s *VPSService) SyncUsersToEdge(vpsID uint64, users []*User) error {
 		return err
 	}
 
-	url := fmt.Sprintf("https://%s:%d/admin/subs", ep.Host, port)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return err
+	targets := []string{}
+	if ep.Host != "" && net.ParseIP(ep.Host) == nil {
+		targets = append(targets, ep.Host)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Aero-Admin-Key", ep.AdminKey)
+	if ep.IP != "" && ep.IP != ep.Host {
+		targets = append(targets, ep.IP)
+	}
+	if len(targets) == 0 && ep.Host != "" {
+		targets = append(targets, ep.Host)
+	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-				ServerName:         ep.Host,
+	var lastSyncErr error
+	synced := false
+	for _, tgt := range targets {
+		url := fmt.Sprintf("https://%s:%d/admin/subs", tgt, port)
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			lastSyncErr = err
+			continue
+		}
+		if ep.Host != "" && net.ParseIP(ep.Host) == nil {
+			req.Host = ep.Host
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Aero-Admin-Key", ep.AdminKey)
+
+		client := &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+					ServerName:         ep.Host,
+				},
+				DisableKeepAlives: true,
 			},
-		},
-	}
+		}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("sync to %s:%d failed: %w", ep.Host, port, err)
-	}
-	defer resp.Body.Close()
+		resp, err := client.Do(req)
+		if err != nil {
+			lastSyncErr = fmt.Errorf("sync to %s:%d failed: %w", tgt, port, err)
+			continue
+		}
+		_ = resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("sync to %s:%d returned http %d", ep.Host, port, resp.StatusCode)
+		if resp.StatusCode >= 400 {
+			lastSyncErr = fmt.Errorf("sync to %s:%d returned http %d", tgt, port, resp.StatusCode)
+			continue
+		}
+		synced = true
+		break
+	}
+	if !synced {
+		return lastSyncErr
 	}
 	return nil
 }

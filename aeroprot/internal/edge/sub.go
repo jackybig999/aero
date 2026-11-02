@@ -227,11 +227,12 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 
 	altPorts := p.AltPorts
 	if len(altPorts) == 0 {
+		candidates := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
 		if primaryPort == 443 {
-			altPorts = []int{2083, 2087, 8443}
+			altPorts = append([]int(nil), candidates...)
 		} else {
 			altPorts = []int{443}
-			for _, cp := range []int{2083, 2087, 8443} {
+			for _, cp := range candidates {
 				if cp != primaryPort {
 					altPorts = append(altPorts, cp)
 				}
@@ -353,11 +354,12 @@ func (s *SubStore) UpdatePrimaryPort(port int, host string) error {
 		s.meta.Document.Servers[0].Address = net.JoinHostPort(targetHost, strconv.Itoa(port))
 	}
 
+	candidates := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
 	altPorts := []int{443}
 	if port == 443 {
-		altPorts = []int{2083, 2087, 8443}
+		altPorts = append([]int(nil), candidates...)
 	} else {
-		for _, cp := range []int{2083, 2087, 8443} {
+		for _, cp := range candidates {
 			if cp != port {
 				altPorts = append(altPorts, cp)
 			}

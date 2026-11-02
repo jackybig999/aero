@@ -180,11 +180,12 @@ func (s *Subscription) ValidateAndNormalize() error {
 			mainPort = 443
 		}
 		if len(srv.AltPorts) == 0 {
+			candidates := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
 			if mainPort == 443 {
-				srv.AltPorts = []int{2083, 2087, 8443}
+				srv.AltPorts = append([]int(nil), candidates...)
 			} else {
 				srv.AltPorts = []int{443}
-				for _, cp := range []int{2083, 2087, 8443} {
+				for _, cp := range candidates {
 					if cp != mainPort {
 						srv.AltPorts = append(srv.AltPorts, cp)
 					}

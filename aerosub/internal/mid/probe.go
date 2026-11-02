@@ -485,8 +485,10 @@ echo "disk_used=$DU"
 			}
 		}
 		candidatePorts := []int{targetPort}
-		if targetPort != 443 {
-			candidatePorts = append(candidatePorts, 443)
+		for _, cp := range []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443} {
+			if cp != targetPort {
+				candidatePorts = append(candidatePorts, cp)
+			}
 		}
 		certMap, _ := ProbeTLSCertificate(vps.Domain, cred.IP, candidatePorts...)
 		met.Cert = certMap
@@ -763,6 +765,7 @@ func ProbeTLSCertificate(domain, ip string, candidatePorts ...int) (map[string]a
 	}
 
 	var lastErr error
+	var bestMismatch map[string]any
 	for _, tgt := range targets {
 		conn, err := tls.DialWithDialer(dialer, "tcp", tgt, &tls.Config{
 			ServerName:         domain,
@@ -772,7 +775,6 @@ func ProbeTLSCertificate(domain, ip string, candidatePorts ...int) (map[string]a
 			lastErr = err
 			continue
 		}
-		defer conn.Close()
 
 		state := conn.ConnectionState()
 		if len(state.PeerCertificates) > 0 {
@@ -805,7 +807,7 @@ func ProbeTLSCertificate(domain, ip string, candidatePorts ...int) (map[string]a
 				detail = fmt.Sprintf("有效 (剩余 %d 天 · %s 签发)", daysLeft, issuer)
 			}
 
-			return map[string]any{
+			res := map[string]any{
 				"mode":       "tls-online",
 				"ok":         ok,
 				"domain":     domain,
@@ -816,8 +818,22 @@ func ProbeTLSCertificate(domain, ip string, candidatePorts ...int) (map[string]a
 				"file_count": 1,
 				"dir":        "在线握手",
 				"detail":     detail,
-			}, ok
+			}
+			_ = conn.Close()
+
+			if ok {
+				return res, true
+			}
+			if bestMismatch == nil {
+				bestMismatch = res
+			}
+		} else {
+			_ = conn.Close()
 		}
+	}
+
+	if bestMismatch != nil {
+		return bestMismatch, false
 	}
 
 	errMsg := "候选端口未监听或 TLS 握手超时"
@@ -1119,10 +1135,12 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 		}
 	}
 
-	// 3. Fallback 原生 TLS 握手抓取真实证书信息（探测实际端口与 443）
+	// 3. Fallback 原生 TLS 握手抓取真实证书信息（顺位探测候选端口池）
 	candidatePorts := []int{targetPort}
-	if targetPort != 443 {
-		candidatePorts = append(candidatePorts, 443)
+	for _, cp := range []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443} {
+		if cp != targetPort {
+			candidatePorts = append(candidatePorts, cp)
+		}
 	}
 	fastCert, certOK := ProbeTLSCertificate(vps.Domain, vps.IP, candidatePorts...)
 	certMap := fastCert
@@ -2106,7 +2124,7 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		if verBytes, err := os.ReadFile("VERSION"); err == nil && len(strings.TrimSpace(string(verBytes))) > 0 {
 			targetVer = strings.TrimSpace(string(verBytes))
 		} else {
-			targetVer = "1.2.19"
+			targetVer = "1.2.20"
 		}
 	}
 	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
