@@ -9,6 +9,7 @@ package client
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -143,7 +144,8 @@ func TestSetupRoutesDNSGatewayAlignment(t *testing.T) {
 		t.Fatalf("unexpected error from SetupRoutes: %v", err)
 	}
 
-	foundDNS := false
+	foundDNSIPv4 := false
+	foundDNSIPv6 := false
 	foundNRPT := false
 	foundMetric := false
 
@@ -152,21 +154,27 @@ func TestSetupRoutesDNSGatewayAlignment(t *testing.T) {
 		for _, arg := range cmd {
 			joined += arg + " "
 		}
-		// 校验 1: DNS 服务器必须指向虚拟网关 10.88.0.1，绝不可指向网卡自身 10.88.0.2
-		if len(cmd) >= 6 && cmd[0] == "netsh" && cmd[3] == "set" && cmd[4] == "dnsservers" {
-			foundDNS = true
+		// 校验 1: DNS 服务器必须指向虚拟网关 10.88.0.1 与 fd88::1，绝不可指向网卡自身 10.88.0.2 / fd88::2
+		if len(cmd) >= 6 && cmd[0] == "netsh" && cmd[2] == "ip" && cmd[3] == "set" && cmd[4] == "dnsservers" {
+			foundDNSIPv4 = true
 			if !reflect.DeepEqual(cmd, []string{"netsh", "interface", "ip", "set", "dnsservers", "name=aero0", "source=static", "address=10.88.0.1", "validate=no"}) {
-				t.Errorf("unexpected dnsservers command: %v", cmd)
+				t.Errorf("unexpected ipv4 dnsservers command: %v", cmd)
 			}
 		}
-		// 校验 2: NRPT 规则必须指向虚拟网关 10.88.0.1
+		if len(cmd) >= 6 && cmd[0] == "netsh" && cmd[2] == "ipv6" && cmd[3] == "set" && cmd[4] == "dnsservers" {
+			foundDNSIPv6 = true
+			if !reflect.DeepEqual(cmd, []string{"netsh", "interface", "ipv6", "set", "dnsservers", "name=aero0", "source=static", "address=fd88::1", "validate=no"}) {
+				t.Errorf("unexpected ipv6 dnsservers command: %v", cmd)
+			}
+		}
+		// 校验 2: NRPT 规则必须指向双栈虚拟网关 10.88.0.1 与 fd88::1
 		if cmd[0] == "powershell" {
 			for _, arg := range cmd {
-				if reflect.DeepEqual(arg, "Add-DnsClientNrptRule -Namespace '.' -NameServers '10.88.0.1' -Comment 'AERO_aero0'") {
+				if strings.Contains(arg, "Add-DnsClientNrptRule") && strings.Contains(arg, "10.88.0.1") && strings.Contains(arg, "fd88::1") {
 					foundNRPT = true
 				}
-				if reflect.DeepEqual(arg, "Add-DnsClientNrptRule -Namespace '.' -NameServers '10.88.0.2' -Comment 'AERO_aero0'") {
-					t.Errorf("CRITICAL BUG: NRPT was directed to local adapter IP 10.88.0.2 causing 10054 loopback blackhole!")
+				if strings.Contains(arg, "10.88.0.2") || strings.Contains(arg, "fd88::2") {
+					t.Errorf("CRITICAL BUG: NRPT was directed to local adapter IP causing loopback blackhole!")
 				}
 			}
 		}
@@ -176,11 +184,14 @@ func TestSetupRoutesDNSGatewayAlignment(t *testing.T) {
 		}
 	}
 
-	if !foundDNS {
-		t.Errorf("expected netsh set dnsservers address=10.88.0.1 command not executed")
+	if !foundDNSIPv4 {
+		t.Errorf("expected netsh ipv4 set dnsservers address=10.88.0.1 command not executed")
+	}
+	if !foundDNSIPv6 {
+		t.Errorf("expected netsh ipv6 set dnsservers address=fd88::1 command not executed")
 	}
 	if !foundNRPT {
-		t.Errorf("expected Add-DnsClientNrptRule NameServers 10.88.0.1 command not executed")
+		t.Errorf("expected Add-DnsClientNrptRule NameServers 10.88.0.1,fd88::1 command not executed")
 	}
 	if !foundMetric {
 		t.Errorf("expected netsh interface metric=1 command not executed")
