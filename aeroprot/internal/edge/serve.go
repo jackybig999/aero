@@ -247,6 +247,27 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("bootstrap subscription: %w", err)
 	}
 
+	// 3b. Sync user tokens from subStore into tokenStore and validator
+	if subStore != nil && tokenStore != nil {
+		for _, u := range subStore.ListUserSubs() {
+			if u.Token == "" {
+				continue
+			}
+			ttl := 100 * 365 * 24 * time.Hour
+			if u.ExpireAt > 0 {
+				rem := time.Until(time.Unix(u.ExpireAt, 0))
+				if rem > 0 {
+					ttl = rem
+				} else {
+					continue
+				}
+			}
+			if err := tokenStore.Ensure(u.Token, "user:"+u.Slug, ttl); err != nil {
+				log.Printf("[EDGE] Warning: failed to sync user token %s (%s): %v", MaskToken(u.Token), u.Slug, err)
+			}
+		}
+	}
+
 	// 4. Traffic & Flow Limiters
 	maxConn := cfg.MaxConn
 	if maxConn <= 0 {

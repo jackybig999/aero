@@ -16,7 +16,7 @@
         </div>
         <div class="brand-text">
           <h1>AERO Edge Console</h1>
-          <span class="version-tag" id="appVersion">v1.2.21 • aero/3.0</span>
+          <span class="version-tag" id="appVersion">v1.2.22 • aero/3.0</span>
         </div>
       </div>
       <div class="nav-status">
@@ -197,8 +197,8 @@
             <h3>开通用户专属订阅</h3>
             <form id="createUserForm" class="form-grid">
               <div class="form-group">
-                <label>用户名 (字母/数字)</label>
-                <input type="text" id="newUsername" placeholder="例如: jacky" required pattern="^[a-zA-Z0-9_-]{2,32}$">
+                <label>用户名 (字母/数字/邮箱)</label>
+                <input type="text" id="newUsername" placeholder="例如: jacky 或 jacky@domain.com" required pattern="^[a-zA-Z0-9_@.-]{2,64}$">
               </div>
               <div class="form-group">
                 <label>6位随机安全码</label>
@@ -243,7 +243,7 @@
                   <th>状态</th>
                   <th>有效期</th>
                   <th>流量配额 (已用 / 上限)</th>
-                  <th>专属零端口订阅链接</th>
+                  <th>专属订阅链接 (零端口 / 直连测试)</th>
                   <th>操作</th>
                 </tr>
               </thead>

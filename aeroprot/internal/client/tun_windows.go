@@ -328,6 +328,7 @@ func SetupRoutes(devName, ipv4 string) error {
 	time.Sleep(300 * time.Millisecond)
 
 	_ = runCmd("netsh", "interface", "ipv6", "add", "address", devName, "fd88::2/64")
+	_ = runCmd("netsh", "interface", "ipv6", "set", "dnsservers", "name="+devName, "source=static", "address=fd88::1", "validate=no")
 
 	idx := interfaceIndex(devName)
 
@@ -356,18 +357,18 @@ func SetupRoutes(devName, ipv4 string) error {
 	addSplitDefault("0.0.0.0", "128.0.0.0")
 	addSplitDefault("128.0.0.0", "128.0.0.0")
 
-	// 3. IPv6 黑洞路由：在 TUN 网卡上添加 ::/1 和 8000::/1（仅绑定 devName）
+	// 3. IPv6 全局接管路由：在 TUN 网卡上添加 ::/1 和 8000::/1 指向 fd88::1（覆盖 ::/0）
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", devName)
-	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "::/1", devName)
-	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "8000::/1", devName)
+	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "::/1", devName, "fd88::1", "metric=1")
+	_ = runCmd("netsh", "interface", "ipv6", "add", "route", "8000::/1", devName, "fd88::1", "metric=1")
 
 	// 4. 为虚拟网卡绑定纯净虚拟网关 DNS (gwIP = 10.88.0.1)，使系统将 DNS 流量送入虚拟网卡，被 gVisor 端口 53 拦截处理
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=static", "address="+gwIP, "validate=no")
 
-	// 5. NRPT 策略配置：所有域名（Namespace "."）指向虚拟网关 DNS（gwIP = 10.88.0.1，绝对严禁指向网卡自身 tunIP！），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！ (SEC-11)
+	// 5. NRPT 策略配置：所有域名（Namespace "."）指向双栈虚拟网关 DNS（gwIP = 10.88.0.1 与 fd88::1），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！ (SEC-11)
 	_ = runCmd("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
-		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s' -Comment 'AERO_%s'", gwIP, devName))
+		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s','fd88::1' -Comment 'AERO_%s'", gwIP, devName))
 	_ = runCmd("ipconfig", "/flushdns")
 
 	log.Printf("[TUN] Routes and DNS configured on %s via tunIP=%s gwIP=%s if=%s (MTU=1360)", devName, tunIP, gwIP, idx)
@@ -384,6 +385,7 @@ func TeardownRoutes(devName string) {
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", devName)
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "address", devName, "fd88::2")
+	_ = runCmd("netsh", "interface", "ipv6", "set", "dnsservers", "name="+devName, "source=dhcp")
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
@@ -398,6 +400,7 @@ func CleanAero0StaleRoutes() {
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "8000::/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "address", "aero0", "fd88::2")
+	_ = runCmd("netsh", "interface", "ipv6", "set", "dnsservers", "name=aero0", "source=dhcp")
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name=aero0", "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", "aero0")

@@ -356,8 +356,11 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return h.queryFastUDP(pkt)
 	}
 
-	// 节点自身域名：返回真实 IP
+	// 节点自身域名：返回真实 IP (AAAA 立即返回空响应，防止操作系统解析器超时死等)
 	if h.edgeHost != "" && (qnameLower == h.edgeHost || strings.HasSuffix(qnameLower, "."+h.edgeHost)) {
+		if qtype == 0x001C {
+			return buildEmptyResponse(pkt, qname, qtype)
+		}
 		if h.edgeIP != nil {
 			return buildAResponse(pkt, qname, h.edgeIP)
 		}

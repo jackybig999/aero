@@ -417,13 +417,42 @@ func (g *DialGuard) backgroundWarpHealthChecker() {
 	}
 }
 
+var googleAICIDRs = parseAICIDRs([]string{
+	"142.250.0.0/16",
+	"172.217.0.0/16",
+	"216.58.192.0/19",
+	"108.177.0.0/17",
+	"2607:f8b0::/32",
+	"2001:4860::/32",
+})
+
+func parseAICIDRs(cidrs []string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, ipNet, err := net.ParseCIDR(c)
+		if err == nil && ipNet != nil {
+			nets = append(nets, ipNet)
+		}
+	}
+	return nets
+}
+
 func isTargetAIDomain(address string) bool {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		host = address
 	}
-	host = strings.TrimRight(strings.ToLower(strings.TrimSpace(host)), ".")
+	host = strings.Trim(strings.TrimRight(strings.ToLower(strings.TrimSpace(host)), "."), "[]")
 	if host == "" {
+		return false
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		for _, ipNet := range googleAICIDRs {
+			if ipNet.Contains(ip) {
+				return true
+			}
+		}
 		return false
 	}
 

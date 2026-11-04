@@ -694,7 +694,6 @@ type subSignBody struct {
 	UserID            string      `json:"userId,omitempty"`
 	ExpireAt          int64       `json:"expireAt,omitempty"`
 	TrafficLimitBytes int64       `json:"trafficLimitBytes,omitempty"`
-	TrafficUsedBytes  int64       `json:"trafficUsedBytes,omitempty"`
 	Servers           []SubServer `json:"servers"`
 	CreatedAt         int64       `json:"createdAt,omitempty"`
 }
@@ -939,6 +938,32 @@ func FormatZeroPortSubURL(domainOrHost, slug string) string {
 	}
 	cleanSlug := strings.TrimPrefix(slug, "/")
 	return fmt.Sprintf("https://%s/sub/%s", raw, cleanSlug)
+}
+
+// FormatDirectSubURL formats direct URL with port for testing/preview if port is not 443
+func FormatDirectSubURL(domainOrHost string, port int, slug string) string {
+	raw := strings.TrimSpace(domainOrHost)
+	raw = strings.TrimPrefix(raw, "http://")
+	raw = strings.TrimPrefix(raw, "https://")
+	if idx := strings.Index(raw, "/"); idx != -1 {
+		raw = raw[:idx]
+	}
+	host, _, err := net.SplitHostPort(raw)
+	if err == nil {
+		raw = host
+	}
+	raw = strings.Trim(raw, "[]")
+	if raw == "" {
+		raw = "127.0.0.1"
+	}
+	if ip := net.ParseIP(raw); ip != nil && ip.To4() == nil {
+		raw = "[" + raw + "]"
+	}
+	cleanSlug := strings.TrimPrefix(slug, "/")
+	if port <= 0 || port == 443 {
+		return fmt.Sprintf("https://%s/sub/%s", raw, cleanSlug)
+	}
+	return fmt.Sprintf("https://%s:%d/sub/%s", raw, port, cleanSlug)
 }
 
 // ExtractSPKIPinFromCert extracts SPKI SHA-256 base64 pin directly from parsed x509.Certificate

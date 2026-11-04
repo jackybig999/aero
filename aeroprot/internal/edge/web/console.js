@@ -335,7 +335,10 @@
             <div class="progress-bar" style="height: 6px;"><div class="progress-fill" style="width: ${usagePct}%;"></div></div>
           </td>
           <td>
-            <button class="btn btn-secondary btn-sm" onclick="window.AeroCopy('${escapeHtml(u.sub_url)}')">复制零端口链接</button>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+              <button class="btn btn-secondary btn-sm" onclick="window.AeroCopy('${escapeHtml(u.sub_url)}')">复制零端口链接</button>
+              ${u.direct_sub_url && u.direct_sub_url !== u.sub_url ? `<button class="btn btn-secondary btn-sm" style="border-color: var(--blue);" onclick="window.AeroCopy('${escapeHtml(u.direct_sub_url)}')">复制直连链接 (测试用)</button>` : ''}
+            </div>
           </td>
           <td>
             <button class="btn btn-danger btn-sm" onclick="window.AeroDeleteUser('${escapeHtml(u.slug)}')">删除</button>
@@ -424,7 +427,7 @@
           alert(`创建失败: ${result.error || '未知错误'}`);
         }
       } catch (err) {
-        alert(`请求失败: ${err.message}`);
+        alert(`请求失败: ${err.message || '网络连接超时或服务未就绪'}`);
       }
     });
   }

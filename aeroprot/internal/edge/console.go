@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,7 +32,7 @@ var consoleCSS []byte
 //go:embed web/console.js
 var consoleJS []byte
 
-var validUsernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{2,32}$`)
+var validUsernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_@.-]{2,64}$`)
 var validCodeRegex = regexp.MustCompile(`^[a-z0-9]{6}$`)
 
 // ConsoleHandler provides the embedded Web Console routes, authentication, and REST APIs.
@@ -248,6 +249,27 @@ func (h *ConsoleHandler) primaryDomain() string {
 		}
 	}
 	return "localhost"
+}
+
+func (h *ConsoleHandler) listenPort() int {
+	if h.server != nil && h.server.cfg.Listen != "" {
+		if _, portStr, err := net.SplitHostPort(h.server.cfg.Listen); err == nil {
+			if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+				return p
+			}
+		}
+	}
+	if h.subStore != nil {
+		doc := h.subStore.Document()
+		if len(doc.Servers) > 0 && doc.Servers[0].Address != "" {
+			if _, portStr, err := net.SplitHostPort(doc.Servers[0].Address); err == nil {
+				if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+					return p
+				}
+			}
+		}
+	}
+	return 443
 }
 
 func (h *ConsoleHandler) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
@@ -578,7 +600,7 @@ func (r *CreateUserRequest) ValidateAndNormalize() error {
 		return fmt.Errorf("username required")
 	}
 	if !validUsernameRegex.MatchString(r.Username) {
-		return fmt.Errorf("invalid username format (alphanumeric, underscore, hyphen, length 2-32)")
+		return fmt.Errorf("invalid username format (alphanumeric, underscore, hyphen, dot, @, length 2-64)")
 	}
 	if r.Code != "" {
 		r.Code = strings.ToLower(strings.TrimSpace(r.Code))
@@ -633,8 +655,8 @@ func (h *ConsoleHandler) handleAPICreateUser(w http.ResponseWriter, r *http.Requ
 
 	slug := req.Username + code
 
-	// Calculate token TTL
-	ttl := 365 * 24 * time.Hour
+	// Calculate token TTL (default 100 years for permanent valid subscriptions)
+	ttl := 100 * 365 * 24 * time.Hour
 	if req.ExpireAt > 0 {
 		rem := time.Until(time.Unix(req.ExpireAt, 0))
 		if rem > 0 {
@@ -671,6 +693,7 @@ func (h *ConsoleHandler) handleAPICreateUser(w http.ResponseWriter, r *http.Requ
 
 	domain := h.primaryDomain()
 	subURL := FormatZeroPortSubURL(domain, slug)
+	directSubURL := FormatDirectSubURL(domain, h.listenPort(), slug)
 
 	w.WriteHeader(http.StatusOK)
 	writeJSON(w, map[string]any{
@@ -678,6 +701,7 @@ func (h *ConsoleHandler) handleAPICreateUser(w http.ResponseWriter, r *http.Requ
 		"username":            req.Username,
 		"slug":                slug,
 		"sub_url":             subURL,
+		"direct_sub_url":      directSubURL,
 		"token":               token,
 		"expire_at":           req.ExpireAt,
 		"traffic_limit_bytes": req.TrafficLimitBytes,
@@ -692,6 +716,7 @@ func (h *ConsoleHandler) handleAPIListUsers(w http.ResponseWriter, r *http.Reque
 	}
 
 	domain := h.primaryDomain()
+	listenPort := h.listenPort()
 	userSubs := h.subStore.ListUserSubs()
 	out := make([]map[string]any, 0, len(userSubs))
 	now := time.Now().Unix()
@@ -707,10 +732,12 @@ func (h *ConsoleHandler) handleAPIListUsers(w http.ResponseWriter, r *http.Reque
 		}
 
 		subURL := FormatZeroPortSubURL(domain, u.Slug)
+		directSubURL := FormatDirectSubURL(domain, listenPort, u.Slug)
 		out = append(out, map[string]any{
 			"username":            u.Username,
 			"slug":                u.Slug,
 			"sub_url":             subURL,
+			"direct_sub_url":      directSubURL,
 			"expire_at":           u.ExpireAt,
 			"traffic_limit_bytes": u.TrafficLimitBytes,
 			"traffic_used_bytes":  u.TrafficUsedBytes,

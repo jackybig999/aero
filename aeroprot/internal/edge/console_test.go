@@ -418,3 +418,82 @@ func TestConsoleAPI_Users_Validation(t *testing.T) {
 		t.Errorf("expected 400 for unknown field, got %d", rec3.Code)
 	}
 }
+
+func TestConsoleAPI_UserHardening_EmailAndDirectURLAndSignature(t *testing.T) {
+	srv, _ := setupTestConsole(t, "secret_key_123")
+	defer srv.Close()
+
+	// 1. Create user with email format username & permanent expiration (expire_days = 0)
+	payload := `{"username":"alice.dev@company-tech.com","code":"123abc","expire_days":0,"traffic_limit_gb":100}`
+	req := httptest.NewRequest(http.MethodPost, "/console/api/users?key=secret_key_123", strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for email username, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal create response: %v", err)
+	}
+
+	slug := res["slug"].(string)
+	if slug != "alice.dev@company-tech.com123abc" {
+		t.Errorf("expected slug 'alice.dev@company-tech.com123abc', got %v", slug)
+	}
+
+	subURL, _ := res["sub_url"].(string)
+	directSubURL, _ := res["direct_sub_url"].(string)
+	if subURL == "" {
+		t.Errorf("expected sub_url to be non-empty")
+	}
+	if directSubURL == "" {
+		t.Errorf("expected direct_sub_url to be non-empty")
+	}
+
+	// 2. Fetch user subscription document
+	subReq := httptest.NewRequest(http.MethodGet, "/sub/"+slug, nil)
+	subRec := httptest.NewRecorder()
+	srv.ServeHTTP(subRec, subReq)
+	if subRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK fetching sub, got %d", subRec.Code)
+	}
+	var doc SubDocument
+	if err := json.Unmarshal(subRec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("unmarshal sub doc: %v", err)
+	}
+	initialSig := doc.Signature
+	if initialSig == "" {
+		t.Fatalf("expected non-empty initial signature")
+	}
+
+	// 3. Record traffic usage and assert signature remains valid
+	if err := srv.subStore.RecordTraffic(slug, 1024*1024*50); err != nil {
+		t.Fatalf("RecordTraffic: %v", err)
+	}
+
+	subReq2 := httptest.NewRequest(http.MethodGet, "/sub/"+slug, nil)
+	subRec2 := httptest.NewRecorder()
+	srv.ServeHTTP(subRec2, subReq2)
+	if subRec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK fetching sub after traffic, got %d", subRec2.Code)
+	}
+	var doc2 SubDocument
+	if err := json.Unmarshal(subRec2.Body.Bytes(), &doc2); err != nil {
+		t.Fatalf("unmarshal sub doc2: %v", err)
+	}
+	if doc2.TrafficUsedBytes != 1024*1024*50 {
+		t.Errorf("expected 50MB used traffic, got %d", doc2.TrafficUsedBytes)
+	}
+	// Signature must be identical because TrafficUsedBytes is not part of subSignBody
+	if doc2.Signature != initialSig {
+		t.Errorf("traffic accumulation altered signature! before=%s, after=%s", initialSig, doc2.Signature)
+	}
+
+	// Token validation: verify that the signature verifies with the user token
+	userToken := res["token"].(string)
+	if !VerifySub(doc2, []byte(userToken)) {
+		t.Errorf("VerifySub failed after traffic accumulation!")
+	}
+}
