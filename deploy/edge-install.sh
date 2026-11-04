@@ -18,6 +18,7 @@
 set -euo pipefail
 
 TOKEN=""
+ADMIN_KEY=""
 DOMAIN=""
 ADVERTISE_IP=""
 EMAIL=""
@@ -35,6 +36,7 @@ REPO="jackybig999/aero"
 usage() {
     echo "AERO Edge 一键安装"
     echo "  -d, --domain DOMAIN     域名（必须；ACME HTTP-01 需 :80 可达）"
+    echo "  -k, --admin-key KEY     管理员控制台与管控 API 密钥（可选，默认自动生成）"
     echo "  -i, --ip IP             写入订阅的备用公网 IP（有域名时可选）"
     echo "  -t, --token TOKEN       可选，默认自动生成"
     echo "  -e, --email EMAIL       ACME 邮箱（默认 admin@DOMAIN）"
@@ -47,6 +49,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case $1 in
         -t|--token) TOKEN="$2"; shift 2 ;;
+        -k|--admin-key) ADMIN_KEY="$2"; shift 2 ;;
         -d|--domain) DOMAIN="$2"; shift 2 ;;
         -i|--ip) ADVERTISE_IP="$2"; shift 2 ;;
         -e|--email) EMAIL="$2"; shift 2 ;;
@@ -64,6 +67,10 @@ fi
 if [[ -z "$TOKEN" ]]; then
     TOKEN="aero_$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     echo "提示: 已自动生成 token"
+fi
+if [[ -z "$ADMIN_KEY" ]]; then
+    ADMIN_KEY="aero_admin_$(openssl rand -hex 12 2>/dev/null || head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "提示: 已自动生成 admin-key"
 fi
 if [[ -z "$SNI" ]]; then
     SNI="$DOMAIN"
@@ -332,6 +339,7 @@ Environment=AERO_DATA_DIR=$DATA_DIR
 EnvironmentFile=-$CONFIG_DIR/edge.conf
 ExecStart=$INSTALL_DIR/aero-edge \\
   -token $TOKEN \\
+  -admin-key $ADMIN_KEY \\
   -listen :${PRIMARY_PORT} \\
   -profile small \\
   -data-dir $DATA_DIR \\
@@ -448,17 +456,20 @@ else
     SUB_URL="(见 $DATA_DIR/sub_meta.json)"
 fi
 ADMIN_SUB_URL="https://${ADVERTISE_HOST}/sub/admin"
+CONSOLE_URL="https://${ADVERTISE_HOST}:${PRIMARY_PORT}/console?key=${ADMIN_KEY}"
 
 echo ""
 echo "========================================="
 echo " 安装完成 — 客户端一键导入"
 echo "========================================="
-echo " Token:      $TOKEN"
-echo " Listen:     :${PRIMARY_PORT} (可 -p 自定义)"
-echo " Cert:       $CERT (public CA, auto-renew)"
-echo " Data dir:   $DATA_DIR"
-echo " Admin Sub:  $ADMIN_SUB_URL"
-echo " Sub URL:    $SUB_URL"
+echo " Token:       $TOKEN"
+echo " Admin Key:   $ADMIN_KEY"
+echo " Web Console: $CONSOLE_URL"
+echo " Listen:      :${PRIMARY_PORT} (可 -p 自定义)"
+echo " Cert:        $CERT (public CA, auto-renew)"
+echo " Data dir:    $DATA_DIR"
+echo " Admin Sub:   $ADMIN_SUB_URL"
+echo " Sub URL:     $SUB_URL"
 echo ""
 echo " 客户端（本机混合口默认 55555，可 -listen 改）:"
 echo "   aero-ech -sub $SUB_URL -listen 127.0.0.1:55555"
