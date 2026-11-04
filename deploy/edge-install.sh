@@ -47,6 +47,11 @@ usage() {
 }
 
 while [[ $# -gt 0 ]]; do
+    trimmed=$(echo "$1" | tr -d '[:space:]')
+    if [[ -z "$trimmed" ]]; then
+        shift
+        continue
+    fi
     case $1 in
         -t|--token) TOKEN="$2"; shift 2 ;;
         -k|--admin-key) ADMIN_KEY="$2"; shift 2 ;;
