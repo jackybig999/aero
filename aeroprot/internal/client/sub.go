@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,6 +49,9 @@ type ServerConfig struct {
 	AltPorts    []int    `json:"alt_ports,omitempty" yaml:"alt_ports"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
 	ECHConfig   string   `json:"ech_config,omitempty" yaml:"ech_config"`
+	Country     string   `json:"country,omitempty" yaml:"country"`
+	WarpActive  bool     `json:"warp_active,omitempty" yaml:"warp_active"`
+	Tags        []string `json:"tags,omitempty" yaml:"tags"`
 }
 
 // UnmarshalJSON 兼容 snake_case 与 camelCase，杜绝跨系统命名失配导致的静默丢弃
@@ -55,11 +59,20 @@ func (s *ServerConfig) UnmarshalJSON(data []byte) error {
 	type Alias ServerConfig
 	aux := struct {
 		*Alias
-		LegacyISPAffinity string `json:"ispAffinity"`
-		LegacyLineType    string `json:"lineType"`
-		LegacyAltPorts    []int  `json:"altPorts"`
-		LegacyECHConfig   string `json:"echConfig"`
-		LegacyServerECH   string `json:"ech"`
+		LegacyISPAffinity string   `json:"ispAffinity"`
+		LegacyLineType    string   `json:"lineType"`
+		LegacyAltPorts    []int    `json:"altPorts"`
+		LegacyECHConfig   string   `json:"echConfig"`
+		LegacyServerECH   string   `json:"ech"`
+		SnakePurityScore  int      `json:"purity_score"`
+		SnakeAIBlocked    bool     `json:"ai_blocked"`
+		CamelWarpActive   bool     `json:"warpActive"`
+		SnakeWarp         bool     `json:"warp"`
+		SnakeIsWARPEgress bool     `json:"is_warp_egress"`
+		CamelIsWARPEgress bool     `json:"isWarpEgress"`
+		CamelCountryCode  string   `json:"countryCode"`
+		SnakeCountryCode  string   `json:"country_code"`
+		AltTags           []string `json:"tag"`
 	}{
 		Alias: (*Alias)(s),
 	}
@@ -86,6 +99,25 @@ func (s *ServerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if s.ECHConfig == "" && s.ECH != "" {
 		s.ECHConfig = s.ECH
+	}
+	if s.PurityScore == 0 && aux.SnakePurityScore != 0 {
+		s.PurityScore = aux.SnakePurityScore
+	}
+	if !s.AIBlocked && aux.SnakeAIBlocked {
+		s.AIBlocked = aux.SnakeAIBlocked
+	}
+	if !s.WarpActive {
+		s.WarpActive = aux.CamelWarpActive || aux.SnakeWarp || aux.SnakeIsWARPEgress || aux.CamelIsWARPEgress
+	}
+	if s.Country == "" {
+		if aux.CamelCountryCode != "" {
+			s.Country = aux.CamelCountryCode
+		} else if aux.SnakeCountryCode != "" {
+			s.Country = aux.SnakeCountryCode
+		}
+	}
+	if len(s.Tags) == 0 && len(aux.AltTags) > 0 {
+		s.Tags = aux.AltTags
 	}
 	return nil
 }
@@ -118,17 +150,50 @@ type Optimization struct {
 
 // Subscription 瘦客户端专属订阅结构 (aero/3.0)
 type Subscription struct {
-	Version          string         `json:"version" yaml:"ver"`
-	UserID           string         `json:"userId,omitempty" yaml:"user_id"`
-	Slug             string         `json:"slug,omitempty" yaml:"slug"`
-	SubTicketSeed    string         `json:"subTicketSeed,omitempty" yaml:"sub_ticket_seed"`
-	ProtocolPriority []string       `json:"protocolPriority,omitempty" yaml:"protocol_priority"`
-	ExpireAt         int64          `json:"expireAt,omitempty" yaml:"expire_at"`
-	SwitchStatus     string         `json:"switchStatus,omitempty" yaml:"switch_status"`
-	Signature        string         `json:"signature,omitempty" yaml:"sig"`
-	Servers          []ServerConfig `json:"servers" yaml:"nodes"`
-	CreatedAt        int64          `json:"createdAt,omitempty" yaml:"created_at"`
-	Opt              Optimization   `json:"optimization,omitempty" yaml:"optimization"`
+	Version           string         `json:"version" yaml:"ver"`
+	UserID            string         `json:"userId,omitempty" yaml:"user_id"`
+	Slug              string         `json:"slug,omitempty" yaml:"slug"`
+	SubTicketSeed     string         `json:"subTicketSeed,omitempty" yaml:"sub_ticket_seed"`
+	ProtocolPriority  []string       `json:"protocolPriority,omitempty" yaml:"protocol_priority"`
+	ExpireAt          int64          `json:"expireAt,omitempty" yaml:"expire_at"`
+	TrafficLimitBytes int64          `json:"trafficLimitBytes,omitempty" yaml:"traffic_limit_bytes"`
+	TrafficUsedBytes  int64          `json:"trafficUsedBytes,omitempty" yaml:"traffic_used_bytes"`
+	SwitchStatus      string         `json:"switchStatus,omitempty" yaml:"switch_status"`
+	Signature         string         `json:"signature,omitempty" yaml:"sig"`
+	Servers           []ServerConfig `json:"servers" yaml:"nodes"`
+	CreatedAt         int64          `json:"createdAt,omitempty" yaml:"created_at"`
+	Opt               Optimization   `json:"optimization,omitempty" yaml:"optimization"`
+}
+
+func (s *Subscription) UnmarshalJSON(data []byte) error {
+	type Alias Subscription
+	aux := struct {
+		*Alias
+		SnakeTrafficLimit int64 `json:"traffic_limit_bytes"`
+		CamelTrafficLimit int64 `json:"trafficLimitBytes"`
+		SnakeTrafficUsed  int64 `json:"traffic_used_bytes"`
+		CamelTrafficUsed  int64 `json:"trafficUsedBytes"`
+	}{
+		Alias: (*Alias)(s),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if s.TrafficLimitBytes == 0 {
+		if aux.SnakeTrafficLimit != 0 {
+			s.TrafficLimitBytes = aux.SnakeTrafficLimit
+		} else if aux.CamelTrafficLimit != 0 {
+			s.TrafficLimitBytes = aux.CamelTrafficLimit
+		}
+	}
+	if s.TrafficUsedBytes == 0 {
+		if aux.SnakeTrafficUsed != 0 {
+			s.TrafficUsedBytes = aux.SnakeTrafficUsed
+		} else if aux.CamelTrafficUsed != 0 {
+			s.TrafficUsedBytes = aux.CamelTrafficUsed
+		}
+	}
+	return nil
 }
 
 // IsExpired 检查订阅是否过期或已被管理员关闭
@@ -140,6 +205,14 @@ func (s *Subscription) IsExpired() bool {
 		return false
 	}
 	return time.Now().Unix() > s.ExpireAt
+}
+
+// IsTrafficExceeded 检查用户流量是否超限
+func (s *Subscription) IsTrafficExceeded() bool {
+	if s.TrafficLimitBytes <= 0 {
+		return false
+	}
+	return s.TrafficUsedBytes >= s.TrafficLimitBytes
 }
 
 // ValidateAndNormalize 强校验与主动安全兜底，杜绝遗漏字段与空值
@@ -180,7 +253,7 @@ func (s *Subscription) ValidateAndNormalize() error {
 			mainPort = 443
 		}
 		if len(srv.AltPorts) == 0 {
-			candidates := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
+			candidates := StandardCandidatePorts
 			if mainPort == 443 {
 				srv.AltPorts = append([]int(nil), candidates...)
 			} else {
@@ -337,6 +410,223 @@ type SubFetchOptions struct {
 	DisableCache bool
 }
 
+// subPortCacheMu 保护 subPortCache 内存端口映射表
+var (
+	subPortCacheMu sync.RWMutex
+	subPortCache   = make(map[string]int) // normalized host -> working port
+)
+
+// GetCachedSubPort 返回指定主机名已缓存的有效工作端口，若未缓存返回 0, false
+func GetCachedSubPort(host string) (int, bool) {
+	norm := strings.ToLower(strings.TrimSpace(host))
+	if h, _, err := net.SplitHostPort(norm); err == nil {
+		norm = h
+	}
+	norm = strings.Trim(norm, "[]")
+
+	subPortCacheMu.RLock()
+	defer subPortCacheMu.RUnlock()
+	p, ok := subPortCache[norm]
+	if !ok || p <= 0 {
+		return 0, false
+	}
+	return p, true
+}
+
+// SetCachedSubPort 记录指定主机名工作端口（线程安全）
+func SetCachedSubPort(host string, port int) {
+	norm := strings.ToLower(strings.TrimSpace(host))
+	if h, _, err := net.SplitHostPort(norm); err == nil {
+		norm = h
+	}
+	norm = strings.Trim(norm, "[]")
+
+	subPortCacheMu.Lock()
+	defer subPortCacheMu.Unlock()
+	if port <= 0 {
+		delete(subPortCache, norm)
+	} else {
+		subPortCache[norm] = port
+	}
+}
+
+// ClearCachedSubPorts 清空全部缓存的订阅工作端口
+func ClearCachedSubPorts() {
+	subPortCacheMu.Lock()
+	defer subPortCacheMu.Unlock()
+	subPortCache = make(map[string]int)
+}
+
+// FormatZeroPortSubURL 格式化纯净零端口订阅 URL: https://{host}/sub/{slug}
+// 严格遵守 Rule 4 零跨系统导入，客户端独立实现契约对齐
+func FormatZeroPortSubURL(domainOrHost, slug string) string {
+	raw := strings.TrimSpace(domainOrHost)
+	raw = strings.TrimPrefix(raw, "http://")
+	raw = strings.TrimPrefix(raw, "https://")
+	if idx := strings.Index(raw, "/"); idx != -1 {
+		raw = raw[:idx]
+	}
+	host, _, err := net.SplitHostPort(raw)
+	if err == nil {
+		raw = host
+	}
+	raw = strings.Trim(raw, "[]")
+	if raw == "" {
+		raw = "127.0.0.1"
+	}
+	if ip := net.ParseIP(raw); ip != nil && ip.To4() == nil {
+		raw = "[" + raw + "]"
+	}
+	cleanSlug := strings.TrimPrefix(slug, "/")
+	return fmt.Sprintf("https://%s/sub/%s", raw, cleanSlug)
+}
+
+// RenderNodeBadgesSlice 根据节点属性生成权威徽章切片
+func RenderNodeBadgesSlice(country string, purityScore int, aiBlocked bool, warpActive bool) []string {
+	var badges []string
+	cUpper := strings.ToUpper(strings.TrimSpace(country))
+	switch cUpper {
+	case "US":
+		badges = append(badges, "[🇺🇸 原生]")
+	case "HK":
+		badges = append(badges, "[🇭🇰 原生]")
+	case "JP":
+		badges = append(badges, "[🇯🇵 原生]")
+	case "SG":
+		badges = append(badges, "[🇸🇬 原生]")
+	case "TW":
+		badges = append(badges, "[🇹🇼 原生]")
+	case "KR":
+		badges = append(badges, "[🇰🇷 原生]")
+	case "UK", "GB":
+		badges = append(badges, "[🇬🇧 原生]")
+	case "DE":
+		badges = append(badges, "[🇩🇪 原生]")
+	default:
+		if country != "" {
+			badges = append(badges, fmt.Sprintf("[%s 原生]", country))
+		}
+	}
+
+	if !aiBlocked && purityScore >= 80 {
+		badges = append(badges, "[✨ Gemini 解锁]")
+	}
+
+	if warpActive {
+		badges = append(badges, "[🛡️ WARP 接管]")
+	}
+
+	return badges
+}
+
+// RenderNodeBadges 格式化徽章字符串（以空格分隔）
+func RenderNodeBadges(country string, purityScore int, aiBlocked bool, warpActive bool) string {
+	return strings.Join(RenderNodeBadgesSlice(country, purityScore, aiBlocked, warpActive), " ")
+}
+
+// probeCandidatePortsLadder 实施 RFC 8305 风格阶梯并发竞速探测候选端口池
+// 顺位严格对齐 StandardCandidatePorts = []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
+// 阶梯发射间隔 60ms；首个成功返回有效 AERO 订阅的端口赢得竞速，原子取消其余并发探测，返回胜出结果与端口
+func probeCandidatePortsLadder(ctx context.Context, scheme, hostOnly, requestURI string, opt SubFetchOptions) (*Subscription, []byte, int, error) {
+	candPorts := StandardCandidatePorts
+	if len(candPorts) == 0 {
+		return nil, nil, 0, errors.New("no candidate ports configured")
+	}
+
+	ladderOverallTimeout := 6000 * time.Millisecond
+	if opt.Timeout > 0 && opt.Timeout < ladderOverallTimeout {
+		ladderOverallTimeout = opt.Timeout
+	}
+
+	ladderCtx, ladderCancel := context.WithTimeout(ctx, ladderOverallTimeout)
+	defer ladderCancel()
+
+	raceCtx, raceCancel := context.WithCancel(ladderCtx)
+	defer raceCancel()
+
+	type probeResult struct {
+		sub  *Subscription
+		body []byte
+		port int
+		err  error
+	}
+
+	resCh := make(chan probeResult, len(candPorts))
+	var activeProbes atomic.Int32
+	var winOnce sync.Once
+
+	launchProbe := func(port int) {
+		activeProbes.Add(1)
+		go func(p int) {
+			defer activeProbes.Add(-1)
+			altURL := fmt.Sprintf("%s://%s:%d%s", scheme, hostOnly, p, requestURI)
+			portTimeout := 2500 * time.Millisecond
+			if opt.Timeout > 0 && opt.Timeout < portTimeout {
+				portTimeout = opt.Timeout
+			}
+			portCtx, portCancel := context.WithTimeout(raceCtx, portTimeout)
+			defer portCancel()
+
+			altSub, altBody, altErr := fetchSingleSubURL(portCtx, altURL, opt)
+			if altErr == nil && altSub != nil && len(altSub.Servers) > 0 {
+				winOnce.Do(func() {
+					select {
+					case resCh <- probeResult{sub: altSub, body: altBody, port: p}:
+					default:
+					}
+					raceCancel()
+				})
+			} else {
+				select {
+				case resCh <- probeResult{err: altErr, port: p}:
+				case <-raceCtx.Done():
+				}
+			}
+		}(port)
+	}
+
+	// 启动首选高优先级候选端口
+	launchProbe(candPorts[0])
+	attemptIdx := 1
+	staggerTicker := time.NewTicker(60 * time.Millisecond)
+	defer staggerTicker.Stop()
+
+	var firstErr error
+
+	for {
+		select {
+		case <-ladderCtx.Done():
+			return nil, nil, 0, fmt.Errorf("ladder probe exhausted across all candidate ports: %w", ladderCtx.Err())
+
+		case <-staggerTicker.C:
+			if attemptIdx < len(candPorts) {
+				launchProbe(candPorts[attemptIdx])
+				attemptIdx++
+			} else {
+				staggerTicker.Stop()
+			}
+
+		case res := <-resCh:
+			if res.sub != nil {
+				return res.sub, res.body, res.port, nil
+			}
+			if firstErr == nil && res.err != nil {
+				firstErr = res.err
+			}
+			// 若当前端口快速失败，不等满 60ms 立即启动下一顺位候选端口
+			if attemptIdx < len(candPorts) {
+				launchProbe(candPorts[attemptIdx])
+				attemptIdx++
+			} else if activeProbes.Load() == 0 {
+				if firstErr != nil {
+					return nil, nil, 0, fmt.Errorf("ladder probe exhausted across all candidate ports: %w", firstErr)
+				}
+				return nil, nil, 0, errors.New("ladder probe exhausted across all candidate ports")
+			}
+		}
+	}
+}
+
 // FetchSubscription 从远端中台或备用源拉取并解析订阅
 func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) (*Subscription, error) {
 	rawURL = strings.TrimSpace(rawURL)
@@ -348,46 +638,95 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		return nil, fmt.Errorf("invalid subscription URL scheme: %s (must be http:// or https://)", rawURL)
 	}
 
+	u, parseErr := url.Parse(rawURL)
+	isZeroPort := parseErr == nil && (u.Port() == "" || u.Port() == "443" || u.Port() == "80") && strings.HasPrefix(u.Path, "/sub/")
+
+	if isZeroPort {
+		hostOnly := u.Hostname()
+		scheme := u.Scheme
+		if scheme == "" {
+			scheme = "https"
+		}
+
+		// 1. 检查内存端口缓存：若之前已成功探测出非标工作端口，优先走缓存快照
+		if cachedPort, ok := GetCachedSubPort(hostOnly); ok && cachedPort > 0 && cachedPort != 443 && cachedPort != 80 {
+			cachedURL := fmt.Sprintf("%s://%s:%d%s", scheme, hostOnly, cachedPort, u.RequestURI())
+			cachedTimeout := 2500 * time.Millisecond
+			if opt.Timeout > 0 && opt.Timeout < cachedTimeout {
+				cachedTimeout = opt.Timeout
+			}
+			cachedCtx, cachedCancel := context.WithTimeout(ctx, cachedTimeout)
+			cSub, cBody, cErr := fetchSingleSubURL(cachedCtx, cachedURL, opt)
+			cachedCancel()
+			if cErr == nil && cSub != nil && len(cSub.Servers) > 0 {
+				SaveLastBody(cBody)
+				return cSub, nil
+			}
+			// 缓存端口失效（可能服务端换端口），剔除该缓存项并继续正常探测
+			SetCachedSubPort(hostOnly, 0)
+		}
+
+		// 2. 主通道 443 探针：紧缩超时为 2.5s（或 opt.Timeout 较小值），防止在防火墙黑洞下死等 15s
+		primaryTimeout := 2500 * time.Millisecond
+		if opt.Timeout > 0 && opt.Timeout < primaryTimeout {
+			primaryTimeout = opt.Timeout
+		}
+		primaryCtx, primaryCancel := context.WithTimeout(ctx, primaryTimeout)
+		sub, body, err := fetchSingleSubURL(primaryCtx, rawURL, opt)
+		primaryCancel()
+
+		if err == nil && sub != nil && len(sub.Servers) > 0 {
+			SetCachedSubPort(hostOnly, 443)
+			SaveLastBody(body)
+			return sub, nil
+		}
+
+		// 3. 主端口 443 遇阻，启动 RFC 8305 阶梯并发探测 StandardCandidatePorts
+		altSub, altBody, winPort, ladderErr := probeCandidatePortsLadder(ctx, scheme, hostOnly, u.RequestURI(), opt)
+		if ladderErr == nil && altSub != nil && len(altSub.Servers) > 0 {
+			SetCachedSubPort(hostOnly, winPort)
+			SaveLastBody(altBody)
+			return altSub, nil
+		}
+
+		// 4. 判定致命状态：403 明确拒绝（到期或超额）清理缓存
+		if err != nil && strings.Contains(err.Error(), "HTTP 403") {
+			ClearLastBody()
+			return nil, fmt.Errorf("subscription revoked or expired: %w", err)
+		}
+		if ladderErr != nil && strings.Contains(ladderErr.Error(), "HTTP 403") {
+			ClearLastBody()
+			return nil, fmt.Errorf("subscription revoked or expired: %w", ladderErr)
+		}
+
+		// 5. 尝试离线缓存兜底
+		if !opt.DisableCache {
+			if cached := LoadLastBody(); len(cached) > 0 {
+				if lastSub, perr := ParseSubscriptionBytes(cached); perr == nil && len(lastSub.Servers) > 0 {
+					return lastSub, nil
+				}
+			}
+		}
+
+		if ladderErr != nil {
+			return nil, ladderErr
+		}
+		return nil, fmt.Errorf("fetch subscription failed on 443 and all candidate ports: %w", err)
+	}
+
+	// 显式非标端口订阅 URL：直接单目标请求，不触发阶梯并发探测
 	sub, body, err := fetchSingleSubURL(ctx, rawURL, opt)
 	if err == nil && sub != nil {
 		SaveLastBody(body)
 		return sub, nil
 	}
 
-	// 智能候选端口轮试自愈：当主订阅 URL 默认使用 443/80（未显式携带非标端口）时，
-	// 若遭遇 404/连接失败/非订阅 HTML/证书冲突（例如远端 443 被第三方 Xray/Reality/Nginx 占用），
-	// 自动在同域名下探测候选备用端口池（Tier 1 标准 HTTPS 端口 + Tier 2 自治高位端口）。
-	// 服务端与客户端端口池保持完全一致的顺位 [2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443]。
-	// 若在备用端口上成功拉取到有效 AERO 订阅，则无缝自愈接管，彻底解决用户免配端口的体验痛点！
-	u, parseErr := url.Parse(rawURL)
-	if parseErr == nil && (u.Port() == "" || u.Port() == "443" || u.Port() == "80") && strings.HasPrefix(u.Path, "/sub/") {
-		hostOnly := u.Hostname()
-		scheme := u.Scheme
-		if scheme == "" {
-			scheme = "https"
-		}
-		// Tier 1 (标准 HTTPS 候选池) + Tier 2 (自治高位非常用备用池)，两端 100% 对齐
-		candPorts := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
-		for _, candPort := range candPorts {
-			altURL := fmt.Sprintf("%s://%s:%d%s", scheme, hostOnly, candPort, u.RequestURI())
-			candCtx, candCancel := context.WithTimeout(ctx, 2*time.Second)
-			altSub, altBody, altErr := fetchSingleSubURL(candCtx, altURL, opt)
-			candCancel()
-			if altErr == nil && altSub != nil && len(altSub.Servers) > 0 {
-				SaveLastBody(altBody)
-				return altSub, nil
-			}
-		}
-	}
-
-	// 关键判定：若所有端口均失败，且明确遭遇 403 (订阅到期/停用) 或 404 立即清理本地缓存，严禁降级回退旧节点
 	if err != nil && (strings.Contains(err.Error(), "HTTP 403") || strings.Contains(err.Error(), "HTTP 404")) {
 		ClearLastBody()
 		return nil, fmt.Errorf("subscription revoked or expired: %w", err)
 	}
 
 	// 主 URL 失败时，尝试故障漂移
-	u, parseErr = url.Parse(rawURL)
 	if parseErr == nil && u.Path != "" && strings.HasPrefix(u.Path, "/sub/") {
 		if cached := LoadLastBody(); len(cached) > 0 {
 			if lastSub, perr := ParseSubscriptionBytes(cached); perr == nil && len(lastSub.Servers) > 0 {
@@ -417,6 +756,7 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 			}
 		}
 	}
+
 	return nil, fmt.Errorf("fetch subscription (all sources failed): %w", err)
 }
 
@@ -527,11 +867,12 @@ type subServerForSign struct {
 }
 
 type subSignBodyForVerify struct {
-	Version   string             `json:"version"`
-	UserID    string             `json:"userId,omitempty"`
-	ExpireAt  int64              `json:"expireAt,omitempty"`
-	Servers   []subServerForSign `json:"servers"`
-	CreatedAt int64              `json:"createdAt,omitempty"`
+	Version           string             `json:"version"`
+	UserID            string             `json:"userId,omitempty"`
+	ExpireAt          int64              `json:"expireAt,omitempty"`
+	TrafficLimitBytes int64              `json:"trafficLimitBytes,omitempty"`
+	Servers           []subServerForSign `json:"servers"`
+	CreatedAt         int64              `json:"createdAt,omitempty"`
 }
 
 func verifySubscriptionSignature(sub *Subscription) error {
@@ -563,11 +904,12 @@ func verifySubscriptionSignature(sub *Subscription) error {
 	}
 
 	body := subSignBodyForVerify{
-		Version:   sub.Version,
-		UserID:    sub.UserID,
-		ExpireAt:  sub.ExpireAt,
-		Servers:   signServers,
-		CreatedAt: sub.CreatedAt,
+		Version:           sub.Version,
+		UserID:            sub.UserID,
+		ExpireAt:          sub.ExpireAt,
+		TrafficLimitBytes: sub.TrafficLimitBytes,
+		Servers:           signServers,
+		CreatedAt:         sub.CreatedAt,
 	}
 	data, err := json.Marshal(body)
 	if err != nil {

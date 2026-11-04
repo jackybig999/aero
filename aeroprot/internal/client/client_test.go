@@ -11,11 +11,15 @@ import (
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/hpke"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -4595,4 +4599,81 @@ func TestFetchSubscription_PortFallbackWhen443Occupied(t *testing.T) {
 		t.Fatalf("expected server us.mock.net:2083, got %+v", sub.Servers)
 	}
 	t.Logf("[SUCCESS] Successfully recovered and loaded subscription via candidate port 2083: %+v", sub.Servers[0])
+}
+
+func TestClient_M2_HMACVerification_WithTrafficLimit(t *testing.T) {
+	token := "client_test_token_secret"
+	limit := int64(100 * 1024 * 1024) // 100 MB
+	server := ServerConfig{
+		Name:     "us-node-1",
+		Host:     "us.aero.test",
+		Address:  "us.aero.test",
+		Token:    token,
+		Protocol: "connect-ip",
+	}
+
+	sub := Subscription{
+		Version:           "aero/3.0",
+		UserID:            "testuser",
+		ExpireAt:          time.Now().Add(48 * time.Hour).Unix(),
+		TrafficLimitBytes: limit,
+		TrafficUsedBytes:  50 * 1024 * 1024,
+		Servers:           []ServerConfig{server},
+		CreatedAt:         time.Now().Unix(),
+	}
+
+	if sub.IsTrafficExceeded() {
+		t.Errorf("expected traffic not exceeded when used < limit")
+	}
+
+	sub.TrafficUsedBytes = limit + 1
+	if !sub.IsTrafficExceeded() {
+		t.Errorf("expected traffic exceeded when used > limit")
+	}
+	sub.TrafficUsedBytes = 50 * 1024 * 1024
+
+	// Generate valid HMAC signature including TrafficLimitBytes
+	signPayload := struct {
+		Version           string             `json:"version"`
+		UserID            string             `json:"userId,omitempty"`
+		ExpireAt          int64              `json:"expireAt,omitempty"`
+		TrafficLimitBytes int64              `json:"trafficLimitBytes,omitempty"`
+		Servers           []subServerForSign `json:"servers"`
+		CreatedAt         int64              `json:"createdAt,omitempty"`
+	}{
+		Version:           sub.Version,
+		UserID:            sub.UserID,
+		ExpireAt:          sub.ExpireAt,
+		TrafficLimitBytes: sub.TrafficLimitBytes,
+		Servers: []subServerForSign{
+			{
+				Name:     server.Name,
+				Host:     server.Host,
+				Address:  server.Address,
+				Token:    server.Token,
+				Protocol: server.Protocol,
+			},
+		},
+		CreatedAt: sub.CreatedAt,
+	}
+
+	payloadBytes, err := json.Marshal(signPayload)
+	if err != nil {
+		t.Fatalf("marshal signPayload: %v", err)
+	}
+
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write(payloadBytes)
+	sub.Signature = base64.URLEncoding.EncodeToString(mac.Sum(nil))
+
+	// Verify valid signature passes
+	if err := verifySubscriptionSignature(&sub); err != nil {
+		t.Fatalf("expected valid signature to pass verification, got: %v", err)
+	}
+
+	// Verify tampered traffic limit triggers error
+	sub.TrafficLimitBytes = 200 * 1024 * 1024
+	if err := verifySubscriptionSignature(&sub); err == nil {
+		t.Fatalf("expected tampered TrafficLimitBytes to fail verification, but passed")
+	}
 }

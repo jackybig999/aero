@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	Version  = "1.2.20"
+	Version  = "1.2.21"
 	Protocol = "aero/3.0"
 	APILevel = 3
 )
@@ -250,7 +250,7 @@ func (h *AdminHandler) handleDelToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *AdminHandler) handleListSubs(w http.ResponseWriter) {
 	if h.subStore == nil {
-		writeJSON(w, map[string]any{"subs": []any{}, "count": 0})
+		writeJSON(w, map[string]any{"subs": []any{}, "count": 0, "admin_sub": "/sub/admin"})
 		return
 	}
 	subs := h.subStore.ListUserSubs()
@@ -258,16 +258,44 @@ func (h *AdminHandler) handleListSubs(w http.ResponseWriter) {
 		"subs":       subs,
 		"count":      len(subs),
 		"legacy_sub": "/sub/" + h.subStore.Secret(),
+		"admin_sub":  "/sub/admin",
 	})
 }
 
 type upsertSubsAdminReq struct {
-	Username string      `json:"username"`
-	Slug     string      `json:"slug"`
-	Token    string      `json:"token"`
-	ExpireAt int64       `json:"expire_at"`
-	Servers  []SubServer `json:"servers"`
-	Subs     []UserSub   `json:"subs"`
+	Username          string      `json:"username"`
+	Slug              string      `json:"slug"`
+	Token             string      `json:"token"`
+	ExpireAt          int64       `json:"expire_at"`
+	TrafficLimitBytes int64       `json:"traffic_limit_bytes"`
+	TrafficUsedBytes  int64       `json:"traffic_used_bytes"`
+	Servers           []SubServer `json:"servers"`
+	Subs              []UserSub   `json:"subs"`
+}
+
+func (r *upsertSubsAdminReq) UnmarshalJSON(data []byte) error {
+	type Alias upsertSubsAdminReq
+	aux := struct {
+		*Alias
+		CamelExpireAt     int64 `json:"expireAt"`
+		CamelTrafficLimit int64 `json:"trafficLimitBytes"`
+		CamelTrafficUsed  int64 `json:"trafficUsedBytes"`
+	}{
+		Alias: (*Alias)(r),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if r.ExpireAt == 0 && aux.CamelExpireAt != 0 {
+		r.ExpireAt = aux.CamelExpireAt
+	}
+	if r.TrafficLimitBytes == 0 && aux.CamelTrafficLimit != 0 {
+		r.TrafficLimitBytes = aux.CamelTrafficLimit
+	}
+	if r.TrafficUsedBytes == 0 && aux.CamelTrafficUsed != 0 {
+		r.TrafficUsedBytes = aux.CamelTrafficUsed
+	}
+	return nil
 }
 
 func (h *AdminHandler) handleUpsertSubs(w http.ResponseWriter, r *http.Request) {
@@ -283,11 +311,13 @@ func (h *AdminHandler) handleUpsertSubs(w http.ResponseWriter, r *http.Request) 
 	toProcess := req.Subs
 	if req.Slug != "" {
 		toProcess = append(toProcess, UserSub{
-			Username: req.Username,
-			Slug:     req.Slug,
-			Token:    req.Token,
-			ExpireAt: req.ExpireAt,
-			Servers:  req.Servers,
+			Username:          req.Username,
+			Slug:              req.Slug,
+			Token:             req.Token,
+			ExpireAt:          req.ExpireAt,
+			TrafficLimitBytes: req.TrafficLimitBytes,
+			TrafficUsedBytes:  req.TrafficUsedBytes,
+			Servers:           req.Servers,
 		})
 	}
 	if len(toProcess) == 0 {

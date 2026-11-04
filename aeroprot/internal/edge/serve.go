@@ -28,6 +28,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,22 +78,27 @@ type ServerConfig struct {
 
 // Server is the unified edge server instance
 type Server struct {
-	cfg          ServerConfig
-	validator    *Validator
-	tokenStore   *TokenStore
-	subStore     *SubStore
-	connLimit    *ConnLimiter
-	bwLimit      *BandwidthLimiter
-	dialGuard    *DialGuard
-	rateLimit    *RateLimiter
-	quicServer   *QUICServer
-	adminHandler *AdminHandler
-	subHandler   *SubHandler
-	geoHandler   *GeoDataHandler
+	cfg              ServerConfig
+	validator        *Validator
+	tokenStore       *TokenStore
+	subStore         *SubStore
+	connLimit        *ConnLimiter
+	bwLimit          *BandwidthLimiter
+	dialGuard        *DialGuard
+	rateLimit        *RateLimiter
+	quicServer       *QUICServer
+	adminHandler     *AdminHandler
+	subHandler       *SubHandler
+	geoHandler       *GeoDataHandler
+	consoleHandler   *ConsoleHandler
+	metricsCollector *MetricsCollector
+	purityEngine     *PurityEngine
+	warpInstaller    *WarpInstaller
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	certLoader       *DynamicCertLoader
 	tlsCert          *tls.Certificate
 	httpServer       *http.Server
 	tcpListener      net.Listener
@@ -171,14 +177,32 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("ensure token: %w", err)
 	}
 
-	// 2. TLS Certificate
-	var cert *tls.Certificate
+	// 2. TLS Certificate & ACME Auto-Discovery
+	if cfg.CertFile == "" || cfg.KeyFile == "" {
+		candidates := make([]string, 0, 2)
+		if cfg.Domain != "" {
+			candidates = append(candidates, cfg.Domain)
+		}
+		if cfg.AdvertiseHost != "" && cfg.AdvertiseHost != cfg.Domain {
+			candidates = append(candidates, cfg.AdvertiseHost)
+		}
+		if certPath, keyPath, found := DiscoverACMECert(candidates...); found {
+			log.Printf("[EDGE] Auto-discovered ACME certificate: cert=%s, key=%s", certPath, keyPath)
+			cfg.CertFile = certPath
+			cfg.KeyFile = keyPath
+			if cfg.Domain == "" && len(candidates) > 0 {
+				cfg.Domain = candidates[0]
+			}
+		}
+	}
+
+	var certLoader *DynamicCertLoader
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
 		c, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("load tls cert: %w", err)
 		}
-		cert = &c
+		certLoader = NewDynamicCertLoader(cfg.CertFile, cfg.KeyFile, &c)
 	} else {
 		if !cfg.AllowSelfSignedCertForTest {
 			return nil, fmt.Errorf("production edge server strictly requires valid TLS certificate (--cert and --key); self-signed cert is prohibited to prevent active probing")
@@ -191,8 +215,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("generate self-signed cert: %w", err)
 		}
-		cert = c
+		certLoader = NewDynamicCertLoader("", "", c)
 	}
+	cert := certLoader.CurrentCert()
 
 	// 3. Subscriptions (sub_meta.json & client-sub.json)
 	_, portStr, _ := net.SplitHostPort(cfg.Listen)
@@ -272,26 +297,48 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// 7. GeoData Handler
 	geoHandler := NewGeoDataHandler(cfg.DataDir)
 
+	// 8. Console, Sysinfo, Purity & WARP Installer (Milestone 3)
+	metricsCollector := NewMetricsCollector(2 * time.Second)
+	purityEngine := NewPurityEngine(warpProxy)
+	warpInstaller := NewWarpInstaller(dialGuard)
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	srv := &Server{
-		cfg:          cfg,
-		validator:    validator,
-		tokenStore:   tokenStore,
-		subStore:     subStore,
-		connLimit:    connLimit,
-		bwLimit:      bwLimit,
-		dialGuard:    dialGuard,
-		rateLimit:    rateLimit,
-		quicServer:   quicServer,
-		adminHandler: adminHandler,
-		subHandler:   subHandler,
-		geoHandler:   geoHandler,
-		ctx:          ctx,
-		cancel:       cancel,
-		tlsCert:      cert,
-		startedAt:    time.Now(),
+		cfg:              cfg,
+		validator:        validator,
+		tokenStore:       tokenStore,
+		subStore:         subStore,
+		connLimit:        connLimit,
+		bwLimit:          bwLimit,
+		dialGuard:        dialGuard,
+		rateLimit:        rateLimit,
+		quicServer:       quicServer,
+		adminHandler:     adminHandler,
+		subHandler:       subHandler,
+		geoHandler:       geoHandler,
+		metricsCollector: metricsCollector,
+		purityEngine:     purityEngine,
+		warpInstaller:    warpInstaller,
+		ctx:              ctx,
+		cancel:           cancel,
+		certLoader:       certLoader,
+		tlsCert:          cert,
+		startedAt:        time.Now(),
 	}
+
+	consoleHandler := NewConsoleHandler(
+		cfg.AdminKey,
+		srv,
+		dialGuard,
+		tokenStore,
+		subStore,
+		metricsCollector,
+		purityEngine,
+		warpInstaller,
+		srv.serveCover,
+	)
+	srv.consoleHandler = consoleHandler
 
 	if cfg.ObfsPassword != "" && len(cfg.FallbackObfsPasswords) > 0 {
 		RegisterFallbackPasswords(cfg.ObfsPassword, cfg.FallbackObfsPasswords)
@@ -300,12 +347,52 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	return srv, nil
 }
 
+// ConsoleHandler returns the Web Console handler
+func (s *Server) ConsoleHandler() *ConsoleHandler { return s.consoleHandler }
+
+// MetricsCollector returns the hardware metrics collector
+func (s *Server) MetricsCollector() *MetricsCollector { return s.metricsCollector }
+
+// PurityEngine returns the IP cleanliness engine
+func (s *Server) PurityEngine() *PurityEngine { return s.purityEngine }
+
+// WarpInstaller returns the Cloudflare WARP installer
+func (s *Server) WarpInstaller() *WarpInstaller { return s.warpInstaller }
+
+// CertLoader returns the server's dynamic cert loader
+func (s *Server) CertLoader() *DynamicCertLoader {
+	return s.certLoader
+}
+
+// CurrentCert returns the active TLS certificate
+func (s *Server) CurrentCert() *tls.Certificate {
+	if s.certLoader != nil {
+		return s.certLoader.CurrentCert()
+	}
+	return s.tlsCert
+}
+
+// GetCertificateDynamic implements dynamic certificate retrieval tracking ModTime
+func (s *Server) GetCertificateDynamic(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if s.certLoader != nil {
+		return s.certLoader.GetCertificate(hello)
+	}
+	if s.tlsCert != nil {
+		return s.tlsCert, nil
+	}
+	return nil, fmt.Errorf("no certificate available")
+}
+
 // Start launches the TCP/TLS and QUIC servers
 func (s *Server) Start() error {
 	tlsCfg := &tls.Config{
-		MinVersion:   tls.VersionTLS13,
-		Certificates: []tls.Certificate{*s.tlsCert},
-		NextProtos:   []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS13,
+		NextProtos: []string{"h2", "http/1.1"},
+	}
+	if s.certLoader != nil {
+		tlsCfg.GetCertificate = s.certLoader.GetCertificate
+	} else if s.tlsCert != nil {
+		tlsCfg.Certificates = []tls.Certificate{*s.tlsCert}
 	}
 
 	// ECH (Encrypted Client Hello) 阶段四规范：
@@ -386,15 +473,23 @@ func (s *Server) Start() error {
 	if s.geoHandler != nil {
 		s.geoHandler.StartCronUpdate(s.ctx)
 	}
+	if s.metricsCollector != nil {
+		s.metricsCollector.Start(s.ctx)
+	}
 
 	log.Printf("[EDGE] Server started on %s (TLS + QUIC)", s.cfg.Listen)
 	log.Printf("[EDGE] Subscriptions ready at /sub/%s (client-sub: %s/client-sub.json)", s.subStore.Secret(), s.subStore.Dir())
 	log.Printf("[EDGE] Tokens loaded from %s (count: %d)", s.tokenStore.Path(), s.tokenStore.v.Count())
+	if s.cfg.AdminKey != "" {
+		log.Printf("[EDGE] Web Console ready at /console?key=%s", MaskToken(s.cfg.AdminKey))
+	} else {
+		log.Printf("[EDGE] Web Console ready at /console (loopback only)")
+	}
 
 	return nil
 }
 
-// ServeHTTP routes HTTP requests to /admin, /sub, /health, /healthz, /assets/*, or Cover page
+// ServeHTTP routes HTTP requests to /console, /admin, /sub, /health, /healthz, /assets/*, or Cover page
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 纯正 HTTP/3 门禁：TCP/443 仅作 Web 伪装站点，坚决禁用任何 TCP 代理或回退
 	isQUIC := r.Context().Value(quicConnKey{}) != nil
@@ -416,6 +511,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.geoHandler != nil && s.geoHandler.TryServe(w, r) {
+		return
+	}
+	if s.consoleHandler != nil && s.consoleHandler.TryServe(w, r) {
 		return
 	}
 	if s.adminHandler != nil && s.adminHandler.TryServe(w, r) {
@@ -499,6 +597,9 @@ func (s *Server) Close() {
 	}
 	if s.dialGuard != nil {
 		s.dialGuard.Close()
+	}
+	if s.metricsCollector != nil {
+		s.metricsCollector.Stop()
 	}
 	if s.cfg.ObfsPassword != "" {
 		RegisterFallbackPasswords(s.cfg.ObfsPassword, nil)
@@ -621,6 +722,199 @@ func generateSelfSignedCert(domain string) (*tls.Certificate, error) {
 		Certificate: [][]byte{derBytes},
 		PrivateKey:  priv,
 	}, nil
+}
+
+// DynamicCertLoader manages dynamic certificate reloading based on file ModTime
+type DynamicCertLoader struct {
+	mu          sync.RWMutex
+	certFile    string
+	keyFile     string
+	certModTime time.Time
+	cachedCert  *tls.Certificate
+}
+
+// NewDynamicCertLoader creates a new DynamicCertLoader
+func NewDynamicCertLoader(certFile, keyFile string, initialCert *tls.Certificate) *DynamicCertLoader {
+	var modTime time.Time
+	if certFile != "" {
+		if fi, err := os.Stat(certFile); err == nil {
+			modTime = fi.ModTime()
+		}
+	}
+	return &DynamicCertLoader{
+		certFile:    certFile,
+		keyFile:     keyFile,
+		certModTime: modTime,
+		cachedCert:  initialCert,
+	}
+}
+
+// CurrentCert returns the active cached certificate
+func (d *DynamicCertLoader) CurrentCert() *tls.Certificate {
+	if d == nil {
+		return nil
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.cachedCert
+}
+
+// CertModTime returns the last recorded ModTime of the certificate file
+func (d *DynamicCertLoader) CertModTime() time.Time {
+	if d == nil {
+		return time.Time{}
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.certModTime
+}
+
+// GetCertificate dynamically returns the certificate, reloading if the certificate file has updated
+func (d *DynamicCertLoader) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if d == nil {
+		return nil, fmt.Errorf("nil dynamic cert loader")
+	}
+
+	d.mu.RLock()
+	certFile := d.certFile
+	keyFile := d.keyFile
+	modTime := d.certModTime
+	cached := d.cachedCert
+	d.mu.RUnlock()
+
+	// If no certFile is specified (e.g. in-memory test cert), return cached certificate
+	if certFile == "" {
+		if cached != nil {
+			return cached, nil
+		}
+		return nil, fmt.Errorf("no certificate loaded")
+	}
+
+	fi, err := os.Stat(certFile)
+	if err != nil {
+		// Fallback to cached cert if stat fails to avoid dropping active connections
+		if cached != nil {
+			return cached, nil
+		}
+		return nil, fmt.Errorf("stat cert file %s: %w", certFile, err)
+	}
+
+	if !fi.ModTime().After(modTime) {
+		if cached != nil {
+			return cached, nil
+		}
+	}
+
+	// File updated or no cached cert: reload under write lock
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if fi.ModTime().After(d.certModTime) || d.cachedCert == nil {
+		newCert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			log.Printf("[EDGE] [WARN] Dynamic certificate reload failed for %s (keeping existing cert): %v", certFile, err)
+			if d.cachedCert != nil {
+				return d.cachedCert, nil
+			}
+			return nil, fmt.Errorf("reload x509 keypair: %w", err)
+		}
+		d.cachedCert = &newCert
+		d.certModTime = fi.ModTime()
+		log.Printf("[EDGE] TLS certificate hot-reloaded successfully from %s (modTime: %v)", certFile, d.certModTime)
+	}
+	return d.cachedCert, nil
+}
+
+// DiscoverACMECert searches standard acme.sh directories for fullchain.cer and key
+func DiscoverACMECert(domains ...string) (certFile, keyFile string, found bool) {
+	var baseDirs []string
+	if custom := strings.TrimSpace(os.Getenv("ACME_HOME")); custom != "" {
+		baseDirs = append(baseDirs, custom, filepath.Join(custom, ".acme.sh"))
+	}
+	baseDirs = append(baseDirs, "/root/.acme.sh")
+	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+		baseDirs = append(baseDirs, filepath.Join(home, ".acme.sh"), home)
+	}
+	if userHome, err := os.UserHomeDir(); err == nil && strings.TrimSpace(userHome) != "" {
+		baseDirs = append(baseDirs, filepath.Join(userHome, ".acme.sh"))
+	}
+	return DiscoverACMECertIn(baseDirs, domains...)
+}
+
+// DiscoverACMECertIn searches specified base directories for domain certificates
+func DiscoverACMECertIn(baseDirs []string, domains ...string) (certFile, keyFile string, found bool) {
+	seenDomains := make(map[string]bool)
+	var candidateDomains []string
+	for _, d := range domains {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(d); err == nil {
+			d = h
+		}
+		d = strings.Trim(d, "[]")
+		if d == "" || d == "localhost" || d == "127.0.0.1" || d == "::1" || net.ParseIP(d) != nil {
+			continue
+		}
+		if !seenDomains[d] {
+			seenDomains[d] = true
+			candidateDomains = append(candidateDomains, d)
+		}
+	}
+
+	seenBases := make(map[string]bool)
+	for _, base := range baseDirs {
+		base = strings.TrimSpace(base)
+		if base == "" || seenBases[base] {
+			continue
+		}
+		seenBases[base] = true
+
+		for _, dom := range candidateDomains {
+			subDirs := []string{dom + "_ecc", dom}
+			for _, sub := range subDirs {
+				dirPath := filepath.Join(base, sub)
+				fi, err := os.Stat(dirPath)
+				if err != nil || !fi.IsDir() {
+					continue
+				}
+
+				certCandidates := []string{
+					filepath.Join(dirPath, "fullchain.cer"),
+					filepath.Join(dirPath, "fullchain.pem"),
+					filepath.Join(dirPath, "cert.pem"),
+				}
+				var foundCert string
+				for _, cp := range certCandidates {
+					if cfi, err := os.Stat(cp); err == nil && !cfi.IsDir() && cfi.Size() > 0 {
+						foundCert = cp
+						break
+					}
+				}
+
+				keyCandidates := []string{
+					filepath.Join(dirPath, dom+".key"),
+					filepath.Join(dirPath, "privkey.key"),
+					filepath.Join(dirPath, "privkey.pem"),
+					filepath.Join(dirPath, "key.pem"),
+				}
+				var foundKey string
+				for _, kp := range keyCandidates {
+					if kfi, err := os.Stat(kp); err == nil && !kfi.IsDir() && kfi.Size() > 0 {
+						foundKey = kp
+						break
+					}
+				}
+
+				if foundCert != "" && foundKey != "" {
+					return foundCert, foundKey, true
+				}
+			}
+		}
+	}
+
+	return "", "", false
 }
 
 var httpsRRChecker func(domain string) bool
@@ -746,7 +1040,7 @@ func tryPortFallbackTCP(initialListen string, tlsCfg *tls.Config) (net.Listener,
 	initPort, _ := strconv.Atoi(portStr)
 
 	// Tier 1 (标准 HTTPS 候选池，优先 2083/2087) + Tier 2 (自治高位避让候选池)
-	candidates := []int{2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
+	candidates := StandardCandidatePorts
 	for _, cand := range candidates {
 		if cand == initPort {
 			continue

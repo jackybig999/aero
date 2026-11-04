@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.20"
+	ClientVersion = "1.2.21"
 	Protocol      = "aero/3.0"
 )
 
@@ -403,14 +403,15 @@ func (e *Engine) Apply(applied *Applied) error {
 	defer e.mu.Unlock()
 
 	e.appliedSub = applied
+
+	// Feature 18: 在注册新钉扎前强制执行 ClearPins()，消除历史 SPKI 钉扎残留
+	ClearPins()
 	if len(applied.AllPins) > 0 {
 		AddPins(applied.AllPins...)
 	}
 
 	primary := applied.Servers[0]
-	if len(primary.PinSPKI) > 0 {
-		SetActiveEdgePinSPKI(primary.PinSPKI)
-	}
+	SetActiveEdgePinSPKI(primary.PinSPKI)
 	if e.activeAddr == primary.Address {
 		// host:port 严格一致，短路返回，绝对不调用 Reset()！
 		var ech []byte
@@ -2089,18 +2090,54 @@ func (e *Engine) handleSocks5UDPAssociate(tcpConn net.Conn, clientHost string, c
 
 // NodeInfo 表示供应商线路节点的运行与探测状态
 type NodeInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Address     string `json:"address"`
-	IP          string `json:"ip,omitempty"`
-	SNI         string `json:"sni"`
-	LineType    string `json:"line_type,omitempty"`
-	ISPAffinity string `json:"isp_affinity,omitempty"`
-	Active      bool   `json:"active"`
-	Connected   bool   `json:"connected"`
-	Reachable   bool   `json:"reachable"`
-	LatencyMs   int64  `json:"latency_ms"`
-	LastProbeAt string `json:"last_probe_at,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Address     string   `json:"address"`
+	IP          string   `json:"ip,omitempty"`
+	SNI         string   `json:"sni"`
+	LineType    string   `json:"line_type,omitempty"`
+	ISPAffinity string   `json:"isp_affinity,omitempty"`
+	Country     string   `json:"country,omitempty"`
+	PurityScore int      `json:"purity_score,omitempty"`
+	AIBlocked   bool     `json:"ai_blocked,omitempty"`
+	WarpActive  bool     `json:"warp_active,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	Badges      []string `json:"badges,omitempty"`
+	Active      bool     `json:"active"`
+	Connected   bool     `json:"connected"`
+	Reachable   bool     `json:"reachable"`
+	LatencyMs   int64    `json:"latency_ms"`
+	LastProbeAt string   `json:"last_probe_at,omitempty"`
+}
+
+// inferNodeCountry 根据节点名或主机名推断国别代码
+func inferNodeCountry(name, host string) string {
+	combined := strings.ToUpper(name + " " + host)
+	if strings.Contains(combined, "US") || strings.Contains(combined, "美国") || strings.Contains(combined, "🇺🇸") {
+		return "US"
+	}
+	if strings.Contains(combined, "HK") || strings.Contains(combined, "香港") || strings.Contains(combined, "🇭🇰") {
+		return "HK"
+	}
+	if strings.Contains(combined, "JP") || strings.Contains(combined, "日本") || strings.Contains(combined, "🇯🇵") {
+		return "JP"
+	}
+	if strings.Contains(combined, "SG") || strings.Contains(combined, "新加坡") || strings.Contains(combined, "🇸🇬") {
+		return "SG"
+	}
+	if strings.Contains(combined, "TW") || strings.Contains(combined, "台湾") || strings.Contains(combined, "🇹🇼") {
+		return "TW"
+	}
+	if strings.Contains(combined, "KR") || strings.Contains(combined, "韩国") || strings.Contains(combined, "🇰🇷") {
+		return "KR"
+	}
+	if strings.Contains(combined, "UK") || strings.Contains(combined, "英国") || strings.Contains(combined, "🇬🇧") || strings.Contains(combined, "GB") {
+		return "UK"
+	}
+	if strings.Contains(combined, "DE") || strings.Contains(combined, "德国") || strings.Contains(combined, "🇩🇪") {
+		return "DE"
+	}
+	return ""
 }
 
 // GetNodes 提取当前节点状态快照
@@ -2118,6 +2155,13 @@ func (e *Engine) GetNodes() []NodeInfo {
 		} else if s.LineType != "" {
 			name = fmt.Sprintf("%s (%s)", s.LineType, s.Address)
 		}
+		country := s.Country
+		if country == "" {
+			country = inferNodeCountry(s.Name, s.Host)
+		}
+		warp := s.WarpActive || strings.Contains(strings.ToUpper(s.Name), "WARP") || strings.Contains(strings.ToLower(s.LineType), "warp")
+		badges := RenderNodeBadgesSlice(country, s.PurityScore, s.AIBlocked, warp)
+
 		info := NodeInfo{
 			ID:          s.Address,
 			Name:        name,
@@ -2126,6 +2170,12 @@ func (e *Engine) GetNodes() []NodeInfo {
 			SNI:         s.SNI,
 			LineType:    s.LineType,
 			ISPAffinity: s.ISPAffinity,
+			Country:     country,
+			PurityScore: s.PurityScore,
+			AIBlocked:   s.AIBlocked,
+			WarpActive:  warp,
+			Tags:        s.Tags,
+			Badges:      badges,
 			Active:      s.Address == e.activeAddr,
 			Connected:   s.Address == e.activeAddr && e.running.Load(),
 			Reachable:   true,
@@ -2171,6 +2221,13 @@ func (e *Engine) ProbeAllNodes(ctx context.Context) []NodeInfo {
 		} else if s.LineType != "" {
 			name = fmt.Sprintf("%s (%s)", s.LineType, s.Address)
 		}
+		country := s.Country
+		if country == "" {
+			country = inferNodeCountry(s.Name, s.Host)
+		}
+		warp := s.WarpActive || strings.Contains(strings.ToUpper(s.Name), "WARP") || strings.Contains(strings.ToLower(s.LineType), "warp")
+		badges := RenderNodeBadgesSlice(country, s.PurityScore, s.AIBlocked, warp)
+
 		results[i] = NodeInfo{
 			ID:          s.Address,
 			Name:        name,
@@ -2179,6 +2236,12 @@ func (e *Engine) ProbeAllNodes(ctx context.Context) []NodeInfo {
 			SNI:         s.SNI,
 			LineType:    s.LineType,
 			ISPAffinity: s.ISPAffinity,
+			Country:     country,
+			PurityScore: s.PurityScore,
+			AIBlocked:   s.AIBlocked,
+			WarpActive:  warp,
+			Tags:        s.Tags,
+			Badges:      badges,
 			Active:      s.Address == activeAddr,
 			Connected:   s.Address == activeAddr && e.running.Load(),
 			Reachable:   false,

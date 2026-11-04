@@ -7,16 +7,22 @@ package edge
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -4850,4 +4856,469 @@ func TestEdge_InProcessPortFallbackWhen443And8443Occupied(t *testing.T) {
 		t.Fatalf("expected srv.cfg.Listen to skip occupied :8443, but got %s", srv.cfg.Listen)
 	}
 	t.Logf("[SUCCESS] Server automatically rotated listen addr from %s (with 8443 occupied) to %s", occAddr1, srv.cfg.Listen)
+}
+
+// =============================================================================
+// Milestone 2 — Edge Subscriptions & Dynamic TLS ModTime Hot Reload
+// =============================================================================
+
+func generateTestCertPEMForEdge(t *testing.T, domain, org string) (certPEM, keyPEM []byte) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{org},
+			CommonName:   domain,
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{domain},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyBytes, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	return certPEM, keyPEM
+}
+
+func TestEdge_M2_AdminSub_PermanentAndUnlimited(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewSubStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewSubStore: %v", err)
+	}
+	token := "adm_test_token_999"
+	err = store.Ensure(EnsureSubParams{
+		Name:     "default",
+		Host:     "edge.aero.test",
+		Address:  "edge.aero.test:443",
+		Token:    token,
+		SNI:      "edge.aero.test",
+		AltPorts: StandardCandidatePorts,
+	})
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+
+	handler := &SubHandler{Store: store}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sub/", func(w http.ResponseWriter, r *http.Request) {
+		if !handler.TryServe(w, r) {
+			http.NotFound(w, r)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// 1. Fetch /sub/admin
+	resp, err := http.Get(srv.URL + "/sub/admin")
+	if err != nil {
+		t.Fatalf("GET /sub/admin: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	var doc SubDocument
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		t.Fatalf("decode doc: %v", err)
+	}
+
+	if doc.UserID != "admin" {
+		t.Errorf("expected UserID 'admin', got %q", doc.UserID)
+	}
+	if doc.ExpireAt != 0 {
+		t.Errorf("expected ExpireAt 0 for permanent validity, got %d", doc.ExpireAt)
+	}
+	if doc.TrafficLimitBytes != 0 {
+		t.Errorf("expected TrafficLimitBytes 0 for unlimited quota, got %d", doc.TrafficLimitBytes)
+	}
+	if doc.Signature == "" {
+		t.Errorf("expected non-empty signature on admin document")
+	}
+	if !VerifySub(doc, []byte(token)) {
+		t.Errorf("VerifySub failed for admin document with server token")
+	}
+	if len(doc.Servers) == 0 {
+		t.Fatalf("expected servers in admin document")
+	}
+	if strings.HasSuffix(doc.Servers[0].Address, ":443") {
+		t.Errorf("server address redundantly includes :443: %s", doc.Servers[0].Address)
+	}
+
+	// 2. Test zero-port formatting helper
+	formatted := FormatZeroPortSubURL("edge.aero.test:443", "admin")
+	if formatted != "https://edge.aero.test/sub/admin" {
+		t.Errorf("unexpected zero-port URL: %s", formatted)
+	}
+}
+
+func TestEdge_M2_UserSub_NormalAndQuotaEnforcement(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewSubStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewSubStore: %v", err)
+	}
+	serverToken := "srv_tok_user_sub"
+	_ = store.Ensure(EnsureSubParams{
+		Name:     "default",
+		Host:     "edge.aero.test",
+		Address:  "edge.aero.test",
+		Token:    serverToken,
+		SNI:      "edge.aero.test",
+		AltPorts: StandardCandidatePorts,
+	})
+
+	slug := "jacky888xyz"
+	userToken := "usr_tok_jacky"
+	limit := int64(1024 * 1024) // 1 MB
+	err = store.UpsertUserSub(UserSub{
+		Username:          "jacky",
+		Slug:              slug,
+		Token:             userToken,
+		ExpireAt:          time.Now().Add(24 * time.Hour).Unix(),
+		TrafficLimitBytes: limit,
+		TrafficUsedBytes:  0,
+	})
+	if err != nil {
+		t.Fatalf("UpsertUserSub: %v", err)
+	}
+
+	handler := &SubHandler{Store: store}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sub/", func(w http.ResponseWriter, r *http.Request) {
+		if !handler.TryServe(w, r) {
+			http.NotFound(w, r)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// 1. Initial access: within quota -> 200 OK
+	resp1, err := http.Get(srv.URL + "/sub/" + slug)
+	if err != nil {
+		t.Fatalf("GET /sub/%s: %v", slug, err)
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp1.StatusCode)
+	}
+	var doc SubDocument
+	_ = json.NewDecoder(resp1.Body).Decode(&doc)
+	if doc.UserID != "jacky" {
+		t.Errorf("expected UserID 'jacky', got %s", doc.UserID)
+	}
+	if doc.TrafficLimitBytes != limit {
+		t.Errorf("expected TrafficLimitBytes %d, got %d", limit, doc.TrafficLimitBytes)
+	}
+	if !VerifySub(doc, []byte(userToken)) {
+		t.Errorf("VerifySub failed for user sub")
+	}
+
+	// 2. Record traffic: 500 KB used (500 KB < 1 MB) -> 200 OK
+	_ = store.RecordTraffic(slug, 500*1024)
+	resp2, err := http.Get(srv.URL + "/sub/" + slug)
+	if err != nil {
+		t.Fatalf("GET /sub/%s: %v", slug, err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK within quota, got %d", resp2.StatusCode)
+	}
+
+	// 3. Record more traffic: reaches limit (1 MB total) -> 403 Forbidden
+	_ = store.RecordTraffic(slug, 524*1024)
+	resp3, err := http.Get(srv.URL + "/sub/" + slug)
+	if err != nil {
+		t.Fatalf("GET /sub/%s: %v", slug, err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on quota exceeded, got %d", resp3.StatusCode)
+	}
+}
+
+func TestEdge_M2_UserSub_ExpiryEnforcement(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewSubStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewSubStore: %v", err)
+	}
+	slug := "expireduser88"
+	_ = store.UpsertUserSub(UserSub{
+		Username:          "expireduser",
+		Slug:              slug,
+		Token:             "tok_expired",
+		ExpireAt:          time.Now().Add(-2 * time.Hour).Unix(),
+		TrafficLimitBytes: 10 * 1024 * 1024,
+	})
+
+	handler := &SubHandler{Store: store}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sub/", func(w http.ResponseWriter, r *http.Request) {
+		if !handler.TryServe(w, r) {
+			http.NotFound(w, r)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/sub/" + slug)
+	if err != nil {
+		t.Fatalf("GET /sub/%s: %v", slug, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on expired sub, got %d", resp.StatusCode)
+	}
+}
+
+func TestEdge_M2_UserSub_SecurityPathTraversal(t *testing.T) {
+	dataDir := t.TempDir()
+	store, _ := NewSubStore(dataDir)
+	handler := &SubHandler{Store: store}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sub/", func(w http.ResponseWriter, r *http.Request) {
+		if !handler.TryServe(w, r) {
+			http.NotFound(w, r)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	maliciousPaths := []string{
+		"/sub/..",
+		"/sub/../admin",
+		"/sub/nonexistent_123456",
+	}
+	for _, p := range maliciousPaths {
+		resp, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatalf("GET %s: %v", p, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("expected 404 for malicious path %s, got %d", p, resp.StatusCode)
+		}
+	}
+}
+
+func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
+	dataDir := t.TempDir()
+	subStore, err := NewSubStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewSubStore: %v", err)
+	}
+	validator := NewValidator(filepath.Join(dataDir, "nonce.wal"))
+	tokenStore, err := OpenTokenStore(dataDir, validator)
+	if err != nil {
+		t.Fatalf("OpenTokenStore: %v", err)
+	}
+
+	adminKey := "super_secret_admin_key_123"
+	adminHandler := NewAdminHandler(adminKey, validator, tokenStore, subStore, nil, nil, nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
+		if !adminHandler.TryServe(w, r) {
+			http.NotFound(w, r)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// 1. POST /admin/subs with snake_case traffic_limit_bytes
+	payloadSnake := `{
+		"username": "alice",
+		"slug": "alice123456",
+		"token": "tok_alice_quota",
+		"expire_at": 1893456000,
+		"traffic_limit_bytes": 52428800
+	}`
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/subs", strings.NewReader(payloadSnake))
+	req.Header.Set("X-Aero-Admin-Key", adminKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /admin/subs: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	sub, found := subStore.GetUserSub("alice123456")
+	if !found {
+		t.Fatalf("user sub 'alice123456' not found in store")
+	}
+	if sub.TrafficLimitBytes != 52428800 {
+		t.Errorf("expected TrafficLimitBytes 52428800, got %d", sub.TrafficLimitBytes)
+	}
+
+	// 2. POST /admin/subs with camelCase trafficLimitBytes
+	payloadCamel := `{
+		"username": "bob",
+		"slug": "bob654321",
+		"token": "tok_bob_quota",
+		"expireAt": 1893456000,
+		"trafficLimitBytes": 104857600
+	}`
+	req2, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/subs", strings.NewReader(payloadCamel))
+	req2.Header.Set("X-Aero-Admin-Key", adminKey)
+	req2.Header.Set("Content-Type", "application/json")
+
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("POST /admin/subs camelCase: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp2.StatusCode)
+	}
+
+	subBob, foundBob := subStore.GetUserSub("bob654321")
+	if !foundBob {
+		t.Fatalf("user sub 'bob654321' not found in store")
+	}
+	if subBob.TrafficLimitBytes != 104857600 {
+		t.Errorf("expected TrafficLimitBytes 104857600, got %d", subBob.TrafficLimitBytes)
+	}
+
+	// 3. GET /admin/subs -> verify admin_sub is returned
+	reqGet, _ := http.NewRequest(http.MethodGet, srv.URL+"/admin/subs", nil)
+	reqGet.Header.Set("X-Aero-Admin-Key", adminKey)
+	respGet, err := http.DefaultClient.Do(reqGet)
+	if err != nil {
+		t.Fatalf("GET /admin/subs: %v", err)
+	}
+	defer respGet.Body.Close()
+	var listResp map[string]any
+	_ = json.NewDecoder(respGet.Body).Decode(&listResp)
+	if listResp["admin_sub"] != "/sub/admin" {
+		t.Errorf("expected admin_sub '/sub/admin', got %v", listResp["admin_sub"])
+	}
+}
+
+func TestEdge_M2_DynamicCertLoader_HotReload(t *testing.T) {
+	tmpDir := t.TempDir()
+	certFile := filepath.Join(tmpDir, "fullchain.cer")
+	keyFile := filepath.Join(tmpDir, "privkey.key")
+
+	certPEM1, keyPEM1 := generateTestCertPEMForEdge(t, "edge.aero.test", "Org 1 Initial")
+	if err := os.WriteFile(certFile, certPEM1, 0644); err != nil {
+		t.Fatalf("write cert1: %v", err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM1, 0600); err != nil {
+		t.Fatalf("write key1: %v", err)
+	}
+
+	initialPair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		t.Fatalf("LoadX509KeyPair initial: %v", err)
+	}
+
+	loader := NewDynamicCertLoader(certFile, keyFile, &initialPair)
+
+	// First handshake: Org 1
+	c1, err := loader.GetCertificate(&tls.ClientHelloInfo{ServerName: "edge.aero.test"})
+	if err != nil {
+		t.Fatalf("GetCertificate 1: %v", err)
+	}
+	p1, _ := x509.ParseCertificate(c1.Certificate[0])
+	if p1.Subject.Organization[0] != "Org 1 Initial" {
+		t.Fatalf("expected 'Org 1 Initial', got %q", p1.Subject.Organization[0])
+	}
+
+	// Renew cert on disk
+	time.Sleep(20 * time.Millisecond)
+	certPEM2, keyPEM2 := generateTestCertPEMForEdge(t, "edge.aero.test", "Org 2 Renewed")
+	if err := os.WriteFile(certFile, certPEM2, 0644); err != nil {
+		t.Fatalf("write cert2: %v", err)
+	}
+	if err := os.WriteFile(keyFile, keyPEM2, 0600); err != nil {
+		t.Fatalf("write key2: %v", err)
+	}
+
+	// Second handshake: must dynamically reload and present Org 2 without recreating loader
+	c2, err := loader.GetCertificate(&tls.ClientHelloInfo{ServerName: "edge.aero.test"})
+	if err != nil {
+		t.Fatalf("GetCertificate 2: %v", err)
+	}
+	p2, _ := x509.ParseCertificate(c2.Certificate[0])
+	if p2.Subject.Organization[0] != "Org 2 Renewed" {
+		t.Fatalf("expected 'Org 2 Renewed' after hot reload, got %q", p2.Subject.Organization[0])
+	}
+
+	// Corrupt cert on disk -> loader must fall back to cached cert without failing
+	time.Sleep(20 * time.Millisecond)
+	_ = os.WriteFile(certFile, []byte("garbage corrupt cert"), 0644)
+	c3, err := loader.GetCertificate(&tls.ClientHelloInfo{ServerName: "edge.aero.test"})
+	if err != nil {
+		t.Fatalf("expected fallback to cached cert, got error: %v", err)
+	}
+	p3, _ := x509.ParseCertificate(c3.Certificate[0])
+	if p3.Subject.Organization[0] != "Org 2 Renewed" {
+		t.Fatalf("expected cached cert Org 2 Renewed on corrupt file, got %q", p3.Subject.Organization[0])
+	}
+}
+
+func TestEdge_M2_ACME_AutoDiscovery(t *testing.T) {
+	tmpDir := t.TempDir()
+	domain := "acme-node.aero.io"
+	eccDir := filepath.Join(tmpDir, ".acme.sh", domain+"_ecc")
+	if err := os.MkdirAll(eccDir, 0755); err != nil {
+		t.Fatalf("mkdir acme dir: %v", err)
+	}
+
+	certPath := filepath.Join(eccDir, "fullchain.cer")
+	keyPath := filepath.Join(eccDir, domain+".key")
+	certPEM, keyPEM := generateTestCertPEMForEdge(t, domain, "ACME Test CA")
+	_ = os.WriteFile(certPath, certPEM, 0644)
+	_ = os.WriteFile(keyPath, keyPEM, 0600)
+
+	foundCert, foundKey, ok := DiscoverACMECertIn([]string{filepath.Join(tmpDir, ".acme.sh")}, domain)
+	if !ok {
+		t.Fatalf("expected DiscoverACMECertIn to find cert and key")
+	}
+	if foundCert != certPath {
+		t.Errorf("expected cert %s, got %s", certPath, foundCert)
+	}
+	if foundKey != keyPath {
+		t.Errorf("expected key %s, got %s", keyPath, foundKey)
+	}
+}
+
+func TestEdge_M2_Production_SelfSignedBan(t *testing.T) {
+	cfg := ServerConfig{
+		Listen:                     ":2083",
+		Domain:                     "prod.aero.test",
+		AllowSelfSignedCertForTest: false,
+	}
+	srv, err := NewServer(cfg)
+	if err == nil {
+		srv.Close()
+		t.Fatalf("expected NewServer to fail when AllowSelfSignedCertForTest is false and no certs exist")
+	}
+	if !strings.Contains(err.Error(), "self-signed cert is prohibited") {
+		t.Errorf("expected prohibition message, got %v", err)
+	}
 }

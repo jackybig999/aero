@@ -110,6 +110,24 @@ func ClearPins() {
 	pinsSet = make(map[string]struct{})
 }
 
+// GetPinsCount 获取当前激活的 SPKI 钉扎数量（用于状态诊断与单元测试）
+func GetPinsCount() int {
+	pinsMu.RLock()
+	defer pinsMu.RUnlock()
+	return len(pinsSet)
+}
+
+// GetPins 获取当前注册的全部 SPKI 钉扎快照
+func GetPins() []string {
+	pinsMu.RLock()
+	defer pinsMu.RUnlock()
+	pins := make([]string, 0, len(pinsSet))
+	for p := range pinsSet {
+		pins = append(pins, p)
+	}
+	return pins
+}
+
 // CertSPKI 计算证书 RawSubjectPublicKeyInfo 的 SHA-256 Base64
 func CertSPKI(cert *x509.Certificate) string {
 	if cert == nil {

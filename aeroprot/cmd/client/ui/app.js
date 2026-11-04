@@ -835,6 +835,47 @@ function filterAndRenderNodes() {
   renderNodes(list)
 }
 
+function getNodeBadges(node) {
+  if (Array.isArray(node.badges) && node.badges.length > 0) {
+    return node.badges
+  }
+  const list = []
+  const name = node.name || ''
+  let country = (node.country || '').toUpperCase()
+  if (!country) {
+    if (/US|美国|🇺🇸/i.test(name)) country = 'US'
+    else if (/HK|香港|🇭🇰/i.test(name)) country = 'HK'
+    else if (/JP|日本|🇯🇵/i.test(name)) country = 'JP'
+    else if (/SG|新加坡|🇸🇬/i.test(name)) country = 'SG'
+    else if (/TW|台湾|🇹🇼/i.test(name)) country = 'TW'
+    else if (/KR|韩国|🇰🇷/i.test(name)) country = 'KR'
+    else if (/UK|GB|英国|🇬🇧/i.test(name)) country = 'UK'
+    else if (/DE|德国|🇩🇪/i.test(name)) country = 'DE'
+  }
+  if (country === 'US') list.push('[🇺🇸 原生]')
+  else if (country === 'HK') list.push('[🇭🇰 原生]')
+  else if (country === 'JP') list.push('[🇯🇵 原生]')
+  else if (country === 'SG') list.push('[🇸🇬 原生]')
+  else if (country === 'TW') list.push('[🇹🇼 原生]')
+  else if (country === 'KR') list.push('[🇰🇷 原生]')
+  else if (country === 'UK') list.push('[🇬🇧 原生]')
+  else if (country === 'DE') list.push('[🇩🇪 原生]')
+  else if (country) list.push(`[${country} 原生]`)
+
+  const purity = typeof node.purity_score === 'number' ? node.purity_score : (node.purityScore || 0)
+  const aiBlocked = !!(node.ai_blocked || node.aiBlocked)
+  const tagGemini = (Array.isArray(node.tags) && node.tags.some(t => /gemini/i.test(t))) || /gemini/i.test(name)
+  if (tagGemini || (!aiBlocked && purity >= 80)) {
+    list.push('[✨ Gemini 解锁]')
+  }
+
+  const warp = !!(node.warp_active || node.warpActive || (Array.isArray(node.tags) && node.tags.some(t => /warp/i.test(t))) || /warp/i.test(name))
+  if (warp) {
+    list.push('[🛡️ WARP 接管]')
+  }
+  return list
+}
+
 function renderNodes(nodes) {
   const container = $('nodesList')
   const badge = $('nodesCountBadge')
@@ -880,6 +921,23 @@ function renderNodes(nodes) {
       ispTag.textContent = getIspLabel(n.isp_affinity)
       nameRow.appendChild(ispTag)
     }
+
+    // Feature 20: 渲染 [🇺🇸 原生] [✨ Gemini 解锁] [🛡️ WARP 接管] 徽章
+    const badges = getNodeBadges(n)
+    badges.forEach((b) => {
+      const bSpan = document.createElement('span')
+      let bClass = 'badge-default'
+      if (b.includes('原生')) {
+        bClass = 'badge-native'
+      } else if (b.includes('Gemini') || b.includes('解锁')) {
+        bClass = 'badge-gemini'
+      } else if (b.includes('WARP') || b.includes('接管')) {
+        bClass = 'badge-warp'
+      }
+      bSpan.className = 'node-badge ' + bClass
+      bSpan.textContent = b
+      nameRow.appendChild(bSpan)
+    })
     infoCol.appendChild(nameRow)
 
     const addrSpan = document.createElement('span')

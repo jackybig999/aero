@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AERO Edge Console</title>
+  <link rel="stylesheet" href="/console/web/console.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Navigation / Header -->
+    <header class="top-nav">
+      <div class="brand">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        </div>
+        <div class="brand-text">
+          <h1>AERO Edge Console</h1>
+          <span class="version-tag" id="appVersion">v1.2.21 • aero/3.0</span>
+        </div>
+      </div>
+      <div class="nav-status">
+        <span class="status-indicator live"></span>
+        <span class="status-text" id="nodeStatus">运行正常</span>
+        <span class="domain-badge" id="nodeDomain">加载中...</span>
+      </div>
+    </header>
+
+    <!-- Main Grid Layout -->
+    <main class="dashboard-grid">
+      <!-- 1. VPS Hardware Vital Signs Card -->
+      <section class="card vps-card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+            <h2>VPS 硬件监控</h2>
+          </div>
+          <span class="badge" id="vpsUptime">Uptime: --</span>
+        </div>
+        <div class="card-body">
+          <div class="metric-row">
+            <div class="metric-info">
+              <span>CPU 占用率</span>
+              <strong id="cpuPct">0.0%</strong>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="cpuBar" style="width: 0%"></div></div>
+          </div>
+
+          <div class="metric-row">
+            <div class="metric-info">
+              <span>内存使用 (RAM)</span>
+              <strong id="memDetail">0 / 0 MB (0%)</strong>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="memBar" style="width: 0%"></div></div>
+          </div>
+
+          <div class="metric-row">
+            <div class="metric-info">
+              <span>磁盘空间 (Disk)</span>
+              <strong id="diskDetail">0 / 0 GB (0%)</strong>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="diskBar" style="width: 0%"></div></div>
+          </div>
+
+          <div class="net-stats-grid">
+            <div class="stat-mini-box">
+              <span class="mini-label">实时下行 (Rx)</span>
+              <span class="mini-value" id="netRxRate">0.0 KB/s</span>
+            </div>
+            <div class="stat-mini-box">
+              <span class="mini-label">实时上行 (Tx)</span>
+              <span class="mini-value" id="netTxRate">0.0 KB/s</span>
+            </div>
+            <div class="stat-mini-box">
+              <span class="mini-label">累计流量 (Total)</span>
+              <span class="mini-value" id="netTotal">0 MB</span>
+            </div>
+            <div class="stat-mini-box">
+              <span class="mini-label">平均负载 (1/5/15m)</span>
+              <span class="mini-value" id="loadAvg">0.00 / 0.00 / 0.00</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. IP Cleanliness & Unblocking Card -->
+      <section class="card purity-card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <h2>IP 纯净度与解锁体检</h2>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="btnRefreshPurity">重新体检</button>
+        </div>
+        <div class="card-body">
+          <div class="purity-score-container">
+            <div class="score-circle" id="scoreCircle">
+              <span class="score-number" id="purityScore">--</span>
+              <span class="score-label">纯净度评分</span>
+            </div>
+            <div class="purity-badges">
+              <div class="badge-item" id="badgeEgress"><span class="badge-dot"></span><span>物理出口: --</span></div>
+              <div class="badge-item" id="badgeYT"><span class="badge-dot"></span><span>YouTube: 探测中</span></div>
+              <div class="badge-item" id="badgeGoogle"><span class="badge-dot"></span><span>Google: 探测中</span></div>
+              <div class="badge-item" id="badgeGemini"><span class="badge-dot"></span><span>Gemini AI: 探测中</span></div>
+              <div class="badge-item" id="badgeWarpRescue"><span class="badge-dot"></span><span>WARP 救活: 未生效</span></div>
+            </div>
+          </div>
+          <p class="purity-note" id="purityNote">自动防送中检测：若物理 IP 遭判定送中，WARP 将无缝智能接管 AI 流量！</p>
+        </div>
+      </section>
+
+      <!-- 3. Cloudflare WARP Outbound Management Card -->
+      <section class="card warp-card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+            <h2>Cloudflare WARP 智能分流</h2>
+          </div>
+          <span class="badge badge-success" id="warpStatusBadge">未检测</span>
+        </div>
+        <div class="card-body">
+          <div class="warp-controls">
+            <div class="switch-row">
+              <label class="switch-label">
+                <span>出站接管开关</span>
+                <small class="desc-text">将 AI 限制域名（Google/OpenAI/Gemini）通过 WARP SOCKS5 转发</small>
+              </label>
+              <label class="switch">
+                <input type="checkbox" id="warpToggle">
+                <span class="slider round"></span>
+              </label>
+            </div>
+
+            <div class="switch-row">
+              <label class="switch-label">
+                <span>全局流量接管 (WarpAll)</span>
+                <small class="desc-text">全量流量均经由 WARP 转发（建议关闭，仅分流 AI 速度最快）</small>
+              </label>
+              <label class="switch">
+                <input type="checkbox" id="warpAllToggle">
+                <span class="slider round"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="warp-actions">
+            <button class="btn btn-primary" id="btnInstallWarp">一键官方静默安装 WARP</button>
+            <button class="btn btn-secondary" id="btnViewLogs">查看安装日志</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. TLS Certificate & ACME Card -->
+      <section class="card cert-card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            <h2>TLS 证书与域名状态</h2>
+          </div>
+          <span class="badge" id="certDaysBadge">-- 天到期</span>
+        </div>
+        <div class="card-body">
+          <div class="cert-info-list">
+            <div class="info-item"><span>挂载域名:</span><strong id="certDomain">--</strong></div>
+            <div class="info-item"><span>证书有效期:</span><strong id="certExpires">--</strong></div>
+            <div class="info-item"><span>动态热加载:</span><span class="badge badge-success">ModTime 自动重载生效</span></div>
+            <div class="info-item"><span>物理监听端口:</span><strong id="nodeListen">:443</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5. Subscription Hub Card (Zero-Port) -->
+      <section class="card sub-card full-width">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+            <h2>零端口订阅中心 (Zero-Port Subscription Hub)</h2>
+          </div>
+          <span class="badge badge-info">严格零端口规范</span>
+        </div>
+        <div class="card-body">
+          <!-- Admin Dedicated Sub Box -->
+          <div class="admin-sub-box">
+            <div class="sub-box-header">
+              <div class="sub-tag">
+                <span class="badge badge-gold">管理员永久免流订阅</span>
+                <span class="sub-rule">expireAt: 0 • trafficLimit: 0 • 永久有效</span>
+              </div>
+              <button class="btn btn-primary btn-sm" id="btnCopyAdminSub">复制专属链接</button>
+            </div>
+            <div class="url-display" id="adminSubUrl">https://--/sub/admin</div>
+          </div>
+
+          <!-- User Provisioning Form -->
+          <div class="user-provision-form">
+            <h3>开通用户专属订阅</h3>
+            <form id="createUserForm" class="form-grid">
+              <div class="form-group">
+                <label>用户名 (字母/数字)</label>
+                <input type="text" id="newUsername" placeholder="例如: jacky" required pattern="^[a-zA-Z0-9_-]{2,32}$">
+              </div>
+              <div class="form-group">
+                <label>6位随机安全码</label>
+                <div class="input-with-action">
+                  <input type="text" id="newCode" placeholder="随机6位" required maxlength="6">
+                  <button type="button" class="btn btn-secondary btn-sm" id="btnGenCode">换一组</button>
+                </div>
+              </div>
+              <div class="form-group">
+                <label>有效期 (天)</label>
+                <select id="newExpireDays">
+                  <option value="30">30 天 (月度)</option>
+                  <option value="90">90 天 (季度)</option>
+                  <option value="180">180 天 (半年)</option>
+                  <option value="365" selected>365 天 (年度)</option>
+                  <option value="0">永久有效</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>流量上限 (GB)</label>
+                <select id="newTrafficGB">
+                  <option value="50">50 GB</option>
+                  <option value="100" selected>100 GB</option>
+                  <option value="200">200 GB</option>
+                  <option value="500">500 GB</option>
+                  <option value="0">无限流量</option>
+                </select>
+              </div>
+              <div class="form-group btn-col">
+                <button type="submit" class="btn btn-success">立即创建专属订阅</button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Active Users Table -->
+          <div class="users-table-container">
+            <h3>已开通用户订阅列表</h3>
+            <table class="data-table" id="usersTable">
+              <thead>
+                <tr>
+                  <th>用户标识 (Slug)</th>
+                  <th>状态</th>
+                  <th>有效期</th>
+                  <th>流量配额 (已用 / 上限)</th>
+                  <th>专属零端口订阅链接</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="usersTableBody">
+                <tr><td colspan="6" class="text-center">加载用户中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal: WARP Real-time Installation Logs -->
+    <div class="modal" id="logsModal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Cloudflare WARP 静默安装实时日志</h3>
+          <button class="btn-close" id="btnCloseLogs">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="step-progress">
+            <span class="step-badge" id="logStepBadge">检测中</span>
+            <span class="step-desc" id="logStepDesc">准备启动流水线...</span>
+            <div class="progress-bar"><div class="progress-fill" id="logProgressBar" style="width: 0%"></div></div>
+          </div>
+          <pre class="terminal-log" id="terminalLogs">正在连接日志流...</pre>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnCloseLogs2">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast" id="toast">复制成功</div>
+  </div>
+
+  <script src="/console/web/console.js"></script>
+</body>
+</html>

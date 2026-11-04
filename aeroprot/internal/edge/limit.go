@@ -265,12 +265,17 @@ func IsBlockedIP(ip net.IP) (bool, string) {
 	return false, ""
 }
 
+// WarpRouteConfig holds the upstream Cloudflare WARP proxy address and routing scope
+type WarpRouteConfig struct {
+	ProxyAddr string // e.g. "127.0.0.1:40000"
+	WarpAll   bool   // true: route all outbound traffic; false: AI & Google domains only
+}
+
 // DialGuard provides concurrency limiting, SSRF protection, and intelligent Cloudflare WARP upstream routing
 type DialGuard struct {
 	sem          chan struct{}
 	AllowLocal   bool
-	WarpProxy    string // e.g. "127.0.0.1:40000"
-	WarpAll      bool   // route all outbound traffic through WARP proxy
+	warpCfg      atomic.Pointer[WarpRouteConfig]
 	warpHealthy  atomic.Bool
 	probeTrigger chan struct{}
 	stopCh       chan struct{}
@@ -287,6 +292,7 @@ func NewDialGuard(maxConcurrent int) *DialGuard {
 		probeTrigger: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 	}
+	dg.warpCfg.Store(&WarpRouteConfig{})
 	dg.warpHealthy.Store(true)
 	go dg.backgroundWarpHealthChecker()
 	return dg
@@ -304,15 +310,30 @@ func (g *DialGuard) Close() {
 // SetWarpProxy configures upstream Cloudflare WARP SOCKS5 proxy
 func (g *DialGuard) SetWarpProxy(proxyAddr string, all bool) {
 	if g != nil {
-		g.WarpProxy = proxyAddr
-		g.WarpAll = all
-		if proxyAddr != "" {
+		cleanAddr := strings.TrimSpace(proxyAddr)
+		g.warpCfg.Store(&WarpRouteConfig{
+			ProxyAddr: cleanAddr,
+			WarpAll:   all,
+		})
+		if cleanAddr != "" {
 			select {
 			case g.probeTrigger <- struct{}{}:
 			default:
 			}
 		}
 	}
+}
+
+// GetWarpStatus returns the current WARP proxy address, full-route flag, enabled state, and health
+func (g *DialGuard) GetWarpStatus() (proxy string, all bool, enabled bool, healthy bool) {
+	if g == nil {
+		return "", false, false, false
+	}
+	cfg := g.warpCfg.Load()
+	if cfg == nil || cfg.ProxyAddr == "" {
+		return "", false, false, false
+	}
+	return cfg.ProxyAddr, cfg.WarpAll, true, g.warpHealthy.Load()
 }
 
 // DialTimeout dials with concurrency limiting, SSRF protection, and WARP unblocking
@@ -324,11 +345,17 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 
 	isAIDomain := isTargetAIDomain(address)
 
+	var warpCfg *WarpRouteConfig
+	if g != nil {
+		warpCfg = g.warpCfg.Load()
+	}
+	hasWarp := warpCfg != nil && warpCfg.ProxyAddr != ""
+
 	// 智能 WARP 出口净化：当配置/探测到远端 VPS 运行了 Cloudflare WARP SOCKS5 代理时，
 	// 对 Google、OpenAI、Gemini 等 AI 限制域名（或全量流量）经由 WARP 出口转发，彻底消灭 IP 标记与 403 封锁！
-	if g != nil && g.WarpProxy != "" && (g.WarpAll || isAIDomain) {
+	if g != nil && hasWarp && (warpCfg.WarpAll || isAIDomain) {
 		if g.warpHealthy.Load() {
-			c, err := dialViaSOCKS5(g.WarpProxy, address, timeout)
+			c, err := dialViaSOCKS5(warpCfg.ProxyAddr, address, timeout)
 			if err == nil {
 				return c, nil
 			}
@@ -371,15 +398,19 @@ func (g *DialGuard) backgroundWarpHealthChecker() {
 		case <-g.probeTrigger:
 		}
 
-		if g.WarpProxy == "" {
+		if g == nil {
+			continue
+		}
+		cfg := g.warpCfg.Load()
+		if cfg == nil || cfg.ProxyAddr == "" {
 			continue
 		}
 
-		probeConn, err := net.DialTimeout("tcp", g.WarpProxy, 1500*time.Millisecond)
+		probeConn, err := net.DialTimeout("tcp", cfg.ProxyAddr, 1500*time.Millisecond)
 		if err == nil {
 			_ = probeConn.Close()
 			if !g.warpHealthy.Load() {
-				log.Printf("[WARP-CIRCUIT-RESET] WARP proxy %s recovered. Normal routing restored.", g.WarpProxy)
+				log.Printf("[WARP-CIRCUIT-RESET] WARP proxy %s recovered. Normal routing restored.", cfg.ProxyAddr)
 				g.warpHealthy.Store(true)
 			}
 		}
@@ -391,7 +422,7 @@ func isTargetAIDomain(address string) bool {
 	if err != nil {
 		host = address
 	}
-	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.TrimRight(strings.ToLower(strings.TrimSpace(host)), ".")
 	if host == "" {
 		return false
 	}
@@ -415,6 +446,10 @@ func isTargetAIDomain(address string) bool {
 		"deepmind.google",
 		"bing.com",
 		"copilot.microsoft.com",
+		"perplexity.ai",
+		"x.ai",
+		"grok.com",
+		"mistral.ai",
 	}
 
 	for _, suffix := range aiSuffixes {

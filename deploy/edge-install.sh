@@ -29,7 +29,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.2.20"
+VERSION="1.2.21"
 REPO="jackybig999/aero"
 
 usage() {
@@ -354,6 +354,7 @@ if command -v ufw >/dev/null 2>&1; then
     ufw allow "${PRIMARY_PORT}/udp" 2>/dev/null || true
     ufw allow 80/tcp 2>/dev/null || true
     for cp in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
+        ufw allow "${cp}/tcp" 2>/dev/null || true
         ufw allow "${cp}/udp" 2>/dev/null || true
     done
 fi
@@ -362,19 +363,27 @@ if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p udp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
     iptables -I INPUT -p udp -m multiport --dports "$CANDIDATE_POOL" -j ACCEPT 2>/dev/null || true
-    # 备用端口内核级重定向到主端口（防 UDP 443 针对性 QoS 丢包与封锁）
-    SEC_PORTS=""
-    for sp in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
-        if [[ "$sp" != "$PRIMARY_PORT" ]]; then
-            if ! ss -tuln 2>/dev/null | grep -E ":$sp\b" | grep -qv "aero-edge"; then
-                SEC_PORTS="${SEC_PORTS}${sp},"
-            fi
-        fi
+    iptables -I INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -j ACCEPT 2>/dev/null || true
+
+    # 彻底杜绝内核级 NAT PREROUTING REDIRECT，保障服务端物理多端口原生监听
+    # 主动清理历史版本残留的 PREROUTING REDIRECT 规则 (防止 NAT 劫持)
+    iptables -t nat -D PREROUTING -p udp -m multiport --dports "$CANDIDATE_POOL" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
+    iptables -t nat -D PREROUTING -p udp -m multiport --dports "$CANDIDATE_POOL" -j REDIRECT --to-ports 443 2>/dev/null || true
+    for cp in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
+        iptables -t nat -D PREROUTING -p udp --dport "$cp" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
+        iptables -t nat -D PREROUTING -p tcp --dport "$cp" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
+        iptables -t nat -D PREROUTING -p udp --dport "$cp" -j REDIRECT --to-ports 443 2>/dev/null || true
+        iptables -t nat -D PREROUTING -p tcp --dport "$cp" -j REDIRECT --to-ports 443 2>/dev/null || true
     done
-    SEC_PORTS="${SEC_PORTS%,}"
-    if [[ -n "$SEC_PORTS" ]]; then
-        iptables -t nat -A PREROUTING -p udp -m multiport --dports "$SEC_PORTS" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
-    fi
+    while read -r rule; do
+        if [[ -n "$rule" && "$rule" =~ -A\ PREROUTING.*-j\ REDIRECT ]]; then
+            del_rule="${rule/-A/-D}"
+            iptables -t nat $del_rule 2>/dev/null || true
+        fi
+    done < <(iptables -t nat -S PREROUTING 2>/dev/null | grep -E "(2083|2087|8443|2053|2096|10443|24443|34443|44443)" | grep "REDIRECT" || true)
+fi
+if command -v nft >/dev/null 2>&1; then
+    nft delete table inet aero_nat 2>/dev/null || true
 fi
 # --- sysctl: 固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
 echo "[sysctl] 优化 BBR 拥塞控制与 128MB TCP/UDP 缓冲区"
@@ -425,17 +434,20 @@ if [[ ! -f "$DATA_DIR/sub_meta.json" ]]; then
     exit 1
 fi
 
-SUB_SECRET=$(python3 -c "import json;print(json.load(open('$DATA_DIR/sub_meta.json'))['secret'])" 2>/dev/null || true)
+# 纯 Shell 原生解析 JSON（严格遵守 L0 生产零外部解释器依赖铁律）
+SUB_SECRET=$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DATA_DIR/sub_meta.json" 2>/dev/null | head -n 1)
+if [[ -z "$SUB_SECRET" ]]; then
+    SUB_SECRET=$(grep -o '"secret"[[:space:]]*:[[:space:]]*"[^"]*"' "$DATA_DIR/sub_meta.json" 2>/dev/null | head -n 1 | sed 's/.*"secret"[[:space:]]*:[[:space:]]*"//;s/"//' 2>/dev/null || true)
+fi
 cp -f "$DATA_DIR/client-sub.json" "$CONFIG_DIR/client-sub.json" 2>/dev/null || true
 
-if [[ "${PRIMARY_PORT}" == "443" ]]; then
+# 零端口订阅链接绝对红线（Zero-Port Mandate: 严禁携带非 443 端口，由客户端并发探测自愈穿透）
+if [[ -n "$SUB_SECRET" ]]; then
     SUB_URL="https://${ADVERTISE_HOST}/sub/${SUB_SECRET}"
 else
-    SUB_URL="https://${ADVERTISE_HOST}:${PRIMARY_PORT}/sub/${SUB_SECRET}"
-fi
-if [[ -z "$SUB_SECRET" ]]; then
     SUB_URL="(见 $DATA_DIR/sub_meta.json)"
 fi
+ADMIN_SUB_URL="https://${ADVERTISE_HOST}/sub/admin"
 
 echo ""
 echo "========================================="
@@ -445,6 +457,7 @@ echo " Token:      $TOKEN"
 echo " Listen:     :${PRIMARY_PORT} (可 -p 自定义)"
 echo " Cert:       $CERT (public CA, auto-renew)"
 echo " Data dir:   $DATA_DIR"
+echo " Admin Sub:  $ADMIN_SUB_URL"
 echo " Sub URL:    $SUB_URL"
 echo ""
 echo " 客户端（本机混合口默认 55555，可 -listen 改）:"
