@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+func statfsDiskUsage(rootDir string, m *SystemMetrics) {
+}
+
 func collectPlatformMetrics(prev *rawMetricsSample) (*SystemMetrics, *rawMetricsSample) {
 	now := time.Now()
 	m := &SystemMetrics{
@@ -41,11 +44,5 @@ func collectPlatformMetrics(prev *rawMetricsSample) (*SystemMetrics, *rawMetrics
 		SampledAt:        now,
 		Platform:         runtime.GOOS,
 	}
-	return m, nil
-}
-
-// CollectSysInfoFrom is a fallback stub for non-Linux platforms
-func CollectSysInfoFrom(procDir, rootDir string) (*SystemMetrics, error) {
-	m, _ := collectPlatformMetrics(nil)
 	return m, nil
 }

@@ -162,6 +162,25 @@ func (wi *WarpInstaller) GetStatus() WarpInstallStatus {
 	return st
 }
 
+// IsInstalled checks if warp-cli is present or warp is bypassed/active
+func (wi *WarpInstaller) IsInstalled() bool {
+	if wi == nil {
+		return false
+	}
+	wi.mu.RLock()
+	checkCli := wi.checkWarpCli
+	bypassed := wi.status.Bypassed
+	wi.mu.RUnlock()
+	if bypassed {
+		return true
+	}
+	if checkCli != nil {
+		return checkCli()
+	}
+	_, err := exec.LookPath("warp-cli")
+	return err == nil
+}
+
 func (wi *WarpInstaller) appendLogLocked(level, msg string) {
 	entry := WarpLogEntry{
 		Timestamp: time.Now().UTC().Format("15:04:05"),

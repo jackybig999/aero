@@ -258,7 +258,6 @@ func (d *windowsDevice) Write(p []byte) (int, error) {
 }
 
 func (d *windowsDevice) Close() error {
-	stopCrashGuard()
 	if !d.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -290,6 +289,7 @@ func (d *windowsDevice) Close() error {
 		_ = d.adapter.Close()
 		d.adapter = nil
 	}
+	stopCrashGuard()
 
 	log.Printf("[TUN] Windows adapter safely closed: %s", d.name)
 	return nil
@@ -371,6 +371,9 @@ func SetupRoutes(devName, ipv4 string) error {
 		fmt.Sprintf("Add-DnsClientNrptRule -Namespace '.' -NameServers '%s','fd88::1' -Comment 'AERO_%s'", gwIP, devName))
 	_ = runCmd("ipconfig", "/flushdns")
 
+	// 6. 物理 DNS /32 路由捕获：动态添加精准 /32 路由导流进 aero0，免改注册表彻底根治 Windows SMHNR 泄露
+	_ = RotatePhysicalDNSRoute()
+
 	log.Printf("[TUN] Routes and DNS configured on %s via tunIP=%s gwIP=%s if=%s (MTU=1360)", devName, tunIP, gwIP, idx)
 	return nil
 }
@@ -380,6 +383,10 @@ func TeardownRoutes(devName string) {
 	if devName == "" {
 		devName = "aero0"
 	}
+	physDNSRoutesMu.Lock()
+	cleanPhysicalDNSRoutesLocked()
+	physDNSRoutesMu.Unlock()
+
 	_ = runCmd("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
 		fmt.Sprintf("Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_%s' } | Remove-DnsClientNrptRule -Force", devName))
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
@@ -395,6 +402,10 @@ func TeardownRoutes(devName string) {
 
 // CleanAero0StaleRoutes 仅删除归属于 aero0 接口的 0.0.0.0/1 和 128.0.0.0/1 及 DNS，碰不到任何其他网卡
 func CleanAero0StaleRoutes() {
+	physDNSRoutesMu.Lock()
+	cleanPhysicalDNSRoutesLocked()
+	physDNSRoutesMu.Unlock()
+
 	_ = runCmd("powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
 		"Get-DnsClientNrptRule | Where-Object { $_.Comment -eq 'AERO_aero0' } | Remove-DnsClientNrptRule -Force")
 	_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", "aero0")
@@ -405,6 +416,115 @@ func CleanAero0StaleRoutes() {
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", "aero0")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", "aero0")
 	_ = runCmd("ipconfig", "/flushdns")
+}
+
+var (
+	physDNSRoutesMu         sync.Mutex
+	physDNSRoutes           []string
+	getPhysicalDNSServersFn = getPhysicalAdapterDNSServers
+)
+
+// getPhysicalAdapterDNSServers 通过原生 IP Helper API 探测活动物理网卡的 DNS 服务器 IP
+func getPhysicalAdapterDNSServers() ([]string, error) {
+	_, idxStr, err := PhysicalDefaultGateway()
+	if err != nil || idxStr == "" {
+		return nil, err
+	}
+	targetIdx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		return nil, err
+	}
+
+	var size uint32 = 15000
+	for i := 0; i < 3; i++ {
+		buf := make([]byte, size)
+		p := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
+		flags := uint32(windows.GAA_FLAG_INCLUDE_ALL_INTERFACES | windows.GAA_FLAG_SKIP_MULTICAST)
+		err := windows.GetAdaptersAddresses(windows.AF_INET, flags, 0, p, &size)
+		if err == nil {
+			var dnsIPs []string
+			for curr := p; curr != nil; curr = curr.Next {
+				if int(curr.IfIndex) != targetIdx && int(curr.Ipv6IfIndex) != targetIdx {
+					continue
+				}
+				for d := curr.FirstDnsServerAddress; d != nil; d = d.Next {
+					ip := d.Address.IP()
+					if ip == nil {
+						continue
+					}
+					ip4 := ip.To4()
+					if ip4 == nil {
+						continue
+					}
+					if ip4.IsLoopback() || ip4.IsUnspecified() {
+						continue
+					}
+					// 过滤虚拟网卡自身保留网段 (10.88.0.x)
+					if ip4[0] == 10 && ip4[1] == 88 && ip4[2] == 0 {
+						continue
+					}
+					dnsIPs = append(dnsIPs, ip4.String())
+				}
+			}
+			return dnsIPs, nil
+		}
+		if err != windows.ERROR_BUFFER_OVERFLOW {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("GetAdaptersAddresses buffer overflow")
+}
+
+// RotatePhysicalDNSRoute 动态检测物理网卡 DNS，并将 /32 主机路由导向 aero0，彻底阻断 Windows SMHNR 并行 DNS 泄漏
+func RotatePhysicalDNSRoute() error {
+	newDNS, err := getPhysicalDNSServersFn()
+	if err != nil {
+		log.Printf("[TUN] Failed to query physical DNS servers: %v", err)
+		return err
+	}
+
+	physDNSRoutesMu.Lock()
+	defer physDNSRoutesMu.Unlock()
+
+	idx := interfaceIndex("aero0")
+	gwIP := "10.88.0.1"
+
+	// 删除在新网络中已失效的旧物理 DNS /32 路由
+	for _, oldIP := range physDNSRoutes {
+		found := false
+		for _, nip := range newDNS {
+			if nip == oldIP {
+				found = true
+				break
+			}
+		}
+		if !found {
+			_ = routeCmd("route", "delete", oldIP, "mask", "255.255.255.255", gwIP)
+			_ = runCmd("netsh", "interface", "ipv4", "delete", "route", oldIP+"/32", "aero0")
+			log.Printf("[TUN] Deleted old physical DNS route: %s/32", oldIP)
+		}
+	}
+
+	// 为当前物理网卡的所有 DNS 服务器添加 /32 主机路由指向 aero0
+	for _, nip := range newDNS {
+		args := []string{"add", nip, "mask", "255.255.255.255", gwIP, "metric", "1"}
+		if idx != "" {
+			args = append(args, "if", idx)
+		}
+		_ = routeCmd("route", args...)
+		log.Printf("[TUN] Added physical DNS route into aero0: %s/32 via %s (if=%s)", nip, gwIP, idx)
+	}
+
+	physDNSRoutes = newDNS
+	return nil
+}
+
+func cleanPhysicalDNSRoutesLocked() {
+	for _, ip := range physDNSRoutes {
+		_ = routeCmd("route", "delete", ip, "mask", "255.255.255.255", "10.88.0.1")
+		_ = runCmd("netsh", "interface", "ipv4", "delete", "route", ip+"/32", "aero0")
+	}
+	physDNSRoutes = nil
 }
 
 // getWindowsAdaptersSummary 通过原生 IP Helper API 采集完整的网卡描述与 IfType

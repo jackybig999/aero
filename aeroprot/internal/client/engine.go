@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.23"
+	ClientVersion = "1.2.24"
 	Protocol      = "aero/3.0"
 )
 
@@ -1196,6 +1196,8 @@ func (e *Engine) onNetworkChange(newGW, ifName string) {
 		if ip != nil {
 			_ = ProtectHostRoute(ip.String())
 		}
+		// 2. 刷新物理 DNS 捕获路由（自动撤销旧 Wi-Fi DNS /32，绑定新 Wi-Fi DNS /32，免改注册表防泄露）
+		_ = RotatePhysicalDNSRoute()
 	}
 
 	// 2. 斩断前一网络留存的悬挂连接
@@ -1892,7 +1894,7 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 	// 成功响应
 	_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0})
 
-	relayTraffic(conn, remote)
+	relayTraffic(conn, remote, e.getContext())
 }
 
 func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
@@ -1915,7 +1917,7 @@ func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
 	defer remote.Close()
 
 	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	relayTraffic(conn, remote)
+	relayTraffic(conn, remote, e.getContext())
 }
 
 func readSocks5Target(br *bufio.Reader, atyp byte) (string, uint16, error) {

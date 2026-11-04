@@ -164,3 +164,6 @@ func DetectThirdPartyTUN() (bool, string, error) {
 func SetCmdExecutorForTest(f func(name string, args ...string) error) func() {
 	return func() {}
 }
+
+// RotatePhysicalDNSRoute 移动端占位
+func RotatePhysicalDNSRoute() error { return nil }

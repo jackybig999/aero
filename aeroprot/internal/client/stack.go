@@ -162,15 +162,15 @@ func (e *StackEngine) Start() error {
 // Stop 停止协议栈
 func (e *StackEngine) Stop() {
 	e.cancel()
+	if e.device != nil {
+		_ = e.device.Close()
+	}
 	if e.gvEP != nil {
 		e.gvEP.Close()
 	}
 	if e.gvStack != nil {
 		e.gvStack.Close()
 		e.gvStack.Destroy()
-	}
-	if e.device != nil {
-		_ = e.device.Close()
 	}
 	e.wg.Wait()
 }
@@ -410,7 +410,11 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 			}
 			defer dialCancel()
 			defer remote.Close()
-			relayTraffic(local, remote)
+			relayTraffic(local, remote, e.ctx)
+			return
+		}
+
+		if e.dialer == nil {
 			return
 		}
 
@@ -423,7 +427,7 @@ func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
 		defer dialCancel()
 		defer remote.Close()
 
-		relayTraffic(local, remote)
+		relayTraffic(local, remote, e.ctx)
 	}()
 }
 
@@ -571,7 +575,7 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 			}
 			defer dialCancel()
 			defer remote.Close()
-			relayTraffic(activeLocal, remote)
+			relayTraffic(activeLocal, remote, e.ctx)
 			return
 		}
 
@@ -584,7 +588,11 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 			}
 			defer dialCancel()
 			defer remote.Close()
-			relayTraffic(activeLocal, remote)
+			relayTraffic(activeLocal, remote, e.ctx)
+			return
+		}
+
+		if e.dialer == nil {
 			return
 		}
 
@@ -602,6 +610,16 @@ func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
 			_, _ = activeLocal.Write(payload)
 		})
 		defer UnregisterInboundDatagramHandler(contextID)
+
+		stopDone := make(chan struct{})
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				_ = activeLocal.Close()
+			case <-stopDone:
+			}
+		}()
+		defer close(stopDone)
 
 		// 出站读循环向远端发送数据报
 		buf := make([]byte, 65535)
@@ -689,6 +707,15 @@ func isUDPConn(c net.Conn) bool {
 	if c == nil {
 		return false
 	}
+	if _, ok := c.(*gonet.UDPConn); ok {
+		return true
+	}
+	if _, ok := c.(*net.UDPConn); ok {
+		return true
+	}
+	if pref, ok := c.(*prefixedUDPConn); ok {
+		return isUDPConn(pref.Conn)
+	}
 	if la := c.LocalAddr(); la != nil && strings.HasPrefix(strings.ToLower(la.Network()), "udp") {
 		return true
 	}
@@ -709,22 +736,67 @@ var relayBufPool = sync.Pool{
 	},
 }
 
-func relayTraffic(a, b net.Conn) {
-	isUDP := isUDPConn(a) || isUDPConn(b)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	pipe := func(dst, src net.Conn) {
-		defer wg.Done()
-		bufPtr := relayBufPool.Get().(*[]byte)
-		buf := *bufPtr
-		defer relayBufPool.Put(bufPtr)
+func relayTraffic(a, b net.Conn, ctxs ...context.Context) {
+	var ctx context.Context
+	if len(ctxs) > 0 && ctxs[0] != nil {
+		ctx = ctxs[0]
+	} else {
+		ctx = context.Background()
+	}
 
-		if isUDP {
+	isUDP := isUDPConn(a) || isUDPConn(b)
+
+	ctxDone := make(chan struct{})
+	defer close(ctxDone)
+	if ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = a.Close()
+				_ = b.Close()
+			case <-ctxDone:
+			}
+		}()
+	}
+
+	if isUDP {
+		lastActive := atomic.Int64{}
+		lastActive.Store(time.Now().UnixNano())
+		idleDone := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
 			for {
-				_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
+				select {
+				case <-idleDone:
+					return
+				case <-ticker.C:
+					if time.Since(time.Unix(0, lastActive.Load())) > 45*time.Second {
+						_ = a.Close()
+						_ = b.Close()
+						return
+					}
+				}
+			}
+		}()
+		defer close(idleDone)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		pipeUDP := func(dst, src net.Conn) {
+			defer wg.Done()
+			defer func() {
+				_ = dst.Close()
+				_ = src.Close()
+			}()
+			bufPtr := relayBufPool.Get().(*[]byte)
+			defer relayBufPool.Put(bufPtr)
+			buf := *bufPtr
+
+			for {
 				n, err := src.Read(buf)
 				if n > 0 {
-					_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
+					lastActive.Store(time.Now().UnixNano())
 					payload := SanitizeWebRTCPayload(buf[:n])
 					if _, werr := dst.Write(payload); werr != nil {
 						break
@@ -734,23 +806,36 @@ func relayTraffic(a, b net.Conn) {
 					break
 				}
 			}
-		} else {
-			for {
+		}
+		go pipeUDP(a, b)
+		go pipeUDP(b, a)
+		wg.Wait()
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	pipe := func(dst, src net.Conn) {
+		defer wg.Done()
+		bufPtr := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufPtr)
+		buf := *bufPtr
+
+		for {
+			_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
+			n, err := src.Read(buf)
+			if n > 0 {
 				_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
-				n, err := src.Read(buf)
-				if n > 0 {
-					_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
-					payload := buf[:n]
-					if hasDomesticIPv6(string(payload)) {
-						payload = SanitizeWebRTCPayload(payload)
-					}
-					if _, werr := dst.Write(payload); werr != nil {
-						break
-					}
+				payload := buf[:n]
+				if hasDomesticIPv6(string(payload)) {
+					payload = SanitizeWebRTCPayload(payload)
 				}
-				if err != nil {
+				if _, werr := dst.Write(payload); werr != nil {
 					break
 				}
+			}
+			if err != nil {
+				break
 			}
 		}
 		if cw, ok := dst.(closeWriter); ok {

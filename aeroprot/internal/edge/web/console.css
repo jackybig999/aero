@@ -295,6 +295,26 @@ body {
   padding-top: 12px;
 }
 
+/* WARP Safety Notice Banner */
+.warp-safety-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  color: #93c5fd;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.warp-safety-notice svg {
+  flex-shrink: 0;
+  stroke: #60a5fa;
+}
+
 /* WARP Controls */
 .warp-controls {
   display: flex;

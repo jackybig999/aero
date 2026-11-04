@@ -1304,6 +1304,10 @@ func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx conte
 	if err != nil {
 		return nil, fmt.Errorf("quic listen packet %s: %w", addr, err)
 	}
+	if uc, ok := conn.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(7 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(7 * 1024 * 1024)
+	}
 
 	if server != nil && server.cfg != nil && server.cfg.ObfsPassword != "" {
 		conn = NewSalamanderPacketConn(conn, server.cfg.ObfsPassword, server.cfg.PaddingJitter)
@@ -1591,7 +1595,12 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	} else if s.dialGuard != nil {
 		targetConn, err = s.dialGuard.DialTimeout("tcp", target, 10*time.Second)
 	} else {
-		targetConn, err = net.DialTimeout("tcp", target, 10*time.Second)
+		tcpNet := "tcp4"
+		targetHost, _, _ := net.SplitHostPort(target)
+		if tip := net.ParseIP(targetHost); tip != nil && tip.To4() == nil {
+			tcpNet = "tcp"
+		}
+		targetConn, err = net.DialTimeout(tcpNet, target, 10*time.Second)
 	}
 	if err != nil {
 		w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
@@ -1709,8 +1718,21 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		targetUDP = uConn
+	} else if s.udpDialFn == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(proxyReq.Target, 0) {
+		warpConn, err := s.dialGuard.DialUDPViaWARP(proxyReq.Target, 10*time.Second)
+		if err != nil {
+			w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		targetUDP = warpConn
 	} else {
-		dstAddr, err := s.resolveUDP("udp", proxyReq.Target)
+		resolveNet := "udp4"
+		targetHost, _, _ := net.SplitHostPort(proxyReq.Target)
+		if tip := net.ParseIP(targetHost); tip != nil && tip.To4() == nil {
+			resolveNet = "udp"
+		}
+		dstAddr, err := s.resolveUDP(resolveNet, proxyReq.Target)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -1724,12 +1746,26 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		uConn, err := s.dialUDP("udp", nil, dstAddr)
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			return
+		if s.udpDialFn == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(dstAddr.String(), dstAddr.Port) {
+			warpConn, err := s.dialGuard.DialUDPViaWARP(dstAddr.String(), 10*time.Second)
+			if err != nil {
+				w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			targetUDP = warpConn
+		} else {
+			udpNet := "udp4"
+			if dstAddr.IP != nil && dstAddr.IP.To4() == nil {
+				udpNet = "udp"
+			}
+			uConn, err := s.dialUDP(udpNet, nil, dstAddr)
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			targetUDP = uConn
 		}
-		targetUDP = uConn
 	}
 	defer targetUDP.Close()
 

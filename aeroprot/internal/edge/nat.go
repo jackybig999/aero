@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -459,9 +460,23 @@ func (r *UserSpaceNATRouter) handleUDP(req *udp.ForwarderRequest) bool {
 				return
 			}
 		}
-		remoteUDP, err := r.server.dialUDP("udp", nil, dstUDP)
-		if err != nil {
-			return
+		var remoteUDP io.ReadWriteCloser
+		if r.server.udpDialFn == nil && r.server.dialGuard != nil && r.server.dialGuard.ShouldRouteUDP(dst, int(id.LocalPort)) {
+			warpConn, err := r.server.dialGuard.DialUDPViaWARP(dst, 10*time.Second)
+			if err != nil {
+				return
+			}
+			remoteUDP = warpConn
+		} else {
+			udpNet := "udp4"
+			if dstUDP.IP != nil && dstUDP.IP.To4() == nil {
+				udpNet = "udp"
+			}
+			uConn, err := r.server.dialUDP(udpNet, nil, dstUDP)
+			if err != nil {
+				return
+			}
+			remoteUDP = uConn
 		}
 		defer remoteUDP.Close()
 
@@ -503,6 +518,7 @@ func (r *UserSpaceNATRouter) handleUDP(req *udp.ForwarderRequest) bool {
 					break
 				}
 			}
+			_ = remoteUDP.Close()
 		}()
 		go func() {
 			defer wg.Done()
@@ -519,6 +535,7 @@ func (r *UserSpaceNATRouter) handleUDP(req *udp.ForwarderRequest) bool {
 					break
 				}
 			}
+			_ = localConn.Close()
 		}()
 		wg.Wait()
 	}()

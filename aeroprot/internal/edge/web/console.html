@@ -16,7 +16,7 @@
         </div>
         <div class="brand-text">
           <h1>AERO Edge Console</h1>
-          <span class="version-tag" id="appVersion">v1.2.23 • aero/3.0</span>
+          <span class="version-tag" id="appVersion">v1.2.24 • aero/3.0</span>
         </div>
       </div>
       <div class="nav-status">
@@ -120,6 +120,11 @@
           <span class="badge badge-success" id="warpStatusBadge">未检测</span>
         </div>
         <div class="card-body">
+          <div class="warp-safety-notice">
+            <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <span>保护 VPS 真实源 IP，防止访问 AI 时位置泄露导致 VPS IP 遭机房封禁或被判定送中</span>
+          </div>
+
           <div class="warp-controls">
             <div class="switch-row">
               <label class="switch-label">
@@ -151,7 +156,29 @@
         </div>
       </section>
 
-      <!-- 4. TLS Certificate & ACME Card -->
+      <!-- 4. GeoData Direct Rule Base Card -->
+      <section class="card geodata-card">
+        <div class="card-header">
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+            <h2>GeoData 直连分流规则库</h2>
+          </div>
+          <span class="badge badge-success" id="geodataStatusBadge">云端已同步</span>
+        </div>
+        <div class="card-body">
+          <div class="geodata-info-list" style="display:flex;flex-direction:column;gap:12px">
+            <div class="info-item"><span>直连规则总数:</span><strong id="geodataRulesCount">-- 条</strong></div>
+            <div class="info-item"><span>最近同步时间:</span><strong id="geodataLastUpdated">--</strong></div>
+            <div class="info-item"><span>数据版本 ETag:</span><strong id="geodataEtag" style="font-family:monospace;font-size:12px">--</strong></div>
+            <div class="info-item"><span>容灾多源镜像:</span><span class="badge badge-info">GitHub / jsDelivr 双活</span></div>
+          </div>
+          <div class="geodata-actions" style="margin-top:16px">
+            <button class="btn btn-secondary" id="btnUpdateGeoData">立即同步上游规则</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5. TLS Certificate & ACME Card -->
       <section class="card cert-card">
         <div class="card-header">
           <div class="card-title">

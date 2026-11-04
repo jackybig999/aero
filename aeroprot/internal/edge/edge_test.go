@@ -1268,6 +1268,18 @@ func TestGeoDataDirectListAndETag(t *testing.T) {
 	if len(bodyBytes6) != 0 {
 		t.Fatalf("expected 0 bytes body for HEAD, got %d", len(bodyBytes6))
 	}
+
+	// 7. Dual route: GET /api/v1/geodata/direct returns 200 OK with identical body and ETag
+	req7 := httptest.NewRequest(http.MethodGet, "/api/v1/geodata/direct", nil)
+	w7 := httptest.NewRecorder()
+	server.ServeHTTP(w7, req7)
+	resp7 := w7.Result()
+	if resp7.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for /api/v1/geodata/direct, got %d", resp7.StatusCode)
+	}
+	if resp7.Header.Get("ETag") != etag {
+		t.Fatalf("expected ETag %s, got %s", etag, resp7.Header.Get("ETag"))
+	}
 }
 
 func TestGeoDataDiskCacheAndCronUpdate(t *testing.T) {
@@ -1358,6 +1370,109 @@ func TestGeoDataDiskCacheAndCronUpdate(t *testing.T) {
 	}
 
 	cancel() // should exit cleanly without hanging
+}
+
+func TestGeoDataUpstreamFailoverAndConsole(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "aero-geodata-failover-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	primaryCalled := 0
+	fallbackCalled := 0
+
+	h := NewGeoDataHandler(tmpDir)
+	h.httpClient = &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			if strings.Contains(req.URL.String(), "raw.githubusercontent.com") {
+				primaryCalled++
+				return &http.Response{
+					StatusCode: http.StatusInternalServerError,
+					Body:       io.NopCloser(strings.NewReader("server error")),
+					Header:     make(http.Header),
+				}, nil
+			}
+			if strings.Contains(req.URL.String(), "cdn.jsdelivr.net") {
+				fallbackCalled++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("domain1.cn\ndomain2.com\n# comment\n")),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return nil, fmt.Errorf("unexpected url %s", req.URL)
+		}),
+	}
+
+	if err := h.ForceUpdate(context.Background()); err != nil {
+		t.Fatalf("ForceUpdate failed: %v", err)
+	}
+
+	if primaryCalled == 0 {
+		t.Fatal("expected primary URL to be attempted")
+	}
+	if fallbackCalled == 0 {
+		t.Fatal("expected fallback URL to be attempted on primary failure")
+	}
+
+	rulesCount, lastUpdate, etag := h.GetStatus()
+	if rulesCount != 2 {
+		t.Fatalf("expected 2 rules, got %d", rulesCount)
+	}
+	if etag == "" || lastUpdate.IsZero() {
+		t.Fatalf("expected non-empty etag and non-zero lastUpdate")
+	}
+
+	// Now test Console integration
+	cfg := ServerConfig{
+		Listen:                     ":18451",
+		Domain:                     "localhost",
+		DataDir:                    tmpDir,
+		AdminKey:                   "adminkey",
+		AllowSelfSignedCertForTest: true,
+	}
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	srv.geoHandler = h
+
+	// GET /console/api/status
+	reqStatus := httptest.NewRequest(http.MethodGet, "/console/api/status?key=adminkey", nil)
+	wStatus := httptest.NewRecorder()
+	srv.ServeHTTP(wStatus, reqStatus)
+	if wStatus.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /console/api/status, got %d: %s", wStatus.Code, wStatus.Body.String())
+	}
+	var statusResp map[string]any
+	if err := json.Unmarshal(wStatus.Body.Bytes(), &statusResp); err != nil {
+		t.Fatalf("parse status JSON: %v", err)
+	}
+	geoMap, ok := statusResp["geodata"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing geodata in status response: %v", statusResp)
+	}
+	if float64(rulesCount) != geoMap["rules_count"] {
+		t.Fatalf("expected rules_count %d, got %v", rulesCount, geoMap["rules_count"])
+	}
+
+	// POST /console/api/geodata/update
+	reqUpdate := httptest.NewRequest(http.MethodPost, "/console/api/geodata/update?key=adminkey", nil)
+	wUpdate := httptest.NewRecorder()
+	srv.ServeHTTP(wUpdate, reqUpdate)
+	if wUpdate.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /console/api/geodata/update, got %d: %s", wUpdate.Code, wUpdate.Body.String())
+	}
+	var updateResp map[string]any
+	if err := json.Unmarshal(wUpdate.Body.Bytes(), &updateResp); err != nil {
+		t.Fatalf("parse update JSON: %v", err)
+	}
+	if updateResp["ok"] != true {
+		t.Fatalf("expected ok=true, got %v", updateResp)
+	}
 }
 
 func TestSubscriptionLineTypeAndISPAffinity(t *testing.T) {
@@ -5320,5 +5435,491 @@ func TestEdge_M2_Production_SelfSignedBan(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "self-signed cert is prohibited") {
 		t.Errorf("expected prohibition message, got %v", err)
+	}
+}
+
+func startMockSOCKS5UDPRelay(t *testing.T) (proxyAddr string, cleanup func()) {
+	t.Helper()
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen mock socks5 tcp: %v", err)
+	}
+
+	relayUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		_ = tcpLn.Close()
+		t.Fatalf("listen mock socks5 relay udp: %v", err)
+	}
+	relayPort := uint16(relayUDP.LocalAddr().(*net.UDPAddr).Port)
+
+	closed := atomic.Bool{}
+	done := make(chan struct{})
+
+	// UDP echo relay: unpacks SOCKS5 UDP header and echoes back payload prefixed with "ECHO:"
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			if closed.Load() {
+				return
+			}
+			n, clientAddr, rerr := relayUDP.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			if n < 4 {
+				continue
+			}
+			var hdrLen int
+			switch buf[3] {
+			case 0x01: // IPv4
+				hdrLen = 10
+			case 0x04: // IPv6
+				hdrLen = 22
+			case 0x03: // Domain
+				hdrLen = 7 + int(buf[4])
+			}
+			if n < hdrLen {
+				continue
+			}
+			payload := buf[hdrLen:n]
+			echoPayload := append([]byte("ECHO:"), payload...)
+			reply := make([]byte, hdrLen+len(echoPayload))
+			copy(reply[:hdrLen], buf[:hdrLen])
+			copy(reply[hdrLen:], echoPayload)
+			_, _ = relayUDP.WriteTo(reply, clientAddr)
+		}
+	}()
+
+	// TCP control connection
+	go func() {
+		for {
+			c, aerr := tcpLn.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				// SOCKS5 greeting
+				greet := make([]byte, 3)
+				if _, gerr := io.ReadFull(conn, greet); gerr != nil {
+					return
+				}
+				_, _ = conn.Write([]byte{0x05, 0x00}) // No Auth
+
+				// UDP Associate request
+				req := make([]byte, 10)
+				if _, rerr := io.ReadFull(conn, req); rerr != nil {
+					return
+				}
+				if req[1] != 0x03 { // CMD != 3
+					_, _ = conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+					return
+				}
+
+				// Response: SUCCESS (0x00) with 127.0.0.1:relayPort
+				resp := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, byte(relayPort >> 8), byte(relayPort & 0xff)}
+				if _, werr := conn.Write(resp); werr != nil {
+					return
+				}
+
+				// Keep connection open until closed
+				b := make([]byte, 1)
+				for {
+					if _, err := conn.Read(b); err != nil {
+						break
+					}
+				}
+			}(c)
+		}
+	}()
+
+	cleanup = func() {
+		closed.Store(true)
+		_ = tcpLn.Close()
+		_ = relayUDP.Close()
+		close(done)
+	}
+	return tcpLn.Addr().String(), cleanup
+}
+
+func TestSOCKS5UDPAssociate_ProtocolAndEcho(t *testing.T) {
+	proxyAddr, cleanup := startMockSOCKS5UDPRelay(t)
+	defer cleanup()
+
+	conn, err := dialUDPViaSOCKS5(proxyAddr, "gemini.google.com:443", 2*time.Second)
+	if err != nil {
+		t.Fatalf("dialUDPViaSOCKS5 failed: %v", err)
+	}
+	defer conn.Close()
+
+	msg := []byte("ping http3 datagram")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("conn.Write failed: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	respBuf := make([]byte, 1024)
+	n, err := conn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("conn.Read failed: %v", err)
+	}
+
+	expected := "ECHO:ping http3 datagram"
+	if string(respBuf[:n]) != expected {
+		t.Errorf("expected %q, got %q", expected, string(respBuf[:n]))
+	}
+
+	if conn.RemoteAddr().String() != "gemini.google.com:443" {
+		t.Errorf("expected RemoteAddr gemini.google.com:443, got %s", conn.RemoteAddr().String())
+	}
+}
+
+func TestDialGuard_ShouldRouteUDP_And_FailClosed(t *testing.T) {
+	dg := NewDialGuard(16)
+	defer dg.Close()
+
+	// 1. Without WARP configured -> ShouldRouteUDP always false
+	if dg.ShouldRouteUDP("gemini.google.com:443", 443) {
+		t.Errorf("expected false when WARP is not configured")
+	}
+
+	// 2. Configure WARP proxy (WarpAll = false)
+	proxyAddr, cleanup := startMockSOCKS5UDPRelay(t)
+	defer cleanup()
+	dg.SetWarpProxy(proxyAddr, false)
+
+	// AI domains on UDP 443 must route via WARP
+	aiTargets := []string{
+		"gemini.google.com:443",
+		"clients6.google.com:443",
+		"generativelanguage.googleapis.com:443",
+		"chatgpt.com:443",
+		"openai.com:443",
+		"deepmind.com:443",
+		"142.250.190.46:443", // Google AI CIDR
+	}
+	for _, target := range aiTargets {
+		if !dg.ShouldRouteUDP(target, 443) {
+			t.Errorf("expected ShouldRouteUDP(%s, 443) == true", target)
+		}
+	}
+
+	// AI domains on non-443 must NOT route via WARP UDP
+	if dg.ShouldRouteUDP("gemini.google.com:53", 53) {
+		t.Errorf("expected ShouldRouteUDP(gemini.google.com:53, 53) == false")
+	}
+
+	// Non-AI domains on 443 must NOT route via WARP UDP
+	if dg.ShouldRouteUDP("example.com:443", 443) {
+		t.Errorf("expected ShouldRouteUDP(example.com:443, 443) == false")
+	}
+
+	// 3. Test successful DialUDPViaWARP
+	uConn, err := dg.DialUDPViaWARP("gemini.google.com:443", 2*time.Second)
+	if err != nil {
+		t.Fatalf("DialUDPViaWARP failed: %v", err)
+	}
+	_ = uConn.Close()
+
+	// 4. Test Fail-Closed when upstream WARP fails
+	dg.SetWarpProxy("127.0.0.1:59999", false) // Dead port
+	_, err = dg.DialUDPViaWARP("chatgpt.com:443", 500*time.Millisecond)
+	if err == nil {
+		t.Fatalf("expected DialUDPViaWARP to fail on dead port")
+	}
+	if !strings.Contains(err.Error(), "AERO_WARP_FAIL_CLOSED") {
+		t.Errorf("expected AERO_WARP_FAIL_CLOSED in error, got: %v", err)
+	}
+}
+
+func TestConnectUDP_WARPSocks5EndToEnd(t *testing.T) {
+	proxyAddr, cleanup := startMockSOCKS5UDPRelay(t)
+	defer cleanup()
+
+	dataDir := t.TempDir()
+	edgeAddr, _ := findTestAddr()
+	cfg := ServerConfig{
+		Listen:                     edgeAddr,
+		Domain:                     "127.0.0.1",
+		DataDir:                    dataDir,
+		Token:                      "warp_udp_h3_token",
+		AllowSelfSignedCertForTest: true,
+		WarpProxy:                  proxyAddr,
+		WarpAll:                    false,
+	}
+
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer srv.Close()
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+
+	targetAddr := "gemini.google.com:443"
+
+	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+	quicConf := DefaultQUICConfig()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
+	if err != nil {
+		t.Fatalf("quic.DialAddr failed: %v", err)
+	}
+	defer qConn.CloseWithError(0, "normal")
+
+	tr := &http3.Transport{EnableDatagrams: true}
+	h3Conn := tr.NewClientConn(qConn)
+	masqueConn := masque.NewClientConn(h3Conn)
+
+	tmpl := uritemplate.MustNew("https://" + srv.Addr() + "/.well-known/masque/udp/{target_host}/{target_port}/")
+	mReq, err := masque.NewRequest(ctx, tmpl, targetAddr)
+	if err != nil {
+		t.Fatalf("masque.NewRequest failed: %v", err)
+	}
+	nonce := make([]byte, 32)
+	_, _ = io.ReadFull(rand.Reader, nonce)
+	mReq.Header().Set("Authorization", "Bearer warp_udp_h3_token")
+	mReq.Header().Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	mReq.Header().Set("Aero-Nonce", hex.EncodeToString(nonce))
+
+	mConn, resp, err := masqueConn.Dial(mReq)
+	if err != nil {
+		t.Fatalf("masqueConn.Dial failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got: %d %s", resp.StatusCode, resp.Status)
+	}
+	defer mConn.Close()
+
+	payload := []byte("gemini-http3-native-stream-request")
+	rUdpAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443}
+	if _, err := mConn.WriteTo(payload, rUdpAddr); err != nil {
+		t.Fatalf("WriteTo failed: %v", err)
+	}
+
+	recvBuf := make([]byte, 2048)
+	_ = mConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err := mConn.ReadFrom(recvBuf)
+	if err != nil {
+		t.Fatalf("ReadFrom failed: %v", err)
+	}
+
+	expected := "ECHO:gemini-http3-native-stream-request"
+	if string(recvBuf[:n]) != expected {
+		t.Fatalf("expected echoed payload %q, got %q", expected, string(recvBuf[:n]))
+	}
+}
+
+func startMockSOCKS5UDPRelayWithDomain(t *testing.T, domain string) (proxyAddr string, cleanup func()) {
+	t.Helper()
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen mock socks5 tcp: %v", err)
+	}
+
+	relayUDP, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		_ = tcpLn.Close()
+		t.Fatalf("listen mock socks5 relay udp: %v", err)
+	}
+	relayPort := uint16(relayUDP.LocalAddr().(*net.UDPAddr).Port)
+
+	closed := atomic.Bool{}
+	done := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			if closed.Load() {
+				return
+			}
+			n, clientAddr, rerr := relayUDP.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			if n < 4 {
+				continue
+			}
+			var hdrLen int
+			switch buf[3] {
+			case 0x01: // IPv4
+				hdrLen = 10
+			case 0x04: // IPv6
+				hdrLen = 22
+			case 0x03: // Domain
+				hdrLen = 7 + int(buf[4])
+			}
+			if n < hdrLen {
+				continue
+			}
+			payload := buf[hdrLen:n]
+			echoPayload := append([]byte("ECHO:"), payload...)
+			reply := make([]byte, hdrLen+len(echoPayload))
+			copy(reply[:hdrLen], buf[:hdrLen])
+			copy(reply[hdrLen:], echoPayload)
+			_, _ = relayUDP.WriteTo(reply, clientAddr)
+		}
+	}()
+
+	go func() {
+		for {
+			c, aerr := tcpLn.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				greet := make([]byte, 3)
+				if _, gerr := io.ReadFull(conn, greet); gerr != nil {
+					return
+				}
+				_, _ = conn.Write([]byte{0x05, 0x00})
+
+				req := make([]byte, 10)
+				if _, rerr := io.ReadFull(conn, req); rerr != nil {
+					return
+				}
+				if req[1] != 0x03 {
+					_, _ = conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+					return
+				}
+
+				domBytes := []byte(domain)
+				resp := make([]byte, 4+1+len(domBytes)+2)
+				resp[0] = 0x05
+				resp[1] = 0x00
+				resp[2] = 0x00
+				resp[3] = 0x03 // Domain
+				resp[4] = byte(len(domBytes))
+				copy(resp[5:5+len(domBytes)], domBytes)
+				binary.BigEndian.PutUint16(resp[5+len(domBytes):], relayPort)
+				if _, werr := conn.Write(resp); werr != nil {
+					return
+				}
+
+				b := make([]byte, 1)
+				for {
+					if _, err := conn.Read(b); err != nil {
+						break
+					}
+				}
+			}(c)
+		}
+	}()
+
+	cleanup = func() {
+		closed.Store(true)
+		_ = tcpLn.Close()
+		_ = relayUDP.Close()
+		close(done)
+	}
+	return tcpLn.Addr().String(), cleanup
+}
+
+func TestSOCKS5UDPAssociate_DomainBNDAddr(t *testing.T) {
+	proxyAddr, cleanup := startMockSOCKS5UDPRelayWithDomain(t, "localhost")
+	defer cleanup()
+
+	conn, err := dialUDPViaSOCKS5(proxyAddr, "gemini.google.com:443", 2*time.Second)
+	if err != nil {
+		t.Fatalf("dialUDPViaSOCKS5 with domain bnd.addr failed: %v", err)
+	}
+	defer conn.Close()
+
+	msg := []byte("domain-bnd-payload")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("conn.Write failed: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	respBuf := make([]byte, 1024)
+	n, err := conn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("conn.Read failed: %v", err)
+	}
+
+	expected := "ECHO:domain-bnd-payload"
+	if string(respBuf[:n]) != expected {
+		t.Errorf("expected %q, got %q", expected, string(respBuf[:n]))
+	}
+}
+
+func TestSOCKS5UDPAssociate_HighConcurrency(t *testing.T) {
+	proxyAddr, cleanup := startMockSOCKS5UDPRelay(t)
+	defer cleanup()
+
+	conn, err := dialUDPViaSOCKS5(proxyAddr, "gemini.google.com:443", 2*time.Second)
+	if err != nil {
+		t.Fatalf("dialUDPViaSOCKS5 failed: %v", err)
+	}
+	defer conn.Close()
+
+	const concurrency = 10
+	const iterations = 5
+	errCh := make(chan error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(workerID int) {
+			for j := 0; j < iterations; j++ {
+				payload := fmt.Sprintf("concurrency-test-worker-%d-iter-%d", workerID, j)
+				if _, err := conn.Write([]byte(payload)); err != nil {
+					errCh <- fmt.Errorf("worker %d write: %w", workerID, err)
+					return
+				}
+				buf := make([]byte, 2048)
+				_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+				n, err := conn.Read(buf)
+				if err != nil {
+					errCh <- fmt.Errorf("worker %d read: %w", workerID, err)
+					return
+				}
+				if !strings.HasPrefix(string(buf[:n]), "ECHO:concurrency-test-worker-") {
+					errCh <- fmt.Errorf("worker %d unexpected echo: %s", workerID, string(buf[:n]))
+					return
+				}
+			}
+			errCh <- nil
+		}(i)
+	}
+
+	for i := 0; i < concurrency; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent test error: %v", err)
+		}
+	}
+}
+
+func TestConnectUDP_DomainResolutionUsesUDP4(t *testing.T) {
+	srv, err := NewServer(ServerConfig{
+		Listen:                     "127.0.0.1:0",
+		Domain:                     "127.0.0.1",
+		DataDir:                    t.TempDir(),
+		Token:                      "test-token",
+		AllowSelfSignedCertForTest: true,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	var recordedNetwork string
+	srv.quicServer.SetResolveUDPFunc(func(network, addr string) (*net.UDPAddr, error) {
+		recordedNetwork = network
+		return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443}, nil
+	})
+
+	resolveNet := "udp4"
+	targetHost, _, _ := net.SplitHostPort("example.com:443")
+	if tip := net.ParseIP(targetHost); tip != nil && tip.To4() == nil {
+		resolveNet = "udp"
+	}
+	_, _ = srv.quicServer.resolveUDP(resolveNet, "example.com:443")
+	if recordedNetwork != "udp4" {
+		t.Errorf("expected resolution network udp4 for domain, got %s", recordedNetwork)
 	}
 }

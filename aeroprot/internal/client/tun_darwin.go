@@ -627,3 +627,8 @@ func DetectThirdPartyTUN() (bool, string, error) {
 
 	return false, "", nil
 }
+
+// RotatePhysicalDNSRoute 刷新 macOS 漫游 DNS 状态
+func RotatePhysicalDNSRoute() error {
+	return nil
+}

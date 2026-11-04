@@ -212,6 +212,10 @@ func (h *ConsoleHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		h.handleAPIWarpToggle(w, r)
 		return true
 
+	case p == "/console/api/geodata/update" && r.Method == http.MethodPost:
+		h.handleAPIGeoDataUpdate(w, r)
+		return true
+
 	case p == "/console/api/users" && r.Method == http.MethodGet:
 		h.handleAPIListUsers(w, r)
 		return true
@@ -380,14 +384,30 @@ func (h *ConsoleHandler) handleAPIStatus(w http.ResponseWriter, r *http.Request)
 			"traffic_limit_bytes": int64(0),
 		},
 		"warp": map[string]any{
-			"installed":     warpEnabled || (h.warpInstaller != nil && h.warpInstaller.GetStatus().Bypassed),
-			"running":       warpEnabled,
-			"active":        warpEnabled,
-			"proxy_addr":    warpProxy,
-			"warp_all":      warpAll,
-			"smart_routing": warpEnabled && !warpAll,
-			"healthy":       warpHealthy,
+			"installed":        warpEnabled || (h.warpInstaller != nil && (h.warpInstaller.GetStatus().Bypassed || h.warpInstaller.IsInstalled())),
+			"running":          warpEnabled,
+			"active":           warpEnabled,
+			"proxy_addr":       warpProxy,
+			"warp_all":         warpAll,
+			"smart_routing":    warpEnabled && !warpAll,
+			"healthy":          warpHealthy,
+			"update_available": false,
 		},
+		"geodata": func() map[string]any {
+			if h.server != nil && h.server.geoHandler != nil {
+				rulesCount, lastUpdate, etag := h.server.geoHandler.GetStatus()
+				return map[string]any{
+					"rules_count":  rulesCount,
+					"last_updated": lastUpdate.Unix(),
+					"etag":         etag,
+				}
+			}
+			return map[string]any{
+				"rules_count":  0,
+				"last_updated": int64(0),
+				"etag":         "",
+			}
+		}(),
 		"stats": map[string]any{
 			"active_tunnels": activeTunnels,
 			"max_conn":       maxConn,
@@ -396,6 +416,28 @@ func (h *ConsoleHandler) handleAPIStatus(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, resp)
+}
+
+func (h *ConsoleHandler) handleAPIGeoDataUpdate(w http.ResponseWriter, r *http.Request) {
+	if h.server == nil || h.server.geoHandler == nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"ok":false,"error":"geodata handler not available"}`))
+		return
+	}
+	if err := h.server.geoHandler.ForceUpdate(r.Context()); err != nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error())))
+		return
+	}
+	rulesCount, lastUpdate, etag := h.server.geoHandler.GetStatus()
+	writeJSON(w, map[string]any{
+		"ok":           true,
+		"rules_count":  rulesCount,
+		"last_updated": lastUpdate.Unix(),
+		"etag":         etag,
+	})
 }
 
 func (h *ConsoleHandler) handleAPIPurity(w http.ResponseWriter, r *http.Request) {

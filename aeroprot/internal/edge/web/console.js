@@ -50,6 +50,13 @@
     btnInstallWarp: document.getElementById('btnInstallWarp'),
     btnViewLogs: document.getElementById('btnViewLogs'),
 
+    // GeoData
+    geodataRulesCount: document.getElementById('geodataRulesCount'),
+    geodataLastUpdated: document.getElementById('geodataLastUpdated'),
+    geodataEtag: document.getElementById('geodataEtag'),
+    geodataStatusBadge: document.getElementById('geodataStatusBadge'),
+    btnUpdateGeoData: document.getElementById('btnUpdateGeoData'),
+
     // Cert
     certDomain: document.getElementById('certDomain'),
     certExpires: document.getElementById('certExpires'),
@@ -218,14 +225,49 @@
 
     // WARP
     if (data.warp) {
-      const running = data.warp.running || data.warp.active;
-      const installed = data.warp.installed || running;
+      const running = !!(data.warp.running || data.warp.active);
+      const installed = !!(data.warp.installed || running);
+      const updateAvailable = !!data.warp.update_available;
       el.warpStatusBadge.textContent = running ? '运行中 (SOCKS5 40000)' : (installed ? '已安装 (未启动)' : '未安装');
       el.warpStatusBadge.className = 'badge ' + (running ? 'badge-success' : 'badge-warning');
 
       if (!document.activeElement || (document.activeElement !== el.warpToggle && document.activeElement !== el.warpAllToggle)) {
         el.warpToggle.checked = !!running;
         el.warpAllToggle.checked = !!data.warp.warp_all;
+      }
+
+      if (el.btnInstallWarp) {
+        if (running && !updateAvailable) {
+          el.btnInstallWarp.disabled = true;
+          el.btnInstallWarp.className = 'btn btn-secondary';
+          el.btnInstallWarp.textContent = 'WARP 官方组件已就绪 (源 IP 已保护)';
+        } else if (updateAvailable) {
+          el.btnInstallWarp.disabled = false;
+          el.btnInstallWarp.className = 'btn btn-primary';
+          el.btnInstallWarp.textContent = '检测到新版本 (点击静默升级)';
+        } else {
+          el.btnInstallWarp.disabled = false;
+          el.btnInstallWarp.className = 'btn btn-primary';
+          el.btnInstallWarp.textContent = '一键官方静默安装 WARP';
+        }
+      }
+    }
+
+    // GeoData
+    if (data.geodata) {
+      if (el.geodataRulesCount) {
+        el.geodataRulesCount.textContent = (data.geodata.rules_count || 0) + ' 条';
+      }
+      if (el.geodataLastUpdated) {
+        const ts = data.geodata.last_updated;
+        if (ts && ts > 0) {
+          el.geodataLastUpdated.textContent = new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
+        } else {
+          el.geodataLastUpdated.textContent = '初始化完成';
+        }
+      }
+      if (el.geodataEtag) {
+        el.geodataEtag.textContent = data.geodata.etag || '--';
       }
     }
   }
@@ -524,6 +566,29 @@
     if (isPollingLogs) {
       logPollTimer = setTimeout(pollLogs, 1500);
     }
+  }
+
+  // GeoData Sync Handler
+  if (el.btnUpdateGeoData) {
+    el.btnUpdateGeoData.addEventListener('click', async () => {
+      try {
+        el.btnUpdateGeoData.disabled = true;
+        el.btnUpdateGeoData.textContent = '同步中...';
+        const res = await fetch(getApiUrl('/console/api/geodata/update'), { method: 'POST' });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          showToast(`GeoData 同步成功 (${data.rules_count} 条规则)`);
+          fetchStatus();
+        } else {
+          alert(`同步失败: ${data.error || '未知错误'}`);
+        }
+      } catch (e) {
+        alert(`请求异常: ${e.message}`);
+      } finally {
+        el.btnUpdateGeoData.disabled = false;
+        el.btnUpdateGeoData.textContent = '立即同步上游规则';
+      }
+    });
   }
 
   // 6. Initialization

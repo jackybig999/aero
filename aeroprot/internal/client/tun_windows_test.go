@@ -197,3 +197,84 @@ func TestSetupRoutesDNSGatewayAlignment(t *testing.T) {
 		t.Errorf("expected netsh interface metric=1 command not executed")
 	}
 }
+
+func TestRotatePhysicalDNSRoute(t *testing.T) {
+	origCmd := routeCmd
+	origDNSFn := getPhysicalDNSServersFn
+	t.Cleanup(func() {
+		routeCmd = origCmd
+		getPhysicalDNSServersFn = origDNSFn
+		physDNSRoutesMu.Lock()
+		physDNSRoutes = nil
+		physDNSRoutesMu.Unlock()
+	})
+
+	var routeCalls [][]string
+	routeCmd = func(name string, args ...string) error {
+		routeCalls = append(routeCalls, append([]string{name}, args...))
+		return nil
+	}
+
+	// 1. First network: physical DNS 192.168.3.1
+	getPhysicalDNSServersFn = func() ([]string, error) {
+		return []string{"192.168.3.1"}, nil
+	}
+
+	if err := RotatePhysicalDNSRoute(); err != nil {
+		t.Fatalf("first RotatePhysicalDNSRoute failed: %v", err)
+	}
+
+	foundAdd3 := false
+	for _, call := range routeCalls {
+		if len(call) >= 4 && call[0] == "route" && call[1] == "add" && call[2] == "192.168.3.1" {
+			foundAdd3 = true
+			break
+		}
+	}
+	if !foundAdd3 {
+		t.Fatalf("expected route add 192.168.3.1, calls: %v", routeCalls)
+	}
+
+	// 2. Wi-Fi roaming: network changes, physical DNS is now 192.168.1.1
+	routeCalls = nil
+	getPhysicalDNSServersFn = func() ([]string, error) {
+		return []string{"192.168.1.1"}, nil
+	}
+
+	if err := RotatePhysicalDNSRoute(); err != nil {
+		t.Fatalf("roaming RotatePhysicalDNSRoute failed: %v", err)
+	}
+
+	foundDel3 := false
+	foundAdd1 := false
+	for _, call := range routeCalls {
+		if len(call) >= 3 && call[0] == "route" && call[1] == "delete" && call[2] == "192.168.3.1" {
+			foundDel3 = true
+		}
+		if len(call) >= 4 && call[0] == "route" && call[1] == "add" && call[2] == "192.168.1.1" {
+			foundAdd1 = true
+		}
+	}
+	if !foundDel3 {
+		t.Fatalf("expected old DNS 192.168.3.1 route delete, got calls: %v", routeCalls)
+	}
+	if !foundAdd1 {
+		t.Fatalf("expected new DNS 192.168.1.1 route add, got calls: %v", routeCalls)
+	}
+
+	// 3. Teardown / Clean
+	routeCalls = nil
+	physDNSRoutesMu.Lock()
+	cleanPhysicalDNSRoutesLocked()
+	physDNSRoutesMu.Unlock()
+
+	foundDel1 := false
+	for _, call := range routeCalls {
+		if len(call) >= 3 && call[0] == "route" && call[1] == "delete" && call[2] == "192.168.1.1" {
+			foundDel1 = true
+		}
+	}
+	if !foundDel1 {
+		t.Fatalf("expected route delete 192.168.1.1 on clean, got calls: %v", routeCalls)
+	}
+}

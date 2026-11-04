@@ -19,6 +19,7 @@ import (
 )
 
 const defaultGeoDataURL = "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
+const fallbackGeoDataURL = "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/direct-list.txt"
 
 const defaultDirectRules = `# China Direct Domain & IP Rules (Built-in Fallback)
 cn
@@ -48,13 +49,28 @@ tencent.com
 aliyun.com
 `
 
+// countRules counts valid direct rule entries, ignoring empty lines and comments
+func countRules(data []byte) int {
+	count := 0
+	lines := strings.Split(string(data), "\n")
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			count++
+		}
+	}
+	return count
+}
+
 // GeoDataHandler manages direct rules dataset and handles HTTP /geodata/direct-list requests
 type GeoDataHandler struct {
-	mu       sync.RWMutex
-	data     []byte
-	etag     string
-	dataDir  string
-	filePath string
+	mu         sync.RWMutex
+	data       []byte
+	etag       string
+	rulesCount int
+	lastUpdate time.Time
+	dataDir    string
+	filePath   string
 
 	cronInterval time.Duration
 
@@ -82,11 +98,19 @@ func NewGeoDataHandler(dataDir string) *GeoDataHandler {
 	data, err := os.ReadFile(filePath)
 	if err == nil && len(data) > 0 {
 		h.data = data
+		h.rulesCount = countRules(data)
+		if fi, fierr := os.Stat(filePath); fierr == nil {
+			h.lastUpdate = fi.ModTime()
+		} else {
+			h.lastUpdate = time.Now()
+		}
 		sum := sha256.Sum256(data)
 		h.etag = fmt.Sprintf("\"%x\"", sum)
 	} else {
 		defaultData := []byte(defaultDirectRules)
 		h.data = defaultData
+		h.rulesCount = countRules(defaultData)
+		h.lastUpdate = time.Now()
 		sum := sha256.Sum256(defaultData)
 		h.etag = fmt.Sprintf("\"%x\"", sum)
 	}
@@ -103,6 +127,12 @@ func (h *GeoDataHandler) StartCronUpdate(ctx context.Context) {
 	if interval <= 0 {
 		interval = 24 * time.Hour
 	}
+	// Initial update immediately in background to eliminate 24h cold-start wait
+	go func() {
+		if err := h.fetchAndUpdateWithContext(ctx); err != nil {
+			log.Printf("[GEODATA] Initial startup update failed: %v", err)
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -127,9 +157,9 @@ func (h *GeoDataHandler) fetchAndUpdate() error {
 }
 
 func (h *GeoDataHandler) fetchAndUpdateWithContext(parentCtx context.Context) error {
-	fetchURL := h.fetchURL
-	if fetchURL == "" {
-		fetchURL = defaultGeoDataURL
+	urls := []string{h.fetchURL}
+	if h.fetchURL == "" || h.fetchURL == defaultGeoDataURL {
+		urls = []string{defaultGeoDataURL, fallbackGeoDataURL}
 	}
 
 	client := h.httpClient
@@ -137,68 +167,87 @@ func (h *GeoDataHandler) fetchAndUpdateWithContext(parentCtx context.Context) er
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 
+	var lastErr error
+	for _, targetURL := range urls {
+		body, err := h.tryFetchURL(parentCtx, client, targetURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		sum := sha256.Sum256(body)
+		newEtag := fmt.Sprintf("\"%x\"", sum)
+
+		h.mu.RLock()
+		currentEtag := h.etag
+		h.mu.RUnlock()
+
+		if newEtag == currentEtag {
+			h.mu.Lock()
+			h.lastUpdate = time.Now()
+			h.mu.Unlock()
+			return nil
+		}
+
+		// Atomic disk persistence: write to .tmp, then rename
+		if err := os.MkdirAll(h.dataDir, 0o755); err != nil {
+			return fmt.Errorf("create geodata dir: %w", err)
+		}
+
+		tmpFile := h.filePath + ".tmp"
+		if err := os.WriteFile(tmpFile, body, 0o644); err != nil {
+			return fmt.Errorf("write temp geodata: %w", err)
+		}
+		if err := os.Rename(tmpFile, h.filePath); err != nil {
+			_ = os.Remove(tmpFile)
+			return fmt.Errorf("rename geodata: %w", err)
+		}
+
+		h.mu.Lock()
+		h.data = body
+		h.etag = newEtag
+		h.rulesCount = countRules(body)
+		h.lastUpdate = time.Now()
+		h.mu.Unlock()
+
+		log.Printf("[GEODATA] Updated geodata direct list (%d rules, %d bytes, etag: %s) from %s", h.rulesCount, len(body), newEtag, targetURL)
+		return nil
+	}
+
+	return fmt.Errorf("all geodata upstream fetches failed, last error: %w", lastErr)
+}
+
+func (h *GeoDataHandler) tryFetchURL(parentCtx context.Context, client *http.Client, fetchURL string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parentCtx, 15*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
 	if err != nil {
-		return fmt.Errorf("create geodata request: %w", err)
+		return nil, fmt.Errorf("create geodata request: %w", err)
 	}
 	req.Header.Set("User-Agent", "AERO-Edge-GeoData/1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("fetch geodata error: %w", err)
+		return nil, fmt.Errorf("fetch geodata error: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("fetch geodata unexpected status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("fetch geodata unexpected status: %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10MB safety cap
 	if err != nil {
-		return fmt.Errorf("read geodata body: %w", err)
+		return nil, fmt.Errorf("read geodata body: %w", err)
 	}
 	if len(body) == 0 {
-		return fmt.Errorf("fetched geodata is empty")
+		return nil, fmt.Errorf("fetched geodata is empty")
 	}
-
-	sum := sha256.Sum256(body)
-	newEtag := fmt.Sprintf("\"%x\"", sum)
-
-	h.mu.RLock()
-	currentEtag := h.etag
-	h.mu.RUnlock()
-
-	if newEtag == currentEtag {
-		return nil
-	}
-
-	// Atomic disk persistence: write to .tmp, then rename
-	if err := os.MkdirAll(h.dataDir, 0o755); err != nil {
-		return fmt.Errorf("create geodata dir: %w", err)
-	}
-
-	tmpFile := h.filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, body, 0o644); err != nil {
-		return fmt.Errorf("write temp geodata: %w", err)
-	}
-	if err := os.Rename(tmpFile, h.filePath); err != nil {
-		_ = os.Remove(tmpFile)
-		return fmt.Errorf("rename geodata: %w", err)
-	}
-
-	h.mu.Lock()
-	h.data = body
-	h.etag = newEtag
-	h.mu.Unlock()
-
-	log.Printf("[GEODATA] Updated geodata direct list (%d bytes, etag: %s)", len(body), newEtag)
-	return nil
+	return body, nil
 }
 
-// TryServe intercepts GET/HEAD /geodata/direct-list:
+// TryServe intercepts GET/HEAD /geodata/direct-list and /api/v1/geodata/direct:
 // Returns 304 Not Modified if If-None-Match matches etag;
 // Otherwise returns 200 OK with ETag header and rules text.
 func (h *GeoDataHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
@@ -206,7 +255,8 @@ func (h *GeoDataHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	path := r.URL.Path
-	if path != "/geodata/direct-list" && path != "/geodata/direct-list/" {
+	if path != "/geodata/direct-list" && path != "/geodata/direct-list/" &&
+		path != "/api/v1/geodata/direct" && path != "/api/v1/geodata/direct/" {
 		return false
 	}
 
@@ -238,6 +288,18 @@ func (h *GeoDataHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		_, _ = w.Write(data)
 	}
 	return true
+}
+
+// GetStatus returns current rule count, last update time, and etag
+func (h *GeoDataHandler) GetStatus() (rulesCount int, lastUpdate time.Time, etag string) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.rulesCount, h.lastUpdate, h.etag
+}
+
+// ForceUpdate triggers an immediate update from upstream
+func (h *GeoDataHandler) ForceUpdate(ctx context.Context) error {
+	return h.fetchAndUpdateWithContext(ctx)
 }
 
 // Data returns a copy of the current cached rules data

@@ -422,6 +422,10 @@ var googleAICIDRs = parseAICIDRs([]string{
 	"172.217.0.0/16",
 	"216.58.192.0/19",
 	"108.177.0.0/17",
+	"74.125.0.0/16",
+	"173.194.0.0/16",
+	"64.233.160.0/19",
+	"66.249.64.0/19",
 	"2607:f8b0::/32",
 	"2001:4860::/32",
 })
@@ -472,13 +476,26 @@ func isTargetAIDomain(address string) bool {
 		"claude.ai",
 		"ai.google.dev",
 		"makersuite.google.com",
+		"aistudio.google.com",
+		"gemini.google.com",
+		"clients6.google.com",
+		"generativelanguage.googleapis.com",
 		"deepmind.google",
+		"deepmind.com",
 		"bing.com",
 		"copilot.microsoft.com",
 		"perplexity.ai",
 		"x.ai",
 		"grok.com",
 		"mistral.ai",
+		"groq.com",
+		"cohere.ai",
+		"together.xyz",
+		"replicate.com",
+		"openrouter.ai",
+		"fireworks.ai",
+		"cursor.sh",
+		"cursorapi.com",
 	}
 
 	for _, suffix := range aiSuffixes {
@@ -490,7 +507,12 @@ func isTargetAIDomain(address string) bool {
 }
 
 func dialViaSOCKS5(proxyAddr, targetAddr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", proxyAddr, timeout)
+	tcpNet := "tcp4"
+	proxyHost, _, _ := net.SplitHostPort(proxyAddr)
+	if ip := net.ParseIP(proxyHost); ip != nil && ip.To4() == nil {
+		tcpNet = "tcp"
+	}
+	conn, err := net.DialTimeout(tcpNet, proxyAddr, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -595,7 +617,438 @@ func dialViaSOCKS5(proxyAddr, targetAddr string, timeout time.Duration) (net.Con
 	return conn, nil
 }
 
+var socks5UDPReadPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65535)
+		return &b
+	},
+}
+
+var socks5UDPWritePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65535)
+		return &b
+	},
+}
+
+type socksTargetAddr struct {
+	network string
+	addr    string
+}
+
+func (a socksTargetAddr) Network() string { return a.network }
+func (a socksTargetAddr) String() string  { return a.addr }
+
+// socks5UDPConn wraps a UDP connection associate session with an upstream SOCKS5 proxy
+type socks5UDPConn struct {
+	tcpConn   net.Conn
+	udpConn   *net.UDPConn
+	relayAddr *net.UDPAddr
+	targetHdr []byte
+	raddr     net.Addr
+	closeOnce sync.Once
+	closed    atomic.Bool
+}
+
+func (c *socks5UDPConn) Read(p []byte) (int, error) {
+	bufPtr := socks5UDPReadPool.Get().(*[]byte)
+	defer socks5UDPReadPool.Put(bufPtr)
+	rawBuf := *bufPtr
+
+	for {
+		if c.closed.Load() {
+			return 0, net.ErrClosed
+		}
+		n, err := c.udpConn.Read(rawBuf)
+		if err != nil {
+			return 0, err
+		}
+		if n < 4 {
+			continue
+		}
+		if rawBuf[0] != 0x00 || rawBuf[1] != 0x00 {
+			continue
+		}
+		if rawBuf[2] != 0x00 {
+			// RFC 1928: fragment dropped
+			continue
+		}
+		var hdrLen int
+		switch rawBuf[3] {
+		case 0x01: // IPv4 (4 bytes IP + 2 bytes port)
+			hdrLen = 10
+		case 0x04: // IPv6 (16 bytes IP + 2 bytes port)
+			hdrLen = 22
+		case 0x03: // Domain (1 byte len + domain + 2 bytes port)
+			if n < 5 {
+				continue
+			}
+			dLen := int(rawBuf[4])
+			hdrLen = 7 + dLen
+		default:
+			continue
+		}
+		if n < hdrLen {
+			continue
+		}
+		payload := rawBuf[hdrLen:n]
+		copied := copy(p, payload)
+		return copied, nil
+	}
+}
+
+func (c *socks5UDPConn) Write(p []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	hdrLen := len(c.targetHdr)
+	totalLen := hdrLen + len(p)
+	if totalLen <= 65535 {
+		bufPtr := socks5UDPWritePool.Get().(*[]byte)
+		defer socks5UDPWritePool.Put(bufPtr)
+		buf := *bufPtr
+		copy(buf[:hdrLen], c.targetHdr)
+		copy(buf[hdrLen:totalLen], p)
+		_, err := c.udpConn.Write(buf[:totalLen])
+		if err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+	packet := make([]byte, totalLen)
+	copy(packet[:hdrLen], c.targetHdr)
+	copy(packet[hdrLen:], p)
+	_, err := c.udpConn.Write(packet)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *socks5UDPConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		if c.udpConn != nil {
+			_ = c.udpConn.Close()
+		}
+		if c.tcpConn != nil {
+			_ = c.tcpConn.Close()
+		}
+	})
+	return nil
+}
+
+func (c *socks5UDPConn) LocalAddr() net.Addr {
+	if c.udpConn != nil {
+		return c.udpConn.LocalAddr()
+	}
+	return nil
+}
+
+func (c *socks5UDPConn) RemoteAddr() net.Addr {
+	return c.raddr
+}
+
+func (c *socks5UDPConn) SetDeadline(t time.Time) error {
+	if c.udpConn != nil {
+		return c.udpConn.SetDeadline(t)
+	}
+	return nil
+}
+
+func (c *socks5UDPConn) SetReadDeadline(t time.Time) error {
+	if c.udpConn != nil {
+		return c.udpConn.SetReadDeadline(t)
+	}
+	return nil
+}
+
+func (c *socks5UDPConn) SetWriteDeadline(t time.Time) error {
+	if c.udpConn != nil {
+		return c.udpConn.SetWriteDeadline(t)
+	}
+	return nil
+}
+
+func dialUDPViaSOCKS5(proxyAddr, targetAddr string, timeout time.Duration) (net.Conn, error) {
+	tcpNet := "tcp4"
+	proxyHost, _, _ := net.SplitHostPort(proxyAddr)
+	if ip := net.ParseIP(proxyHost); ip != nil && ip.To4() == nil {
+		tcpNet = "tcp"
+	}
+	tcpConn, err := net.DialTimeout(tcpNet, proxyAddr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	_ = tcpConn.SetDeadline(time.Now().Add(timeout))
+	if tc, ok := tcpConn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
+
+	// 1. SOCKS5 握手: 客户端问候 [VER=5, NMETHODS=1, METHOD=0 (No Auth)]
+	if _, err := tcpConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 greeting failed: %w", err)
+	}
+
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(tcpConn, authResp); err != nil {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 auth resp failed: %w", err)
+	}
+	if authResp[0] != 0x05 || authResp[1] != 0x00 {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 auth rejected: 0x%02x", authResp[1])
+	}
+
+	// 2. UDP ASSOCIATE 请求 [VER=5, CMD=3 (UDP ASSOCIATE), RSV=0, ATYP=1, 0.0.0.0:0]
+	if _, err := tcpConn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 udp associate request failed: %w", err)
+	}
+
+	// 3. 读取连接响应头 [VER, REP, RSV, ATYP]
+	respHdr := make([]byte, 4)
+	if _, err := io.ReadFull(tcpConn, respHdr); err != nil {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 udp associate resp header failed: %w", err)
+	}
+	if respHdr[0] != 0x05 {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 udp associate invalid version: 0x%02x", respHdr[0])
+	}
+	if respHdr[1] != 0x00 {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 udp associate rejected by upstream: 0x%02x", respHdr[1])
+	}
+
+	var relayIP net.IP
+	var relayPort uint16
+	switch respHdr[3] {
+	case 0x01: // IPv4
+		b := make([]byte, 4+2)
+		if _, err := io.ReadFull(tcpConn, b); err != nil {
+			_ = tcpConn.Close()
+			return nil, fmt.Errorf("socks5 read bnd.addr ipv4 failed: %w", err)
+		}
+		relayIP = net.IP(b[:4])
+		relayPort = binary.BigEndian.Uint16(b[4:])
+	case 0x04: // IPv6
+		b := make([]byte, 16+2)
+		if _, err := io.ReadFull(tcpConn, b); err != nil {
+			_ = tcpConn.Close()
+			return nil, fmt.Errorf("socks5 read bnd.addr ipv6 failed: %w", err)
+		}
+		relayIP = net.IP(b[:16])
+		relayPort = binary.BigEndian.Uint16(b[16:])
+	case 0x03: // Domain
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(tcpConn, lenBuf); err != nil {
+			_ = tcpConn.Close()
+			return nil, fmt.Errorf("socks5 read bnd.addr domain len failed: %w", err)
+		}
+		b := make([]byte, int(lenBuf[0])+2)
+		if _, err := io.ReadFull(tcpConn, b); err != nil {
+			_ = tcpConn.Close()
+			return nil, fmt.Errorf("socks5 read bnd.addr domain failed: %w", err)
+		}
+		domain := string(b[:lenBuf[0]])
+		relayPort = binary.BigEndian.Uint16(b[lenBuf[0]:])
+		if domain == "" || domain == "localhost" {
+			tcpHost, _, _ := net.SplitHostPort(proxyAddr)
+			if ip := net.ParseIP(tcpHost); ip != nil {
+				relayIP = ip
+			} else {
+				relayIP = net.IPv4(127, 0, 0, 1)
+			}
+		} else {
+			ips, err := net.LookupIP(domain)
+			if err != nil || len(ips) == 0 {
+				_ = tcpConn.Close()
+				return nil, fmt.Errorf("socks5 resolve bnd domain %s failed: %w", domain, err)
+			}
+			for _, ip := range ips {
+				if ip4 := ip.To4(); ip4 != nil {
+					relayIP = ip4
+					break
+				}
+			}
+			if relayIP == nil {
+				relayIP = ips[0]
+			}
+		}
+	default:
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 unknown bnd address type: 0x%02x", respHdr[3])
+	}
+
+	_ = tcpConn.SetDeadline(time.Time{})
+
+	if relayIP == nil || relayIP.IsUnspecified() {
+		tcpHost, _, _ := net.SplitHostPort(proxyAddr)
+		if ip := net.ParseIP(tcpHost); ip != nil {
+			relayIP = ip
+		} else {
+			relayIP = net.IPv4(127, 0, 0, 1)
+		}
+	}
+
+	if relayPort == 0 {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 udp associate returned invalid relay port 0")
+	}
+
+	relayUDPAddr := &net.UDPAddr{
+		IP:   relayIP,
+		Port: int(relayPort),
+	}
+
+	udpNet := "udp4"
+	if relayIP.To4() == nil {
+		udpNet = "udp"
+	}
+	udpConn, err := net.DialUDP(udpNet, nil, relayUDPAddr)
+	if err != nil {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("socks5 dial relay udp %s failed: %w", relayUDPAddr, err)
+	}
+
+	host, portStr, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		host = targetAddr
+		portStr = "443"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		port = 443
+	}
+	host = strings.Trim(strings.TrimRight(strings.ToLower(strings.TrimSpace(host)), "."), "[]")
+	if host == "" {
+		_ = udpConn.Close()
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("empty target host in %s", targetAddr)
+	}
+
+	var targetHdr []byte
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			targetHdr = make([]byte, 10)
+			targetHdr[3] = 0x01
+			copy(targetHdr[4:8], ip4)
+			binary.BigEndian.PutUint16(targetHdr[8:10], uint16(port))
+		} else {
+			targetHdr = make([]byte, 22)
+			targetHdr[3] = 0x04
+			copy(targetHdr[4:20], ip.To16())
+			binary.BigEndian.PutUint16(targetHdr[20:22], uint16(port))
+		}
+	} else {
+		if len(host) > 255 {
+			_ = udpConn.Close()
+			_ = tcpConn.Close()
+			return nil, fmt.Errorf("domain too long: %s", host)
+		}
+		targetHdr = make([]byte, 7+len(host))
+		targetHdr[3] = 0x03
+		targetHdr[4] = byte(len(host))
+		copy(targetHdr[5:5+len(host)], host)
+		binary.BigEndian.PutUint16(targetHdr[5+len(host):], uint16(port))
+	}
+
+	sc := &socks5UDPConn{
+		tcpConn:   tcpConn,
+		udpConn:   udpConn,
+		relayAddr: relayUDPAddr,
+		targetHdr: targetHdr,
+		raddr:     socksTargetAddr{network: "udp", addr: targetAddr},
+	}
+
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			if _, err := tcpConn.Read(buf); err != nil {
+				_ = sc.Close()
+				return
+			}
+		}
+	}()
+
+	return sc, nil
+}
+
+// ShouldRouteUDP determines whether the target UDP traffic should be routed via Cloudflare WARP.
+func (g *DialGuard) ShouldRouteUDP(target string, port int) bool {
+	if g == nil {
+		return false
+	}
+	cfg := g.warpCfg.Load()
+	if cfg == nil || cfg.ProxyAddr == "" {
+		return false
+	}
+	if cfg.WarpAll {
+		return true
+	}
+	if port == 0 {
+		_, portStr, err := net.SplitHostPort(target)
+		if err == nil {
+			if p, err := strconv.Atoi(portStr); err == nil {
+				port = p
+			}
+		}
+	}
+	// AI HTTP/3 / QUIC traffic (UDP 443) must be routed via WARP IPv6 to protect VPS source IP
+	if port == 443 && isTargetAIDomain(target) {
+		return true
+	}
+	return false
+}
+
+// DialUDPViaWARP dials targetAddr using SOCKS5 UDP Associate via upstream Cloudflare WARP.
+func (g *DialGuard) DialUDPViaWARP(targetAddr string, timeout time.Duration) (net.Conn, error) {
+	if g == nil {
+		return nil, fmt.Errorf("dial guard not configured")
+	}
+	cfg := g.warpCfg.Load()
+	if cfg == nil || cfg.ProxyAddr == "" {
+		return nil, fmt.Errorf("warp proxy not configured")
+	}
+	if !g.warpHealthy.Load() {
+		return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: WARP circuit open, direct dial refused (target: %s)", targetAddr)
+	}
+	conn, err := dialUDPViaSOCKS5(cfg.ProxyAddr, targetAddr, timeout)
+	if err != nil {
+		g.warpHealthy.Store(false)
+		select {
+		case g.probeTrigger <- struct{}{}:
+		default:
+		}
+		log.Printf("[WARP-UDP-CIRCUIT-OPEN] Upstream WARP UDP Associate failed for %s (%v). Circuit tripped.", targetAddr, err)
+		if isTargetAIDomain(targetAddr) {
+			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: WARP UDP Associate failed to prevent AI region leak (target: %s): %w", targetAddr, err)
+		}
+		return nil, err
+	}
+	return conn, nil
+}
+
 func safeDial(network, address string, timeout time.Duration) (net.Conn, error) {
+	if network == "tcp" {
+		host, _, _ := net.SplitHostPort(address)
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+			// Explicit IPv6 literal
+		} else {
+			network = "tcp4"
+		}
+	} else if network == "udp" {
+		host, _, _ := net.SplitHostPort(address)
+		if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+			// Explicit IPv6 literal
+		} else {
+			network = "udp4"
+		}
+	}
 	d := &net.Dialer{
 		Timeout: timeout,
 		Control: func(network, address string, c syscall.RawConn) error {

@@ -388,6 +388,10 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 	}
 
 	if isDirect {
+		// Type 65 HTTPS RR 零时延空应答，消灭 Edge/Chrome 浏览器等待超时
+		if qtype == 0x0041 { // Type 65 HTTPS RR
+			return buildEmptyResponse(pkt, qname, qtype)
+		}
 		// .cn 直连 & 丢弃 AAAA
 		if qtype == 0x001C { // AAAA
 			return buildEmptyResponse(pkt, qname, qtype)
@@ -397,8 +401,11 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		if dnsResp != nil {
 			return dnsResp
 		}
-		// 物理 DNS 超时/失败，回退到 Fake-IP 专线
-		return h.respondFakeIP(pkt, qname)
+		// 物理 DNS 超时/失败：仅 Type A 回退到 Fake-IP 专线，非 A 类型返回空应答
+		if qtype == 0x0001 {
+			return h.respondFakeIP(pkt, qname)
+		}
+		return buildEmptyResponse(pkt, qname, qtype)
 	}
 
 	// 阶段三：其余境外站/非直连域名
