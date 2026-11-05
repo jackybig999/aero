@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# AERO Edge — 命令行终端后台管理工具 (类 x-ui / s-ui 架构)
+# 支持交互式终端菜单与非交互式快捷命令调用
+# ==============================================================================
+set -e
+
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+PLAIN="\033[0m"
+BOLD="\033[1m"
+
+CONFIG_FILE="/etc/aero/edge.conf"
+YAML_CONFIG="/etc/aero/edge.yaml"
+DATA_DIR="/var/lib/aero"
+SUB_META="$DATA_DIR/sub_meta.json"
+TOKENS_FILE="$DATA_DIR/tokens.json"
+CERT_FILE="$DATA_DIR/tls/fullchain.pem"
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/jackybig999/aero/main/deploy/edge-install.sh"
+UNINSTALL_SCRIPT_URL="https://raw.githubusercontent.com/jackybig999/aero/main/deploy/edge-uninstall.sh"
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}错误: 必须使用 root 用户或 sudo 执行此脚本！${PLAIN}"
+        exit 1
+    fi
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+    DOMAIN="${AERO_DOMAIN:-}"
+    TOKEN="${AERO_TOKEN:-}"
+    PORTS="${AERO_PORTS:-443}"
+    PRIMARY_PORT=$(echo "$PORTS" | cut -d, -f1 | tr -d ' ')
+    ADMIN_KEY="${AERO_ADMIN_KEY:-}"
+    
+    # 若在 edge.conf 中未记录 ADMIN_KEY，尝试从 systemd service 文件读取
+    if [[ -z "$ADMIN_KEY" && -f "/etc/systemd/system/aero-edge.service" ]]; then
+        ADMIN_KEY=$(grep -o "\-admin-key[[:space:]]\+[^[:space:]]\+" /etc/systemd/system/aero-edge.service 2>/dev/null | awk '{print $2}' || true)
+    fi
+    
+    # 获取随机订阅 Secret
+    SUB_SECRET=""
+    if [[ -f "$SUB_META" ]]; then
+        SUB_SECRET=$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SUB_META" 2>/dev/null | head -n 1 || true)
+        if [[ -z "$SUB_SECRET" ]]; then
+            SUB_SECRET=$(grep -o '"secret"[[:space:]]*:[[:space:]]*"[^"]*"' "$SUB_META" 2>/dev/null | head -n 1 | sed 's/.*"secret"[[:space:]]*:[[:space:]]*"//;s/"//' 2>/dev/null || true)
+        fi
+    fi
+}
+
+get_status() {
+    if systemctl is-active --quiet aero-edge 2>/dev/null; then
+        echo -e "${GREEN}运行中 (Active)${PLAIN}"
+    else
+        echo -e "${RED}未运行 (Stopped)${PLAIN}"
+    fi
+}
+
+cmd_status() {
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}              AERO Edge 节点运行状态               ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e " 运行状态:       $(get_status)"
+    echo -e " 绑定域名:       ${GREEN}${DOMAIN:-未配置}${PLAIN}"
+    echo -e " 监听主端口:     ${GREEN}${PRIMARY_PORT:-443}${PLAIN}"
+    if [[ -f "$YAML_CONFIG" ]]; then
+        ALT_PORTS=$(grep -o '"alt_listen_ports":[^]]*]' "$YAML_CONFIG" 2>/dev/null || true)
+        echo -e " 跳频备用端口:   ${YELLOW}${ALT_PORTS:-2083, 2087, 8443, 2053, ...}${PLAIN}"
+    fi
+    echo -e " 数据目录:       ${DATA_DIR}"
+    echo -e " 配置文件:       ${CONFIG_FILE}"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    
+    if systemctl is-active --quiet aero-edge 2>/dev/null; then
+        UPTIME=$(systemctl show aero-edge --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2 || true)
+        PID=$(systemctl show aero-edge --property=MainPID 2>/dev/null | cut -d= -f2 || true)
+        echo -e " 进程 PID:       ${GREEN}${PID}${PLAIN}"
+        echo -e " 启动时间:       ${UPTIME}"
+    fi
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_info() {
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}            AERO Edge 订阅与接入信息               ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e " 节点域名:       ${GREEN}${DOMAIN}${PLAIN}"
+    echo -e " 主端口:         ${GREEN}:${PRIMARY_PORT}${PLAIN}"
+    echo -e " 连接 Token:     ${YELLOW}${TOKEN}${PLAIN}"
+    echo -e " 管理密钥:       ${YELLOW}${ADMIN_KEY:-未设置}${PLAIN}"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    if [[ -n "$SUB_SECRET" && -n "$DOMAIN" ]]; then
+        SUB_URL="https://${DOMAIN}/sub/${SUB_SECRET}"
+        ADMIN_SUB_URL="https://${DOMAIN}/sub/admin"
+        CONSOLE_URL="https://${DOMAIN}:${PRIMARY_PORT}/console?key=${ADMIN_KEY}"
+        
+        echo -e " 客户端订阅链接: ${GREEN}${SUB_URL}${PLAIN}"
+        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN}"
+        echo -e " Web 管理控制台: ${GREEN}${CONSOLE_URL}${PLAIN}"
+    else
+        echo -e "${YELLOW}提示: 订阅元数据未就绪，请先启动 aero-edge 服务${PLAIN}"
+    fi
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_start() {
+    check_root
+    echo -e "${CYAN}正在启动 aero-edge 服务...${PLAIN}"
+    systemctl start aero-edge
+    sleep 1
+    if systemctl is-active --quiet aero-edge; then
+        echo -e "${GREEN}aero-edge 启动成功！${PLAIN}"
+    else
+        echo -e "${RED}aero-edge 启动失败，最近日志如下：${PLAIN}"
+        journalctl -u aero-edge -n 20 --no-pager
+    fi
+}
+
+cmd_stop() {
+    check_root
+    echo -e "${YELLOW}正在停止 aero-edge 服务...${PLAIN}"
+    systemctl stop aero-edge || true
+    echo -e "${GREEN}aero-edge 已停止。${PLAIN}"
+}
+
+cmd_restart() {
+    check_root
+    echo -e "${CYAN}正在重启 aero-edge 服务...${PLAIN}"
+    systemctl restart aero-edge
+    sleep 1
+    if systemctl is-active --quiet aero-edge; then
+        echo -e "${GREEN}aero-edge 重启成功！${PLAIN}"
+    else
+        echo -e "${RED}aero-edge 启动失败，最近日志如下：${PLAIN}"
+        journalctl -u aero-edge -n 20 --no-pager
+    fi
+}
+
+cmd_log() {
+    echo -e "${CYAN}正在查看实时运行日志 (按 Ctrl+C 退出)...${PLAIN}"
+    journalctl -u aero-edge -f
+}
+
+cmd_tokens() {
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}               已授权用户 Token 列表                ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    if [[ -f "$TOKENS_FILE" ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            jq -r '.[] | "Token: \(.token)\n  备注: \(.label // "默认用户")\n  到期时间: \(.expires_at // "永久")\n"' "$TOKENS_FILE" 2>/dev/null || cat "$TOKENS_FILE"
+        else
+            cat "$TOKENS_FILE"
+        fi
+    else
+        echo -e "${YELLOW}暂无用户 Token 记录${PLAIN}"
+    fi
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_add_token() {
+    check_root
+    echo -e "${CYAN}--- 添加新用户 Token ---${PLAIN}"
+    read -r -p "请输入用户备注名 (例如 user01): " label
+    if [[ -z "$label" ]]; then
+        label="user_$(date +%s)"
+    fi
+    read -r -p "请输入自定义 Token (直接回车自动生成密码学强随机 Token): " new_token
+    if [[ -z "$new_token" ]]; then
+        new_token="aero_$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    fi
+    
+    # 追加进 tokens.json
+    mkdir -p "$DATA_DIR"
+    if [[ ! -f "$TOKENS_FILE" || ! -s "$TOKENS_FILE" ]]; then
+        echo "[]" > "$TOKENS_FILE"
+    fi
+    
+    python3 -c "
+import json, sys
+data = []
+try:
+    with open('$TOKENS_FILE', 'r') as f:
+        data = json.load(f)
+except Exception:
+    data = []
+data.append({
+    'token': '$new_token',
+    'label': '$label',
+    'created_at': '$(date +%s)'
+})
+with open('$TOKENS_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+" 2>/dev/null || true
+    
+    echo -e "${GREEN}成功添加 Token！${PLAIN}"
+    echo -e "备注:  ${label}"
+    echo -e "Token: ${GREEN}${new_token}${PLAIN}"
+    echo -e "${YELLOW}提示: 重启或重新加载服务后生效 (systemctl reload aero-edge 或 aero restart)${PLAIN}"
+}
+
+cmd_cert() {
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}                 TLS 证书信息                      ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    if [[ -f "$CERT_FILE" ]]; then
+        echo -e " 证书路径:   ${CERT_FILE}"
+        echo -e " 域名匹配:   $(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | sed 's/subject= //')"
+        echo -e " 签发机构:   $(openssl x509 -in "$CERT_FILE" -noout -issuer 2>/dev/null | sed 's/issuer= //')"
+        echo -e " 生效时间:   $(openssl x509 -in "$CERT_FILE" -noout -startdate 2>/dev/null | cut -d= -f2)"
+        echo -e " 过期时间:   ${GREEN}$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2)${PLAIN}"
+        
+        if openssl x509 -in "$CERT_FILE" -noout -checkend 604800 >/dev/null 2>&1; then
+            echo -e " 状态:       ${GREEN}有效 (距过期 > 7 天)${PLAIN}"
+        else
+            echo -e " 状态:       ${YELLOW}即将过期或已过期${PLAIN}"
+        fi
+    else
+        echo -e "${RED}未在 ${CERT_FILE} 检测到已签发的证书！${PLAIN}"
+    fi
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_update() {
+    check_root
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e " 正在在线更新 AERO Edge 服务端至最新版本..."
+    echo -e "${CYAN}====================================================${PLAIN}"
+    if [[ -z "$DOMAIN" ]]; then
+        read -r -p "请输入节点绑定的域名: " DOMAIN
+    fi
+    curl -fsSL "$INSTALL_SCRIPT_URL" | bash -s -- -d "$DOMAIN" ${ADMIN_KEY:+-k "$ADMIN_KEY"} ${TOKEN:+-t "$TOKEN"}
+    echo -e "${GREEN}AERO Edge 节点更新流程完成！${PLAIN}"
+}
+
+cmd_uninstall() {
+    check_root
+    echo -e "${RED}====================================================${PLAIN}"
+    echo -e "${RED}${BOLD}             警告: 即将卸载 AERO Edge 节点         ${PLAIN}"
+    echo -e "${RED}====================================================${PLAIN}"
+    read -r -p "是否同时彻底清除全部数据目录与配置 (/var/lib/aero, /etc/aero)? [y/N]: " confirm_purge
+    
+    PURGE_FLAG=""
+    if [[ "$confirm_purge" =~ ^[yY]$ ]]; then
+        PURGE_FLAG="--purge"
+    fi
+    
+    if [[ -f "/usr/local/bin/edge-uninstall.sh" ]]; then
+        bash /usr/local/bin/edge-uninstall.sh $PURGE_FLAG
+    else
+        curl -fsSL "$UNINSTALL_SCRIPT_URL" | bash -s -- $PURGE_FLAG
+    fi
+    echo -e "${GREEN}AERO Edge 卸载完成。${PLAIN}"
+}
+
+show_menu() {
+    clear
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.25)        ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e " 服务状态: [ $(get_status) ]"
+    echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "  ${BOLD}1.${PLAIN} 查看节点运行状态 (Status)"
+    echo -e "  ${BOLD}2.${PLAIN} 查看客户端订阅与控制台链接 (Info / Sub URL)"
+    echo -e "  ${BOLD}3.${PLAIN} 查看实时运行日志 (Live Logs)"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "  ${BOLD}4.${PLAIN} 启动 AERO Edge 服务 (Start)"
+    echo -e "  ${BOLD}5.${PLAIN} 停止 AERO Edge 服务 (Stop)"
+    echo -e "  ${BOLD}6.${PLAIN} 重启 AERO Edge 服务 (Restart)"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "  ${BOLD}7.${PLAIN} 查看所有用户 Token (List Tokens)"
+    echo -e "  ${BOLD}8.${PLAIN} 添加新用户 Token (Add Token)"
+    echo -e "  ${BOLD}9.${PLAIN} 查看 TLS 公网证书状态 (Cert Status)"
+    echo -e " ${BOLD}10.${PLAIN} 检查并在线更新服务端 (Update)"
+    echo -e " ${BOLD}11.${PLAIN} 完全对称卸载节点 (Uninstall)"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e "  ${BOLD}0.${PLAIN} 退出管理菜单"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    read -r -p "请输入选项 [0-11]: " choice
+    case "$choice" in
+        1) cmd_status ;;
+        2) cmd_info ;;
+        3) cmd_log ;;
+        4) cmd_start ;;
+        5) cmd_stop ;;
+        6) cmd_restart ;;
+        7) cmd_tokens ;;
+        8) cmd_add_token ;;
+        9) cmd_cert ;;
+        10) cmd_update ;;
+        11) cmd_uninstall ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入无效，请输入 0-11 的数字！${PLAIN}" ;;
+    esac
+}
+
+# ----------------- 参数路由 -----------------
+action="${1:-}"
+case "$action" in
+    status)     cmd_status ;;
+    info|sub)   cmd_info ;;
+    start)      cmd_start ;;
+    stop)       cmd_stop ;;
+    restart)    cmd_restart ;;
+    log|logs)   cmd_log ;;
+    token|tokens) cmd_tokens ;;
+    add-token)  cmd_add_token ;;
+    cert)       cmd_cert ;;
+    update)     cmd_update ;;
+    uninstall)  cmd_uninstall ;;
+    help|-h|--help)
+        echo "用法: aero [命令]"
+        echo "命令:"
+        echo "  status       查看服务运行状态"
+        echo "  info, sub    查看客户端订阅链接与 Web 控制台 URL"
+        echo "  start        启动服务"
+        echo "  stop         停止服务"
+        echo "  restart      重启服务"
+        echo "  log          查看实时运行日志"
+        echo "  tokens       查看已授权 Token"
+        echo "  add-token    新增用户 Token"
+        echo "  cert         查看 TLS 证书信息"
+        echo "  update       更新服务端至最新版本"
+        echo "  uninstall    对称卸载节点"
+        echo "  (不带参数直接运行进入交互式管理菜单)"
+        ;;
+    *)
+        show_menu
+        ;;
+esac

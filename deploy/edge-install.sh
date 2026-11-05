@@ -226,6 +226,32 @@ fi
 chmod 755 "$INSTALL_DIR/aeroprot-edge"
 ln -sf "$INSTALL_DIR/aeroprot-edge" "$INSTALL_DIR/aero-edge"
 
+# --- CLI & 运维工具: 安装 aero 交互式管理菜单 (类 x-ui / s-ui) ---
+AERO_CLI_URL="https://raw.githubusercontent.com/${REPO}/main/deploy/aero"
+UNINSTALL_URL="https://raw.githubusercontent.com/${REPO}/main/deploy/edge-uninstall.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+
+if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/aero" ]]; then
+    cp -f "$SCRIPT_DIR/aero" "$INSTALL_DIR/aero"
+elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$AERO_CLI_URL" -o "$INSTALL_DIR/aero" 2>/dev/null || true
+fi
+
+if [[ -f "$INSTALL_DIR/aero" ]]; then
+    chmod 755 "$INSTALL_DIR/aero"
+    ln -sf "$INSTALL_DIR/aero" "/usr/bin/aero" 2>/dev/null || true
+    echo "[cli] 终端交互管理工具已就绪: 输入 'aero' 即可呼出管理菜单"
+fi
+
+if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/edge-uninstall.sh" ]]; then
+    cp -f "$SCRIPT_DIR/edge-uninstall.sh" "$INSTALL_DIR/edge-uninstall.sh"
+elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$UNINSTALL_URL" -o "$INSTALL_DIR/edge-uninstall.sh" 2>/dev/null || true
+fi
+if [[ -f "$INSTALL_DIR/edge-uninstall.sh" ]]; then
+    chmod 755 "$INSTALL_DIR/edge-uninstall.sh"
+fi
+
 # --- TLS: detect → copy → issue (LE → ZeroSSL) → never self-sign ---
 need_issue=1
 if [[ -f "$CERT" && -f "$KEY" ]]; then
@@ -521,5 +547,6 @@ echo "   aero-ech -sub $SUB_URL -listen 127.0.0.1:55555"
 echo "   浏览器/软件代理设为 127.0.0.1:55555（HTTP 或 SOCKS5）"
 echo "   不改 Windows 注册表 / 系统代理"
 echo ""
-echo " 管理: systemctl status aero-edge | journalctl -u aero-edge -f"
+echo " 终端管理: 输入 'aero' 呼出交互式管理后台 (类似 x-ui / s-ui)"
+echo " 服务状态: systemctl status aero-edge | journalctl -u aero-edge -f"
 echo "========================================="
