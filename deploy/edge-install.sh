@@ -171,6 +171,7 @@ chmod 600 "$CONFIG_DIR/edge.conf"
 cat > "$CONFIG_DIR/edge.yaml" << 'EOF'
 {
   "alt_listen_ports": [2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443],
+  "global_tun_device": "aero-tun0",
   "ech": ""
 }
 EOF
@@ -377,6 +378,7 @@ ExecStart=$INSTALL_DIR/aero-edge \\
   -data-dir $DATA_DIR \\
   -domain $DOMAIN \\
   -advertise-host $ADVERTISE_HOST \\
+  -global-tun aero-tun0 \\
   -cert $CERT \\
   -key $KEY \\
   -config $CONFIG_DIR/edge.yaml
@@ -398,11 +400,19 @@ if command -v ufw >/dev/null 2>&1; then
         ufw allow "${cp}/udp" 2>/dev/null || true
     done
 fi
-# --- 虚拟 TUN 接口与网络转发 (幂等创建与探测) ---
+# --- 虚拟 TUN 接口与网络转发 (落地方案 §7.1，幂等创建与探测) ---
+OUT_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
+if [[ -z "$OUT_IF" ]]; then
+    OUT_IF=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $5}' | head -n1)
+fi
+
 if ! ip link show aero-tun0 >/dev/null 2>&1; then
     echo "[network] 幂等探测与创建 aero-tun0 TUN 接口..."
     ip tuntap add mode tun dev aero-tun0 2>/dev/null || true
 fi
+ip addr replace 10.88.0.1/16 dev aero-tun0 2>/dev/null || true
+ip addr replace fd88:ae80::1/64 dev aero-tun0 2>/dev/null || true
+ip link set dev aero-tun0 up mtu 1360 2>/dev/null || true
 
 if command -v iptables >/dev/null 2>&1; then
     # 幂等放行基础端口并打上 aero_edge_default Tag (先使用 -C 探测)
@@ -417,13 +427,23 @@ if command -v iptables >/dev/null 2>&1; then
     iptables -C INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
         iptables -I INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
 
-    # aero-tun0 转发与 MASQUERADE 规则（带 /* aero_edge_default */ 注释，-C 幂等防护）
-    iptables -t nat -C POSTROUTING -o aero-tun0 -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -o aero-tun0 -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || true
-    iptables -C FORWARD -i aero-tun0 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -i aero-tun0 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-    iptables -C FORWARD -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-        iptables -A FORWARD -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+    # aero-tun0 转发与 MASQUERADE 规则（严格对齐方案 §7.1，出口网卡 SNAT 与受控转发）
+    iptables -C FORWARD -i aero-tun0 -o aero-tun0 -m comment --comment "aero_edge_default" -j DROP 2>/dev/null || \
+        iptables -I FORWARD -i aero-tun0 -o aero-tun0 -m comment --comment "aero_edge_default" -j DROP 2>/dev/null || true
+
+    if [[ -n "$OUT_IF" ]]; then
+        iptables -C FORWARD -i aero-tun0 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -i aero-tun0 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -i "$OUT_IF" -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -i "$OUT_IF" -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+        iptables -t nat -C POSTROUTING -s 10.88.0.0/16 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -A POSTROUTING -s 10.88.0.0/16 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || true
+    fi
+
+    # 清理历史反向错误残留规则
+    iptables -t nat -D POSTROUTING -o aero-tun0 -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i aero-tun0 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
 
     # 彻底杜绝内核级 NAT PREROUTING REDIRECT，保障服务端物理多端口原生监听
     # 主动清理历史版本残留的 PREROUTING REDIRECT 规则 (防止 NAT 劫持)

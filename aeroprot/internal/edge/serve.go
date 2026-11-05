@@ -321,10 +321,21 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.AllowSelfSignedCertForTest {
 		quicServer.SetAllowLoopbackForTest(true)
 	}
-	if strings.TrimSpace(cfg.GlobalTUNDevice) != "" {
-		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), strings.TrimSpace(cfg.GlobalTUNDevice)); err != nil {
-			quicServer.Close()
-			return nil, fmt.Errorf("attach configured global TUN: %w", err)
+	tunDevice := strings.TrimSpace(cfg.GlobalTUNDevice)
+	if tunDevice == "" && runtime.GOOS == "linux" {
+		if _, err := net.InterfaceByName("aero-tun0"); err == nil {
+			tunDevice = "aero-tun0"
+		}
+	}
+	if tunDevice != "" {
+		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
+			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" {
+				quicServer.Close()
+				return nil, fmt.Errorf("attach configured global TUN %s: %w", tunDevice, err)
+			}
+			log.Printf("[EDGE] [WARN] Auto-detected global TUN %s could not be attached: %v (CONNECT-IP proxy may be disabled)", tunDevice, err)
+		} else {
+			log.Printf("[EDGE] Global TUN device %s attached and active for CONNECT-IP data plane", tunDevice)
 		}
 	}
 

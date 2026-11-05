@@ -34,6 +34,7 @@ func main() {
 	configPath := flag.String("config", "", "path to JSON configuration file")
 	warpProxy := flag.String("warp-proxy", "", "upstream Cloudflare WARP SOCKS5 proxy e.g. 127.0.0.1:40000 (auto-detected if empty)")
 	warpAll := flag.Bool("warp-all", false, "route all outbound traffic via WARP proxy instead of only AI & Google domains")
+	globalTUNDevice := flag.String("global-tun", "", "shared TUN device name for CONNECT-IP NAT (e.g. aero-tun0)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "AERO edge v%s — high-performance protocol edge node\n\n", edge.Version)
@@ -65,6 +66,7 @@ func main() {
 		AllowSelfSignedCertForTest: *allowSelfSigned,
 		WarpProxy:                  *warpProxy,
 		WarpAll:                    *warpAll,
+		GlobalTUNDevice:            *globalTUNDevice,
 	}
 
 	if *configPath != "" {
@@ -74,6 +76,9 @@ func main() {
 		}
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			log.Fatalf("failed to parse config file %s: %v", *configPath, err)
+		}
+		if *globalTUNDevice != "" {
+			cfg.GlobalTUNDevice = *globalTUNDevice
 		}
 		log.Printf("[CONFIG] loaded configuration from %s", *configPath)
 	}
