@@ -384,8 +384,11 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 		}
 	}
 
-	// 4. 为虚拟网卡绑定纯净虚拟网关 DNS (gwIP = 10.88.0.1)，使系统将 DNS 流量送入虚拟网卡，被本地 DNSHandler 端口 53 拦截处理
+	// 4. 为虚拟网卡绑定纯净双栈虚拟网关 DNS (gwIP = 10.88.0.1, gatewayIPv6 = fd88::1)，使系统将 DNS 流量送入虚拟网卡，被本地 DNSHandler 端口 53 拦截处理
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=static", "address="+gwIP, "validate=no")
+	if gatewayIPv6 != "" {
+		_ = runCmd("netsh", "interface", "ipv6", "set", "dnsservers", "name="+devName, "source=static", "address="+gatewayIPv6, "validate=no")
+	}
 
 	// 5. NRPT 策略配置：所有域名（Namespace "."）指向双栈虚拟网关 DNS（gwIP = 10.88.0.1 与 fd88::1），标记 Comment 为 "AERO_" + devName。不改动任何物理网卡的 DNS！ (SEC-11)
 	nameservers := "'" + gwIP + "'"
