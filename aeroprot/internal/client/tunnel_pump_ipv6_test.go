@@ -369,3 +369,56 @@ func TestIPDataPump_ICMPExtractAndMTUClamping(t *testing.T) {
 		t.Fatalf("expected pump currentMTU to be clamped to 1360, got %d", finalMTU)
 	}
 }
+
+// Gate G2: 第 3 重 IPv6 防泄漏黑洞 (ICMPv6 Type 1 Code 3 原生拒绝)
+func TestIPDataPump_IPv6BlackholeRejection(t *testing.T) {
+	tun := newMockIPv6TunDevice()
+	conn := newMockIPv6PacketConn()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var killSw atomic.Bool
+	pump := NewIPDataPump(ctx, tun, conn, &killSw, nil)
+	// Enable 第 3 重防泄漏
+	pump.SetIPv6Blackhole(true)
+	pump.Start()
+	defer pump.Close()
+
+	// Send an ordinary non-DNS IPv6 UDP packet to arbitrary external host
+	src := net.ParseIP("fd88::2")
+	dst := net.ParseIP("2606:4700::6810")
+	udpPayload := []byte("leaked-ipv6-payload-must-be-blocked")
+	origPkt := buildIPv6UDPResponsePacket(src, dst, 12345, 8080, udpPayload)
+
+	tun.inCh <- origPkt
+
+	// 1. MUST NOT forward leaked IPv6 packet to remote
+	select {
+	case p := <-conn.outCh:
+		t.Fatalf("leaked IPv6 packet was unexpectedly forwarded to remote: %x", p)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: nothing forwarded
+	}
+
+	// 2. MUST return ICMPv6 Destination Unreachable (Type 1 Code 3) to virtual NIC
+	select {
+	case reply := <-tun.outCh:
+		if len(reply) < 48 {
+			t.Fatalf("ICMPv6 rejection packet too short: %d", len(reply))
+		}
+		if reply[0]>>4 != 6 || reply[6] != 58 {
+			t.Fatalf("expected IPv6 ICMPv6 packet, got version %d nextHeader %d", reply[0]>>4, reply[6])
+		}
+		// ICMPv6 Header: Type 1 (Dest Unreachable), Code 3 (Address Unreachable)
+		if reply[40] != 1 || reply[41] != 3 {
+			t.Fatalf("expected ICMPv6 Type 1 Code 3, got Type=%d Code=%d", reply[40], reply[41])
+		}
+		// Destination must be original source
+		if !bytes.Equal(reply[24:40], src.To16()) {
+			t.Fatalf("expected destination to be original source %v, got %v", src, reply[24:40])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for ICMPv6 Type 1 Code 3 rejection packet on virtual NIC")
+	}
+}

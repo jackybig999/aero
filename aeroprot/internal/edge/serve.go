@@ -307,7 +307,16 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	rateLimit := NewRateLimiter(cfg.RateIP)
 
 	// 5. QUIC Server
-	quicServer := NewQUICServerWithIPv6Prefix(validator, connLimit, bwLimit, dialGuard, rateLimit, cfg.IPv6Prefix)
+	ipv6Prefix := strings.TrimSpace(cfg.IPv6Prefix)
+	if ipv6Prefix == "" && !cfg.AllowSelfSignedCertForTest {
+		if prefix, err := ProbeHostPublicIPv6(); err == nil {
+			ipv6Prefix = prefix.String()
+			log.Printf("[EDGE] Auto-probed public routed IPv6 prefix on host: %s", ipv6Prefix)
+		} else {
+			log.Printf("[EDGE] No public IPv6 detected on host (%v); running in IPv4-only mode", err)
+		}
+	}
+	quicServer := NewQUICServerWithIPv6Prefix(validator, connLimit, bwLimit, dialGuard, rateLimit, ipv6Prefix)
 	quicServer.SetServerConfig(&cfg)
 	if cfg.AllowSelfSignedCertForTest {
 		quicServer.SetAllowLoopbackForTest(true)

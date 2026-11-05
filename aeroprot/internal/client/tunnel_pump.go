@@ -43,6 +43,7 @@ type IPDataPump struct {
 	bytesIn        atomic.Uint64
 	bytesOut       atomic.Uint64
 	currentMTU     atomic.Int32
+	ipv6Blackhole  atomic.Bool
 }
 
 // SetOnDisconnect registers the single asynchronous disconnect callback.
@@ -104,6 +105,16 @@ func (p *IPDataPump) KillSwitch() bool {
 		return p.killSwitch.Load()
 	}
 	return false
+}
+
+// SetIPv6Blackhole 动态设置第 3 重 IPv6 黑洞防泄漏拦截状态 (方案 §3.2)
+func (p *IPDataPump) SetIPv6Blackhole(active bool) {
+	p.ipv6Blackhole.Store(active)
+}
+
+// IPv6Blackhole 返回当前 IPv6 黑洞防泄漏状态
+func (p *IPDataPump) IPv6Blackhole() bool {
+	return p.ipv6Blackhole.Load()
 }
 
 // Start 启动双向转发 Goroutine
@@ -204,6 +215,14 @@ func (p *IPDataPump) pumpTunToRemote() {
 				if isSTUNPacket(raw[48:]) {
 					continue
 				}
+			}
+
+			// 第 3 重防泄漏 (方案 §3.2)：若开启 IPv6 黑洞模式，拒绝非 DNS 的 IPv6 报文，原生回写 ICMPv6 Type 1 Code 3
+			if p.ipv6Blackhole.Load() {
+				if unreach := buildICMPv6AddressUnreachable(raw); len(unreach) > 0 {
+					_, _ = p.dev.Write(unreach)
+				}
+				continue
 			}
 		}
 
@@ -433,4 +452,59 @@ func (p *IPDataPump) applyNextHopMTU(newMTU int) {
 			break
 		}
 	}
+}
+
+// buildICMPv6AddressUnreachable 构造 ICMPv6 Type 1 Code 3 (Address Unreachable) (方案 §3.2)
+func buildICMPv6AddressUnreachable(origPkt []byte) []byte {
+	if len(origPkt) < 40 {
+		return nil
+	}
+	origPayload := origPkt
+	if len(origPayload) > 1232 {
+		origPayload = origPayload[:1232]
+	}
+	payloadLen := 8 + len(origPayload)
+	resp := make([]byte, 40+payloadLen)
+
+	// 1. IPv6 首部
+	resp[0] = 0x60
+	binary.BigEndian.PutUint16(resp[4:6], uint16(payloadLen))
+	resp[6] = 58 // Next Header: ICMPv6
+	resp[7] = 64 // Hop Limit
+	copy(resp[8:24], origPkt[24:40]) // Src = 原 Dst
+	copy(resp[24:40], origPkt[8:24]) // Dst = 原 Src
+
+	// 2. ICMPv6 首部
+	icmp := resp[40:]
+	icmp[0] = 1 // Type: Destination Unreachable
+	icmp[1] = 3 // Code: Address Unreachable
+	copy(icmp[8:], origPayload)
+
+	// 3. 计算并填充 RFC 4443 ICMPv6 伪首部校验和
+	pseudo := make([]byte, 40)
+	copy(pseudo[0:16], resp[8:24])
+	copy(pseudo[16:32], resp[24:40])
+	binary.BigEndian.PutUint32(pseudo[32:36], uint32(payloadLen))
+	pseudo[39] = 58 // Next Header
+
+	var sum uint32
+	calc := func(b []byte) {
+		for i := 0; i+1 < len(b); i += 2 {
+			sum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
+		}
+		if len(b)%2 == 1 {
+			sum += uint32(b[len(b)-1]) << 8
+		}
+	}
+	calc(pseudo)
+	calc(icmp)
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	csum := ^uint16(sum)
+	if csum == 0 {
+		csum = 0xFFFF
+	}
+	binary.BigEndian.PutUint16(icmp[2:4], csum)
+	return resp
 }
