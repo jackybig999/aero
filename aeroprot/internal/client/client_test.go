@@ -3561,6 +3561,43 @@ func TestPhase6Gate_ClientSalamander(t *testing.T) {
 			t.Fatalf("expected pconn to be wrapped by *SalamanderPacketConn, got %T", interceptedConn)
 		}
 	})
+
+	// 7. 测试落地方案 §5.1 PMTU 与外层 IPv6 严格拦截
+	t.Run("PMTUAndIPv6BoundaryInterception", func(t *testing.T) {
+		p1, p2 := createTestUDPPair(t)
+		defer p1.Close()
+		defer p2.Close()
+
+		s := NewSalamanderPacketConn(p1, "pmtu-secret-key", true)
+		s.SetActivePMTU(1360)
+		s.SetOuterIPv6(false) // IPv4: max wire payload = 1360 - 28 = 1332
+
+		// 1307 + 26 = 1333 > 1332 -> 必须拦截
+		oversized := make([]byte, 1307)
+		_, err := s.WriteTo(oversized, p2.LocalAddr())
+		if err == nil {
+			t.Fatalf("expected error for oversized packet exceeding IPv4 PMTU, got nil")
+		}
+
+		// 外层切换至 IPv6: max wire payload = 1360 - 48 = 1312
+		s.SetOuterIPv6(true)
+		// 1287 + 26 = 1313 > 1312 -> 必须拦截
+		oversizedV6 := make([]byte, 1287)
+		_, err = s.WriteTo(oversizedV6, p2.LocalAddr())
+		if err == nil {
+			t.Fatalf("expected error for oversized packet exceeding IPv6 PMTU, got nil")
+		}
+
+		// 合法长度包正常发送
+		validPayload := make([]byte, 100)
+		n, err := s.WriteTo(validPayload, p2.LocalAddr())
+		if err != nil {
+			t.Fatalf("expected success for valid payload, got error: %v", err)
+		}
+		if n != len(validPayload) {
+			t.Fatalf("expected written %d, got %d", len(validPayload), n)
+		}
+	})
 }
 
 // TestFinalGate_DrainQueueDepthLimit 验证短时间内连续 5 次切线时，并发存在的 Draining Session 数量严格 <= 2，最旧的被主动释放。

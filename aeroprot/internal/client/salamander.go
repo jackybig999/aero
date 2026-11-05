@@ -24,8 +24,18 @@ var (
 	recvBufPool     = sync.Pool{New: func() any { b := make([]byte, 65536); return &b }}
 )
 
-// computeJitteredLen 抗 ML-DPI 高斯分布包长抖动 (均值 1320，标准差 25)
-func computeJitteredLen(origLen int) int {
+// computeJitteredLen 抗 ML-DPI 高斯分布包长抖动 (均值 1320，标准差 25)，并严格联动外层地址族与链路 PMTU 约束 (§5.1)
+func computeJitteredLen(origLen, pmtu int, isV6 bool) (int, error) {
+	outerOverhead := 28
+	if isV6 {
+		outerOverhead = 48
+	}
+	maxWirePayload := pmtu - outerOverhead
+	minOverhead := 8 + 16 + 2 // 26 bytes: salt (8) + tag (16) + origLen header (2)
+	if origLen+minOverhead > maxWirePayload {
+		return 0, fmt.Errorf("datagram length %d exceeds max wire payload %d (pmtu=%d)", origLen+minOverhead, maxWirePayload, pmtu)
+	}
+
 	var b [8]byte
 	_, _ = io.ReadFull(rand.Reader, b[:])
 	val := float64(binary.LittleEndian.Uint64(b[:])) / float64(^uint64(0))
@@ -44,11 +54,13 @@ func computeJitteredLen(origLen int) int {
 	if target > 1380 {
 		target = 1380
 	}
-	minOverhead := 8 + 16 + 2
 	if origLen+minOverhead > target {
-		return origLen + minOverhead
+		target = origLen + minOverhead
 	}
-	return target
+	if target > maxWirePayload {
+		target = maxWirePayload
+	}
+	return target, nil
 }
 
 // SalamanderPacketConn implements UDP obfuscation using Blake2b key derivation,
@@ -91,33 +103,32 @@ func (c *SalamanderPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if pmtu < 576 {
 		pmtu = 1360
 	}
-	outerOverhead := 28
-	if c.isIPv6Outer.Load() {
-		outerOverhead = 48
-	}
-	maxWirePayload := pmtu - outerOverhead
-	if maxWirePayload < 26 || len(b)+26 > maxWirePayload {
-		return 0, fmt.Errorf("salamander: datagram length %d exceeds path MTU payload %d", len(b)+26, maxWirePayload)
+	isV6 := c.isIPv6Outer.Load()
+
+	var targetLen int
+	if c.paddingJitter {
+		var err error
+		targetLen, err = computeJitteredLen(len(b), pmtu, isV6)
+		if err != nil {
+			// 核心红线：若已超限，绝对不盲目发送，立即拦截并向上层 QUIC 报错 (§5.1)
+			return 0, fmt.Errorf("salamander: datagram length %d exceeds path MTU: %w", len(b), err)
+		}
+	} else {
+		outerOverhead := 28
+		if isV6 {
+			outerOverhead = 48
+		}
+		maxPayload := pmtu - outerOverhead
+		if len(b)+26 > maxPayload {
+			return 0, fmt.Errorf("salamander: datagram exceeds wire payload: %d > %d", len(b)+26, maxPayload)
+		}
+		targetLen = len(b) + 26
 	}
 
 	// 8 字节密码学强随机盐
 	salt := make([]byte, 8)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return 0, err
-	}
-
-	minOverhead := 8 + 16 + 2
-	var targetLen int
-	if c.paddingJitter {
-		targetLen = computeJitteredLen(len(b))
-		if minOverhead+len(b) > targetLen {
-			targetLen = minOverhead + len(b)
-		}
-	} else {
-		targetLen = minOverhead + len(b)
-	}
-	if targetLen > maxWirePayload {
-		targetLen = maxWirePayload
 	}
 
 	plaintextLen := targetLen - 24
