@@ -371,12 +371,32 @@ if command -v ufw >/dev/null 2>&1; then
         ufw allow "${cp}/udp" 2>/dev/null || true
     done
 fi
+# --- 虚拟 TUN 接口与网络转发 (幂等创建与探测) ---
+if ! ip link show aero-tun0 >/dev/null 2>&1; then
+    echo "[network] 幂等探测与创建 aero-tun0 TUN 接口..."
+    ip tuntap add mode tun dev aero-tun0 2>/dev/null || true
+fi
+
 if command -v iptables >/dev/null 2>&1; then
-    iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp --dport "${PRIMARY_PORT}" -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p udp -m multiport --dports "$CANDIDATE_POOL" -j ACCEPT 2>/dev/null || true
-    iptables -I INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -j ACCEPT 2>/dev/null || true
+    # 幂等放行基础端口并打上 aero_edge_default Tag (先使用 -C 探测)
+    iptables -C INPUT -p tcp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p udp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p udp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p tcp --dport 80 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport 80 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p udp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p udp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+
+    # aero-tun0 转发与 MASQUERADE 规则（带 /* aero_edge_default */ 注释，-C 幂等防护）
+    iptables -t nat -C POSTROUTING -o aero-tun0 -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -o aero-tun0 -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || true
+    iptables -C FORWARD -i aero-tun0 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i aero-tun0 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
 
     # 彻底杜绝内核级 NAT PREROUTING REDIRECT，保障服务端物理多端口原生监听
     # 主动清理历史版本残留的 PREROUTING REDIRECT 规则 (防止 NAT 劫持)
@@ -397,10 +417,22 @@ if command -v iptables >/dev/null 2>&1; then
 fi
 if command -v nft >/dev/null 2>&1; then
     nft delete table inet aero_nat 2>/dev/null || true
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+    if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/edge.nft" ]]; then
+        nft -f "$SCRIPT_DIR/edge.nft" 2>/dev/null || true
+    fi
 fi
-# --- sysctl: 固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
-echo "[sysctl] 优化 BBR 拥塞控制与 128MB TCP/UDP 缓冲区"
-cat > /etc/sysctl.d/99-aero-bbr.conf << 'EOF'
+# --- sysctl: 备份并固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
+echo "[sysctl] 备份原有配置并优化 BBR 拥塞控制与 128MB TCP/UDP 缓冲区"
+if [[ -f "/etc/sysctl.d/99-aero-sysctl.conf" && ! -f "/etc/sysctl.d/99-aero-sysctl.conf.bak" ]]; then
+    cp -f "/etc/sysctl.d/99-aero-sysctl.conf" "/etc/sysctl.d/99-aero-sysctl.conf.bak"
+fi
+if [[ -f "/etc/sysctl.d/99-aero-bbr.conf" && ! -f "/etc/sysctl.d/99-aero-bbr.conf.bak" ]]; then
+    cp -f "/etc/sysctl.d/99-aero-bbr.conf" "/etc/sysctl.d/99-aero-bbr.conf.bak"
+fi
+cat > /etc/sysctl.d/99-aero-sysctl.conf << 'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 134217728
@@ -412,6 +444,7 @@ net.ipv4.udp_wmem_min = 16384
 net.ipv4.tcp_mtu_probing = 1
 net.core.netdev_max_backlog = 10000
 EOF
+cp -f /etc/sysctl.d/99-aero-sysctl.conf /etc/sysctl.d/99-aero-bbr.conf 2>/dev/null || true
 sysctl --system >/dev/null 2>&1 || true
 
 systemctl daemon-reload

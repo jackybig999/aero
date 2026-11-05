@@ -1,0 +1,22 @@
+#!/usr/sbin/nft -f
+# AERO Edge 原生 nftables 规则定义 (Hyper-MASQUE 对称交付)
+
+table inet aero_edge_default {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        # 放行 Edge 服务多端口与 ACME HTTP-01 验证端口
+        tcp dport { 80, 443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443 } accept comment "aero_edge_default"
+        udp dport { 443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443 } accept comment "aero_edge_default"
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        iifname "aero-tun0" accept comment "aero_edge_default"
+        oifname "aero-tun0" ct state established,related accept comment "aero_edge_default"
+    }
+
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        iifname "aero-tun0" masquerade comment "aero_edge_default"
+    }
+}
