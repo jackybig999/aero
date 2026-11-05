@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -293,7 +294,7 @@ func (p *IPPool) Available() bool {
 	return uint32(len(p.used)) < p.maxHost
 }
 
-// IPv6Pool dynamically allocates client IPv6 prefixes within a ULA pool (fd88::/64).
+// IPv6Pool dynamically allocates client IPv6 addresses from a configured prefix.
 type IPv6Pool struct {
 	mu       sync.Mutex
 	baseIP   netip.Addr
@@ -303,10 +304,10 @@ type IPv6Pool struct {
 	used     map[netip.Addr]struct{}
 }
 
-// NewIPv6Pool creates an IPv6Pool with specified CIDR (default fd88::/64).
+// NewIPv6Pool creates an IPv6Pool with a configured routed IPv6 CIDR.
 func NewIPv6Pool(cidrStr string) (*IPv6Pool, error) {
 	if cidrStr == "" {
-		cidrStr = "fd88::/64"
+		return nil, errors.New("IPv6 prefix is not configured")
 	}
 	prefix, err := netip.ParsePrefix(cidrStr)
 	if err != nil {
@@ -521,6 +522,9 @@ type QUICServer struct {
 	connTracker      *ConnTracker
 	ipPool           *IPPool
 	ipv6Pool         *IPv6Pool
+	globalRouter     *GlobalTunnelRouter
+	globalReaderMu   sync.Mutex
+	globalReader     *GlobalTunnelReader
 	authJail         *AuthFailureJail
 	masqueProxy      *masque.Proxy
 	connectIPProxy   *connectip.Proxy
@@ -1119,10 +1123,62 @@ func (c *nextHopUDPRelayConn) SetDeadline(t time.Time) error      { return nil }
 func (c *nextHopUDPRelayConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *nextHopUDPRelayConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// NewQUICServer creates a new QUICServer instance
+// NewQUICServer creates a test-compatible QUICServer with the legacy ULA pool.
+// Production construction must use NewQUICServerWithIPv6Prefix so an unverified
+// ULA is never advertised as public IPv6 capability.
 func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter) *QUICServer {
 	ipPool, _ := NewIPPool("10.88.0.0/16")
-	ipv6Pool, _ := NewIPv6Pool("fd88::/64")
+	ipv6Pool, _ := newIPv6PoolForTests()
+	return newQUICServer(v, cl, bl, dg, rl, ipPool, ipv6Pool)
+}
+
+// NewQUICServerWithIPv6Prefix creates a production QUICServer. An empty prefix
+// deliberately disables IPv6 allocation until a routed public prefix is proven.
+func NewQUICServerWithIPv6Prefix(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter, ipv6CIDR string) *QUICServer {
+	ipPool, _ := NewIPPool("10.88.0.0/16")
+	var ipv6Pool *IPv6Pool
+	if strings.TrimSpace(ipv6CIDR) != "" {
+		ipv6Pool, _ = newRoutedIPv6Pool(ipv6CIDR)
+	}
+	return newQUICServer(v, cl, bl, dg, rl, ipPool, ipv6Pool)
+}
+
+func newRoutedIPv6Pool(cidrStr string) (*IPv6Pool, error) {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(cidrStr))
+	if err != nil {
+		return nil, fmt.Errorf("parse IPv6 prefix: %w", err)
+	}
+	addr := prefix.Addr()
+	if !addr.Is6() || !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLinkLocalUnicast() {
+		return nil, fmt.Errorf("IPv6 prefix is not globally routable: %s", prefix)
+	}
+	if bits := prefix.Bits(); bits < 48 || bits > 64 {
+		return nil, fmt.Errorf("IPv6 prefix length must be between /48 and /64: %s", prefix)
+	}
+	return &IPv6Pool{
+		baseIP:   addr,
+		prefix:   prefix.Bits(),
+		nextHost: 2,
+		maxHost:  65534,
+		used:     make(map[netip.Addr]struct{}),
+	}, nil
+}
+
+func newIPv6PoolForTests() (*IPv6Pool, error) {
+	prefix, err := netip.ParsePrefix("fd88::/64")
+	if err != nil {
+		return nil, err
+	}
+	return &IPv6Pool{
+		baseIP:   prefix.Addr(),
+		prefix:   prefix.Bits(),
+		nextHost: 2,
+		maxHost:  65534,
+		used:     make(map[netip.Addr]struct{}),
+	}, nil
+}
+
+func newQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter, ipPool *IPPool, ipv6Pool *IPv6Pool) *QUICServer {
 	qs := &QUICServer{
 		validator:        v,
 		connLimiter:      cl,
@@ -1133,6 +1189,7 @@ func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		connTracker:      NewConnTracker(),
 		ipPool:           ipPool,
 		ipv6Pool:         ipv6Pool,
+		globalRouter:     NewGlobalTunnelRouter(),
 		authJail:         NewAuthFailureJail(),
 		masqueProxy:      &masque.Proxy{},
 		connectIPProxy:   &connectip.Proxy{},
@@ -1175,6 +1232,68 @@ func (s *QUICServer) Close() {
 	if s.authJail != nil {
 		s.authJail.Close()
 	}
+	s.globalReaderMu.Lock()
+	reader := s.globalReader
+	s.globalReader = nil
+	s.globalReaderMu.Unlock()
+	if reader != nil {
+		if err := reader.Close(); err != nil {
+			log.Printf("[TUN] shared reader close failed: %v", err)
+		}
+	}
+	if s.globalRouter != nil {
+		s.globalRouter.Close()
+	}
+}
+
+// AttachGlobalTunnelDevice starts the shared reader explicitly. Platform
+// device opening remains outside QUICServer so startup cannot mutate host
+// networking unless the caller has opted into the M6 data plane.
+func (s *QUICServer) AttachGlobalTunnelDevice(ctx context.Context, device GlobalTunnelDevice) error {
+	if s == nil || s.globalRouter == nil {
+		return errors.New("global tunnel router is not initialized")
+	}
+	reader, err := NewGlobalTunnelReader(ctx, device, s.globalRouter)
+	if err != nil {
+		return err
+	}
+	s.globalReaderMu.Lock()
+	previous := s.globalReader
+	s.globalReader = reader
+	s.globalReaderMu.Unlock()
+	if previous != nil {
+		if err := previous.Close(); err != nil {
+			return fmt.Errorf("close previous shared reader: %w", err)
+		}
+	}
+	reader.Start()
+	return nil
+}
+
+func (s *QUICServer) globalTunnelReader() *GlobalTunnelReader {
+	if s == nil {
+		return nil
+	}
+	s.globalReaderMu.Lock()
+	reader := s.globalReader
+	s.globalReaderMu.Unlock()
+	return reader
+}
+
+// AttachGlobalTunnelDeviceByName opens a platform device and starts the shared
+// reader. It is only called when explicitly enabled by server configuration.
+func (s *QUICServer) AttachGlobalTunnelDeviceByName(ctx context.Context, name string) error {
+	device, err := openGlobalTunnelDevice(name)
+	if err != nil {
+		return err
+	}
+	if err := s.AttachGlobalTunnelDevice(ctx, device); err != nil {
+		if closeErr := device.Close(); closeErr != nil {
+			return fmt.Errorf("attach shared TUN: %w; close device: %v", err, closeErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // SetHandler sets the HTTP handler for HTTP/3 requests.
@@ -1984,6 +2103,43 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 			IPProtocol: 0,
 		},
 	}); err != nil {
+		return
+	}
+
+	var generation uint64
+	if s.globalRouter != nil {
+		binding := GlobalTunnelBinding{
+			Token: token,
+			IPv4:  assignedPrefix.Addr(),
+			Conn:  conn,
+		}
+		if assignedIPv6.IsValid() {
+			binding.IPv6 = assignedIPv6.Addr()
+		}
+		generation, err = s.globalRouter.Register(binding)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		defer s.globalRouter.Unregister(assignedPrefix.Addr(), generation)
+	}
+
+	if reader := s.globalTunnelReader(); reader != nil {
+		binding := GlobalTunnelBinding{
+			Token:      token,
+			IPv4:       assignedPrefix.Addr(),
+			IPv6:       assignedIPv6.Addr(),
+			Generation: generation,
+			Conn:       conn,
+		}
+		if !assignedIPv6.IsValid() {
+			binding.IPv6 = netip.Addr{}
+		}
+		if err := reader.StartBinding(r.Context(), binding); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		<-r.Context().Done()
 		return
 	}
 

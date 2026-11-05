@@ -371,19 +371,26 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 	if factory == nil {
 		return nil, fmt.Errorf("physical packet conn factory not registered")
 	}
-	pconn, perr := factory(ctx, "udp4")
+	if cfg.RemoteUDPAddr == nil {
+		return nil, fmt.Errorf("RemoteUDPAddr is required for quic dial %s", cfg.Address)
+	}
+	network := "udp4"
+	isIPv6Outer := false
+	if cfg.RemoteUDPAddr.IP.To4() == nil {
+		network = "udp6"
+		isIPv6Outer = true
+	}
+	pconn, perr := factory(ctx, network)
 	if perr != nil {
 		return nil, fmt.Errorf("factory physical packet conn: %w", perr)
-	}
-
-	if cfg.RemoteUDPAddr == nil {
-		_ = pconn.Close()
-		return nil, fmt.Errorf("RemoteUDPAddr is required for quic dial %s", cfg.Address)
 	}
 	udpAddr := cfg.RemoteUDPAddr
 
 	if cfg.ObfsPassword != "" {
-		pconn = NewSalamanderPacketConn(pconn, cfg.ObfsPassword, cfg.PaddingJitter)
+		salConn := NewSalamanderPacketConn(pconn, cfg.ObfsPassword, cfg.PaddingJitter)
+		salConn.SetOuterIPv6(isIPv6Outer)
+		salConn.SetActivePMTU(1360)
+		pconn = salConn
 	}
 
 	actualPort := 0

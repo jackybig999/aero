@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -45,12 +46,18 @@ const (
 
 var (
 	// ErrUDPUnavailable 标识 TUN 模式下 UDP/443 (QUIC/HTTP/3) 拨号失败，降级防御阻止整机伪装
-	ErrUDPUnavailable       = errors.New("UDP_UNAVAILABLE")
-	ErrStartAborted         = errors.New("start aborted by stop request")
-	subSingleFlight         singleflight.Group
-	detectThirdPartyTUN     = DetectThirdPartyTUN
-	openTunDeviceFn         = OpenTunDevice
-	setupRoutesFn           = SetupRoutes
+	ErrUDPUnavailable   = errors.New("UDP_UNAVAILABLE")
+	ErrStartAborted     = errors.New("start aborted by stop request")
+	subSingleFlight     singleflight.Group
+	detectThirdPartyTUN = DetectThirdPartyTUN
+	openTunDeviceFn     = OpenTunDevice
+	setupRoutesFn       = func(devName, ipv4 string) error {
+		cfg, err := NewRouteConfig(ipv4, nil, 1224)
+		if err != nil {
+			return err
+		}
+		return SetupRoutesWithConfig(devName, cfg)
+	}
 	teardownRoutesFn        = TeardownRoutes
 	cleanAero0StaleRoutesFn = CleanAero0StaleRoutes
 	dialIPFn                = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
@@ -59,11 +66,20 @@ var (
 			if err != nil {
 				return nil, "", err
 			}
-			pStr := "10.88.0.2/24"
-			if len(prefixes) > 0 {
-				pStr = prefixes[0].String()
+			var ipv4Prefix netip.Prefix
+			for _, prefix := range prefixes {
+				if prefix.IsValid() && prefix.Addr().Is4() {
+					ipv4Prefix = prefix
+					break
+				}
 			}
-			return conn, pStr, nil
+			if !ipv4Prefix.IsValid() {
+				if closeErr := conn.Close(); closeErr != nil {
+					return nil, "", fmt.Errorf("CONNECT-IP response has no valid IPv4 prefix; close connection: %w", closeErr)
+				}
+				return nil, "", errors.New("CONNECT-IP response has no valid IPv4 prefix")
+			}
+			return conn, ipv4Prefix.String(), nil
 		}
 		return nil, "", errors.New("session manager is nil")
 	}
@@ -1055,7 +1071,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 		return nil
 	}
 
-	dev, err = openTunDeviceFn("aero0", 1360)
+	dev, err = openTunDeviceFn("aero0", 1224)
 	if err != nil {
 		UnprotectHostRoute(ip.String())
 		if e.rootCancel != nil {
@@ -1065,7 +1081,31 @@ func (e *Engine) startLocked(ticket uint64) error {
 	}
 	e.tunDevice = dev
 
-	e.stackEngine = NewStackEngine(dev, e.tunnelClient, e.dnsHandler)
+	ipConn, prefixStr, err := dialIPFn(e.rootCtx, e.sessionMgr)
+	if err != nil {
+		_ = dev.Close()
+		e.tunDevice = nil
+		UnprotectHostRoute(ip.String())
+		if e.rootCancel != nil {
+			e.rootCancel()
+		}
+		return failStart(fmt.Errorf("dial CONNECT-IP: %w", err))
+	}
+	if _, err := NewRouteConfig(prefixStr, nil, 1224); err != nil {
+		closeErr := ipConn.Close()
+		_ = dev.Close()
+		e.tunDevice = nil
+		UnprotectHostRoute(ip.String())
+		if e.rootCancel != nil {
+			e.rootCancel()
+		}
+		if closeErr != nil {
+			return failStart(fmt.Errorf("invalid route configuration: %w; close CONNECT-IP: %v", err, closeErr))
+		}
+		return failStart(fmt.Errorf("invalid route configuration: %w", err))
+	}
+
+	e.stackEngine = NewStackEngineWithConn(dev, ipConn, e.dnsHandler)
 	e.stackEngine.SetKillSwitch(e.killSwitch.Load())
 	if err := e.stackEngine.Start(); err != nil {
 		_ = dev.Close()
@@ -1080,9 +1120,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 
 	// WebRTC 生产激活：探测成功且 stackEngine 启动后，显式激活 WebRTC
 	e.stackEngine.SetWebRTCActive(true)
-
-	// 路由配置固定使用 10.88.0.2/24，与 gVisor 协议栈保持一致
-	prefixStr := "10.88.0.2/24"
 
 	if err := setupRoutesFn(dev.Name(), prefixStr); err != nil {
 		if e.stackEngine != nil {

@@ -89,6 +89,10 @@ func SetupRoutes(devName, ipv4 string) error {
 	return fmt.Errorf("TUN not supported on this platform")
 }
 
+func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
+	return fmt.Errorf("TUN not supported on this platform")
+}
+
 // TeardownRoutes 移动端占位
 func TeardownRoutes(devName string) {}
 

@@ -1,74 +1,31 @@
-# ==============================================================================
-# AERO Unified .gitignore
-# ==============================================================================
-
-# OS & Editor
-.DS_Store
-Thumbs.db
-desktop.ini
-*.swp
-*.swo
-*~
-.idea/
-.vscode/
-
-# Node.js & Web build
-node_modules/
-
-# Binaries & Executables
-*.exe
-*.exe~
-*.dll
-!aeroprot/internal/client/wintun.dll
-*.so
-*.dylib
-
-# Logs & Runtime Temp
-logs/
-**/logs/
 tmp/
-**/tmp/
 backup/
-**/backup/
-*.log
-**/*.log
-*.tmp
-*.temp
-*.out
-*.test
-*.pprof
-coverage/
-
-# Environment & Local Secrets
-.env
-.env.*
-*.key
-*.pem
-*.p12
-*secret*
-*credential*
-target/
-vendor/
-
-# Local databases and runtime state
 data/
-**/data/
+logs/
 *.db
 *.db-shm
 *.db-wal
-
-# Cross-platform IDE path compatibility symlink
-*D:*
-D\\:*
-
-
-*REPORT*.md
-*PLAN*.md
-*MANIFEST*.md
-
-# Subagent directories
-.agents/
-
-
-
-
+*.wal
+*.nonce
+*.lock
+*.tmp
+*.exe
+*.bin
+*.dll
+*.so
+*.dylib
+*.syso
+*.test
+*.out
+*.log
+*.pprof
+coverage/
+node_modules/
+target/
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+*.Zone.Identifier

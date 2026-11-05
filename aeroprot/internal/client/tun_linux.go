@@ -175,22 +175,31 @@ func RestoreLinuxDNS(dev ...string) error {
 	return firstErr
 }
 
-// SetupRoutes 配置 Linux 路由
+// SetupRoutes 保留旧入口，供现有测试和兼容调用使用。
 func SetupRoutes(devName, ipv4 string) error {
+	return SetupRoutesWithConfig(devName, legacyRouteConfig(ipv4))
+}
+
+// SetupRoutesWithConfig 配置 Linux 路由。
+func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	if devName == "" {
 		devName = "aero0"
 	}
 	if err := runLinux("ip", "link", "set", devName, "up"); err != nil {
 		return err
 	}
-	if ipv4 == "" {
-		ipv4 = "10.88.0.2/24"
+	_ = runLinux("ip", "addr", "add", cfg.IPv4.String(), "dev", devName)
+	if cfg.EnableIPv6 {
+		clientAddr, err := clientIPv6Addr(cfg.IPv6)
+		if err != nil {
+			return err
+		}
+		if err := runLinux("ip", "-6", "addr", "add", clientAddr.String()+fmt.Sprintf("/%d", cfg.IPv6.Bits()), "dev", devName); err != nil {
+			return err
+		}
 	}
-	_ = runLinux("ip", "addr", "add", ipv4, "dev", devName)
-
-	_ = runLinux("ip", "-6", "addr", "add", "fd88::2/64", "dev", devName)
-
-	_ = SetInterfaceMTU(devName, 1360)
+	_ = SetInterfaceMTU(devName, cfg.InitialMTU)
+	setActiveRouteConfig(devName, cfg)
 	RegisterVirtualNICMTUSetter(func(mtu int) error {
 		return SetInterfaceMTU(devName, mtu)
 	})
@@ -198,14 +207,16 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runLinux("ip", "route", "replace", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "replace", "128.0.0.0/1", "dev", devName)
 
-	_ = runLinux("ip", "-6", "route", "replace", "::/1", "dev", devName)
-	_ = runLinux("ip", "-6", "route", "replace", "8000::/1", "dev", devName)
+	if cfg.EnableIPv6 || cfg.EnableIPv6Blackhole {
+		_ = runLinux("ip", "-6", "route", "replace", "::/1", "dev", devName)
+		_ = runLinux("ip", "-6", "route", "replace", "8000::/1", "dev", devName)
+	}
 
 	if err := SetupLinuxDNS(devName); err != nil {
 		log.Printf("[TUN] Linux DNS configuration warning: %v", err)
 	}
 
-	log.Printf("[TUN] Routes configured on %s (MTU=1360)", devName)
+	log.Printf("[TUN] Routes configured on %s (MTU=%d, IPv6=%t, blackhole=%t)", devName, cfg.InitialMTU, cfg.EnableIPv6, cfg.EnableIPv6Blackhole)
 	return nil
 }
 
@@ -219,9 +230,15 @@ func TeardownRoutes(devName string) {
 	}
 	_ = runLinux("ip", "-6", "route", "del", "::/1", "dev", devName)
 	_ = runLinux("ip", "-6", "route", "del", "8000::/1", "dev", devName)
-	_ = runLinux("ip", "-6", "addr", "del", "fd88::2/64", "dev", devName)
+	cfg := getActiveRouteConfig(devName)
+	if cfg.EnableIPv6 {
+		if clientAddr, err := clientIPv6Addr(cfg.IPv6); err == nil {
+			_ = runLinux("ip", "-6", "addr", "del", clientAddr.String()+fmt.Sprintf("/%d", cfg.IPv6.Bits()), "dev", devName)
+		}
+	}
 	_ = runLinux("ip", "route", "del", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "del", "128.0.0.0/1", "dev", devName)
+	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
 }
 

@@ -7,10 +7,12 @@ package client
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -55,21 +57,47 @@ type SalamanderPacketConn struct {
 	net.PacketConn
 	password      []byte
 	paddingJitter bool
+	activePMTU    atomic.Int32
+	isIPv6Outer   atomic.Bool
 }
 
 // NewSalamanderPacketConn creates a new SalamanderPacketConn.
 func NewSalamanderPacketConn(pconn net.PacketConn, password string, paddingJitter bool) *SalamanderPacketConn {
-	return &SalamanderPacketConn{
+	c := &SalamanderPacketConn{
 		PacketConn:    pconn,
 		password:      []byte(password),
 		paddingJitter: paddingJitter,
 	}
+	c.activePMTU.Store(1360)
+	return c
+}
+
+func (c *SalamanderPacketConn) SetActivePMTU(pmtu int) {
+	if pmtu >= 576 {
+		c.activePMTU.Store(int32(pmtu))
+	}
+}
+
+func (c *SalamanderPacketConn) SetOuterIPv6(isIPv6 bool) {
+	c.isIPv6Outer.Store(isIPv6)
 }
 
 // WriteTo encrypts and obfuscates datagram b, sending it to addr.
 func (c *SalamanderPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if len(c.password) == 0 {
 		return c.PacketConn.WriteTo(b, addr)
+	}
+	pmtu := int(c.activePMTU.Load())
+	if pmtu < 576 {
+		pmtu = 1360
+	}
+	outerOverhead := 28
+	if c.isIPv6Outer.Load() {
+		outerOverhead = 48
+	}
+	maxWirePayload := pmtu - outerOverhead
+	if maxWirePayload < 26 || len(b)+26 > maxWirePayload {
+		return 0, fmt.Errorf("salamander: datagram length %d exceeds path MTU payload %d", len(b)+26, maxWirePayload)
 	}
 
 	// 8 字节密码学强随机盐
@@ -87,6 +115,9 @@ func (c *SalamanderPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 		}
 	} else {
 		targetLen = minOverhead + len(b)
+	}
+	if targetLen > maxWirePayload {
+		targetLen = maxWirePayload
 	}
 
 	plaintextLen := targetLen - 24

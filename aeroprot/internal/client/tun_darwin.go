@@ -215,21 +215,37 @@ func RestoreDarwinDNS() error {
 	return nil
 }
 
-// SetupRoutes 配置 macOS 路由
+// SetupRoutes 保留旧入口，供现有测试和兼容调用使用。
 func SetupRoutes(devName, ipv4 string) error {
+	return SetupRoutesWithConfig(devName, legacyRouteConfig(ipv4))
+}
+
+// SetupRoutesWithConfig 配置 macOS 路由。
+func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	if devName == "" {
 		return fmt.Errorf("empty devName")
 	}
-	tunIP := "10.88.0.2"
-	if ipv4 != "" {
-		tunIP = strings.Split(ipv4, "/")[0]
-	}
+	tunIP := cfg.IPv4.Addr().String()
 	_ = runMac("ifconfig", devName, "inet", tunIP, tunIP)
 	_ = runMac("ifconfig", devName, "up")
 
-	_ = runMac("ifconfig", devName, "inet6", "add", "fd88::2/64")
+	var clientIPv6, gatewayIPv6 string
+	if cfg.EnableIPv6 {
+		clientAddr, err := clientIPv6Addr(cfg.IPv6)
+		if err != nil {
+			return err
+		}
+		gatewayAddr, err := gatewayIPv6Addr(cfg.IPv6)
+		if err != nil {
+			return err
+		}
+		clientIPv6 = clientAddr.String() + fmt.Sprintf("/%d", cfg.IPv6.Bits())
+		gatewayIPv6 = gatewayAddr.String()
+		_ = runMac("ifconfig", devName, "inet6", "add", clientIPv6)
+	}
 
-	_ = SetInterfaceMTU(devName, 1360)
+	_ = SetInterfaceMTU(devName, cfg.InitialMTU)
+	setActiveRouteConfig(devName, cfg)
 	RegisterVirtualNICMTUSetter(func(mtu int) error {
 		return SetInterfaceMTU(devName, mtu)
 	})
@@ -237,14 +253,16 @@ func SetupRoutes(devName, ipv4 string) error {
 	_ = runMac("route", "add", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "add", "-net", "128.0.0.0/1", "-interface", devName)
 
-	_ = runMac("route", "add", "-inet6", "::/1", "-interface", devName)
-	_ = runMac("route", "add", "-inet6", "8000::/1", "-interface", devName)
+	if cfg.EnableIPv6 || cfg.EnableIPv6Blackhole {
+		_ = runMac("route", "add", "-inet6", "::/1", "-interface", devName)
+		_ = runMac("route", "add", "-inet6", "8000::/1", "-interface", devName)
+	}
 
 	if err := SetupDarwinDNS(); err != nil {
 		log.Printf("[TUN] Darwin DNS configuration warning: %v", err)
 	}
 
-	log.Printf("[TUN] Routes configured on %s (MTU=1360)", devName)
+	log.Printf("[TUN] Routes configured on %s (MTU=%d, IPv6=%t, gateway=%s)", devName, cfg.InitialMTU, cfg.EnableIPv6, gatewayIPv6)
 	return nil
 }
 
@@ -258,9 +276,15 @@ func TeardownRoutes(devName string) {
 	}
 	_ = runMac("route", "delete", "-inet6", "::/1", "-interface", devName)
 	_ = runMac("route", "delete", "-inet6", "8000::/1", "-interface", devName)
-	_ = runMac("ifconfig", devName, "inet6", "delete", "fd88::2")
+	cfg := getActiveRouteConfig(devName)
+	if cfg.EnableIPv6 {
+		if clientAddr, err := clientIPv6Addr(cfg.IPv6); err == nil {
+			_ = runMac("ifconfig", devName, "inet6", "delete", clientAddr.String())
+		}
+	}
 	_ = runMac("route", "delete", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "delete", "-net", "128.0.0.0/1", "-interface", devName)
+	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
 }
 

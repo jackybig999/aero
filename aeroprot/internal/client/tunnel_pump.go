@@ -30,16 +30,44 @@ var _ IPPacketConn = (*connectip.Conn)(nil)
 
 // IPDataPump 负责在 Wintun 虚拟网卡 (TunDevice) 与远端 CONNECT-IP 隧道 (IPPacketConn) 之间双向转发数据
 type IPDataPump struct {
-	dev        TunDevice
-	conn       IPPacketConn
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	closed     atomic.Bool
-	killSwitch *atomic.Bool
-	dnsHandler *DNSHandler
-	bytesIn    atomic.Uint64
-	bytesOut   atomic.Uint64
+	dev            TunDevice
+	conn           IPPacketConn
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	closed         atomic.Bool
+	disconnectOnce sync.Once
+	onDisconnect   atomic.Pointer[func(error)]
+	killSwitch     *atomic.Bool
+	dnsHandler     *DNSHandler
+	bytesIn        atomic.Uint64
+	bytesOut       atomic.Uint64
+}
+
+// SetOnDisconnect registers the single asynchronous disconnect callback.
+func (p *IPDataPump) SetOnDisconnect(callback func(error)) {
+	if callback == nil {
+		p.onDisconnect.Store(nil)
+		return
+	}
+	p.onDisconnect.Store(&callback)
+}
+
+func (p *IPDataPump) notifyDisconnect(err error) {
+	p.disconnectOnce.Do(func() {
+		callback := p.onDisconnect.Load()
+		if callback == nil || *callback == nil {
+			return
+		}
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("[PUMP] disconnect callback panic: %v", recovered)
+				}
+			}()
+			(*callback)(err)
+		}()
+	})
 }
 
 // NewIPDataPump 创建数据泵实例
@@ -94,6 +122,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 			if !p.closed.Load() && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				log.Printf("[PUMP] read tun error: %v", err)
 			}
+			p.notifyDisconnect(err)
 			return
 		}
 		if n < 20 {
@@ -176,6 +205,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 			if !p.closed.Load() {
 				log.Printf("[PUMP] write remote error: %v", werr)
 			}
+			p.notifyDisconnect(werr)
 			return
 		}
 		p.bytesOut.Add(uint64(n))
@@ -198,6 +228,7 @@ func (p *IPDataPump) pumpRemoteToTun() {
 			if !p.closed.Load() && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				log.Printf("[PUMP] read remote error: %v", err)
 			}
+			p.notifyDisconnect(err)
 			return
 		}
 		if n < 20 {
@@ -212,6 +243,7 @@ func (p *IPDataPump) pumpRemoteToTun() {
 			if !p.closed.Load() {
 				log.Printf("[PUMP] write tun error: %v", werr)
 			}
+			p.notifyDisconnect(werr)
 			return
 		}
 		p.bytesIn.Add(uint64(n))
@@ -224,7 +256,7 @@ func (p *IPDataPump) Close() error {
 		return nil
 	}
 	p.cancel()
-	_ = p.conn.Close()
+	closeErr := p.conn.Close()
 
 	done := make(chan struct{})
 	go func() {
@@ -236,11 +268,11 @@ func (p *IPDataPump) Close() error {
 	case <-done:
 	case <-time.After(300 * time.Millisecond):
 		log.Printf("[PUMP] IPDataPump close wait timeout, forcing shutdown (RX: %d, TX: %d)", p.bytesIn.Load(), p.bytesOut.Load())
-		return nil
+		return closeErr
 	}
 
 	log.Printf("[PUMP] IPDataPump stopped. Total RX: %d bytes, TX: %d bytes", p.bytesIn.Load(), p.bytesOut.Load())
-	return nil
+	return closeErr
 }
 
 // buildIPv4UDPResponsePacket 原生构造 IPv4/UDP 应答报文（回写虚拟网卡，零额外依赖）

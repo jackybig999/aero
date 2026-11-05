@@ -45,6 +45,9 @@ type StackEngine struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	device             TunDevice
+	conn               IPPacketConn
+	pump               *IPDataPump
+	closeDevice        bool
 	gvEP               *channel.Endpoint
 	gvStack            *stack.Stack
 	dialer             *TunnelClient
@@ -62,18 +65,42 @@ type StackEngine struct {
 func NewStackEngine(dev TunDevice, dialer *TunnelClient, dnsHandler *DNSHandler) *StackEngine {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &StackEngine{
-		ctx:       ctx,
-		cancel:    cancel,
-		device:    dev,
-		dialer:    dialer,
-		dns:       dnsHandler,
-		gatewayIP: net.ParseIP("10.88.0.1"),
+		ctx:         ctx,
+		cancel:      cancel,
+		device:      dev,
+		dialer:      dialer,
+		dns:         dnsHandler,
+		gatewayIP:   net.ParseIP("10.88.0.1"),
+		closeDevice: true,
+	}
+}
+
+// NewStackEngineWithConn creates the CONNECT-IP data-plane implementation.
+// The connection is owned by the resulting IPDataPump and is closed by Stop.
+// The TunDevice remains owned by Engine and is never closed by the pump path.
+func NewStackEngineWithConn(dev TunDevice, conn IPPacketConn, dnsHandler *DNSHandler) *StackEngine {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &StackEngine{
+		ctx:         ctx,
+		cancel:      cancel,
+		device:      dev,
+		conn:        conn,
+		dns:         dnsHandler,
+		gatewayIP:   net.ParseIP("10.88.0.1"),
+		closeDevice: false,
 	}
 }
 
 // Start 启动 gVisor 协议栈
 // 规则：Channel MTU >= 1280 (设为 1420 保证内部 buffer 充裕)
 func (e *StackEngine) Start() error {
+	if e.conn != nil {
+		e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+		e.pump.Start()
+		log.Printf("[STACK] CONNECT-IP data plane started on %s (MTU=%d)", e.device.Name(), 1224)
+		return nil
+	}
+
 	mtu := uint32(1420)
 	ep := channel.New(4096, mtu, "")
 	s := stack.New(stack.Options{
@@ -162,7 +189,11 @@ func (e *StackEngine) Start() error {
 // Stop 停止协议栈
 func (e *StackEngine) Stop() {
 	e.cancel()
-	if e.device != nil {
+	if e.pump != nil {
+		_ = e.pump.Close()
+		e.pump = nil
+	}
+	if e.closeDevice && e.device != nil {
 		_ = e.device.Close()
 	}
 	if e.gvEP != nil {
@@ -178,6 +209,9 @@ func (e *StackEngine) Stop() {
 // SetKillSwitch 激活或关闭纯内存 Kill Switch
 func (e *StackEngine) SetKillSwitch(active bool) {
 	e.killSwitch.Store(active)
+	if e.pump != nil {
+		e.pump.SetKillSwitch(active)
+	}
 }
 
 // KillSwitch 返回当前 Kill Switch 激活状态

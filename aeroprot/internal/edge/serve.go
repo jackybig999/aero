@@ -72,6 +72,8 @@ type ServerConfig struct {
 	FallbackObfsPasswords      []string                      `json:"fallback_obfs_passwords,omitempty" yaml:"fallback_obfs_passwords"`
 	PaddingJitter              bool                          `json:"padding_jitter,omitempty" yaml:"padding_jitter"`
 	AltListenPorts             []int                         `json:"alt_listen_ports,omitempty" yaml:"alt_listen_ports"`
+	IPv6Prefix                 string                        `json:"ipv6_prefix,omitempty" yaml:"ipv6_prefix"`
+	GlobalTUNDevice            string                        `json:"global_tun_device,omitempty" yaml:"global_tun_device"`
 	WarpProxy                  string                        `json:"warp_proxy,omitempty" yaml:"warp_proxy"`
 	WarpAll                    bool                          `json:"warp_all,omitempty" yaml:"warp_all"`
 }
@@ -305,10 +307,16 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	rateLimit := NewRateLimiter(cfg.RateIP)
 
 	// 5. QUIC Server
-	quicServer := NewQUICServer(validator, connLimit, bwLimit, dialGuard, rateLimit)
+	quicServer := NewQUICServerWithIPv6Prefix(validator, connLimit, bwLimit, dialGuard, rateLimit, cfg.IPv6Prefix)
 	quicServer.SetServerConfig(&cfg)
 	if cfg.AllowSelfSignedCertForTest {
 		quicServer.SetAllowLoopbackForTest(true)
+	}
+	if strings.TrimSpace(cfg.GlobalTUNDevice) != "" {
+		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), strings.TrimSpace(cfg.GlobalTUNDevice)); err != nil {
+			quicServer.Close()
+			return nil, fmt.Errorf("attach configured global TUN: %w", err)
+		}
 	}
 
 	// 6. Admin & Sub HTTP Handlers
