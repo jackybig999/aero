@@ -11,10 +11,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/sagernet/gvisor/pkg/tcpip"
-	"github.com/sagernet/gvisor/pkg/tcpip/checksum"
-	"github.com/sagernet/gvisor/pkg/tcpip/header"
 )
 
 // independentRFC4443Checksum computes the 16-bit RFC 4443 / RFC 8200 checksum
@@ -132,29 +128,7 @@ func TestAdversarial_RFC4443ChecksumOracle(t *testing.T) {
 				// 1. Compute expected checksum using cleanroom independent oracle
 				expectedIndependent := independentRFC4443Checksum(ips.src, ips.dst, icmpPayload)
 
-				// 2. Compute expected checksum using gVisor reference implementation
-				gvisorHdr := header.ICMPv6(icmpPayload[:4])
-				var gvisorPayloadCsum uint16
-				if size > 4 {
-					gvisorPayloadCsum = checksum.Checksum(icmpPayload[4:], 0)
-				}
-				var srcArr, dstArr [16]byte
-				copy(srcArr[:], ips.src.To16())
-				copy(dstArr[:], ips.dst.To16())
-				expectedGVisor := header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
-					Header:      gvisorHdr,
-					Src:         tcpip.AddrFrom16(srcArr),
-					Dst:         tcpip.AddrFrom16(dstArr),
-					PayloadCsum: gvisorPayloadCsum,
-					PayloadLen:  size - 4,
-				})
-
-				// Assert that cleanroom independent oracle strictly agrees with gVisor
-				if expectedIndependent != expectedGVisor {
-					t.Fatalf("Oracle disagreement: independent=0x%04x, gVisor=0x%04x", expectedIndependent, expectedGVisor)
-				}
-
-				// 3. Execute implementation under test: buildIPv6ICMPv6Packet
+				// 2. Execute implementation under test: buildIPv6ICMPv6Packet
 				pkt := buildIPv6ICMPv6Packet(ips.src, ips.dst, icmpPayload)
 				if pkt == nil {
 					t.Fatalf("buildIPv6ICMPv6Packet returned nil for size %d", size)
@@ -178,10 +152,9 @@ func TestAdversarial_RFC4443ChecksumOracle(t *testing.T) {
 					t.Fatalf("Whole packet checksum verification failed for size %d", size)
 				}
 
-				// 5. Verify gVisor stack accepts the generated packet
-				ipHdr := header.IPv6(pkt[:40])
-				if ipHdr.TransportProtocol() != header.ICMPv6ProtocolNumber {
-					t.Fatalf("IPv6 NextHeader mismatch: got %d", ipHdr.TransportProtocol())
+				// 5. Verify IPv6 next header is ICMPv6 (58)
+				if pkt[6] != 58 {
+					t.Fatalf("IPv6 NextHeader mismatch: got %d", pkt[6])
 				}
 			})
 		}

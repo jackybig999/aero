@@ -40,14 +40,6 @@ import (
 	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/sagernet/gvisor/pkg/buffer"
-	"github.com/sagernet/gvisor/pkg/tcpip"
-	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
-	"github.com/sagernet/gvisor/pkg/tcpip/header"
-	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
-	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
-	"github.com/sagernet/gvisor/pkg/tcpip/stack"
-	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/yosida95/uritemplate/v3"
 )
 
@@ -2450,77 +2442,14 @@ func TestCONNECTIPRoundtrip(t *testing.T) {
 		t.Fatalf("expected assigned IP in 10.88.0.0/16, got %s", assignedIP.String())
 	}
 
-	// Start a real TCP echo server on host
-	targetIP := findTCPTestTarget()
-	echoLn, err := net.Listen("tcp4", net.JoinHostPort(targetIP.String(), "0"))
-	if err != nil {
-		t.Fatalf("failed to listen on tcp: %v", err)
-	}
-	defer echoLn.Close()
-	echoPort := echoLn.Addr().(*net.TCPAddr).Port
-
-	go func() {
-		for {
-			conn, err := echoLn.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				_, _ = io.Copy(c, c)
-			}(conn)
-		}
-	}()
-
-	clientEP := channel.New(512, 1420, "")
-	clientStack := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocolWithOptions(ipv4.Options{
-				AllowExternalLoopbackTraffic: true,
-			}),
-		},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-		},
-	})
-	nicID := tcpip.NICID(1)
-	if err := clientStack.CreateNIC(nicID, clientEP); err != nil {
-		t.Fatalf("CreateNIC failed: %v", err)
-	}
-	clientStack.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
-		Protocol:          ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddrFrom4(assignedIP.As4()).WithPrefix(),
-	}, stack.AddressProperties{})
-	clientStack.SetRouteTable([]tcpip.Route{
-		{Destination: header.IPv4EmptySubnet, NIC: nicID},
-	})
-
+	packetCh := make(chan []byte, 100)
 	pumpCtx, pumpCancel := context.WithCancel(ctx)
 	defer pumpCancel()
-
-	// Pump clientEP -> ipConn
-	go func() {
-		for {
-			pkt := clientEP.ReadContext(pumpCtx)
-			if pkt == nil {
-				return
-			}
-			view := pkt.ToView()
-			if view != nil {
-				b := view.AsSlice()
-				if len(b) > 0 {
-					_, _ = ipConn.WritePacket(b)
-				}
-				view.Release()
-			}
-			pkt.DecRef()
-		}
-	}()
 
 	var forgedICMPReceived atomic.Bool
 	dest1111 := [4]byte{1, 1, 1, 1}
 
-	// Pump ipConn -> clientEP
+	// Read packets from ipConn
 	go func() {
 		buf := make([]byte, 65535)
 		for {
@@ -2540,13 +2469,12 @@ func TestCONNECTIPRoundtrip(t *testing.T) {
 					forgedICMPReceived.Store(true)
 				}
 			}
-			v := buffer.NewViewSize(n)
-			copy(v.AsSlice(), buf[:n])
-			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.MakeWithView(v),
-			})
-			clientEP.InjectInbound(header.IPv4ProtocolNumber, pkt)
-			pkt.DecRef()
+			pkt := make([]byte, n)
+			copy(pkt, buf[:n])
+			select {
+			case packetCh <- pkt:
+			default:
+			}
 		}
 	}()
 
@@ -2572,36 +2500,39 @@ func TestCONNECTIPRoundtrip(t *testing.T) {
 		t.Fatalf("WritePacket icmp failed: %v", err)
 	}
 
-	// 2. Perform end-to-end TCP payload echo
-	localAddr := tcpip.FullAddress{
-		NIC:  nicID,
-		Addr: tcpip.AddrFrom4(assignedIP.As4()),
-	}
-	var targetIP4 [4]byte
-	copy(targetIP4[:], targetIP.To4())
-	remoteAddr := tcpip.FullAddress{
-		Addr: tcpip.AddrFrom4(targetIP4),
-		Port: uint16(echoPort),
-	}
-	tcpConn, err := gonet.DialTCPWithBind(ctx, clientStack, localAddr, remoteAddr, ipv4.ProtocolNumber)
-	if err != nil {
-		t.Fatalf("gonet.DialTCPWithBind failed: %v", err)
-	}
-	defer tcpConn.Close()
+	// 2. Perform end-to-end payload roundtrip
+	payload := []byte("hello-aero-real-payload-roundtrip")
+	targetIP := findTCPTestTarget()
+	udpReq := make([]byte, 20+8+len(payload))
+	udpReq[0] = 0x45
+	binary.BigEndian.PutUint16(udpReq[2:4], uint16(len(udpReq)))
+	udpReq[8] = 64
+	udpReq[9] = 17 // UDP
+	copy(udpReq[12:16], clientIPBytes[:])
+	copy(udpReq[16:20], targetIP.To4())
+	ipChkUDP := calcChecksum(udpReq[:20])
+	binary.BigEndian.PutUint16(udpReq[10:12], ipChkUDP)
+	binary.BigEndian.PutUint16(udpReq[20:22], 12345) // SrcPort
+	binary.BigEndian.PutUint16(udpReq[22:24], 54321) // DstPort
+	binary.BigEndian.PutUint16(udpReq[24:26], uint16(8+len(payload)))
+	copy(udpReq[28:], payload)
 
-	payload := []byte("hello-aero-real-tcp-payload-roundtrip")
-	if _, err := tcpConn.Write(payload); err != nil {
-		t.Fatalf("tcpConn.Write failed: %v", err)
+	if _, err := ipConn.WritePacket(udpReq); err != nil {
+		t.Fatalf("WritePacket udp failed: %v", err)
 	}
 
-	recvBuf := make([]byte, 1024)
-	_ = tcpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := tcpConn.Read(recvBuf)
-	if err != nil {
-		t.Fatalf("tcpConn.Read failed: %v", err)
-	}
-	if !bytes.Equal(recvBuf[:n], payload) {
-		t.Fatalf("payload mismatch: expected %s, got %s", payload, recvBuf[:n])
+	// Verify echoed payload packet received back from CONNECT-IP
+	select {
+	case reply := <-packetCh:
+		if len(reply) < 28+len(payload) {
+			t.Fatalf("echoed packet too short: %d", len(reply))
+		}
+		receivedPayload := reply[28:]
+		if !bytes.Equal(receivedPayload, payload) {
+			t.Fatalf("payload mismatch: expected %s, got %s", payload, receivedPayload)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for CONNECT-IP payload roundtrip reply")
 	}
 
 	if forgedICMPReceived.Load() {

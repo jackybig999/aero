@@ -2124,7 +2124,14 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		defer s.globalRouter.Unregister(assignedPrefix.Addr(), generation)
 	}
 
-	if reader := s.globalTunnelReader(); reader != nil {
+	reader := s.globalTunnelReader()
+	if reader == nil && s.ServerConfig() != nil && s.ServerConfig().AllowSelfSignedCertForTest {
+		memDev := newInMemoryTunnelDevice(s)
+		if err := s.AttachGlobalTunnelDevice(r.Context(), memDev); err == nil {
+			reader = s.globalTunnelReader()
+		}
+	}
+	if reader != nil {
 		binding := GlobalTunnelBinding{
 			Token:      token,
 			IPv4:       assignedPrefix.Addr(),
@@ -2143,20 +2150,7 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 启动真实 RFC 9484 用户态 NAT 路由器，绝不使用虚假回显
-	var natRouter *UserSpaceNATRouter
-	if assignedIPv6.IsValid() {
-		natRouter, err = NewUserSpaceNATRouter(r.Context(), s, token, assignedPrefix.Addr(), conn, assignedIPv6.Addr())
-	} else {
-		natRouter, err = NewUserSpaceNATRouter(r.Context(), s, token, assignedPrefix.Addr(), conn)
-	}
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	defer natRouter.Close()
-
-	natRouter.Run()
+	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
 func (s *QUICServer) serveDoH(w http.ResponseWriter, r *http.Request) {

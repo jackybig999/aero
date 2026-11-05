@@ -123,6 +123,14 @@ func (r *GlobalTunnelReader) StartBinding(parent context.Context, binding Global
 			if n > 0 {
 				packet := append([]byte(nil), buffer[:n]...)
 				if source, parseErr := packetSource(packet); parseErr == nil && r.router.IsCurrent(binding) && r.router.ValidateSource(binding, source) == nil {
+					if len(packet) > 1360 && packet[0]>>4 == 6 {
+						gwIPv6 := net.ParseIP("fd88::1")
+						ptbPkt := buildICMPv6PacketTooBig(packet, gwIPv6, 1360)
+						if len(ptbPkt) > 0 {
+							_, _ = binding.Conn.WritePacket(ptbPkt)
+						}
+						continue
+					}
 					if _, writeErr := writer.Write(packet); writeErr != nil {
 						return
 					}

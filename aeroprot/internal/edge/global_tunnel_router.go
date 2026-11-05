@@ -11,6 +11,13 @@ import (
 
 var errGlobalTunnelRouterClosed = errors.New("global tunnel router is closed")
 
+// IPPacketConn abstracts the MASQUE CONNECT-IP tunnel packet stream.
+type IPPacketConn interface {
+	ReadPacket([]byte) (int, error)
+	WritePacket([]byte) ([]byte, error)
+	Close() error
+}
+
 type GlobalTunnelBinding struct {
 	Token      string
 	IPv4       netip.Addr

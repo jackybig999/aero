@@ -6,122 +6,13 @@ package edge
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"net"
 	"net/netip"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/sagernet/gvisor/pkg/buffer"
-	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
-	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 )
-
-func TestNAT_BufferPools(t *testing.T) {
-	// 1. Verify natTCPBufPool specification: 32768 bytes, storing *[]byte
-	tcpBufPtr := natTCPBufPool.Get().(*[]byte)
-	if tcpBufPtr == nil {
-		t.Fatal("natTCPBufPool returned nil")
-	}
-	if len(*tcpBufPtr) != 32768 || cap(*tcpBufPtr) != 32768 {
-		t.Fatalf("expected TCP buffer of size 32768, got len=%d, cap=%d", len(*tcpBufPtr), cap(*tcpBufPtr))
-	}
-	// Write dummy data and return to pool
-	(*tcpBufPtr)[0] = 0xAA
-	(*tcpBufPtr)[32767] = 0xBB
-	natTCPBufPool.Put(tcpBufPtr)
-
-	// 2. Verify natUDPBufPool specification: 65535 bytes, storing *[]byte
-	udpBufPtr := natUDPBufPool.Get().(*[]byte)
-	if udpBufPtr == nil {
-		t.Fatal("natUDPBufPool returned nil")
-	}
-	if len(*udpBufPtr) != 65535 || cap(*udpBufPtr) != 65535 {
-		t.Fatalf("expected UDP buffer of size 65535, got len=%d, cap=%d", len(*udpBufPtr), cap(*udpBufPtr))
-	}
-	(*udpBufPtr)[0] = 0xCC
-	(*udpBufPtr)[65534] = 0xDD
-	natUDPBufPool.Put(udpBufPtr)
-
-	// 3. Concurrent multi-goroutine Get/Put race stress test
-	const goroutines = 64
-	const iterations = 100
-	var wg sync.WaitGroup
-	wg.Add(goroutines * 2)
-
-	// Concurrent TCP pool users
-	for i := 0; i < goroutines; i++ {
-		go func(workerID int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				bPtr := natTCPBufPool.Get().(*[]byte)
-				buf := *bPtr
-				buf[0] = byte(workerID)
-				buf[len(buf)-1] = byte(j)
-				natTCPBufPool.Put(bPtr)
-			}
-		}(i)
-	}
-
-	// Concurrent UDP pool users
-	for i := 0; i < goroutines; i++ {
-		go func(workerID int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				bPtr := natUDPBufPool.Get().(*[]byte)
-				buf := *bPtr
-				buf[0] = byte(workerID)
-				buf[len(buf)-1] = byte(j)
-				natUDPBufPool.Put(bPtr)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-func TestNAT_QueueCapacity(t *testing.T) {
-	// Verify that channel.New(2048, 1420, "") can hold more than 512 packets (specifically 2048)
-	ep := channel.New(2048, 1420, "")
-	defer ep.Close()
-
-	if ep.NumQueued() != 0 {
-		t.Fatalf("expected initial NumQueued=0, got %d", ep.NumQueued())
-	}
-
-	// Queue 1024 packets (which would overflow the old 512 queue)
-	const packetCount = 1024
-	for i := 0; i < packetCount; i++ {
-		v := buffer.NewViewSize(64)
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithView(v),
-		})
-		var pkts stack.PacketBufferList
-		pkts.PushBack(pkt)
-		n, err := ep.WritePackets(pkts)
-		if err != nil {
-			t.Fatalf("WritePackets failed at packet %d: %v", i, err)
-		}
-		if n != 1 {
-			t.Fatalf("expected 1 packet written, got %d at %d", n, i)
-		}
-	}
-
-	if ep.NumQueued() != packetCount {
-		t.Fatalf("expected %d packets queued, got %d", packetCount, ep.NumQueued())
-	}
-
-	// Drain all queued packets
-	drained := ep.Drain()
-	if drained != packetCount {
-		t.Fatalf("expected %d packets drained, got %d", packetCount, drained)
-	}
-	if ep.NumQueued() != 0 {
-		t.Fatalf("expected NumQueued=0 after drain, got %d", ep.NumQueued())
-	}
-}
 
 func TestIPv6Pool_AllocationAndRelease(t *testing.T) {
 	pool, err := NewIPv6Pool("fd88::/64")
@@ -341,8 +232,9 @@ func TestIPv6ICMPv6_PacketTooBig(t *testing.T) {
 }
 
 type mockNATPacketConn struct {
-	inCh  chan []byte
-	outCh chan []byte
+	inCh      chan []byte
+	outCh     chan []byte
+	closeOnce sync.Once
 }
 
 func newMockNATPacketConn() *mockNATPacketConn {
@@ -369,104 +261,9 @@ func (m *mockNATPacketConn) WritePacket(b []byte) ([]byte, error) {
 }
 
 func (m *mockNATPacketConn) Close() error {
+	m.closeOnce.Do(func() {
+		close(m.inCh)
+	})
 	return nil
 }
 
-func TestIPv6NAT_RouterEchoAndPTB(t *testing.T) {
-	server := NewQUICServer(nil, nil, nil, nil, nil)
-	server.SetAllowLoopbackForTest(true)
-
-	// Register ICMPv6 hook that returns Echo Reply (Type 129, Code 0)
-	server.SetICMPv6ForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
-		reply := make([]byte, len(echoReq))
-		copy(reply, echoReq)
-		reply[0] = 129 // Type 129: Echo Reply
-		reply[1] = 0
-		return reply, nil
-	})
-
-	conn := newMockNATPacketConn()
-	clientIPv4 := netip.MustParseAddr("10.88.0.2")
-	clientIPv6 := netip.MustParseAddr("fd88::2")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	router, err := NewUserSpaceNATRouter(ctx, server, "tok123", clientIPv4, conn, clientIPv6)
-	if err != nil {
-		t.Fatalf("NewUserSpaceNATRouter failed: %v", err)
-	}
-	defer router.Close()
-
-	go router.Run()
-
-	// 1. Test ICMPv6 Echo Request forwarding
-	echoReq := make([]byte, 12)
-	echoReq[0] = 128
-	echoReq[1] = 0
-	binary.BigEndian.PutUint16(echoReq[4:6], 0xABCD)
-	binary.BigEndian.PutUint16(echoReq[6:8], 0x0001)
-	copy(echoReq[8:], "ping")
-
-	srcIPv6 := net.ParseIP("fd88::2")
-	dstIPv6 := net.ParseIP("2606:4700:4700::1111")
-	reqPkt := buildIPv6ICMPv6Packet(srcIPv6, dstIPv6, echoReq)
-
-	conn.inCh <- reqPkt
-
-	select {
-	case replyPkt := <-conn.outCh:
-		if len(replyPkt) < 48 {
-			t.Fatalf("reply packet too short: %d", len(replyPkt))
-		}
-		if replyPkt[0]>>4 != 6 {
-			t.Fatalf("expected IPv6 reply, got version %d", replyPkt[0]>>4)
-		}
-		if replyPkt[6] != 58 {
-			t.Fatalf("expected NextHeader 58 (ICMPv6), got %d", replyPkt[6])
-		}
-		icmp := replyPkt[40:]
-		if icmp[0] != 129 || icmp[1] != 0 {
-			t.Fatalf("expected ICMPv6 Echo Reply (129, 0), got Type=%d Code=%d", icmp[0], icmp[1])
-		}
-		if binary.BigEndian.Uint16(icmp[4:6]) != 0xABCD {
-			t.Fatalf("expected identifier 0xABCD, got 0x%04x", binary.BigEndian.Uint16(icmp[4:6]))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for ICMPv6 Echo Reply")
-	}
-
-	// 2. Test IPv6 Packet Too Big backpressure for oversized packets (> 1360)
-	oversized := make([]byte, 1400)
-	oversized[0] = 0x60
-	binary.BigEndian.PutUint16(oversized[4:6], 1360)
-	oversized[6] = 17 // UDP
-	oversized[7] = 64
-	copy(oversized[8:24], srcIPv6.To16())
-	copy(oversized[24:40], dstIPv6.To16())
-
-	conn.inCh <- oversized
-
-	select {
-	case ptbPkt := <-conn.outCh:
-		if len(ptbPkt) < 48 {
-			t.Fatalf("PTB packet too short: %d", len(ptbPkt))
-		}
-		if ptbPkt[0]>>4 != 6 {
-			t.Fatalf("expected IPv6 PTB packet, got version %d", ptbPkt[0]>>4)
-		}
-		if ptbPkt[6] != 58 {
-			t.Fatalf("expected NextHeader 58, got %d", ptbPkt[6])
-		}
-		icmp := ptbPkt[40:]
-		if icmp[0] != 2 || icmp[1] != 0 {
-			t.Fatalf("expected ICMPv6 Packet Too Big (2, 0), got Type=%d Code=%d", icmp[0], icmp[1])
-		}
-		mtu := binary.BigEndian.Uint32(icmp[4:8])
-		if mtu != 1360 {
-			t.Fatalf("expected PTB MTU 1360, got %d", mtu)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for ICMPv6 Packet Too Big backpressure")
-	}
-}

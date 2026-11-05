@@ -239,22 +239,36 @@ func TestAdversarial_Edge_ICMPv6_PTB_Boundaries_And_RFC4443Checksum(t *testing.T
 	}
 
 	// 3. Router PMTU boundary backpressure test (1360 vs 1361 bytes)
-	server := NewQUICServer(nil, nil, nil, nil, nil)
-	server.SetAllowLoopbackForTest(true)
+	mockDev := &readerTestDevice{packets: make(chan []byte, 16), closed: make(chan struct{}), writes: make(chan []byte, 16)}
+	tunnelRouter := NewGlobalTunnelRouter()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reader, err := NewGlobalTunnelReader(ctx, mockDev, tunnelRouter)
+	if err != nil {
+		t.Fatalf("NewGlobalTunnelReader failed: %v", err)
+	}
+	defer reader.Close()
 
 	conn := newMockNATPacketConn()
 	clientIPv4 := netip.MustParseAddr("10.88.0.2")
 	clientIPv6 := netip.MustParseAddr("fd88::2")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	router, err := NewUserSpaceNATRouter(ctx, server, "tok_boundary", clientIPv4, conn, clientIPv6)
-	if err != nil {
-		t.Fatalf("NewUserSpaceNATRouter failed: %v", err)
+	binding := GlobalTunnelBinding{
+		Token: "tok_boundary",
+		IPv4:  clientIPv4,
+		IPv6:  clientIPv6,
+		Conn:  conn,
 	}
-	defer router.Close()
-	go router.Run()
+	gen, err := tunnelRouter.Register(binding)
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	binding.Generation = gen
+
+	if err := reader.StartBinding(ctx, binding); err != nil {
+		t.Fatalf("StartBinding failed: %v", err)
+	}
 
 	// 3a. Packet of length 1360 (exact MTU threshold) -> MUST NOT trigger PTB
 	atMTUPkt := make([]byte, 1360)
@@ -271,7 +285,7 @@ func TestAdversarial_Edge_ICMPv6_PTB_Boundaries_And_RFC4443Checksum(t *testing.T
 			t.Fatal("unexpected PTB generated for packet of exact MTU size (1360)")
 		}
 	case <-time.After(150 * time.Millisecond):
-		// Expected: 1360 byte packet entered gVisor stack without generating local PTB
+		// Expected: 1360 byte packet entered tunnel pipeline without generating local PTB
 	}
 
 	// 3b. Packet of length 1361 (1 byte over MTU threshold) -> MUST trigger PTB!
