@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -269,6 +270,7 @@ func IsBlockedIP(ip net.IP) (bool, string) {
 type WarpRouteConfig struct {
 	ProxyAddr string // e.g. "127.0.0.1:40000"
 	WarpAll   bool   // true: route all outbound traffic; false: AI & Google domains only
+	FailOpen  bool   // true: fail-open to direct dial on WARP error; false: fail-closed for AI domains (M4)
 }
 
 // DialGuard provides concurrency limiting, SSRF protection, and intelligent Cloudflare WARP upstream routing
@@ -309,11 +311,17 @@ func (g *DialGuard) Close() {
 
 // SetWarpProxy configures upstream Cloudflare WARP SOCKS5 proxy
 func (g *DialGuard) SetWarpProxy(proxyAddr string, all bool) {
+	g.SetWarpProxyWithPolicy(proxyAddr, all, false)
+}
+
+// SetWarpProxyWithPolicy configures upstream Cloudflare WARP SOCKS5 proxy with explicit Fail-Open policy (M4)
+func (g *DialGuard) SetWarpProxyWithPolicy(proxyAddr string, all bool, failOpen bool) {
 	if g != nil {
 		cleanAddr := strings.TrimSpace(proxyAddr)
 		g.warpCfg.Store(&WarpRouteConfig{
 			ProxyAddr: cleanAddr,
 			WarpAll:   all,
+			FailOpen:  failOpen,
 		})
 		if cleanAddr != "" {
 			select {
@@ -367,12 +375,15 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 			log.Printf("[WARP-CIRCUIT-OPEN] Upstream WARP dial failed for %s (%v). Circuit tripped.", address, err)
 		}
 
-		// AI 核心资产 Fail-Closed 保护：0ms 立即阻断，绝不直连裸奔！
-		if isAIDomain {
+		// WARP 策略收敛（M4）：统一支持 Fail-Open（平滑放行直连）与 Fail-Closed（审计阻断防泄漏）。
+		// 当配置 FailOpen=true 或设置 AERO_WARP_MODE=fail-open 时平滑放行直连出站；默认保留 Fail-Closed 保护。
+		mode := os.Getenv("AERO_WARP_MODE")
+		failOpen := (warpCfg != nil && warpCfg.FailOpen) || strings.EqualFold(mode, "fail-open")
+		if isAIDomain && !failOpen {
 			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: direct dial refused to prevent AI region leak (target: %s)", address)
 		}
 
-		log.Printf("[WARP-FALLBACK] Non-AI target %s dial via direct due to open circuit.", address)
+		log.Printf("[WARP-FALLBACK] Target %s dial via direct due to open circuit (fail-open=%v).", address, failOpen)
 	}
 
 	if g == nil || g.sem == nil {
@@ -1025,7 +1036,9 @@ func (g *DialGuard) DialUDPViaWARP(targetAddr string, timeout time.Duration) (ne
 		default:
 		}
 		log.Printf("[WARP-UDP-CIRCUIT-OPEN] Upstream WARP UDP Associate failed for %s (%v). Circuit tripped.", targetAddr, err)
-		if isTargetAIDomain(targetAddr) {
+		mode := os.Getenv("AERO_WARP_MODE")
+		failOpen := (cfg != nil && cfg.FailOpen) || strings.EqualFold(mode, "fail-open")
+		if isTargetAIDomain(targetAddr) && !failOpen {
 			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: WARP UDP Associate failed to prevent AI region leak (target: %s): %w", targetAddr, err)
 		}
 		return nil, err
