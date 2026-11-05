@@ -42,6 +42,7 @@ type IPDataPump struct {
 	dnsHandler     *DNSHandler
 	bytesIn        atomic.Uint64
 	bytesOut       atomic.Uint64
+	currentMTU     atomic.Int32
 }
 
 // SetOnDisconnect registers the single asynchronous disconnect callback.
@@ -73,7 +74,7 @@ func (p *IPDataPump) notifyDisconnect(err error) {
 // NewIPDataPump 创建数据泵实例
 func NewIPDataPump(parentCtx context.Context, dev TunDevice, conn IPPacketConn, killSwitch *atomic.Bool, dnsHandler *DNSHandler) *IPDataPump {
 	ctx, cancel := context.WithCancel(parentCtx)
-	return &IPDataPump{
+	p := &IPDataPump{
 		dev:        dev,
 		conn:       conn,
 		ctx:        ctx,
@@ -81,6 +82,13 @@ func NewIPDataPump(parentCtx context.Context, dev TunDevice, conn IPPacketConn, 
 		killSwitch: killSwitch,
 		dnsHandler: dnsHandler,
 	}
+	p.currentMTU.Store(1224)
+	return p
+}
+
+// CurrentMTU 返回当前路径收缩后生效的虚拟网卡 MTU
+func (p *IPDataPump) CurrentMTU() int {
+	return int(p.currentMTU.Load())
 }
 
 // SetKillSwitch 动态设置纯内存 Kill Switch 状态
@@ -200,7 +208,14 @@ func (p *IPDataPump) pumpTunToRemote() {
 		}
 
 		// 4. 发送至远端 CONNECT-IP 隧道（原生透传所有 TCP、游戏 UDP 与 QUIC 443 报文）
-		_, werr := p.conn.WritePacket(raw)
+		icmpPkt, werr := p.conn.WritePacket(raw)
+		if len(icmpPkt) > 0 {
+			// 回写本地虚拟网卡 (使操作系统/上层应用收到 Destination Unreachable / PTB 差错)
+			_, _ = p.dev.Write(icmpPkt)
+			if nextMTU := parseICMPNextHopMTU(icmpPkt); nextMTU > 0 {
+				p.applyNextHopMTU(nextMTU)
+			}
+		}
 		if werr != nil {
 			if !p.closed.Load() {
 				log.Printf("[PUMP] write remote error: %v", werr)
@@ -372,4 +387,50 @@ func buildIPv6UDPResponsePacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, pa
 	binary.BigEndian.PutUint16(udpData[6:8], csum)
 
 	return pkt
+}
+
+// parseICMPNextHopMTU 从完整的 L3 ICMP 差错报文中精准提取 Next-Hop MTU (方案 §2.4)
+func parseICMPNextHopMTU(pkt []byte) int {
+	if len(pkt) < 28 {
+		return 0
+	}
+	version := pkt[0] >> 4
+	if version == 4 {
+		ihl := int(pkt[0]&0x0F) * 4
+		if len(pkt) < ihl+8 {
+			return 0
+		}
+		// 校验 Protocol == 1 (ICMP), Type == 3 (Dest Unreachable), Code == 4 (Fragmentation Needed)
+		if pkt[9] == 1 && pkt[ihl] == 3 && pkt[ihl+1] == 4 {
+			// Next-Hop MTU 位于 ICMP 首部字节 6~7 (大端 uint16)
+			return int(binary.BigEndian.Uint16(pkt[ihl+6 : ihl+8]))
+		}
+	} else if version == 6 {
+		if len(pkt) < 40+8 {
+			return 0
+		}
+		// 校验 Next Header == 58 (ICMPv6), Type == 2 (Packet Too Big), Code == 0
+		if pkt[6] == 58 && pkt[40] == 2 && pkt[41] == 0 {
+			// MTU 位于 ICMPv6 首部字节 4~7 (大端 uint32)
+			return int(binary.BigEndian.Uint32(pkt[44:48]))
+		}
+	}
+	return 0
+}
+
+func (p *IPDataPump) applyNextHopMTU(newMTU int) {
+	if newMTU < 1224 || newMTU > 1500 {
+		return // 越界异常值丢弃
+	}
+	for {
+		cur := p.currentMTU.Load()
+		if int32(newMTU) >= cur {
+			break // 仅单调向下收缩，已小于等于当前 MTU 则忽略
+		}
+		if p.currentMTU.CompareAndSwap(cur, int32(newMTU)) {
+			log.Printf("[PUMP] Path MTU clamped down to %d, updating virtual NIC", newMTU)
+			_ = SetInterfaceMTU(p.dev.Name(), newMTU)
+			break
+		}
+	}
 }

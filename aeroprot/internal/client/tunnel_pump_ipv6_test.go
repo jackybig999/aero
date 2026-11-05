@@ -51,8 +51,9 @@ func (m *mockIPv6TunDevice) Name() string {
 }
 
 type mockIPv6PacketConn struct {
-	inCh  chan []byte
-	outCh chan []byte
+	inCh          chan []byte
+	outCh         chan []byte
+	returnOnWrite []byte
 }
 
 func newMockIPv6PacketConn() *mockIPv6PacketConn {
@@ -75,6 +76,11 @@ func (m *mockIPv6PacketConn) WritePacket(b []byte) ([]byte, error) {
 	cp := make([]byte, len(b))
 	copy(cp, b)
 	m.outCh <- cp
+	if len(m.returnOnWrite) > 0 {
+		ret := make([]byte, len(m.returnOnWrite))
+		copy(ret, m.returnOnWrite)
+		return ret, nil
+	}
 	return nil, nil
 }
 
@@ -277,5 +283,89 @@ func TestTunnelPump_IPv6STUNDropping(t *testing.T) {
 		t.Fatal("WebRTC STUN packet should have been dropped")
 	case <-time.After(300 * time.Millisecond):
 		// Success: packet dropped
+	}
+}
+
+// Gate G4: M1 DF+ICMP 回写功能与 parseICMPNextHopMTU / applyNextHopMTU 原子收缩验证
+func TestIPDataPump_ICMPExtractAndMTUClamping(t *testing.T) {
+	// 1. IPv4 ICMP Type 3 Code 4 (Next-Hop MTU = 1360)
+	v4ICMP := make([]byte, 20+8+28)
+	v4ICMP[0] = 0x45
+	binary.BigEndian.PutUint16(v4ICMP[2:4], uint16(len(v4ICMP)))
+	v4ICMP[8] = 64
+	v4ICMP[9] = 1 // ICMP
+	copy(v4ICMP[12:16], net.ParseIP("192.0.2.1").To4())
+	copy(v4ICMP[16:20], net.ParseIP("10.88.0.2").To4())
+	v4ICMP[20] = 3 // Type 3: Destination Unreachable
+	v4ICMP[21] = 4 // Code 4: Fragmentation Needed
+	binary.BigEndian.PutUint16(v4ICMP[26:28], 1360) // Next-Hop MTU at offset 6..8 of ICMP header
+
+	if mtu := parseICMPNextHopMTU(v4ICMP); mtu != 1360 {
+		t.Fatalf("expected extracted IPv4 Next-Hop MTU 1360, got %d", mtu)
+	}
+
+	// 2. IPv6 ICMPv6 Type 2 Code 0 (MTU = 1280)
+	v6ICMP := make([]byte, 40+8+40)
+	v6ICMP[0] = 0x60
+	binary.BigEndian.PutUint16(v6ICMP[4:6], 48)
+	v6ICMP[6] = 58 // ICMPv6
+	v6ICMP[7] = 64
+	copy(v6ICMP[8:24], net.ParseIP("2606:4700::1").To16())
+	copy(v6ICMP[24:40], net.ParseIP("fd88::2").To16())
+	v6ICMP[40] = 2 // Type 2: Packet Too Big
+	v6ICMP[41] = 0 // Code 0
+	binary.BigEndian.PutUint32(v6ICMP[44:48], 1280) // MTU at offset 4..8 of ICMPv6 header
+
+	if mtu := parseICMPNextHopMTU(v6ICMP); mtu != 1280 {
+		t.Fatalf("expected extracted IPv6 Next-Hop MTU 1280, got %d", mtu)
+	}
+
+	// 3. Test IPDataPump loop writes ICMP back to dev and clamps MTU
+	tun := newMockIPv6TunDevice()
+	conn := newMockIPv6PacketConn()
+	// Set conn to return v4ICMP when a packet is written
+	conn.returnOnWrite = v4ICMP
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var killSw atomic.Bool
+	pump := NewIPDataPump(ctx, tun, conn, &killSw, nil)
+	pump.currentMTU.Store(1420)
+	pump.Start()
+	defer pump.Close()
+
+	// Send an oversized UDP packet into tun
+	testPkt := make([]byte, 1420)
+	testPkt[0] = 0x45
+	binary.BigEndian.PutUint16(testPkt[2:4], 1420)
+	testPkt[8] = 64
+	testPkt[9] = 17 // UDP
+	copy(testPkt[12:16], net.ParseIP("10.88.0.2").To4())
+	copy(testPkt[16:20], net.ParseIP("192.0.2.1").To4())
+
+	tun.inCh <- testPkt
+
+	// Local virtual NIC MUST receive the ICMP error packet
+	select {
+	case receivedICMP := <-tun.outCh:
+		if len(receivedICMP) != len(v4ICMP) || !bytes.Equal(receivedICMP, v4ICMP) {
+			t.Fatal("virtual NIC did not receive exact ICMP error packet returned by WritePacket")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for ICMP packet write-back to virtual NIC")
+	}
+
+	// Pump MTU must be monotonically clamped down to 1360
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var finalMTU int
+	for time.Now().Before(deadline) {
+		if finalMTU = pump.CurrentMTU(); finalMTU == 1360 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if finalMTU != 1360 {
+		t.Fatalf("expected pump currentMTU to be clamped to 1360, got %d", finalMTU)
 	}
 }
