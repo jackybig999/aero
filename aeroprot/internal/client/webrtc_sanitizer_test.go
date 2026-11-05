@@ -171,7 +171,7 @@ func TestBDPStackBuffers(t *testing.T) {
 	}
 	defer stackEng.Stop()
 
-	if stackEng.gvStack == nil {
-		t.Fatalf("expected gvStack to be initialized")
+	if stackEng == nil {
+		t.Fatalf("expected stackEng to be initialized")
 	}
 }

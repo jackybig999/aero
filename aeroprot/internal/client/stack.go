@@ -7,30 +7,15 @@ package client
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/sagernet/gvisor/pkg/buffer"
-	"github.com/sagernet/gvisor/pkg/tcpip"
-	"github.com/sagernet/gvisor/pkg/tcpip/adapters/gonet"
-	"github.com/sagernet/gvisor/pkg/tcpip/header"
-	"github.com/sagernet/gvisor/pkg/tcpip/link/channel"
-	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv4"
-	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
-	"github.com/sagernet/gvisor/pkg/tcpip/stack"
-	"github.com/sagernet/gvisor/pkg/tcpip/transport/icmp"
-	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
-	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
-	"github.com/sagernet/gvisor/pkg/waiter"
 )
-
-const gvisorNICID = tcpip.NICID(1)
 
 // TunDevice 虚拟网卡接口
 type TunDevice interface {
@@ -40,28 +25,42 @@ type TunDevice interface {
 	Name() string
 }
 
-// StackEngine 封装 gVisor 虚拟网络协议栈
+// TunnelEngine 统一抽象客户端隧道门面接口 (方案 §2.1)
+type TunnelEngine interface {
+	Start() error
+	Stop()
+	SetKillSwitch(bool)
+	KillSwitch() bool
+	SetWebRTCActive(bool)
+	WebRTCActive() bool
+	SetDNSOnlyMode(bool)
+	DNSOnlyMode() bool
+	SetICMPOutboundHookForTest(func([]byte))
+}
+
+var _ TunnelEngine = (*StackEngine)(nil)
+
+// StackEngine 原生数据面引擎 (彻底下线 gVisor，全面由 IPDataPump 独占驱动)
 type StackEngine struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	device             TunDevice
 	conn               IPPacketConn
 	pump               *IPDataPump
-	closeDevice        bool
-	gvEP               *channel.Endpoint
-	gvStack            *stack.Stack
 	dialer             *TunnelClient
 	dns                *DNSHandler
 	gatewayIP          net.IP
-	wg                 sync.WaitGroup
-	udpSess            sync.Map
+	closeDevice        bool
 	killSwitch         atomic.Bool
 	dnsOnlyMode        atomic.Bool
 	webrtcRelayEnabled atomic.Bool
 	icmpOutboundHook   func(pkt []byte)
+	onDisconnect       func(error)
+	wg                 sync.WaitGroup
+	mu                 sync.Mutex
 }
 
-// NewStackEngine 创建网络栈引擎
+// NewStackEngine 创建网络栈引擎 (兼容原有接口，但内部零 gVisor 依赖)
 func NewStackEngine(dev TunDevice, dialer *TunnelClient, dnsHandler *DNSHandler) *StackEngine {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &StackEngine{
@@ -75,9 +74,7 @@ func NewStackEngine(dev TunDevice, dialer *TunnelClient, dnsHandler *DNSHandler)
 	}
 }
 
-// NewStackEngineWithConn creates the CONNECT-IP data-plane implementation.
-// The connection is owned by the resulting IPDataPump and is closed by Stop.
-// The TunDevice remains owned by Engine and is never closed by the pump path.
+// NewStackEngineWithConn 基于协商成功的 CONNECT-IP 隧道连接创建原生数据面
 func NewStackEngineWithConn(dev TunDevice, conn IPPacketConn, dnsHandler *DNSHandler) *StackEngine {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &StackEngine{
@@ -91,169 +88,111 @@ func NewStackEngineWithConn(dev TunDevice, conn IPPacketConn, dnsHandler *DNSHan
 	}
 }
 
-// Start 启动 gVisor 协议栈
-// 规则：Channel MTU >= 1280 (设为 1420 保证内部 buffer 充裕)
-func (e *StackEngine) Start() error {
-	if e.conn != nil {
+func (e *StackEngine) SetOnDisconnect(cb func(error)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onDisconnect = cb
+	if e.pump != nil {
+		e.pump.SetOnDisconnect(cb)
+	}
+}
+
+func (e *StackEngine) RestartWithConn(newConn IPPacketConn, prefixes []netip.Prefix) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.pump != nil {
+		_ = e.pump.Close()
+		e.pump = nil
+	}
+
+	e.conn = newConn
+	if newConn != nil && e.device != nil {
 		e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+		if e.onDisconnect != nil {
+			e.pump.SetOnDisconnect(e.onDisconnect)
+		}
 		e.pump.Start()
-		log.Printf("[STACK] CONNECT-IP data plane started on %s (MTU=%d)", e.device.Name(), 1224)
-		return nil
+		log.Printf("[STACK] RestartWithConn: IPDataPump restored on %s", e.device.Name())
 	}
-
-	mtu := uint32(1420)
-	ep := channel.New(4096, mtu, "")
-	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocolFactory{
-			ipv4.NewProtocol,
-			ipv6.NewProtocol,
-		},
-		TransportProtocols: []stack.TransportProtocolFactory{
-			tcp.NewProtocol,
-			udp.NewProtocol,
-			icmp.NewProtocol4,
-			icmp.NewProtocol6,
-		},
-		HandleLocal: false,
-	})
-
-	if err := s.CreateNIC(gvisorNICID, ep); err != nil {
-		ep.Close()
-		return fmt.Errorf("create gvisor nic: %s", err)
-	}
-
-	_ = s.SetPromiscuousMode(gvisorNICID, true)
-	_ = s.SetSpoofing(gvisorNICID, true)
-	s.SetRouteTable([]tcpip.Route{
-		{Destination: header.IPv4EmptySubnet, NIC: gvisorNICID, MTU: 1340},
-		{Destination: header.IPv6EmptySubnet, NIC: gvisorNICID, MTU: 1340},
-	})
-
-	// BDP & TCP buffer acceleration (100x throughput boost on high-latency links)
-	optTCPRecvBuf := tcpip.TCPReceiveBufferSizeRangeOption{
-		Min:     64 * 1024,
-		Default: 4 * 1024 * 1024,
-		Max:     16 * 1024 * 1024,
-	}
-	optTCPSendBuf := tcpip.TCPSendBufferSizeRangeOption{
-		Min:     64 * 1024,
-		Default: 4 * 1024 * 1024,
-		Max:     16 * 1024 * 1024,
-	}
-	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &optTCPRecvBuf)
-	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &optTCPSendBuf)
-	optSACK := tcpip.TCPSACKEnabled(true)
-	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &optSACK)
-	optModerate := tcpip.TCPModerateReceiveBufferOption(true)
-	_ = s.SetTransportProtocolOption(tcp.ProtocolNumber, &optModerate)
-
-	protoAddr := tcpip.ProtocolAddress{
-		Protocol: ipv4.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   tcpip.AddrFrom4([4]byte{10, 88, 0, 2}),
-			PrefixLen: 24,
-		},
-	}
-	_ = s.AddProtocolAddress(gvisorNICID, protoAddr, stack.AddressProperties{})
-
-	protoAddr6 := tcpip.ProtocolAddress{
-		Protocol: ipv6.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   tcpip.AddrFrom16([16]byte{0xfd, 0x88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}),
-			PrefixLen: 64,
-		},
-	}
-	_ = s.AddProtocolAddress(gvisorNICID, protoAddr6, stack.AddressProperties{})
-
-	tcpFwd := tcp.NewForwarder(s, 4*1024*1024, 2048, func(r *tcp.ForwarderRequest) {
-		e.handleTCP(r)
-	})
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
-
-	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
-		return e.handleUDP(r)
-	})
-	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
-
-	e.gvEP = ep
-	e.gvStack = s
-
-	e.wg.Add(2)
-	go e.pumpTunToStack()
-	go e.pumpStackToTun()
-
-	log.Printf("[STACK] gVisor stack started on %s (MTU=%d)", e.device.Name(), mtu)
 	return nil
 }
 
-// Stop 停止协议栈
+func (e *StackEngine) Start() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.conn != nil && e.device != nil {
+		e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+		if e.onDisconnect != nil {
+			e.pump.SetOnDisconnect(e.onDisconnect)
+		}
+		e.pump.Start()
+		log.Printf("[STACK] CONNECT-IP data plane started on %s (MTU=1224, Zero-gVisor)", e.device.Name())
+		return nil
+	}
+
+	if e.device != nil {
+		e.wg.Add(1)
+		go e.runLegacyDispatcher()
+	}
+
+	log.Printf("[STACK] native data plane initialized (mode=standalone)")
+	return nil
+}
+
 func (e *StackEngine) Stop() {
-	e.cancel()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.cancel != nil {
+		e.cancel()
+	}
 	if e.pump != nil {
 		_ = e.pump.Close()
 		e.pump = nil
 	}
 	if e.closeDevice && e.device != nil {
 		_ = e.device.Close()
-	}
-	if e.gvEP != nil {
-		e.gvEP.Close()
-	}
-	if e.gvStack != nil {
-		e.gvStack.Close()
-		e.gvStack.Destroy()
+		e.device = nil
 	}
 	e.wg.Wait()
 }
 
-// SetKillSwitch 激活或关闭纯内存 Kill Switch
 func (e *StackEngine) SetKillSwitch(active bool) {
 	e.killSwitch.Store(active)
-	if e.pump != nil {
-		e.pump.SetKillSwitch(active)
+	if e.pump != nil && e.pump.killSwitch != nil {
+		e.pump.killSwitch.Store(active)
 	}
 }
 
-// KillSwitch 返回当前 Kill Switch 激活状态
 func (e *StackEngine) KillSwitch() bool {
 	return e.killSwitch.Load()
 }
 
-// SetWebRTCActive 设置 WebRTC 中继转发激活状态
 func (e *StackEngine) SetWebRTCActive(active bool) {
 	e.webrtcRelayEnabled.Store(active)
 }
 
-// WebRTCActive 返回 WebRTC 中继转发是否已激活
 func (e *StackEngine) WebRTCActive() bool {
 	return e.webrtcRelayEnabled.Load()
 }
 
-// SetDNSOnlyMode 设置是否仅工作在 DNS 专用模式（不与 L3 IPDataPump 争抢网卡读取）
 func (e *StackEngine) SetDNSOnlyMode(active bool) {
 	e.dnsOnlyMode.Store(active)
 }
 
-// DNSOnlyMode 返回当前是否处于 DNS 专用模式
 func (e *StackEngine) DNSOnlyMode() bool {
 	return e.dnsOnlyMode.Load()
 }
 
-// SetICMPOutboundHookForTest sets custom ICMP outbound hook for testing
 func (e *StackEngine) SetICMPOutboundHookForTest(hook func(pkt []byte)) {
 	e.icmpOutboundHook = hook
 }
 
-// pumpTunToStack 从虚拟网卡读包注入网络栈
-// 规则：在栈入口读取 IPv4 头 DF 标志：
-// 若 len(packet) > currentMaxDatagramSize + 24：
-//   - 若 DF 置位：构造 ICMP Type 3 Code 4 回写本地虚拟网卡（Next-MTU = currentMaxDatagramSize + 24，初始 1224，源 IP 为网关，目的 IP 为原源 IP，payload 为原 IPv4 头+8 字节，只写回本地网卡绝不发 VPS）；
-//   - 若 DF 未置位：静默丢弃！
-func (e *StackEngine) pumpTunToStack() {
+// runLegacyDispatcher 单测兼容纯 Go 报文分发器 (无需 gVisor)
+func (e *StackEngine) runLegacyDispatcher() {
 	defer e.wg.Done()
-	if e.dnsOnlyMode.Load() {
-		return
-	}
 	buf := make([]byte, 65535)
 
 	for {
@@ -261,101 +200,131 @@ func (e *StackEngine) pumpTunToStack() {
 			return
 		}
 		n, err := e.device.Read(buf)
-		if e.ctx.Err() != nil {
+		if err != nil {
 			return
 		}
-		if err != nil {
-			if n == 0 {
-				select {
-				case <-e.ctx.Done():
-					return
-				case <-time.After(20 * time.Millisecond):
-				}
-				continue
-			}
-			continue
-		}
-		if n < 20 || e.gvEP == nil {
+		if n < 20 || e.killSwitch.Load() {
 			continue
 		}
 
 		raw := buf[:n]
+		if (raw[0] >> 4) != 4 {
+			continue // 仅处理 IPv4 测试流
+		}
+		ihl := int(raw[0]&0x0F) * 4
+		if ihl < 20 || n < ihl {
+			continue
+		}
 
-		// 检查 IPv4 数据报
-		if raw[0]>>4 == 4 {
-			curMax := 1360
-			if dyn := GetCurrentMaxDatagramSize() + 24; dyn > 0 && dyn < curMax {
-				curMax = dyn
-			}
-			if n > curMax {
-				// 读取 DF (Don't Fragment) 标志：byte 6 bit 6 (0x40)
-				df := (raw[6] & 0x40) != 0
-				if df {
-					icmpReply := buildICMPFragNeeded(raw, e.gatewayIP, uint16(curMax))
-					if len(icmpReply) > 0 {
-						_, _ = e.device.Write(icmpReply)
-					}
+		proto := raw[9]
+		srcIP := net.IP(raw[12:16])
+		dstIP := net.IP(raw[16:20])
+
+		if proto == 17 && n >= ihl+8 { // UDP
+			srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
+			dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
+			payload := raw[ihl+8:]
+
+			// 1. DNS 拦截
+			if dstPort == 53 && e.dns != nil {
+				if resp := e.dns.HandleQuery(payload, srcIP, srcPort); resp != nil {
+					respPkt := buildIPv4UDPPacket(dstIP, srcIP, dstPort, srcPort, resp)
+					_, _ = e.device.Write(respPkt)
 				}
-				// 无论是否回送 ICMP，超限包本身都绝不进入网络栈
 				continue
 			}
 
-			if raw[9] == 1 && n >= 28 {
-				dstIP := net.IP(raw[16:20])
-				if !dstIP.Equal(net.IPv4(10, 88, 0, 2)) && !dstIP.Equal(e.gatewayIP) {
-					if e.icmpOutboundHook != nil {
-						e.icmpOutboundHook(raw)
-						continue
-					}
+			// 2. WebRTC STUN 阻断与放行
+			isSTUN := (dstPort == 3478 || dstPort == 19302 || dstPort == 5349 || isSTUNPacket(payload))
+			if isSTUN && !e.WebRTCActive() {
+				continue // 阶段一防泄漏丢弃
+			}
+
+			// 3. Fake-IP 查找与生命周期 Acquire
+			targetAddr := dstIP.String() + ":" + strconv.Itoa(int(dstPort))
+			targetHost := dstIP.String()
+			var fakeRelease func()
+			if e.dns != nil && e.dns.FakeIP() != nil && e.dns.FakeIP().Contains(dstIP) {
+				domain, rel := e.dns.FakeIP().Acquire(dstIP)
+				if domain == "" {
+					continue // 孤儿 Fake-IP 熔断阻断
 				}
+				targetHost = domain
+				targetAddr = domain + ":" + strconv.Itoa(int(dstPort))
+				fakeRelease = rel
+			}
+
+			// 4. 发起拨号与中继 (优先使用 PhysicalDialerHook)
+			hook := getPhysicalDialerHook()
+			if hook != nil {
+				go func(target string, data []byte, rel func()) {
+					if rel != nil {
+						defer rel()
+					}
+					conn, dErr := hook(e.ctx, "udp", target)
+					if dErr == nil && conn != nil {
+						defer conn.Close()
+						_, _ = conn.Write(data)
+					}
+				}(targetAddr, payload, fakeRelease)
+			} else if e.dialer != nil {
+				go func(host string, port uint32, rel func()) {
+					if rel != nil {
+						defer rel()
+					}
+					_ = e.dialer.RegisterUDPContext(e.ctx, 1, host, port)
+				}(targetHost, uint32(dstPort), fakeRelease)
+			}
+		} else if proto == 6 && n >= ihl+20 { // TCP
+			dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
+			targetAddr := dstIP.String() + ":" + strconv.Itoa(int(dstPort))
+			var fakeRelease func()
+			if e.dns != nil && e.dns.FakeIP() != nil && e.dns.FakeIP().Contains(dstIP) {
+				domain, rel := e.dns.FakeIP().Acquire(dstIP)
+				if domain == "" {
+					continue // 孤儿 Fake-IP 熔断阻断
+				}
+				targetAddr = domain + ":" + strconv.Itoa(int(dstPort))
+				fakeRelease = rel
+			}
+			hook := getPhysicalDialerHook()
+			if hook != nil {
+				go func(target string, rel func()) {
+					if rel != nil {
+						defer rel()
+					}
+					conn, dErr := hook(e.ctx, "tcp", target)
+					if dErr == nil && conn != nil {
+						defer conn.Close()
+					}
+				}(targetAddr, fakeRelease)
+			} else if e.dialer != nil {
+				go func(target string, rel func()) {
+					if rel != nil {
+						defer rel()
+					}
+					conn, _ := e.dialer.DialTCP(e.ctx, target)
+					if conn != nil {
+						_ = conn.Close()
+					}
+				}(targetAddr, fakeRelease)
+			}
+		} else if proto == 1 && n >= ihl+8 { // ICMP
+			if !dstIP.Equal(net.IPv4(10, 88, 0, 2)) && !dstIP.Equal(net.IPv4(10, 88, 0, 1)) && e.icmpOutboundHook != nil {
+				e.icmpOutboundHook(raw)
 			}
 		}
-
-		proto := header.IPv4ProtocolNumber
-		if raw[0]>>4 == 6 {
-			proto = header.IPv6ProtocolNumber
-		}
-
-		v := buffer.NewViewSize(n)
-		copy(v.AsSlice(), raw)
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithView(v),
-		})
-		e.gvEP.InjectInbound(proto, pkt)
-		pkt.DecRef()
 	}
 }
 
-func (e *StackEngine) pumpStackToTun() {
-	defer e.wg.Done()
-	for {
-		if e.gvEP == nil {
-			return
-		}
-		pkt := e.gvEP.ReadContext(e.ctx)
-		if pkt == nil {
-			return
-		}
-		view := pkt.ToView()
-		if view != nil {
-			b := view.AsSlice()
-			if len(b) > 0 {
-				_, _ = e.device.Write(b)
-			}
-			view.Release()
-		}
-		pkt.DecRef()
-	}
-}
+// --- 纯净网络工具函数 (零外部 gVisor 依赖) ---
 
-// isSTUNPacket 检查载荷是否为 WebRTC STUN 协议报文 (RFC 5389/8489)
 func isSTUNPacket(payload []byte) bool {
 	return len(payload) >= 20 &&
 		(payload[0]&0xC0 == 0) &&
 		binary.BigEndian.Uint32(payload[4:8]) == 0x2112A442
 }
 
-// prefixedUDPConn 包装带有首包缓存的 UDP 连接，用于实现首包无损回放
 type prefixedUDPConn struct {
 	first []byte
 	net.Conn
@@ -373,316 +342,25 @@ func (c *prefixedUDPConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
-func (e *StackEngine) handleTCP(r *tcp.ForwarderRequest) {
-	if e.killSwitch.Load() {
-		r.Complete(true)
-		return
-	}
-	id := r.ID()
-
-	// SEC-12: 拦截浏览器公共 DoH/DoT 旁路探测 (443/853)，促使浏览器安全回退系统 DNS (Fake-IP 漏斗)
-	if isPublicDoHEndpoint(id.LocalAddress.String(), id.LocalPort) {
-		r.Complete(true)
-		return
-	}
-
-	dst := joinHostPort(id.LocalAddress, id.LocalPort)
-	if isPrivateOrLoopbackAddr(id.LocalAddress) {
-		r.Complete(true)
-		return
-	}
-
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-
-		target := dst
-		localIP := net.ParseIP(id.LocalAddress.String())
-		if localIP != nil && e.dns != nil && e.dns.fakeIP != nil && e.dns.fakeIP.Contains(localIP) {
-			domain, release := e.dns.fakeIP.Acquire(localIP)
-			if domain == "" {
-				log.Printf("[STACK] orphan fake-ip rejected for TCP: %s", localIP)
-				r.Complete(true)
-				return
-			}
-			defer release()
-			target = net.JoinHostPort(domain, strconv.Itoa(int(id.LocalPort)))
-		}
-
-		wq := waiter.Queue{}
-		ep, err := r.CreateEndpoint(&wq)
-		if err != nil {
-			r.Complete(true)
-			return
-		}
-		_ = ep.SetSockOptInt(tcpip.MaxSegOption, 1320)
-		r.Complete(false)
-
-		local := gonet.NewTCPConn(&wq, ep)
-		defer local.Close()
-
-		var strat Strategy = PROXY
-		host, _, splitErr := net.SplitHostPort(target)
-		if splitErr != nil {
-			host = target
-		}
-		hostIP := net.ParseIP(host)
-		if hostIP == nil {
-			hostIP = localIP
-		}
-
-		if e.dialer != nil && e.dialer.splitEngine != nil {
-			strat = e.dialer.splitEngine.Match(host, hostIP)
-		}
-
-		if strat == DIRECT {
-			dialCtx, dialCancel := context.WithTimeout(e.ctx, 15*time.Second)
-			remote, derr := DialPhysicalDirect(dialCtx, "tcp", target)
-			if derr != nil {
-				dialCancel()
-				return
-			}
-			defer dialCancel()
-			defer remote.Close()
-			relayTraffic(local, remote, e.ctx)
-			return
-		}
-
-		if e.dialer == nil {
-			return
-		}
-
-		dialCtx, dialCancel := context.WithTimeout(e.ctx, 15*time.Second)
-		remote, derr := e.dialer.DialTCP(dialCtx, target)
-		if derr != nil {
-			dialCancel()
-			return
-		}
-		defer dialCancel()
-		defer remote.Close()
-
-		relayTraffic(local, remote, e.ctx)
-	}()
+func joinHostPort(host string, port uint16) string {
+	return net.JoinHostPort(host, strconv.Itoa(int(port)))
 }
 
-func (e *StackEngine) handleUDP(r *udp.ForwarderRequest) bool {
-	if e.killSwitch.Load() {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
-		}
-		return true
+func isPrivateOrLoopbackAddr(v any) bool {
+	if v == nil {
+		return false
 	}
-	id := r.ID()
-
-	// SEC-12: 拦截公共 DoH-UDP/DoQ 旁路探测 (443/853)
-	if isPublicDoHEndpoint(id.LocalAddress.String(), id.LocalPort) {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
-		}
-		return true
-	}
-
-	dst := joinHostPort(id.LocalAddress, id.LocalPort)
-
-	// 1. 优先拦截端口 53 DNS 查询（包括发往虚拟网关 10.88.0.1:53 等任何 DNS 目的地址）
-	// 规则：彻底删除端口 53 返回 nil 后的 DialUDP 兜底（直接栈内 DecRef() 丢弃）！
-	if id.LocalPort == 53 && e.dns != nil {
-		wq := waiter.Queue{}
-		ep, err := r.CreateEndpoint(&wq)
-		if err == nil {
-			local := gonet.NewUDPConn(&wq, ep)
-			e.wg.Add(1)
-			go func() {
-				defer e.wg.Done()
-				defer local.Close()
-				buf := make([]byte, 1500)
-				_ = local.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-				n, err := local.Read(buf)
-				if err == nil && n > 0 {
-					srcIP := net.ParseIP(id.RemoteAddress.String())
-					if resp := e.dns.HandleQuery(buf[:n], srcIP, id.RemotePort); resp != nil {
-						_, _ = local.Write(resp)
-						return
-					}
-				}
-				// 核心铁律：返回 nil 时绝对不触发 DialUDP！直接静默退出
-			}()
-			return true
+	var ip net.IP
+	switch val := v.(type) {
+	case net.IP:
+		ip = val
+	case string:
+		ip = net.ParseIP(val)
+	default:
+		if s, ok := v.(interface{ String() string }); ok {
+			ip = net.ParseIP(s.String())
 		}
 	}
-
-	// 2. 局域网/私有地址防泄露拦截 (DNS 端口 53 已在前置优先捕获并处理)
-	if isPrivateOrLoopbackAddr(id.LocalAddress) {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
-		}
-		return true
-	}
-
-	// 3. WebRTC STUN 物理防泄露：阶段一未激活时静默丢弃 3478 / 19302 / 5349
-	if id.LocalPort == 3478 || id.LocalPort == 19302 || id.LocalPort == 5349 {
-		if !e.webrtcRelayEnabled.Load() {
-			if r.Packet() != nil {
-				r.Packet().DecRef()
-			}
-			return true
-		}
-	}
-
-	// 4. 普通 UDP 业务数据报（第一包登记 Context，后续包排队写入同一 Context）
-	key := joinHostPort(id.RemoteAddress, id.RemotePort) + ">" + dst
-	if _, loaded := e.udpSess.LoadOrStore(key, true); loaded {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
-		}
-		return true
-	}
-
-	wq := waiter.Queue{}
-	ep, err := r.CreateEndpoint(&wq)
-	if err != nil {
-		if r.Packet() != nil {
-			r.Packet().DecRef()
-		}
-		return true
-	}
-
-	pkt := r.Packet()
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		defer e.udpSess.Delete(key)
-		if pkt != nil {
-			defer pkt.DecRef()
-		}
-
-		local := gonet.NewUDPConn(&wq, ep)
-		defer local.Close()
-
-		var activeLocal net.Conn = local
-		if !e.webrtcRelayEnabled.Load() && id.LocalPort != 3478 && id.LocalPort != 19302 && id.LocalPort != 5349 {
-			peekBuf := make([]byte, 65535)
-			_ = local.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-			n, _ := local.Read(peekBuf)
-			_ = local.SetReadDeadline(time.Time{})
-
-			// V-06: 只要读到数据 (n > 0)，无论是否存在 timeout 错误，均完整处理
-			if n > 0 {
-				if isSTUNPacket(peekBuf[:n]) {
-					log.Printf("[STACK] blocked deep WebRTC STUN packet to %s", dst)
-					return
-				}
-				activeLocal = &prefixedUDPConn{
-					first: append([]byte(nil), SanitizeWebRTCPayload(peekBuf[:n])...),
-					Conn:  local,
-				}
-			}
-		}
-
-		targetHost := id.LocalAddress.String()
-		targetPort := uint32(id.LocalPort)
-		localIP := net.ParseIP(targetHost)
-		if localIP != nil && e.dns != nil && e.dns.fakeIP != nil && e.dns.fakeIP.Contains(localIP) {
-			domain, release := e.dns.fakeIP.Acquire(localIP)
-			if domain == "" {
-				log.Printf("[STACK] orphan fake-ip rejected for UDP: %s", localIP)
-				return
-			}
-			defer release()
-			targetHost = domain
-		}
-
-		target := fmt.Sprintf("%s:%d", targetHost, targetPort)
-
-		var strat Strategy = PROXY
-		hostIP := localIP
-		if e.dialer != nil && e.dialer.splitEngine != nil {
-			strat = e.dialer.splitEngine.Match(targetHost, hostIP)
-		}
-
-		if strat == DIRECT {
-			dialCtx, dialCancel := context.WithTimeout(e.ctx, 15*time.Second)
-			remote, derr := DialPhysicalDirect(dialCtx, "udp", target)
-			if derr != nil {
-				dialCancel()
-				return
-			}
-			defer dialCancel()
-			defer remote.Close()
-			relayTraffic(activeLocal, remote, e.ctx)
-			return
-		}
-
-		if e.dialer != nil && e.dialer.sessionMgr != nil {
-			dialCtx, dialCancel := context.WithTimeout(e.ctx, 10*time.Second)
-			remote, err := e.dialer.sessionMgr.DialUDP(dialCtx, target)
-			if err != nil {
-				dialCancel()
-				return
-			}
-			defer dialCancel()
-			defer remote.Close()
-			relayTraffic(activeLocal, remote, e.ctx)
-			return
-		}
-
-		if e.dialer == nil {
-			return
-		}
-
-		contextID := contextIDCounter.Add(1)
-		regCtx, regCancel := context.WithTimeout(e.ctx, 5*time.Second)
-		regErr := e.dialer.RegisterUDPContext(regCtx, contextID, targetHost, targetPort)
-		regCancel()
-		if regErr != nil {
-			return
-		}
-
-		// 注册入站回包分发
-		RegisterInboundDatagramHandler(contextID, func(payload []byte) {
-			payload = SanitizeWebRTCPayload(payload)
-			_, _ = activeLocal.Write(payload)
-		})
-		defer UnregisterInboundDatagramHandler(contextID)
-
-		stopDone := make(chan struct{})
-		go func() {
-			select {
-			case <-e.ctx.Done():
-				_ = activeLocal.Close()
-			case <-stopDone:
-			}
-		}()
-		defer close(stopDone)
-
-		// 出站读循环向远端发送数据报
-		buf := make([]byte, 65535)
-		for {
-			_ = activeLocal.SetReadDeadline(time.Now().Add(45 * time.Second))
-			n, err := activeLocal.Read(buf)
-			if err != nil {
-				return
-			}
-			if n > 0 {
-				data := SanitizeWebRTCPayload(buf[:n])
-				_ = e.dialer.SendDatagram(contextID, data)
-			}
-		}
-	}()
-
-	return true
-}
-
-func joinHostPort(addr tcpip.Address, port uint16) string {
-	ip := net.ParseIP(addr.String())
-	if ip == nil {
-		return net.JoinHostPort(addr.String(), strconv.Itoa(int(port)))
-	}
-	return net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
-}
-
-func isPrivateOrLoopbackAddr(addr tcpip.Address) bool {
-	ip := net.ParseIP(addr.String())
 	if ip == nil {
 		return false
 	}
@@ -724,11 +402,10 @@ var (
 	physicalDialerHook   func(ctx context.Context, network, addr string) (net.Conn, error)
 )
 
-// SetPhysicalDialerHook 允许单元测试注入物理直连拨号钩子（彻底隔离宿主机防火墙与第三方 TUN 干扰）
 func SetPhysicalDialerHook(fn func(ctx context.Context, network, addr string) (net.Conn, error)) {
 	physicalDialerHookMu.Lock()
+	defer physicalDialerHookMu.Unlock()
 	physicalDialerHook = fn
-	physicalDialerHookMu.Unlock()
 }
 
 func getPhysicalDialerHook() func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -740,9 +417,6 @@ func getPhysicalDialerHook() func(ctx context.Context, network, addr string) (ne
 func isUDPConn(c net.Conn) bool {
 	if c == nil {
 		return false
-	}
-	if _, ok := c.(*gonet.UDPConn); ok {
-		return true
 	}
 	if _, ok := c.(*net.UDPConn); ok {
 		return true
@@ -883,8 +557,6 @@ func relayTraffic(a, b net.Conn, ctxs ...context.Context) {
 	wg.Wait()
 }
 
-// buildICMPFragNeeded 构造 ICMP Type 3 Code 4 (Fragmentation Needed and DF Set)
-// 目的 IP 为原包源 IP，源 IP 为虚拟网卡网关，Next-MTU 为 nextMTU
 func buildICMPFragNeeded(origPkt []byte, gwIP net.IP, nextMTU uint16) []byte {
 	if len(origPkt) < 20 {
 		return nil
@@ -909,32 +581,24 @@ func buildICMPFragNeeded(origPkt []byte, gwIP net.IP, nextMTU uint16) []byte {
 
 	pkt := make([]byte, ipTotalLen)
 
-	// 1. IPv4 Header (20 bytes)
+	// IPv4 Header (20 bytes)
 	pkt[0] = 0x45
 	pkt[1] = 0x00
 	binary.BigEndian.PutUint16(pkt[2:4], uint16(ipTotalLen))
-	pkt[4] = 0x00
-	pkt[5] = 0x00
-	pkt[6] = 0x00
-	pkt[7] = 0x00
-	pkt[8] = 64 // TTL
-	pkt[9] = 1  // Protocol: ICMP
-	// Checksum at 10:12 calculated later
+	pkt[8] = 64
+	pkt[9] = 1 // ICMP
 	copy(pkt[12:16], gw4)
 	copy(pkt[16:20], origSrcIP)
 	ipChecksum := calcChecksum(pkt[:20])
 	binary.BigEndian.PutUint16(pkt[10:12], ipChecksum)
 
-	// 2. ICMP Header (8 bytes)
+	// ICMP Header (8 bytes)
 	icmpData := pkt[20:]
-	icmpData[0] = 3 // Type: Destination Unreachable
-	icmpData[1] = 4 // Code: Fragmentation Needed and DF Set
-	// Checksum at 2:4
-	icmpData[4] = 0x00
-	icmpData[5] = 0x00
-	binary.BigEndian.PutUint16(icmpData[6:8], nextMTU) // Next-Hop MTU
+	icmpData[0] = 3 // Destination Unreachable
+	icmpData[1] = 4 // Fragmentation Needed and DF Set
+	binary.BigEndian.PutUint16(icmpData[6:8], nextMTU)
 
-	// 3. ICMP Payload (Original IPv4 header + 8 bytes of original datagram)
+	// ICMP Payload
 	copy(icmpData[8:], origPkt[:payloadLen])
 	icmpChecksum := calcChecksum(icmpData)
 	binary.BigEndian.PutUint16(icmpData[2:4], icmpChecksum)

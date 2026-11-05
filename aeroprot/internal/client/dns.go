@@ -296,6 +296,14 @@ func NewDNSHandler(split *SplitEngine) *DNSHandler {
 	}
 }
 
+// FakeIP 获取绑定的 Fake-IP 表
+func (h *DNSHandler) FakeIP() *FakeIPTable {
+	if h == nil {
+		return nil
+	}
+	return h.fakeIP
+}
+
 // SetFakeIP 绑定 Fake-IP 表
 func (h *DNSHandler) SetFakeIP(t *FakeIPTable) {
 	h.fakeIP = t

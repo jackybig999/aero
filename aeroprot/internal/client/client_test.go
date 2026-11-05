@@ -37,8 +37,6 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/sagernet/gvisor/pkg/tcpip"
-	"github.com/sagernet/gvisor/pkg/tcpip/header"
 	"golang.org/x/crypto/cryptobyte"
 )
 
@@ -775,13 +773,7 @@ func TestIsPrivateOrLoopbackAddr(t *testing.T) {
 			if parsed == nil {
 				t.Fatalf("failed to parse IP %s", tc.ipStr)
 			}
-			var addr tcpip.Address
-			if v4 := parsed.To4(); v4 != nil {
-				addr = tcpip.AddrFromSlice(v4)
-			} else {
-				addr = tcpip.AddrFromSlice(parsed.To16())
-			}
-			result := isPrivateOrLoopbackAddr(addr)
+			result := isPrivateOrLoopbackAddr(parsed)
 			if result != tc.expected {
 				t.Errorf("isPrivateOrLoopbackAddr(%s) = %v; want %v", tc.ipStr, result, tc.expected)
 			}
@@ -844,27 +836,30 @@ func (m *mockTunDevice) injectPacket(pkt []byte) {
 }
 
 func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) []byte {
-	totalLen := header.IPv4MinimumSize + header.UDPMinimumSize + len(payload)
+	totalLen := 20 + 8 + len(payload)
 	b := make([]byte, totalLen)
 
-	ip := header.IPv4(b[:header.IPv4MinimumSize])
-	ip.Encode(&header.IPv4Fields{
-		TotalLength: uint16(totalLen),
-		TTL:         64,
-		Protocol:    uint8(header.UDPProtocolNumber),
-		SrcAddr:     tcpip.AddrFromSlice(srcIP.To4()),
-		DstAddr:     tcpip.AddrFromSlice(dstIP.To4()),
-	})
-	ip.SetChecksum(^ip.CalculateChecksum())
+	// IPv4 Header (20 bytes)
+	b[0] = 0x45
+	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
+	b[8] = 64
+	b[9] = 17 // UDP
+	copy(b[12:16], srcIP.To4())
+	copy(b[16:20], dstIP.To4())
+	var ipCsum uint32
+	for i := 0; i < 20; i += 2 {
+		ipCsum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
+	}
+	for ipCsum > 0xffff {
+		ipCsum = (ipCsum & 0xffff) + (ipCsum >> 16)
+	}
+	binary.BigEndian.PutUint16(b[10:12], ^uint16(ipCsum))
 
-	u := header.UDP(b[header.IPv4MinimumSize:])
-	u.Encode(&header.UDPFields{
-		SrcPort: srcPort,
-		DstPort: dstPort,
-		Length:  uint16(header.UDPMinimumSize + len(payload)),
-	})
-	copy(b[header.IPv4MinimumSize+header.UDPMinimumSize:], payload)
-	u.SetChecksum(0)
+	// UDP Header (8 bytes)
+	binary.BigEndian.PutUint16(b[20:22], srcPort)
+	binary.BigEndian.PutUint16(b[22:24], dstPort)
+	binary.BigEndian.PutUint16(b[24:26], uint16(8+len(payload)))
+	copy(b[28:], payload)
 	return b
 }
 
@@ -1833,7 +1828,7 @@ func TestStackOrphanFakeIPCircuitBreaking(t *testing.T) {
 	}
 
 	// 2. 发送 TCP SYN 到孤儿 Fake-IP
-	tcpPkt := buildIPv4TCPPacket(srcIP, orphanFakeIP, 51235, 8080, header.TCPFlagSyn, nil, 1000)
+	tcpPkt := buildIPv4TCPPacket(srcIP, orphanFakeIP, 51235, 8080, 0x02, nil, 1000)
 	mockDev.injectPacket(tcpPkt)
 
 	time.Sleep(100 * time.Millisecond)
@@ -1844,34 +1839,34 @@ func TestStackOrphanFakeIPCircuitBreaking(t *testing.T) {
 	}
 }
 
-func buildIPv4TCPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, flags header.TCPFlags, payload []byte, seq uint32) []byte {
-	totalLen := header.IPv4MinimumSize + header.TCPMinimumSize + len(payload)
+func buildIPv4TCPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, flags uint8, payload []byte, seq uint32) []byte {
+	totalLen := 20 + 20 + len(payload)
 	b := make([]byte, totalLen)
 
-	ip := header.IPv4(b[:header.IPv4MinimumSize])
-	ip.Encode(&header.IPv4Fields{
-		TotalLength: uint16(totalLen),
-		TTL:         64,
-		Protocol:    uint8(header.TCPProtocolNumber),
-		SrcAddr:     tcpip.AddrFromSlice(srcIP.To4()),
-		DstAddr:     tcpip.AddrFromSlice(dstIP.To4()),
-	})
-	ip.SetChecksum(^ip.CalculateChecksum())
+	// IPv4 Header (20 bytes)
+	b[0] = 0x45
+	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
+	b[8] = 64
+	b[9] = 6 // TCP
+	copy(b[12:16], srcIP.To4())
+	copy(b[16:20], dstIP.To4())
+	var ipCsum uint32
+	for i := 0; i < 20; i += 2 {
+		ipCsum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
+	}
+	for ipCsum > 0xffff {
+		ipCsum = (ipCsum & 0xffff) + (ipCsum >> 16)
+	}
+	binary.BigEndian.PutUint16(b[10:12], ^uint16(ipCsum))
 
-	t := header.TCP(b[header.IPv4MinimumSize:])
-	t.Encode(&header.TCPFields{
-		SrcPort:    srcPort,
-		DstPort:    dstPort,
-		SeqNum:     seq,
-		AckNum:     0,
-		DataOffset: header.TCPMinimumSize,
-		Flags:      flags,
-		WindowSize: 65535,
-	})
-	copy(b[header.IPv4MinimumSize+header.TCPMinimumSize:], payload)
-
-	xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, tcpip.AddrFromSlice(srcIP.To4()), tcpip.AddrFromSlice(dstIP.To4()), uint16(header.TCPMinimumSize+len(payload)))
-	t.SetChecksum(^t.CalculateChecksum(xsum))
+	// TCP Header (20 bytes)
+	binary.BigEndian.PutUint16(b[20:22], srcPort)
+	binary.BigEndian.PutUint16(b[22:24], dstPort)
+	binary.BigEndian.PutUint32(b[24:28], seq)
+	b[32] = 0x50 // DataOffset 5
+	b[33] = flags
+	binary.BigEndian.PutUint16(b[34:36], 65535)
+	copy(b[40:], payload)
 	return b
 }
 
@@ -4153,27 +4148,29 @@ func TestDNSVirtualGatewayInterception(t *testing.T) {
 		t.Fatalf("timeout waiting for DNS response on virtual NIC from gateway 10.88.0.1:53")
 	}
 
-	if len(respPacket) < header.IPv4MinimumSize+header.UDPMinimumSize+12 {
+	if len(respPacket) < 20+8+12 {
 		t.Fatalf("response packet too short: %d bytes", len(respPacket))
 	}
 
-	ipHdr := header.IPv4(respPacket[:header.IPv4MinimumSize])
-	if ipHdr.SourceAddress().String() != "10.88.0.1" {
-		t.Errorf("expected response from 10.88.0.1, got %s", ipHdr.SourceAddress())
+	srcAddr := net.IP(respPacket[12:16]).String()
+	dstAddr := net.IP(respPacket[16:20]).String()
+	if srcAddr != "10.88.0.1" {
+		t.Errorf("expected response from 10.88.0.1, got %s", srcAddr)
 	}
-	if ipHdr.DestinationAddress().String() != "10.88.0.2" {
-		t.Errorf("expected response destined to 10.88.0.2, got %s", ipHdr.DestinationAddress())
-	}
-
-	udpHdr := header.UDP(respPacket[header.IPv4MinimumSize : header.IPv4MinimumSize+header.UDPMinimumSize])
-	if udpHdr.SourcePort() != 53 {
-		t.Errorf("expected source port 53, got %d", udpHdr.SourcePort())
-	}
-	if udpHdr.DestinationPort() != 53535 {
-		t.Errorf("expected dest port 53535, got %d", udpHdr.DestinationPort())
+	if dstAddr != "10.88.0.2" {
+		t.Errorf("expected response destined to 10.88.0.2, got %s", dstAddr)
 	}
 
-	dnsPayload := respPacket[header.IPv4MinimumSize+header.UDPMinimumSize:]
+	srcPort := binary.BigEndian.Uint16(respPacket[20:22])
+	dstPort := binary.BigEndian.Uint16(respPacket[22:24])
+	if srcPort != 53 {
+		t.Errorf("expected source port 53, got %d", srcPort)
+	}
+	if dstPort != 53535 {
+		t.Errorf("expected dest port 53535, got %d", dstPort)
+	}
+
+	dnsPayload := respPacket[28:]
 	// 校验 Transaction ID
 	if dnsPayload[0] != 0x12 || dnsPayload[1] != 0x34 {
 		t.Errorf("mismatched transaction ID: got 0x%02x%02x, want 0x1234", dnsPayload[0], dnsPayload[1])
