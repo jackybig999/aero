@@ -835,34 +835,6 @@ func (m *mockTunDevice) injectPacket(pkt []byte) {
 	}
 }
 
-func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) []byte {
-	totalLen := 20 + 8 + len(payload)
-	b := make([]byte, totalLen)
-
-	// IPv4 Header (20 bytes)
-	b[0] = 0x45
-	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
-	b[8] = 64
-	b[9] = 17 // UDP
-	copy(b[12:16], srcIP.To4())
-	copy(b[16:20], dstIP.To4())
-	var ipCsum uint32
-	for i := 0; i < 20; i += 2 {
-		ipCsum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
-	}
-	for ipCsum > 0xffff {
-		ipCsum = (ipCsum & 0xffff) + (ipCsum >> 16)
-	}
-	binary.BigEndian.PutUint16(b[10:12], ^uint16(ipCsum))
-
-	// UDP Header (8 bytes)
-	binary.BigEndian.PutUint16(b[20:22], srcPort)
-	binary.BigEndian.PutUint16(b[22:24], dstPort)
-	binary.BigEndian.PutUint16(b[24:26], uint16(8+len(payload)))
-	copy(b[28:], payload)
-	return b
-}
-
 // 验收项：WebRTC 两阶段精准控制
 // 断言在 webrtcRelayEnabled 为 false 时，发往 3478/19302/5349 端口的包必须被拦截丢弃；
 // 在调用 SetWebRTCActive(true) 之后，验证 WebRTCActive() 状态并验证放行。

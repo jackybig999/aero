@@ -361,7 +361,7 @@ func TestSimulatedFingerprintBrowserSocks5(t *testing.T) {
 // 5. 游戏加速场景模拟 (Gaming Acceleration: UDP / MTU 1224 / Jitter)
 // ============================================================================
 
-// TestSimulatedGameAccelerationDatagramGuard 模拟游戏 UDP 数据报转发预检、gVisor ICMP 回写与抗 DPI 混淆包长
+// TestSimulatedGameAccelerationDatagramGuard 模拟游戏 UDP 数据报转发预检、原生 ICMP 回写与抗 DPI 混淆包长
 func TestSimulatedGameAccelerationDatagramGuard(t *testing.T) {
 	// 1. 验证生产代码 TunnelClient.SendDatagram 预检丢弃逻辑 (规范 P2: 4 + len(payload) > currentMaxDatagramSize 立即丢弃)
 	tc := NewTunnelClient(GlobalSessionPool, NewSplitEngine())
