@@ -28,4 +28,6 @@ target/
 *.key
 *.p12
 *.pfx
-*.Zone.Identifier
+*:Zone.Identifier
+*Zone.Identifier*
+
