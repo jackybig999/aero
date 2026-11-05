@@ -422,8 +422,15 @@ if command -v nft >/dev/null 2>&1; then
         nft -f "$SCRIPT_DIR/edge.nft" 2>/dev/null || true
     fi
 fi
-# --- sysctl: 备份并固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6) ---
+# --- sysctl: 备份并固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6 & §7.1) ---
 echo "[sysctl] 备份原有配置并优化 BBR 拥塞控制与 128MB TCP/UDP 缓冲区"
+BACKUP_DIR="${CONFIG_DIR}"
+mkdir -p "${BACKUP_DIR}"
+if [[ ! -f "${BACKUP_DIR}/sysctl_orig.conf" ]]; then
+    echo "net.ipv4.ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" > "${BACKUP_DIR}/sysctl_orig.conf"
+    echo "net.ipv6.conf.all.forwarding=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" >> "${BACKUP_DIR}/sysctl_orig.conf"
+    echo "net.netfilter.nf_conntrack_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 65536)" >> "${BACKUP_DIR}/sysctl_orig.conf"
+fi
 if [[ -f "/etc/sysctl.d/99-aero-sysctl.conf" && ! -f "/etc/sysctl.d/99-aero-sysctl.conf.bak" ]]; then
     cp -f "/etc/sysctl.d/99-aero-sysctl.conf" "/etc/sysctl.d/99-aero-sysctl.conf.bak"
 fi
