@@ -30,7 +30,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.2.25"
+VERSION="1.2.26"
 REPO="jackybig999/aero"
 
 usage() {
@@ -383,6 +383,7 @@ ExecStart=$INSTALL_DIR/aero-edge \\
   -key $KEY \\
   -config $CONFIG_DIR/edge.yaml
 LimitNOFILE=65535
+LimitNPROC=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -497,6 +498,10 @@ net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
 net.ipv4.tcp_mtu_probing = 1
 net.core.netdev_max_backlog = 10000
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+net.netfilter.nf_conntrack_udp_timeout = 30
+net.netfilter.nf_conntrack_udp_timeout_stream = 60
 EOF
 cp -f /etc/sysctl.d/99-aero-sysctl.conf /etc/sysctl.d/99-aero-bbr.conf 2>/dev/null || true
 sysctl --system >/dev/null 2>&1 || true

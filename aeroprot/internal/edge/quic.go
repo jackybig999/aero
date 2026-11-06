@@ -1419,7 +1419,8 @@ func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx conte
 	if strings.Contains(addr, "[") || strings.HasPrefix(addr, "::") {
 		network = "udp6"
 	}
-	conn, err := net.ListenPacket(network, addr)
+	lc := net.ListenConfig{Control: setReusePortControl}
+	conn, err := lc.ListenPacket(ctx, network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("quic listen packet %s: %w", addr, err)
 	}

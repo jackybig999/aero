@@ -46,6 +46,13 @@ func packetSource(packet []byte) (netip.Addr, error) {
 	}
 }
 
+var tunnelBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 65535)
+		return &buf
+	},
+}
+
 // GlobalTunnelReader owns exactly one read loop and dispatches packets to the
 // connection selected by GlobalTunnelRouter. It never creates per-session NAT.
 type GlobalTunnelReader struct {
@@ -117,11 +124,13 @@ func (r *GlobalTunnelReader) StartBinding(parent context.Context, binding Global
 			}
 		}()
 		defer close(workerDone)
-		buffer := make([]byte, 65535)
+		bufPtr := tunnelBufPool.Get().(*[]byte)
+		defer tunnelBufPool.Put(bufPtr)
+		buffer := *bufPtr
 		for {
 			n, err := binding.Conn.ReadPacket(buffer)
 			if n > 0 {
-				packet := append([]byte(nil), buffer[:n]...)
+				packet := buffer[:n]
 				if source, parseErr := packetSource(packet); parseErr == nil && r.router.IsCurrent(binding) && r.router.ValidateSource(binding, source) == nil {
 					if len(packet) > 1360 && packet[0]>>4 == 6 {
 						gwIPv6 := net.ParseIP("fd88::1")
@@ -155,14 +164,16 @@ func (r *GlobalTunnelReader) Start() {
 }
 
 func (r *GlobalTunnelReader) run() {
-	buffer := make([]byte, 65535)
+	bufPtr := tunnelBufPool.Get().(*[]byte)
+	defer tunnelBufPool.Put(bufPtr)
+	buffer := *bufPtr
 	for {
 		if r.ctx.Err() != nil {
 			return
 		}
 		n, err := r.device.Read(buffer)
 		if n > 0 {
-			packet := append([]byte(nil), buffer[:n]...)
+			packet := buffer[:n]
 			binding, _, routeErr := r.router.RoutePacket(packet)
 			if routeErr != nil {
 				continue
