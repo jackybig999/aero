@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.26"
+	ClientVersion = "1.2.27"
 	Protocol      = "aero/3.0"
 )
 
@@ -789,6 +789,9 @@ func (e *Engine) startLocked(ticket uint64) error {
 		if startCancel != nil {
 			startCancel()
 		}
+		if e.sessionMgr != nil {
+			e.sessionMgr.Reset()
+		}
 		e.mu.Lock()
 		e.startCancel = nil
 		if e.startEpoch == ticket {
@@ -976,7 +979,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 		return failStart(fmt.Errorf("connect to %s failed: %w", activeAddr, err))
 	}
 	actualPort := cl.ActualPort()
-	_ = cl.Close()
 	rtt := time.Since(start)
 
 	// 多端口跳频动态对齐 (Port Hopping Alignment Contract)
@@ -1017,6 +1019,17 @@ func (e *Engine) startLocked(ticket uint64) error {
 		}
 		activeAddr = alignedAddr
 		port = actualPort
+	}
+
+	// 启动会话单例复用：将已握手的 cl 直接包装为 Session 并注入 sessionMgr，消除二次建连延迟
+	if e.sessionMgr != nil {
+		if newSess, sessErr := NewSession(cl, activeToken, activeAddr, activeSNI); sessErr == nil {
+			e.sessionMgr.SetSession(newSess)
+		} else {
+			_ = cl.Close()
+		}
+	} else {
+		_ = cl.Close()
 	}
 
 	select {
@@ -1169,6 +1182,9 @@ func (e *Engine) startLocked(ticket uint64) error {
 func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice, nm NetworkMonitor, ip net.IP) error {
 	if startCancel != nil {
 		startCancel()
+	}
+	if e.sessionMgr != nil {
+		e.sessionMgr.Reset()
 	}
 	e.mu.Lock()
 	e.startCancel = nil

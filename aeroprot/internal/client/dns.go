@@ -261,6 +261,7 @@ func (t *FakeIPTable) FormatDNSResponse(host string) []byte {
 var DefaultFakeIPTable = NewFakeIPTable("198.18.0.0/15")
 
 type dnsCacheEntry struct {
+	ip        net.IP
 	data      []byte
 	expiresAt time.Time
 }
@@ -375,9 +376,27 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return nil
 	}
 
-	// 阶段一：AI 优先通道（即使后缀是 .cn 亦强制进 Fake-IP 专线，绝不走国内物理 DNS 泄露）
+	// 命中本地 DNS 缓存：0ms 极速响应，消灭重复解析网络延迟
+	if qtype == 0x0001 {
+		h.cacheMu.RLock()
+		entry, found := h.cache[qnameLower]
+		h.cacheMu.RUnlock()
+		if found && time.Now().Before(entry.expiresAt) && entry.ip != nil {
+			return buildAResponse(pkt, qname, entry.ip)
+		}
+	}
+
+	// 阶段一：AI 优先通道（优先走真·DoH 远程解析获取真实公网 IP，彻底消灭纯三层黑洞）
 	if h.split != nil && h.split.Decide(qnameLower) == "ai" {
 		if qtype == 0x0001 {
+			if h.dohResolver != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+				resp := h.queryDoH(ctx, pkt, qname, qnameLower)
+				cancel()
+				if resp != nil {
+					return resp
+				}
+			}
 			if h.fakeIP != nil {
 				resp := h.fakeIP.FormatDNSResponse(qname)
 				if len(pkt) >= 2 && len(resp) >= 2 {
@@ -417,14 +436,123 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 	}
 
 	// 阶段三：其余境外站/非直连域名
-	// 绝对不进入 queryFastUDP！杜绝 DNS 泄露
+	// 绝对不进入 queryFastUDP！优先走真·DoH 远程安全解析获取真实公网 IP，彻底消灭 Fake-IP 黑洞
 	if qtype == 0x0001 {
+		if h.dohResolver != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+			resp := h.queryDoH(ctx, pkt, qname, qnameLower)
+			cancel()
+			if resp != nil {
+				return resp
+			}
+		}
 		return h.respondFakeIP(pkt, qname)
 	}
 
 	// AAAA 和其余查询类型 (Type 65 HTTPS RR, TXT, MX 等)：返回标准空应答 (NOERROR, 0 答案)
 	// 严禁塞入 Type A 答案，彻底消除报文畸变导致浏览器重试！
 	return buildEmptyResponse(pkt, qname, qtype)
+}
+
+func (h *DNSHandler) queryDoH(ctx context.Context, pkt []byte, qname, qnameLower string) []byte {
+	if h.dohResolver == nil {
+		return nil
+	}
+	resp, err := h.dohResolver(ctx, pkt)
+	if err == nil && len(resp) >= 12 {
+		if len(pkt) >= 2 && len(resp) >= 2 {
+			resp[0], resp[1] = pkt[0], pkt[1]
+		}
+		ip4 := parseFirstIPv4FromDNSResponse(resp)
+		if ip4 != nil && ip4.To4() != nil {
+			h.cacheMu.Lock()
+			h.cache[qnameLower] = dnsCacheEntry{
+				ip:        ip4.To4(),
+				expiresAt: time.Now().Add(5 * time.Minute),
+			}
+			h.cacheMu.Unlock()
+		}
+		return resp
+	}
+	return nil
+}
+
+// parseFirstIPv4FromDNSResponse 按 RFC 1035 标准解析 DNS 应答中的首个 A 记录
+// 健壮处理普通标签、0xC0 压缩指针、CNAME 别名链，安全忽略 EDNS0 OPT 伪记录，100% 防越界与死循环
+func parseFirstIPv4FromDNSResponse(resp []byte) net.IP {
+	if len(resp) < 12 {
+		return nil
+	}
+	ancount := binary.BigEndian.Uint16(resp[6:8])
+	if ancount == 0 {
+		return nil
+	}
+	qdcount := binary.BigEndian.Uint16(resp[4:6])
+
+	offset := 12
+	// 安全跳过所有 Question 记录
+	for i := 0; i < int(qdcount); i++ {
+		var ok bool
+		offset, ok = skipDNSName(resp, offset)
+		if !ok {
+			return nil
+		}
+		offset += 4 // QTYPE(2) + QCLASS(2)
+		if offset > len(resp) {
+			return nil
+		}
+	}
+
+	// 遍历 Answer 记录寻找首个有效 Type A 记录
+	for i := 0; i < int(ancount); i++ {
+		var ok bool
+		offset, ok = skipDNSName(resp, offset)
+		if !ok {
+			return nil
+		}
+		if offset+10 > len(resp) {
+			return nil
+		}
+		rtype := binary.BigEndian.Uint16(resp[offset : offset+2])
+		rclass := binary.BigEndian.Uint16(resp[offset+2 : offset+4])
+		// ttl := binary.BigEndian.Uint32(resp[offset+4 : offset+8])
+		rdlen := int(binary.BigEndian.Uint16(resp[offset+8 : offset+10]))
+		offset += 10
+		if offset+rdlen > len(resp) {
+			return nil
+		}
+		// Type A = 0x0001, Class IN = 0x0001, rdlen = 4
+		if rtype == 0x0001 && rclass == 0x0001 && rdlen == 4 {
+			ip := make(net.IP, 4)
+			copy(ip, resp[offset:offset+4])
+			return ip
+		}
+		offset += rdlen
+	}
+	return nil
+}
+
+// skipDNSName 跳过 DNS 名字区段，支持 RFC 1035 §4.1.4 压缩指针 (0xC0 开头)
+func skipDNSName(pkt []byte, offset int) (int, bool) {
+	steps := 0
+	for offset < len(pkt) && steps < 128 {
+		steps++
+		b := pkt[offset]
+		if b == 0 {
+			return offset + 1, true
+		}
+		if b&0xC0 == 0xC0 { // 压缩指针，占 2 字节
+			if offset+2 > len(pkt) {
+				return offset, false
+			}
+			return offset + 2, true
+		}
+		if b > 63 { // 非法标签长度
+			return offset, false
+		}
+		offset += 1 + int(b)
+	}
+	return offset, false
 }
 
 // queryFastUDP 仅用于 .cn 及国内直连域名向物理解析器发包

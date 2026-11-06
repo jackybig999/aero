@@ -335,6 +335,22 @@ func (m *SessionManager) SetDialHook(hook func(ctx context.Context) (*Session, e
 	m.dialHook = hook
 }
 
+// SetSession injects an active session directly into the SessionManager.
+func (m *SessionManager) SetSession(s *Session) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.currentSession != nil && !m.currentSession.IsDraining() && m.currentSession != s {
+		_ = m.currentSession.Close()
+	}
+	m.currentSession = s
+	if m.cond != nil {
+		m.cond.Broadcast()
+	}
+}
+
 // GetSession returns the active session or creates a new one.
 func (m *SessionManager) GetSession(ctx context.Context) (*Session, error) {
 	m.mu.Lock()

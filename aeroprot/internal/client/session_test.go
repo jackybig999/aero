@@ -306,3 +306,39 @@ func TestSocks5UDPAssociateHandling(t *testing.T) {
 		t.Fatal("expected assigned UDP port > 0")
 	}
 }
+
+// TestSessionManager_SetSession 验证会话单例注入与复用，杜绝二次拨号
+func TestSessionManager_SetSession(t *testing.T) {
+	mgr := NewSessionManager()
+	dialCount := 0
+	mgr.SetDialHook(func(ctx context.Context) (*Session, error) {
+		dialCount++
+		return &Session{addr: "hook:443", sni: "hook.com"}, nil
+	})
+
+	injected := &Session{addr: "injected:443", sni: "injected.com"}
+	mgr.SetSession(injected)
+
+	// GetSession 必须直接返回注入的会话，绝不触发 dialHook
+	sess, err := mgr.GetSession(context.Background())
+	if err != nil {
+		t.Fatalf("GetSession failed: %v", err)
+	}
+	if sess != injected {
+		t.Fatalf("expected injected session %v, got %v", injected, sess)
+	}
+	if dialCount != 0 {
+		t.Fatalf("expected 0 dial hook calls, got %d", dialCount)
+	}
+
+	// 再次注入新 session，原 session 应当被替换
+	injected2 := &Session{addr: "injected2:443", sni: "injected2.com"}
+	mgr.SetSession(injected2)
+	sess2, err := mgr.GetSession(context.Background())
+	if err != nil {
+		t.Fatalf("GetSession 2 failed: %v", err)
+	}
+	if sess2 != injected2 {
+		t.Fatalf("expected second session, got %v", sess2)
+	}
+}

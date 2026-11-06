@@ -500,15 +500,22 @@ func (s *Server) Start() error {
 	}
 	s.quicListener = quicLn
 
-	// 2b. Multi-port Hopping Alternative Listeners
+	// 2b. Multi-port Hopping Alternative Listeners (严格去重并跳过主端口，防止 SO_REUSEPORT 分流冲突)
 	host := ""
-	if h, _, herr := net.SplitHostPort(s.cfg.Listen); herr == nil {
+	primaryPort := 0
+	if h, pStr, herr := net.SplitHostPort(s.cfg.Listen); herr == nil {
 		host = h
+		primaryPort, _ = strconv.Atoi(pStr)
+	}
+	boundPorts := make(map[int]bool)
+	if primaryPort > 0 {
+		boundPorts[primaryPort] = true
 	}
 	for _, port := range s.cfg.AltListenPorts {
-		if port <= 0 || port > 65535 {
+		if port <= 0 || port > 65535 || boundPorts[port] {
 			continue
 		}
+		boundPorts[port] = true
 		altAddr := net.JoinHostPort(host, strconv.Itoa(port))
 		altLn, aerr := StartQUIC(altAddr, tlsCfg, s.quicServer, s.ctx)
 		if aerr == nil {
