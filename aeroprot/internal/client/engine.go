@@ -1719,6 +1719,8 @@ func (e *Engine) SetListenAddr(addr string) {
 func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 	e.mu.RLock()
 	dialer := e.tcpDialer
+	split := e.splitEngine
+	dnsH := e.dnsHandler
 	e.mu.RUnlock()
 	if dialer != nil {
 		conn, err := dialer(ctx, target)
@@ -1734,8 +1736,35 @@ func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 		}, nil
 	}
 
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+	}
+	var ip net.IP
+	if dnsH != nil && dnsH.FakeIP() != nil {
+		if parsedIP := net.ParseIP(host); parsedIP != nil && dnsH.FakeIP().Contains(parsedIP) {
+			if domain, _ := dnsH.FakeIP().Acquire(parsedIP); domain != "" {
+				host = domain
+			}
+		}
+	}
+	ip = net.ParseIP(host)
+
+	if split != nil && split.Match(host, ip) == DIRECT {
+		conn, err := DialPhysicalDirect(ctx, "tcp", target)
+		if err != nil {
+			return nil, err
+		}
+		e.activeConns.Store(conn, struct{}{})
+		return &trackedConn{
+			Conn: conn,
+			onClose: func() {
+				e.activeConns.Delete(conn)
+			},
+		}, nil
+	}
+
 	var conn net.Conn
-	var err error
 	if e.sessionMgr != nil {
 		conn, err = e.sessionMgr.DialTCP(ctx, target)
 	} else if e.tunnelClient != nil {

@@ -187,6 +187,11 @@ func isAITraffic(host string) bool {
 	return false
 }
 
+// ClassifyTarget 严格按 IP 报头与 AI 规则判定，结合 splitEngine 激活多通道
+func (tc *TunnelClient) ClassifyTarget(raw string) streamTarget {
+	return tc.classifyTarget(raw)
+}
+
 // classifyTarget 严格按 IP 报头与 AI 规则判定，结合 splitEngine 激活多通道
 func (tc *TunnelClient) classifyTarget(raw string) streamTarget {
 	st := streamTarget{Raw: raw, StreamType: StreamTypeGeneral}
@@ -364,6 +369,17 @@ func (tc *TunnelClient) DialTCP(ctx context.Context, target string) (net.Conn, e
 	cp := tc.chainProxy.Load()
 	if cp != nil && cp.Enabled && cp.Host != "" && cp.Port > 0 {
 		return tc.dialChainTCP(ctx, target, cp)
+	}
+
+	if tc != nil && tc.splitEngine != nil {
+		host, _, err := net.SplitHostPort(target)
+		if err != nil {
+			host = target
+		}
+		ip := net.ParseIP(host)
+		if tc.splitEngine.Match(host, ip) == DIRECT {
+			return DialPhysicalDirect(ctx, "tcp", target)
+		}
 	}
 
 	if tc.sessionMgr != nil {

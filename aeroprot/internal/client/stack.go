@@ -5,6 +5,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"log"
@@ -563,7 +564,7 @@ func relayTraffic(a, b net.Conn, ctxs ...context.Context) {
 			if n > 0 {
 				_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
 				payload := buf[:n]
-				if hasDomesticIPv6(string(payload)) {
+				if bytes.Contains(payload, []byte("candidate")) || bytes.Contains(payload, []byte("c=IN IP6")) || isSTUNPacket(payload) {
 					payload = SanitizeWebRTCPayload(payload)
 				}
 				if _, werr := dst.Write(payload); werr != nil {
