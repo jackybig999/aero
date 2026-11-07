@@ -7,7 +7,7 @@ language: go
 承载 AERO 单 Go 模块迁移工程；本阶段只迁移并重构 `aeroprot` 客户端、边缘服务端和 guard，保留 `aeroos` 与 `aerosub` 目录结构供后续整合。
 
 ## 版本来源
-当前版本来源为根目录 `VERSION`（当前 `1.2.25`）；发布性协议变更必须在发布前递增版本（§15.4）。
+当前版本来源为根目录 `VERSION`（当前 `1.2.29`）；发布性协议变更必须在发布前递增版本（§15.4）。
 
 ## 业务专有规则
 协议和数据面以 `AERO-V2 (Hyper-MASQUE) 落地施工方案.md` 为施工基线；`aeroos`、`aeroprot`、`aerosub` 只保留目录和代码边界，严禁交叉 `import`。

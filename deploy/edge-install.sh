@@ -30,7 +30,7 @@ DATA_DIR="/var/lib/aero"
 TLS_DIR="/var/lib/aero/tls"
 CERT_DIR="/var/lib/aero/certs"
 LOG_DIR="/var/log"
-VERSION="1.2.28"
+VERSION="1.2.29"
 REPO="jackybig999/aero"
 
 usage() {
