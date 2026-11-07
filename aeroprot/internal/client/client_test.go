@@ -4535,6 +4535,75 @@ func TestIPDataPump_LocalDNSBypass(t *testing.T) {
 	}
 }
 
+// TestIPDataPump_DomesticIPBypass 验证国内 IP 与私网 IP 绝不泄露进入远端海外隧道
+func TestIPDataPump_DomesticIPBypass(t *testing.T) {
+	mockDev := newMockTunDevWithCapture()
+	defer mockDev.Close()
+
+	var remoteWritten atomic.Bool
+	mockConn := newMockIPPacketConn()
+	mockConn.writeHook = func(b []byte) ([]byte, error) {
+		remoteWritten.Store(true)
+		return nil, nil
+	}
+
+	split := NewSplitEngine()
+	dnsH := NewDNSHandler(split)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var killSw atomic.Bool
+	pump := NewIPDataPump(ctx, mockDev, mockConn, &killSw, dnsH)
+	pump.Start()
+	defer func() {
+		_ = mockDev.Close()
+		_ = pump.Close()
+	}()
+
+	// 1. 发送国内 IP 报文 (223.5.5.5:80 HTTP) - 必须被阻断，绝不送入远端隧道
+	chinaPkt := make([]byte, 40)
+	chinaPkt[0] = 0x45
+	binary.BigEndian.PutUint16(chinaPkt[2:4], 40)
+	chinaPkt[9] = 6 // TCP
+	copy(chinaPkt[12:16], net.ParseIP("10.88.0.2").To4())
+	copy(chinaPkt[16:20], net.ParseIP("223.5.5.5").To4()) // 阿里 DNS / 阿里云公网 IP
+	mockDev.readCh <- chinaPkt
+
+	time.Sleep(100 * time.Millisecond)
+	if remoteWritten.Load() {
+		t.Fatalf("Domestic IP 223.5.5.5 was leaked to remote CONNECT-IP tunnel!")
+	}
+
+	// 2. 发送私网 IP 报文 (192.168.1.1:80) - 必须被阻断
+	privatePkt := make([]byte, 40)
+	privatePkt[0] = 0x45
+	binary.BigEndian.PutUint16(privatePkt[2:4], 40)
+	privatePkt[9] = 6
+	copy(privatePkt[12:16], net.ParseIP("10.88.0.2").To4())
+	copy(privatePkt[16:20], net.ParseIP("192.168.1.1").To4())
+	mockDev.readCh <- privatePkt
+
+	time.Sleep(100 * time.Millisecond)
+	if remoteWritten.Load() {
+		t.Fatalf("Private IP 192.168.1.1 was leaked to remote CONNECT-IP tunnel!")
+	}
+
+	// 3. 发送海外公网 IP 报文 (8.8.8.8:80) - 必须正常送入远端隧道
+	overseasPkt := make([]byte, 40)
+	overseasPkt[0] = 0x45
+	binary.BigEndian.PutUint16(overseasPkt[2:4], 40)
+	overseasPkt[9] = 6
+	copy(overseasPkt[12:16], net.ParseIP("10.88.0.2").To4())
+	copy(overseasPkt[16:20], net.ParseIP("8.8.8.8").To4())
+	mockDev.readCh <- overseasPkt
+
+	time.Sleep(100 * time.Millisecond)
+	if !remoteWritten.Load() {
+		t.Fatalf("Overseas IP 8.8.8.8 failed to be forwarded to remote CONNECT-IP tunnel")
+	}
+}
+
 func TestIPDataPump_KillSwitch_FailClosed(t *testing.T) {
 	mockDev := newMockTunDevWithCapture()
 	defer mockDev.Close()
@@ -4681,5 +4750,44 @@ func TestClient_M2_HMACVerification_WithTrafficLimit(t *testing.T) {
 	sub.TrafficLimitBytes = 200 * 1024 * 1024
 	if err := verifySubscriptionSignature(&sub); err == nil {
 		t.Fatalf("expected tampered TrafficLimitBytes to fail verification, but passed")
+	}
+}
+
+// TestResidentMixedProxyLifecycle 验证 55555 混合代理在 Stop 后仍然常驻监听，仅在 Close 时释放
+func TestResidentMixedProxyLifecycle(t *testing.T) {
+	eng := NewEngine()
+	// 使用动态随机端口进行测试
+	if err := eng.StartResidentMixedProxy("127.0.0.1:0"); err != nil {
+		t.Fatalf("StartResidentMixedProxy failed: %v", err)
+	}
+
+	addr := eng.GetListenAddr()
+	if addr == "" || addr == "127.0.0.1:55555" {
+		t.Fatalf("expected dynamic port assigned, got %s", addr)
+	}
+
+	// 1. 验证端口可连
+	c1, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to resident proxy: %v", err)
+	}
+	_ = c1.Close()
+
+	// 2. 调用 Stop()，端口必须依然常驻监听 (Permanent Daemon)
+	_ = eng.Stop()
+
+	c2, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("resident proxy port closed after Stop(): %v", err)
+	}
+	_ = c2.Close()
+
+	// 3. 调用 Close()，端口必须被关闭
+	_ = eng.Close()
+
+	c3, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+	if err == nil {
+		_ = c3.Close()
+		t.Fatal("resident proxy port must be closed after eng.Close()")
 	}
 }

@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.29"
+	ClientVersion = "1.2.30"
 	Protocol      = "aero/3.0"
 )
 
@@ -151,6 +151,8 @@ type Engine struct {
 	killSwitch        atomic.Bool
 	sentinel          *nodeSentinel
 	packetConnFactory PacketConnFactory
+	daemonCtx         context.Context
+	daemonCancel      context.CancelFunc
 
 	chainProxyMu  sync.RWMutex
 	chainProxyCfg ChainProxyConfig
@@ -202,6 +204,7 @@ func NewEngine() *Engine {
 		netMon:            NewNetworkMonitor(),
 		packetConnFactory: ListenPhysicalPacket,
 	}
+	eng.daemonCtx, eng.daemonCancel = context.WithCancel(context.Background())
 	eng.sentinel = newNodeSentinel(eng)
 	SetPacketConnFactory(ListenPhysicalPacket)
 	eng.loadChainProxyConfig()
@@ -1205,10 +1208,6 @@ func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice,
 	if ip != nil {
 		UnprotectHostRoute(ip.String())
 	}
-	if e.mixedListener != nil {
-		_ = e.mixedListener.Close()
-		e.mixedListener = nil
-	}
 	if e.rootCancel != nil {
 		e.rootCancel()
 		e.rootCancel = nil
@@ -1303,10 +1302,28 @@ func (e *Engine) closeActiveConns() {
 }
 
 func (e *Engine) getContext() context.Context {
-	if e.rootCtx != nil {
+	if e.rootCtx != nil && e.rootCtx.Err() == nil {
 		return e.rootCtx
 	}
+	if e.daemonCtx != nil && e.daemonCtx.Err() == nil {
+		return e.daemonCtx
+	}
 	return context.Background()
+}
+
+// Close 优雅释放引擎全局资源与常驻代理端口 (进程退出时调用)
+func (e *Engine) Close() error {
+	_ = e.Stop()
+	if e.daemonCancel != nil {
+		e.daemonCancel()
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.mixedListener != nil {
+		_ = e.mixedListener.Close()
+		e.mixedListener = nil
+	}
+	return nil
 }
 
 // Stop 停止客户端数据面
@@ -1328,10 +1345,6 @@ func (e *Engine) Stop() error {
 
 func (e *Engine) stopLocked() error {
 	if e.state.Load() == stateStopped && !e.running.Load() {
-		if e.mixedListener != nil {
-			_ = e.mixedListener.Close()
-			e.mixedListener = nil
-		}
 		e.lastErrMu.Lock()
 		e.lastErr = ""
 		e.lastErrCode = ""
@@ -1360,10 +1373,6 @@ func (e *Engine) stopLocked() error {
 
 	e.closeActiveConns()
 
-	if e.mixedListener != nil {
-		_ = e.mixedListener.Close()
-		e.mixedListener = nil
-	}
 	select {
 	case <-e.stopMixed:
 	default:
@@ -1803,30 +1812,34 @@ func (c *trackedConn) Close() error {
 	return c.Conn.Close()
 }
 
-// startMixedProxy 启动 SOCKS5 + HTTP CONNECT 混合端口监听
-func (e *Engine) startMixedProxy() error {
-	e.mu.RLock()
-	addr := e.listenAddr
+// StartResidentMixedProxy 启动 SOCKS5 + HTTP CONNECT 混合端口常驻守护监听 (Daemon 模式)
+func (e *Engine) StartResidentMixedProxy(addr ...string) error {
+	e.mu.Lock()
+	if len(addr) > 0 && addr[0] != "" {
+		e.listenAddr = addr[0]
+	}
+	targetAddr := e.listenAddr
 	existingLn := e.mixedListener
-	e.mu.RUnlock()
+	e.mu.Unlock()
 
 	if existingLn != nil {
 		return nil
 	}
 
-	if addr == "" {
-		addr = "127.0.0.1:55555"
+	if targetAddr == "" {
+		targetAddr = "127.0.0.1:55555"
 	}
-	ln, err := net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", targetAddr)
 	if err != nil {
-		log.Printf("[PROXY] listen on %s failed: %v", addr, err)
+		log.Printf("[PROXY] resident mixed proxy listen on %s failed: %v", targetAddr, err)
 		return err
 	}
 	e.mu.Lock()
 	e.mixedListener = ln
-	if strings.HasSuffix(addr, ":0") {
+	if strings.HasSuffix(targetAddr, ":0") {
 		e.listenAddr = ln.Addr().String()
 	}
+	actualAddr := e.listenAddr
 	e.mu.Unlock()
 
 	go func() {
@@ -1852,7 +1865,13 @@ func (e *Engine) startMixedProxy() error {
 			}(conn)
 		}
 	}()
+	log.Printf("[PROXY] resident mixed proxy listening on %s (permanent daemon)", actualAddr)
 	return nil
+}
+
+// startMixedProxy 启动 SOCKS5 + HTTP CONNECT 混合端口监听 (兼容旧接口)
+func (e *Engine) startMixedProxy() error {
+	return e.StartResidentMixedProxy()
 }
 
 func (e *Engine) serveMixedConn(conn net.Conn) {

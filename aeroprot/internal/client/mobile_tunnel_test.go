@@ -156,10 +156,10 @@ func TestUDPUnavailableFallback_NoTUN_Port55555Listening(t *testing.T) {
 		t.Fatal("mixed proxy listener (55555) must be active and listening")
 	}
 
-	// 4. 清理资源
-	_ = eng.Stop()
+	// 4. 清理资源：Close() 关闭常驻端口
+	_ = eng.Close()
 	if eng.mixedListener != nil {
-		t.Fatal("mixed listener must be closed after Stop()")
+		t.Fatal("mixed listener must be closed after Close()")
 	}
 }
 

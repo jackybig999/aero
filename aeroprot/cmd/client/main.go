@@ -57,6 +57,13 @@ func main() {
 	eng.SetListenAddr(*listenAddr)
 	eng.SetMode(*mode)
 
+	// 启动 127.0.0.1:55555 进程级常驻混合代理 (SOCKS5/HTTP CONNECT)，不随 VPN 建连断开而变动
+	if err := eng.StartResidentMixedProxy(*listenAddr); err != nil {
+		log.Printf("[CLIENT] warning: failed to start resident mixed proxy on %s: %v", *listenAddr, err)
+	} else {
+		log.Printf("[CLIENT] resident mixed proxy listening on %s (permanent daemon)", eng.GetListenAddr())
+	}
+
 	if *subURL != "" {
 		if _, err := eng.LoadAndApplySubscription(*subURL); err != nil {
 			log.Printf("[CLIENT] initial subscription load failed: %v", err)
@@ -485,6 +492,68 @@ func main() {
 		})
 	})
 
+	// 12b. 实时事件流 (Server-Sent Events) - 供第三方 UI / 高手套壳实时监听状态与吞吐
+	mux.HandleFunc("/api/v1/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		ctx := r.Context()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		// 立即推流第一帧
+		st := eng.GetState()
+		data, _ := json.Marshal(map[string]any{
+			"type":      "status",
+			"timestamp": time.Now().Unix(),
+			"state":     st,
+		})
+		_, _ = fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
+		flusher.Flush()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				st := eng.GetState()
+				data, _ := json.Marshal(map[string]any{
+					"type":      "status",
+					"timestamp": time.Now().Unix(),
+					"state":     st,
+				})
+				if _, err := fmt.Fprintf(w, "event: status\ndata: %s\n\n", data); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	})
+
+	// 12c. 核心网络安全策略管理接口 (Kill Switch / 本地防泄漏状态)
+	mux.HandleFunc("/api/v1/security/policy", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			var req struct {
+				KillSwitch *bool `json:"kill_switch"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err == nil && req.KillSwitch != nil {
+				eng.SetKillSwitch(*req.KillSwitch)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":      "ok",
+			"kill_switch": eng.KillSwitch(),
+		})
+	})
+
 	// 13. 嵌入 Web 前端静态资源
 	mux.Handle("/", http.FileServer(http.FS(uiFS)))
 
@@ -504,7 +573,7 @@ func main() {
 
 	shutdown := func() {
 		log.Println("[CLIENT] stopping engine and api server...")
-		_ = eng.Stop()
+		_ = eng.Close()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = apiServer.Shutdown(shutdownCtx)

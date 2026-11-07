@@ -277,10 +277,10 @@ func matchSplitRule(r Rule, host string, ip net.IP) bool {
 
 func isLocalOrPrivateIP(host string, ip net.IP) bool {
 	h := strings.ToLower(strings.TrimSpace(host))
-	if h == "" || h == "localhost" || h == "localhost." {
+	if h == "localhost" || h == "localhost." {
 		return true
 	}
-	if ip == nil {
+	if ip == nil && h != "" {
 		ip = net.ParseIP(h)
 	}
 	if ip == nil {

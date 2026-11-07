@@ -189,6 +189,12 @@ func (p *IPDataPump) pumpTunToRemote() {
 					continue
 				}
 			}
+
+			// 3b. 智能国内流量下沉与私网防御：若目的 IP 属于私网或中国大陆 IP，严禁送入远端海外 CONNECT-IP 隧道
+			dstIP := net.IP(raw[16:20])
+			if isLocalOrPrivateIP("", dstIP) || (p.dnsHandler != nil && p.dnsHandler.split != nil && p.dnsHandler.split.MatchIP(dstIP) == DIRECT) {
+				continue
+			}
 		} else if version == 6 {
 			if len(raw) < 40 {
 				continue

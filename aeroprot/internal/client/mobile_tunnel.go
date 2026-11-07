@@ -206,7 +206,21 @@ func CopyCONNECTIPTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn *co
 		for {
 			n, err := tun.Read(buf)
 			if n > 0 {
-				if _, werr := ipConn.WritePacket(buf[:n]); werr != nil {
+				raw := buf[:n]
+				// 移动端安全与国内流量防御性下沉拦截
+				if n >= 20 && raw[0]>>4 == 4 {
+					ihl := int(raw[0]&0x0F) * 4
+					if len(raw) >= ihl+8 && raw[9] == 17 {
+						if isSTUNPacket(raw[ihl+8:]) {
+							continue
+						}
+					}
+					dstIP := net.IP(raw[16:20])
+					if isLocalOrPrivateIP("", dstIP) {
+						continue
+					}
+				}
+				if _, werr := ipConn.WritePacket(raw); werr != nil {
 					select {
 					case errCh <- werr:
 					default:
