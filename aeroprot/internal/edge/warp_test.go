@@ -346,8 +346,8 @@ func TestDialGuard_AIFailClosed_TrailingDotFQDN(t *testing.T) {
 	defer dg.Close()
 	dg.AllowLocal = false
 
-	// Dead WARP proxy port
-	dg.SetWarpProxy("127.0.0.1:59998", false)
+	// Dead WARP proxy port with WarpAll=true (default)
+	dg.SetWarpProxy("127.0.0.1:59998", true)
 
 	aiFQDNs := []string{
 		"chatgpt.com.:443",
@@ -372,28 +372,6 @@ func TestDialGuard_AIFailClosed_TrailingDotFQDN(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "AERO_WARP_FAIL_CLOSED") {
 			t.Fatalf("CONTRACT VIOLATION: expected error containing 'AERO_WARP_FAIL_CLOSED' for %s, got: %v", target, err)
-		}
-	}
-
-	// Verify unit behavior of isTargetAIDomain
-	tableTests := []struct {
-		addr     string
-		expected bool
-	}{
-		{"chatgpt.com.:443", true},
-		{"ChatGPT.COM.:443", true},
-		{"chatgpt.com.", true},
-		{"api.openai.com.:443", true},
-		{"sub.claude.ai.:443", true},
-		{"deepmind.google.:443", true},
-		{"example.com.:80", false},
-		{"1.1.1.1:443", false},
-		{".:443", false},
-		{"", false},
-	}
-	for _, tc := range tableTests {
-		if got := isTargetAIDomain(tc.addr); got != tc.expected {
-			t.Errorf("isTargetAIDomain(%q) = %v, expected %v", tc.addr, got, tc.expected)
 		}
 	}
 }

@@ -310,7 +310,11 @@ func (g *DialGuard) Close() {
 }
 
 // SetWarpProxy configures upstream Cloudflare WARP SOCKS5 proxy
-func (g *DialGuard) SetWarpProxy(proxyAddr string, all bool) {
+func (g *DialGuard) SetWarpProxy(proxyAddr string, warpAll ...bool) {
+	all := true
+	if len(warpAll) > 0 {
+		all = warpAll[0]
+	}
 	g.SetWarpProxyWithPolicy(proxyAddr, all, false)
 }
 
@@ -351,17 +355,15 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 		dialFn = net.DialTimeout
 	}
 
-	isAIDomain := isTargetAIDomain(address)
-
 	var warpCfg *WarpRouteConfig
 	if g != nil {
 		warpCfg = g.warpCfg.Load()
 	}
 	hasWarp := warpCfg != nil && warpCfg.ProxyAddr != ""
 
-	// 智能 WARP 出口净化：当配置/探测到远端 VPS 运行了 Cloudflare WARP SOCKS5 代理时，
-	// 对 Google、OpenAI、Gemini 等 AI 限制域名（或全量流量）经由 WARP 出口转发，彻底消灭 IP 标记与 403 封锁！
-	if g != nil && hasWarp && (warpCfg.WarpAll || isAIDomain) {
+	// WARP 出站通道：当配置远端 VPS 运行了 Cloudflare WARP SOCKS5 代理时，
+	// 若开启 warpAll 或目标属于 AI 域名，经由 WARP 出口转发，消灭数据中心 IP 标记。
+	if g != nil && hasWarp && (warpCfg.WarpAll || isTargetAIDomain(address)) {
 		if g.warpHealthy.Load() {
 			c, err := dialViaSOCKS5(warpCfg.ProxyAddr, address, timeout)
 			if err == nil {
@@ -375,11 +377,11 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 			log.Printf("[WARP-CIRCUIT-OPEN] Upstream WARP dial failed for %s (%v). Circuit tripped.", address, err)
 		}
 
-		// WARP 策略收敛（M4）：统一支持 Fail-Open（平滑放行直连）与 Fail-Closed（审计阻断防泄漏）。
+		// WARP 策略收敛：统一支持 Fail-Open（平滑放行直连）与 Fail-Closed（审计阻断防泄漏）。
 		// 当配置 FailOpen=true 或设置 AERO_WARP_MODE=fail-open 时平滑放行直连出站；默认保留 Fail-Closed 保护。
 		mode := os.Getenv("AERO_WARP_MODE")
 		failOpen := (warpCfg != nil && warpCfg.FailOpen) || strings.EqualFold(mode, "fail-open")
-		if isAIDomain && !failOpen {
+		if (warpCfg.WarpAll || isTargetAIDomain(address)) && !failOpen {
 			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: direct dial refused to prevent AI region leak (target: %s)", address)
 		}
 
@@ -1009,7 +1011,6 @@ func (g *DialGuard) ShouldRouteUDP(target string, port int) bool {
 			}
 		}
 	}
-	// AI HTTP/3 / QUIC traffic (UDP 443) must be routed via WARP IPv6 to protect VPS source IP
 	if port == 443 && isTargetAIDomain(target) {
 		return true
 	}
@@ -1038,7 +1039,7 @@ func (g *DialGuard) DialUDPViaWARP(targetAddr string, timeout time.Duration) (ne
 		log.Printf("[WARP-UDP-CIRCUIT-OPEN] Upstream WARP UDP Associate failed for %s (%v). Circuit tripped.", targetAddr, err)
 		mode := os.Getenv("AERO_WARP_MODE")
 		failOpen := (cfg != nil && cfg.FailOpen) || strings.EqualFold(mode, "fail-open")
-		if isTargetAIDomain(targetAddr) && !failOpen {
+		if !failOpen {
 			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: WARP UDP Associate failed to prevent AI region leak (target: %s): %w", targetAddr, err)
 		}
 		return nil, err

@@ -32,15 +32,15 @@ func TestDialGuard_WarpPolicyConfigurableFailOpen(t *testing.T) {
 		}
 	}()
 
-	// 1. By default with dead WARP proxy, AI domain must fail closed
-	dg.SetWarpProxy("127.0.0.1:59997", false)
+	// 1. By default with dead WARP proxy and WarpAll=true, dial must fail closed
+	dg.SetWarpProxy("127.0.0.1:59997", true)
 	_, err = dg.DialTimeout("tcp", "chatgpt.com:443", 200*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "AERO_WARP_FAIL_CLOSED") {
 		t.Fatalf("expected AERO_WARP_FAIL_CLOSED default, got: %v", err)
 	}
 
-	// 2. With FailOpen=true via policy, non-AI target falls back to direct dial smoothly
-	dg.SetWarpProxyWithPolicy("127.0.0.1:59997", false, true)
+	// 2. With FailOpen=true via policy, target falls back to direct dial smoothly
+	dg.SetWarpProxyWithPolicy("127.0.0.1:59997", true, true)
 	c, err := dg.DialTimeout("tcp", targetLn.Addr().String(), 500*time.Millisecond)
 	if err != nil {
 		t.Fatalf("expected direct dial fallback on fail-open, got error: %v", err)
@@ -48,6 +48,7 @@ func TestDialGuard_WarpPolicyConfigurableFailOpen(t *testing.T) {
 	_ = c.Close()
 
 	// 3. With AERO_WARP_MODE=fail-open via environment, fallback is permitted
+	dg.SetWarpProxyWithPolicy("127.0.0.1:59997", true, false)
 	t.Setenv("AERO_WARP_MODE", "fail-open")
 	c2, err := dg.DialTimeout("tcp", targetLn.Addr().String(), 500*time.Millisecond)
 	if err != nil {

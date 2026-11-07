@@ -301,7 +301,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		log.Printf("[WARP] Explicit Cloudflare WARP SOCKS5 proxy configured at %s, AI unblocking active (all=%v)", warpProxy, cfg.WarpAll)
 	}
 	if warpProxy != "" {
-		dialGuard.SetWarpProxy(warpProxy, cfg.WarpAll)
+		warpAll := true
+		if !cfg.WarpAll && cfg.WarpProxy != "" {
+			warpAll = false
+		}
+		dialGuard.SetWarpProxy(warpProxy, warpAll)
 	}
 
 	rateLimit := NewRateLimiter(cfg.RateIP)
