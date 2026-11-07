@@ -414,8 +414,13 @@ fi
 ip addr replace 10.88.0.1/16 dev aero-tun0 2>/dev/null || true
 ip addr replace fd88:ae80::1/64 dev aero-tun0 2>/dev/null || true
 ip link set dev aero-tun0 up mtu 1360 2>/dev/null || true
+ethtool -K aero-tun0 gro off gso off tso off 2>/dev/null || true
 
 if command -v iptables >/dev/null 2>&1; then
+    # 强制 TCPMSS 钳制为 1200，杜绝外部 1500 字节大包引发的 QUIC Datagram 分片黑洞
+    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 -m comment --comment "aero_edge_default" 2>/dev/null || \
+        iptables -t mangle -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 -m comment --comment "aero_edge_default" 2>/dev/null || true
+
     # 幂等放行基础端口并打上 aero_edge_default Tag (先使用 -C 探测)
     iptables -C INPUT -p tcp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
         iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true

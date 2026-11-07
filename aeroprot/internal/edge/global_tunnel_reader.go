@@ -178,7 +178,13 @@ func (r *GlobalTunnelReader) run() {
 			if routeErr != nil {
 				continue
 			}
-			if _, writeErr := binding.Conn.WritePacket(packet); writeErr != nil && !errors.Is(writeErr, net.ErrClosed) {
+			icmpPkt, writeErr := binding.Conn.WritePacket(packet)
+			if len(icmpPkt) > 0 {
+				if writer, ok := r.device.(globalTunnelDeviceWriter); ok {
+					_, _ = writer.Write(icmpPkt)
+				}
+			}
+			if writeErr != nil && !errors.Is(writeErr, net.ErrClosed) {
 				log.Printf("[TUN] shared reader write packet failed: %v", writeErr)
 			}
 		}

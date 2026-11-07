@@ -11,6 +11,7 @@ table inet aero_edge_default {
 
     chain forward {
         type filter hook forward priority filter; policy accept;
+        tcp flags syn tcp option maxseg size set 1200 comment "aero_edge_default"
         iifname "aero-tun0" accept comment "aero_edge_default"
         oifname "aero-tun0" ct state established,related accept comment "aero_edge_default"
     }

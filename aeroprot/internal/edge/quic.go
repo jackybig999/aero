@@ -94,10 +94,10 @@ func (r *DNSResolver) checkRateLimit(token string) bool {
 	b, ok := r.rateBuckets[token]
 	if !ok {
 		b = &rateTokenBucket{
-			tokens:   49,
+			tokens:   299,
 			lastTime: now,
-			rate:     50,
-			max:      50,
+			rate:     100,
+			max:      300,
 		}
 		r.rateBuckets[token] = b
 		return true
