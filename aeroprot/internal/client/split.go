@@ -483,6 +483,13 @@ func builtinChinaDomains() []string {
 		"sohu.com", "sina.com.cn", "163yun.com", "netease.im", "tieba.com",
 		"meituan.com", "dianping.com", "ele.me", "alipayobjects.com", "suning.com",
 		"pinduoduo.com", "yangkeduo.com", "jdcache.com",
+		// 常用国民级应用与通信办公
+		"amap.com", "gaode.com", "dingtalk.com", "yuque.com", "feishu.cn", "feishu.net",
+		"10010.com", "10086.cn", "189.cn", "ctrip.com", "qunar.com", "fliggy.com",
+		"autohome.com.cn", "dongchedi.com", "yiche.com", "58.com", "bosszhipin.com",
+		"kugou.com", "kuwo.cn", "migu.cn", "miguvideo.com", "cctv.com", "cntv.cn",
+		"xinhuanet.com", "people.com.cn", "tianyancha.com", "qcc.com", "eastmoney.com",
+		"mi.com", "xiaomi.com", "huawei.com", "honor.com", "oppo.com", "vivo.com",
 		// 公共 DNS、测速与诊断工具
 		"alidns.com", "dnspod.cn", "114dns.com", "speedtest.cn", "ip138.com", "ip.cn", "chinaz.com",
 	}

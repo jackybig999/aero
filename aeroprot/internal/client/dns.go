@@ -435,8 +435,8 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return buildEmptyResponse(pkt, qname, qtype)
 	}
 
-	// 阶段三：其余境外站/非直连域名
-	// 绝对不进入 queryFastUDP！优先走真·DoH 远程安全解析获取真实公网 IP，彻底消灭 Fake-IP 黑洞
+	// 阶段三：境外站/非直连域名
+	// 绝对不进入 queryFastUDP (严格防止 DNS 泄露 SEC-11)！优先走真·DoH 远程安全解析获取真实公网 IP，彻底消灭 Fake-IP 黑洞
 	if qtype == 0x0001 {
 		if h.dohResolver != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
