@@ -312,7 +312,7 @@ func (wi *WarpInstaller) runPipeline() {
 	}
 
 	if wi.dialGuard != nil {
-		wi.dialGuard.SetWarpProxy("127.0.0.1:40000", false)
+		wi.dialGuard.SetWarpProxy("127.0.0.1:40000", true)
 	}
 
 	wi.mu.Lock()
@@ -320,9 +320,85 @@ func (wi *WarpInstaller) runPipeline() {
 	wi.status.Status = "success"
 	wi.status.Progress = 100
 	wi.status.Step = "complete"
-	wi.status.StepDesc = "WARP 安装配置成功，已接管 AI 出口流量！"
+	wi.status.StepDesc = "WARP 安装配置成功，已接管出站流量！"
 	wi.status.EndTime = &now
-	wi.appendLogLocked("success", "WARP 官方静默安装与配置全部完成！AI & Google 出口已安全接管。")
+	wi.appendLogLocked("success", "WARP 官方静默安装与配置全部完成！出站流量已安全接管。")
+	wi.mu.Unlock()
+}
+
+// StartUninstall initiates Cloudflare WARP uninstallation and cleanup.
+func (wi *WarpInstaller) StartUninstall(ctx context.Context) (status string, err error) {
+	wi.mu.Lock()
+	if wi.status.Status == "running" {
+		wi.mu.Unlock()
+		return "running", ErrInstallInProgress
+	}
+
+	now := time.Now()
+	wi.status = WarpInstallStatus{
+		Status:    "running",
+		Progress:  10,
+		Step:      "uninstall_stop",
+		StepDesc:  "正在停止 WARP 服务并清理出站路由代理...",
+		Bypassed:  false,
+		Logs:      make([]WarpLogEntry, 0, 64),
+		StartTime: &now,
+	}
+	wi.appendLogLocked("info", "启动 Cloudflare 官方 WARP 一键卸载与清理流水线...")
+	wi.mu.Unlock()
+
+	// Launch background uninstallation pipeline
+	go wi.runUninstallPipeline()
+
+	return "running", nil
+}
+
+func (wi *WarpInstaller) runUninstallPipeline() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	fail := func(step string, err error) {
+		wi.mu.Lock()
+		defer wi.mu.Unlock()
+		now := time.Now()
+		wi.status.Status = "failed"
+		wi.status.Step = step
+		wi.status.Error = err.Error()
+		wi.status.EndTime = &now
+		wi.appendLogLocked("error", fmt.Sprintf("卸载失败 [%s]: %v", step, err))
+	}
+
+	// Step 1: Disconnect and stop warp-svc
+	wi.setStep("stop", "正在断开 WARP 连接并停止系统服务...", 30)
+	if wi.dialGuard != nil {
+		wi.dialGuard.SetWarpProxy("", false)
+	}
+	_, _ = wi.execCmd(ctx, "warp-cli", "--accept-tos", "disconnect")
+	_, _ = wi.execCmd(ctx, "systemctl", "stop", "warp-svc")
+	_, _ = wi.execCmd(ctx, "systemctl", "disable", "warp-svc")
+	wi.appendLog("info", "WARP 系统服务已停止并禁用")
+
+	// Step 2: Remove package via APT
+	wi.setStep("remove", "正在卸载 cloudflare-warp 软件包...", 70)
+	_, err := wi.execCmd(ctx, "apt-get", "remove", "-y", "--purge", "cloudflare-warp")
+	if err != nil {
+		fail("remove", fmt.Errorf("卸载 cloudflare-warp 失败: %w", err))
+		return
+	}
+	_, _ = wi.execCmd(ctx, "rm", "-f", "/etc/apt/sources.list.d/cloudflare-warp.list")
+	_, _ = wi.execCmd(ctx, "rm", "-f", "/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg")
+	wi.appendLog("info", "cloudflare-warp 软件包与 APT 源已彻底清理")
+
+	// Step 3: Complete
+	wi.mu.Lock()
+	now := time.Now()
+	wi.status.Status = "idle"
+	wi.status.Progress = 100
+	wi.status.Step = "complete"
+	wi.status.StepDesc = "WARP 已成功卸载，出站已恢复原生直连"
+	wi.status.Bypassed = false
+	wi.status.EndTime = &now
+	wi.appendLogLocked("success", "Cloudflare WARP 官方一键卸载完成！出站恢复原生直连。")
 	wi.mu.Unlock()
 }
 

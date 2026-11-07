@@ -1,0 +1,39 @@
+# ==============================================================================
+# AERO Edge 边缘节点规范配置文件 (标准规范模板)
+# 
+# 【新手说明】：新手无需手动修改本配置文件！
+#              直接在 Web 控制台点击「WARP 出站接管」开关即可一键全量分流。
+# 【进阶说明】：动手用户如需精细化路由，可在此定义 outbounds 与 routing。
+# ==============================================================================
+
+# 基础跳频备用监听端口
+alt_listen_ports: [2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443]
+
+# 统一三层网络设备标识
+global_tun_device: "aero-tun0"
+
+# 出站通道定义 (Outbounds)
+outbounds:
+  # 1. VPS 原生直接出站
+  - tag: direct
+    type: direct
+
+  # 2. Cloudflare WARP 本地 SOCKS5 出站代理
+  - tag: warp-socks
+    type: socks5
+    addr: "127.0.0.1:40000"
+
+# 进阶路由规则 (Routing)
+# 默认行为：Web 控制台开启 WARP 时接管全部出站；关闭时全部直连。
+routing:
+  default_outbound: direct
+
+  # 高级用户精细化示例（取消注释即可生效）：
+  # rules:
+  #   - outbound: warp-socks
+  #     domains:
+  #       - "geosite:google"
+  #       - "geosite:openai"
+  #       - "domain:claude.ai"
+  #   - outbound: direct
+  #     default: true

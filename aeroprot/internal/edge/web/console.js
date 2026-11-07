@@ -46,8 +46,8 @@
     // WARP
     warpStatusBadge: document.getElementById('warpStatusBadge'),
     warpToggle: document.getElementById('warpToggle'),
-    warpAllToggle: document.getElementById('warpAllToggle'),
     btnInstallWarp: document.getElementById('btnInstallWarp'),
+    btnUninstallWarp: document.getElementById('btnUninstallWarp'),
     btnViewLogs: document.getElementById('btnViewLogs'),
 
     // GeoData
@@ -228,19 +228,22 @@
       const running = !!(data.warp.running || data.warp.active);
       const installed = !!(data.warp.installed || running);
       const updateAvailable = !!data.warp.update_available;
-      el.warpStatusBadge.textContent = running ? '运行中 (SOCKS5 40000)' : (installed ? '已安装 (未启动)' : '未安装');
-      el.warpStatusBadge.className = 'badge ' + (running ? 'badge-success' : 'badge-warning');
+      el.warpStatusBadge.textContent = running ? '已接管出站 (SOCKS5 40000)' : (installed ? '未开启接管 (已安装)' : '未安装');
+      el.warpStatusBadge.className = 'badge ' + (running ? 'badge-success' : (installed ? 'badge-warning' : 'badge-danger'));
 
-      if (!document.activeElement || (document.activeElement !== el.warpToggle && document.activeElement !== el.warpAllToggle)) {
+      if (!document.activeElement || document.activeElement !== el.warpToggle) {
         el.warpToggle.checked = !!running;
-        el.warpAllToggle.checked = !!data.warp.warp_all;
+      }
+
+      if (el.btnUninstallWarp) {
+        el.btnUninstallWarp.style.display = installed ? 'inline-block' : 'none';
       }
 
       if (el.btnInstallWarp) {
-        if (running && !updateAvailable) {
+        if (installed && !updateAvailable) {
           el.btnInstallWarp.disabled = true;
           el.btnInstallWarp.className = 'btn btn-secondary';
-          el.btnInstallWarp.textContent = 'WARP 官方组件已就绪 (源 IP 已保护)';
+          el.btnInstallWarp.textContent = 'WARP 官方组件已就绪';
         } else if (updateAvailable) {
           el.btnInstallWarp.disabled = false;
           el.btnInstallWarp.className = 'btn btn-primary';
@@ -477,19 +480,18 @@
   // WARP Toggles
   async function updateWarpToggle() {
     const enabled = el.warpToggle.checked;
-    const warpAll = el.warpAllToggle.checked;
     try {
       const res = await fetch(getApiUrl('/console/api/warp/toggle'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: enabled, warp_all: warpAll })
+        body: JSON.stringify({ enabled: enabled, warp_all: true })
       });
       const data = await res.json();
       if (!res.ok) {
         alert(data.error || '切换失败');
         fetchStatus();
       } else {
-        showToast(enabled ? 'WARP 智能接管已开启' : 'WARP 接管已关闭');
+        showToast(enabled ? 'WARP 出站接管已开启 (全量经由 WARP)' : 'WARP 出站接管已关闭 (直连)');
       }
     } catch (e) {
       alert(`WARP 设置失败: ${e.message}`);
@@ -498,9 +500,8 @@
   }
 
   if (el.warpToggle) el.warpToggle.addEventListener('change', updateWarpToggle);
-  if (el.warpAllToggle) el.warpAllToggle.addEventListener('change', updateWarpToggle);
 
-  // WARP Installer & Logs
+  // WARP Installer, Uninstaller & Logs
   if (el.btnInstallWarp) {
     el.btnInstallWarp.addEventListener('click', async () => {
       if (!confirm('确定启动官方 Cloudflare WARP 静默安装流水线？\n系统将自动检测旁路保护，绝不破坏现有配置。')) return;
@@ -517,6 +518,24 @@
         }
       } catch (e) {
         alert(`触发安装异常: ${e.message}`);
+      }
+    });
+  }
+
+  if (el.btnUninstallWarp) {
+    el.btnUninstallWarp.addEventListener('click', async () => {
+      if (!confirm('确定要卸载官方 Cloudflare WARP 组件吗？\n卸载后出站将恢复原生直连。')) return;
+      openLogsModal();
+      try {
+        const res = await fetch(getApiUrl('/console/api/warp/uninstall'), { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          showToast('卸载清理流水线已启动');
+        } else {
+          alert(data.error || '启动卸载失败');
+        }
+      } catch (e) {
+        alert(`触发卸载异常: ${e.message}`);
       }
     });
   }

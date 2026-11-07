@@ -204,6 +204,10 @@ func (h *ConsoleHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		h.handleAPIWarpInstall(w, r)
 		return true
 
+	case p == "/console/api/warp/uninstall" && r.Method == http.MethodPost:
+		h.handleAPIWarpUninstall(w, r)
+		return true
+
 	case p == "/console/api/warp/logs" && r.Method == http.MethodGet:
 		h.handleAPIWarpLogs(w, r)
 		return true
@@ -516,6 +520,31 @@ func (h *ConsoleHandler) handleAPIWarpInstall(w http.ResponseWriter, r *http.Req
 	})
 }
 
+func (h *ConsoleHandler) handleAPIWarpUninstall(w http.ResponseWriter, r *http.Request) {
+	if h.warpInstaller == nil {
+		h.warpInstaller = NewWarpInstaller(h.dialGuard)
+	}
+	status, err := h.warpInstaller.StartUninstall(r.Context())
+	if err != nil {
+		if errors.Is(err, ErrInstallInProgress) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"installation or uninstallation already in progress"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":false,"error":"%s"}`, err.Error())))
+		return
+	}
+
+	writeJSON(w, map[string]any{
+		"ok":      true,
+		"status":  status,
+		"message": "Cloudflare WARP uninstallation pipeline started.",
+	})
+}
+
 func (h *ConsoleHandler) handleAPIWarpLogs(w http.ResponseWriter, r *http.Request) {
 	if h.warpInstaller == nil {
 		h.warpInstaller = NewWarpInstaller(h.dialGuard)
@@ -561,7 +590,7 @@ func (h *ConsoleHandler) handleAPIWarpToggle(w http.ResponseWriter, r *http.Requ
 		}
 		_ = conn.Close()
 
-		warpAll := false
+		warpAll := true
 		if req.WarpAll != nil {
 			warpAll = *req.WarpAll
 		} else if req.CamelAll != nil {

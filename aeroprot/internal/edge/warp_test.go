@@ -176,6 +176,60 @@ func TestWarpInstaller_ConcurrentInstallConflict(t *testing.T) {
 	close(blockCh)
 }
 
+func TestWarpInstaller_UninstallPipeline(t *testing.T) {
+	dg := NewDialGuard(64)
+	defer dg.Close()
+	installer := NewWarpInstaller(dg)
+
+	// Pre-set proxy
+	dg.SetWarpProxy("127.0.0.1:40000", true)
+
+	var executedCmds []string
+	var mu sync.Mutex
+
+	installer.SetHooks(
+		func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			mu.Lock()
+			executedCmds = append(executedCmds, fmt.Sprintf("%s %s", name, strings.Join(args, " ")))
+			mu.Unlock()
+			return []byte("ok"), nil
+		},
+		func(addr string) bool { return false },
+		func(addr string) bool { return false },
+		func() bool { return false },
+		func() bool { return true },
+	)
+
+	status, err := installer.StartUninstall(context.Background())
+	if err != nil {
+		t.Fatalf("StartUninstall: %v", err)
+	}
+	if status != "running" {
+		t.Errorf("expected status 'running', got %s", status)
+	}
+
+	// Wait for pipeline to finish
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		st := installer.GetStatus()
+		if st.Status == "idle" || st.Status == "failed" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	st := installer.GetStatus()
+	if st.Status != "idle" {
+		t.Fatalf("expected uninstall status 'idle', got: %+v", st)
+	}
+
+	// Verify WARP proxy was cleared in dialGuard
+	proxy, all, enabled, _ := dg.GetWarpStatus()
+	if enabled || all || proxy != "" {
+		t.Errorf("expected dialGuard warp proxy disabled, got proxy=%s, enabled=%v", proxy, enabled)
+	}
+}
+
 func TestDialGuard_WarpToggle_RaceSafety(t *testing.T) {
 	dg := NewDialGuard(128)
 	dg.AllowLocal = true
