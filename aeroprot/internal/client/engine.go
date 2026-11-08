@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.34"
+	ClientVersion = "1.2.35"
 	Protocol      = "aero/3.0"
 )
 
@@ -1580,7 +1580,18 @@ func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
 				if scheme == "" {
 					scheme = "https"
 				}
-				targetURL = fmt.Sprintf("%s://%s/api/v1/geodata/direct", scheme, u.Host)
+				hostOnly := u.Hostname()
+				port := u.Port()
+				if port == "" || port == "443" || port == "80" {
+					if cachedPort, ok := GetCachedSubPort(hostOnly); ok && cachedPort > 0 {
+						port = strconv.Itoa(cachedPort)
+					}
+				}
+				if port != "" && port != "443" && port != "80" {
+					targetURL = fmt.Sprintf("%s://%s:%s/api/v1/geodata/direct", scheme, hostOnly, port)
+				} else {
+					targetURL = fmt.Sprintf("%s://%s/api/v1/geodata/direct", scheme, hostOnly)
+				}
 			}
 		}
 	}

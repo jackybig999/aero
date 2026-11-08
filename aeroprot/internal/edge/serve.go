@@ -326,23 +326,34 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		quicServer.SetAllowLoopbackForTest(true)
 	}
 	tunDevice := strings.TrimSpace(cfg.GlobalTUNDevice)
-	if tunDevice == "" && runtime.GOOS == "linux" {
+	if tunDevice == "" && runtime.GOOS == "linux" && !cfg.AllowSelfSignedCertForTest {
+		tunDevice = "aero-tun0"
+	} else if tunDevice == "" && runtime.GOOS == "linux" {
 		if _, err := net.InterfaceByName("aero-tun0"); err == nil {
 			tunDevice = "aero-tun0"
 		}
 	}
-	if tunDevice != "" {
+	if tunDevice != "" && runtime.GOOS == "linux" {
+		TuneKernelPerformance()
+		_ = EnableKernelForwarding()
 		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
 			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" {
 				quicServer.Close()
 				return nil, fmt.Errorf("attach configured global TUN %s: %w", tunDevice, err)
 			}
-			log.Printf("[EDGE] [WARN] Auto-detected global TUN %s could not be attached: %v (CONNECT-IP proxy may be disabled)", tunDevice, err)
+			log.Printf("[EDGE] [WARN] Auto-configured global TUN %s could not be attached: %v (CONNECT-IP proxy may be disabled)", tunDevice, err)
 		} else {
 			log.Printf("[EDGE] Global TUN device %s attached and active for CONNECT-IP data plane", tunDevice)
 			_ = ConfigureGlobalTunnelDevice(tunDevice, "10.88.0.1/16", "fd88:ae80::1/64", 1360)
-			_ = EnableKernelForwarding()
 			_ = ApplyEdgeFirewall(tunDevice)
+		}
+	} else if tunDevice != "" {
+		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
+			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" {
+				quicServer.Close()
+				return nil, fmt.Errorf("attach configured global TUN %s: %w", tunDevice, err)
+			}
+			log.Printf("[EDGE] [WARN] Global TUN %s could not be attached: %v", tunDevice, err)
 		}
 	}
 
@@ -465,8 +476,24 @@ func (s *Server) Start() error {
 		log.Printf("[EDGE] ECH enabled for domain %s (keys count: %d)", s.cfg.Domain, len(s.cfg.EncryptedClientHelloKeys))
 	}
 
-	// 1. TCP/TLS Listener (支持 443/8443 端口被第三方业务占用时进程内无损智能轮试自愈)
-	ln, err := tls.Listen("tcp", s.cfg.Listen, tlsCfg)
+	// 1. TCP/TLS & QUIC Dual-Stack Listener (支持 443/8443 等主端口被占用或 UDP 碰撞时双协议原子轮试自愈)
+	checkPortDualStackFree := func(addr string) bool {
+		uconn, uerr := net.ListenPacket("udp", addr)
+		if uerr != nil {
+			return false
+		}
+		_ = uconn.Close()
+		return true
+	}
+
+	var ln net.Listener
+	var err error
+	if checkPortDualStackFree(s.cfg.Listen) {
+		ln, err = tls.Listen("tcp", s.cfg.Listen, tlsCfg)
+	} else {
+		err = &net.OpError{Op: "listen", Net: "udp", Err: syscall.EADDRINUSE}
+	}
+
 	if err != nil {
 		if isAddrInUse(err) {
 			rotatedLn, newAddr, rerr := tryPortFallbackTCP(s.cfg.Listen, tlsCfg)
@@ -480,7 +507,7 @@ func (s *Server) Start() error {
 					}
 				}
 			} else {
-				return fmt.Errorf("tcp listen %s: %w", s.cfg.Listen, err)
+				return fmt.Errorf("dual-stack listen %s: %w", s.cfg.Listen, err)
 			}
 		} else {
 			return fmt.Errorf("tcp listen %s: %w", s.cfg.Listen, err)
@@ -518,7 +545,11 @@ func (s *Server) Start() error {
 	if primaryPort > 0 {
 		boundPorts[primaryPort] = true
 	}
-	for _, port := range s.cfg.AltListenPorts {
+	altPorts := s.cfg.AltListenPorts
+	if len(altPorts) == 0 {
+		altPorts = StandardCandidatePorts
+	}
+	for _, port := range altPorts {
 		if port <= 0 || port > 65535 || boundPorts[port] {
 			continue
 		}

@@ -898,6 +898,9 @@ func BootstrapSubscription(cfg ServerConfig, cert *tls.Certificate) (*SubStore, 
 	if len(altPorts) == 0 && len(cfg.AltListenPorts) > 0 {
 		altPorts = append([]int(nil), cfg.AltListenPorts...)
 	}
+	if len(altPorts) == 0 {
+		altPorts = append([]int(nil), StandardCandidatePorts...)
+	}
 
 	if err := store.Ensure(EnsureSubParams{
 		Name:        "default",

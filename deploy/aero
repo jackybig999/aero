@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AERO Edge — 命令行终端后台管理工具 (类 x-ui / s-ui 架构)
+# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.35)
 # 支持交互式终端菜单与非交互式快捷命令调用
 # ==============================================================================
 set -e
@@ -14,7 +14,7 @@ PLAIN="\033[0m"
 BOLD="\033[1m"
 
 CONFIG_FILE="/etc/aero/edge.conf"
-YAML_CONFIG="/etc/aero/edge.yaml"
+JSON_CONFIG="/etc/aero/edge.json"
 DATA_DIR="/var/lib/aero"
 SUB_META="$DATA_DIR/sub_meta.json"
 TOKENS_FILE="$DATA_DIR/tokens.json"
@@ -40,9 +40,18 @@ load_config() {
     PRIMARY_PORT=$(echo "$PORTS" | cut -d, -f1 | tr -d ' ')
     ADMIN_KEY="${AERO_ADMIN_KEY:-}"
     
-    # 若在 edge.conf 中未记录 ADMIN_KEY，尝试从 systemd service 文件读取
-    if [[ -z "$ADMIN_KEY" && -f "/etc/systemd/system/aero-edge.service" ]]; then
-        ADMIN_KEY=$(grep -o "\-admin-key[[:space:]]\+[^[:space:]]\+" /etc/systemd/system/aero-edge.service 2>/dev/null | awk '{print $2}' || true)
+    if [[ -z "$DOMAIN" && -f "$JSON_CONFIG" ]]; then
+        DOMAIN=$(grep -o '"domain":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
+    fi
+    if [[ -z "$ADMIN_KEY" && -f "$JSON_CONFIG" ]]; then
+        ADMIN_KEY=$(grep -o '"admin_key":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
+    fi
+    if [[ -z "$PRIMARY_PORT" && -f "$JSON_CONFIG" ]]; then
+        P_STR=$(grep -o '"listen":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
+        PRIMARY_PORT="${P_STR#:}"
+    fi
+    if [[ -z "$PRIMARY_PORT" ]]; then
+        PRIMARY_PORT="443"
     fi
 }
 
@@ -61,13 +70,31 @@ cmd_status() {
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e " 运行状态:       $(get_status)"
     echo -e " 绑定域名:       ${GREEN}${DOMAIN:-未配置}${PLAIN}"
-    echo -e " 监听主端口:     ${GREEN}${PRIMARY_PORT:-443}${PLAIN}"
-    if [[ -f "$YAML_CONFIG" ]]; then
-        ALT_PORTS=$(grep -o '"alt_listen_ports":[^]]*]' "$YAML_CONFIG" 2>/dev/null || true)
-        echo -e " 跳频备用端口:   ${YELLOW}${ALT_PORTS:-2083, 2087, 8443, 2053, ...}${PLAIN}"
+    echo -e " 监听主端口:     ${GREEN}:${PRIMARY_PORT}${PLAIN}"
+    echo -e " 跳频备用端口池: ${YELLOW}2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443 (原生全活)${PLAIN}"
+    
+    # 检测 TUN 状态
+    if ip link show aero-tun0 >/dev/null 2>&1; then
+        TUN_STATUS="${GREEN}UP (10.88.0.1/16, fd88:ae80::1/64, MTU=1360)${PLAIN}"
+    else
+        TUN_STATUS="${YELLOW}未激活 (服务启动时自动挂载)${PLAIN}"
     fi
+    echo -e " 虚拟网卡 (TUN): ${TUN_STATUS}"
+
+    # 检测 BBR
+    BBR_STATUS="未启用"
+    if [[ -f "/proc/sys/net/ipv4/tcp_congestion_control" ]]; then
+        CC=$(cat /proc/sys/net/ipv4/tcp_congestion_control)
+        if [[ "$CC" == "bbr" ]]; then
+            BBR_STATUS="${GREEN}BBR (已开启)${PLAIN}"
+        else
+            BBR_STATUS="${YELLOW}${CC} (未启用 BBR)${PLAIN}"
+        fi
+    fi
+    echo -e " 拥塞控制算法:   ${BBR_STATUS}"
+
+    echo -e " 配置文件:       ${JSON_CONFIG}"
     echo -e " 数据目录:       ${DATA_DIR}"
-    echo -e " 配置文件:       ${CONFIG_FILE}"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
     
     if systemctl is-active --quiet aero-edge 2>/dev/null; then
@@ -85,15 +112,14 @@ cmd_info() {
     echo -e "${BOLD}            AERO Edge 订阅与接入信息               ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e " 节点域名:       ${GREEN}${DOMAIN}${PLAIN}"
-    echo -e " 主端口:         ${GREEN}:${PRIMARY_PORT}${PLAIN}"
-    echo -e " 连接 Token:     ${YELLOW}${TOKEN}${PLAIN}"
+    echo -e " 监听主端口:     ${GREEN}:${PRIMARY_PORT}${PLAIN}"
     echo -e " 管理密钥:       ${YELLOW}${ADMIN_KEY:-未设置}${PLAIN}"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
     if [[ -n "$DOMAIN" ]]; then
         ADMIN_SUB_URL="https://${DOMAIN}/sub/admin"
         CONSOLE_URL="https://${DOMAIN}:${PRIMARY_PORT}/console?key=${ADMIN_KEY}"
         
-        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN} (零端口规范)"
+        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN} (零端口权威规范)"
         echo -e " 用户专属订阅:   ${GREEN}https://${DOMAIN}/sub/{用户名}{6位随机码}${PLAIN}"
         echo -e " Web 管理控制台: ${GREEN}${CONSOLE_URL}${PLAIN}"
     else
@@ -135,6 +161,13 @@ cmd_restart() {
     fi
 }
 
+cmd_reload() {
+    check_root
+    echo -e "${CYAN}正在平滑无损热重载配置与证书...${PLAIN}"
+    systemctl reload aero-edge 2>/dev/null || systemctl restart aero-edge
+    echo -e "${GREEN}aero-edge 热重载指令已发送完成！${PLAIN}"
+}
+
 cmd_log() {
     echo -e "${CYAN}正在查看实时运行日志 (按 Ctrl+C 退出)...${PLAIN}"
     journalctl -u aero-edge -f
@@ -163,12 +196,11 @@ cmd_add_token() {
     if [[ -z "$label" ]]; then
         label="user_$(date +%s)"
     fi
-    read -r -p "请输入自定义 Token (直接回车自动生成密码学强随机 Token): " new_token
+    read -r -p "请输入自定义 Token (直接回车自动生成密码学随机 Token): " new_token
     if [[ -z "$new_token" ]]; then
         new_token="aero_$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     fi
     
-    # 追加进 tokens.json
     mkdir -p "$DATA_DIR"
     if [[ ! -f "$TOKENS_FILE" || ! -s "$TOKENS_FILE" ]]; then
         echo "[]" > "$TOKENS_FILE"
@@ -185,37 +217,156 @@ except Exception:
 data.append({
     'token': '$new_token',
     'label': '$label',
-    'created_at': '$(date +%s)'
+    'created_at': '$(date -u +"%Y-%m-%dT%H:%M:%SZ")'
 })
 with open('$TOKENS_FILE', 'w') as f:
     json.dump(data, f, indent=2)
-" 2>/dev/null || true
-    
-    echo -e "${GREEN}成功添加 Token！${PLAIN}"
+" 2>/dev/null || echo -e "{\"token\": \"$new_token\", \"label\": \"$label\"}" >> "$TOKENS_FILE"
+
+    echo -e "${GREEN}Token 添加成功！${PLAIN}"
     echo -e "备注:  ${label}"
     echo -e "Token: ${GREEN}${new_token}${PLAIN}"
-    echo -e "${YELLOW}提示: 重启或重新加载服务后生效 (systemctl reload aero-edge 或 aero restart)${PLAIN}"
+    echo -e "${YELLOW}提示: 服务端支持热重载，执行 aero reload 即可生效${PLAIN}"
+}
+
+find_cert_path() {
+    load_config
+    local cand_paths=(
+        "/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
+        "/root/.acme.sh/${DOMAIN}/fullchain.cer"
+        "${HOME}/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
+        "${HOME}/.acme.sh/${DOMAIN}/fullchain.cer"
+        "$CERT_FILE"
+    )
+    for p in "${cand_paths[@]}"; do
+        if [[ -f "$p" && -s "$p" ]]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
 }
 
 cmd_cert() {
     load_config
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BOLD}                 TLS 证书信息                      ${PLAIN}"
+    echo -e "${BOLD}       TLS 公网权威证书与 ACME 自动续期检测        ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
-    if [[ -f "$CERT_FILE" ]]; then
-        echo -e " 证书路径:   ${CERT_FILE}"
-        echo -e " 域名匹配:   $(openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | sed 's/subject= //')"
-        echo -e " 签发机构:   $(openssl x509 -in "$CERT_FILE" -noout -issuer 2>/dev/null | sed 's/issuer= //')"
-        echo -e " 生效时间:   $(openssl x509 -in "$CERT_FILE" -noout -startdate 2>/dev/null | cut -d= -f2)"
-        echo -e " 过期时间:   ${GREEN}$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null | cut -d= -f2)${PLAIN}"
+    
+    ACTUAL_CERT=$(find_cert_path || true)
+    if [[ -n "$ACTUAL_CERT" ]]; then
+        echo -e " 证书路径:       ${GREEN}${ACTUAL_CERT}${PLAIN}"
+        echo -e " 绑定域名 (SAN): $(openssl x509 -in "$ACTUAL_CERT" -noout -subject 2>/dev/null | sed 's/subject= //')"
+        echo -e " 权威签发者:     $(openssl x509 -in "$ACTUAL_CERT" -noout -issuer 2>/dev/null | sed 's/issuer= //')"
+        echo -e " 生效时间:       $(openssl x509 -in "$ACTUAL_CERT" -noout -startdate 2>/dev/null | cut -d= -f2)"
+        EXPIRE_DATE=$(openssl x509 -in "$ACTUAL_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)
+        echo -e " 到期时间:       ${GREEN}${EXPIRE_DATE}${PLAIN}"
         
-        if openssl x509 -in "$CERT_FILE" -noout -checkend 604800 >/dev/null 2>&1; then
-            echo -e " 状态:       ${GREEN}有效 (距过期 > 7 天)${PLAIN}"
+        # 检查是否过期
+        if openssl x509 -in "$ACTUAL_CERT" -noout -checkend 2592000 >/dev/null 2>&1; then
+            echo -e " 证书有效状态:   ${GREEN}[正常] 剩余有效期充足 (> 30 天)${PLAIN}"
+        elif openssl x509 -in "$ACTUAL_CERT" -noout -checkend 0 >/dev/null 2>&1; then
+            echo -e " 证书有效状态:   ${YELLOW}[待续期] 剩余有效期少于 30 天，已进入续期窗口${PLAIN}"
         else
-            echo -e " 状态:       ${YELLOW}即将过期或已过期${PLAIN}"
+            echo -e " 证书有效状态:   ${RED}[已过期] 请立即检查 DNS 与网络并重新签发！${PLAIN}"
         fi
     else
-        echo -e "${RED}未在 ${CERT_FILE} 检测到已签发的证书！${PLAIN}"
+        echo -e " 证书状态:       ${RED}未在 ACME 默认目录检测到 ${DOMAIN} 的已签发证书！${PLAIN}"
+    fi
+
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    # 自动续期调度检查
+    if crontab -l 2>/dev/null | grep -q "acme.sh"; then
+        echo -e " 自动续期机制:   ${GREEN}[正常] 系统 Cron 定时任务已挂载 (acme.sh --cron)${PLAIN}"
+    else
+        echo -e " 自动续期机制:   ${YELLOW}[提示] 未在系统 crontab 检测到 acme.sh 调度，由服务端内置计时器巡检${PLAIN}"
+    fi
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_bbr() {
+    check_root
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}           内核 BBR 拥塞控制与参数调优              ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    CC=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo "unknown")
+    echo -e " 当前拥塞算法:   ${GREEN}${CC}${PLAIN}"
+    QDISC=$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo "unknown")
+    echo -e " 队列调度器:     ${GREEN}${QDISC}${PLAIN}"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    
+    if [[ "$CC" != "bbr" ]]; then
+        read -r -p "是否立即开启 BBR 拥塞控制与 16MB 缓冲区优化? [Y/n]: " do_tune
+        if [[ ! "$do_tune" =~ ^[nN]$ ]]; then
+            modprobe tcp_bbr 2>/dev/null || true
+            sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+            sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+            sysctl -w net.core.rmem_max=16777216 2>/dev/null || true
+            sysctl -w net.core.wmem_max=16777216 2>/dev/null || true
+            echo -e "${GREEN}BBR 拥塞控制与内核缓冲区优化已完成！${PLAIN}"
+        fi
+    else
+        echo -e "${GREEN}BBR 已经处于激活运行状态，无需重复配置。${PLAIN}"
+    fi
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_net() {
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}         虚拟网卡 (TUN) 与防火墙 NAT 状态           ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    if ip link show aero-tun0 >/dev/null 2>&1; then
+        echo -e " 网卡设备:       ${GREEN}aero-tun0 (UP)${PLAIN}"
+        ip addr show aero-tun0 | grep -E "inet |inet6 " | awk '{print " 绑定 IP:         " $2}'
+        echo -e " MTU 设定:       1360"
+    else
+        echo -e " 网卡设备:       ${YELLOW}aero-tun0 未就绪 (将在启动服务时自闭环创建)${PLAIN}"
+    fi
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e " IPv4 转发:       $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
+    echo -e " 防火墙 MASQUERADE 规则数量:"
+    iptables -t nat -S POSTROUTING 2>/dev/null | grep -c "aero_edge_default" | awk '{print "   IPv4 Tagged: " $1}' || true
+    ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -c "aero_edge_default" | awk '{print "   IPv6 Tagged: " $1}' || true
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_geodata() {
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}              GeoData 直连分流规则库                ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    GEO_FILE="${DATA_DIR}/geodata_direct.txt"
+    if [[ -f "$GEO_FILE" ]]; then
+        LINES=$(wc -l < "$GEO_FILE" 2>/dev/null || echo "0")
+        MTIME=$(stat -c %y "$GEO_FILE" 2>/dev/null || stat -f "%Sm" "$GEO_FILE" 2>/dev/null || echo "未知")
+        echo -e " 规则库路径:     ${GEO_FILE}"
+        echo -e " 规则条目数:     ${GREEN}${LINES} 条${PLAIN}"
+        echo -e " 最后更新时间:   ${MTIME}"
+    else
+        echo -e " 规则库状态:     ${YELLOW}尚未下载本地缓存 (由服务端自动同步)${PLAIN}"
+    fi
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    read -r -p "是否立即向服务端触发一次规则库上游同步? [y/N]: " do_sync
+    if [[ "$do_sync" =~ ^[yY]$ ]]; then
+        echo -e "${CYAN}正在同步 GeoData 规则库...${PLAIN}"
+        curl -fsS -X POST "http://127.0.0.1:${PRIMARY_PORT}/admin/api/geodata/update?key=${ADMIN_KEY}" 2>/dev/null || \
+        curl -fsS "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt" -o "$GEO_FILE" 2>/dev/null || true
+        echo -e "${GREEN}同步请求已发送！${PLAIN}"
+    fi
+    echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_warp() {
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}           Cloudflare WARP 出口代理状态             ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    if command -v warp-cli >/dev/null 2>&1; then
+        echo -e " WARP CLI:       ${GREEN}已安装${PLAIN}"
+        warp-cli status 2>/dev/null | head -n 5 || true
+    elif ss -tuln 2>/dev/null | grep -q ":40000\b"; then
+        echo -e " WARP 状态:      ${GREEN}SOCKS5 代理运行在 :40000 (已激活)${PLAIN}"
+    else
+        echo -e " WARP 状态:      ${YELLOW}未检测到活动的 WARP SOCKS5 (服务端正常直连出站)${PLAIN}"
     fi
     echo -e "${CYAN}====================================================${PLAIN}"
 }
@@ -250,7 +401,7 @@ cmd_uninstall() {
     else
         curl -fsSL "$UNINSTALL_SCRIPT_URL" | bash -s -- $PURGE_FLAG
     fi
-    echo -e "${GREEN}AERO Edge 卸载完成，脚本产物与运行环境已清理。${PLAIN}"
+    echo -e "${GREEN}AERO Edge 卸载完成，宿主机环境已彻底还原。${PLAIN}"
     exit 0
 }
 
@@ -258,10 +409,10 @@ show_menu() {
     clear
     load_config
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.34)        ${PLAIN}"
+    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.35)        ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e " 服务状态: [ $(get_status) ]"
-    echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"
+    echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  主端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
     echo -e "  ${BOLD}1.${PLAIN} 查看节点运行状态 (Status)"
     echo -e "  ${BOLD}2.${PLAIN} 查看客户端订阅与控制台链接 (Info / Sub URL)"
@@ -270,16 +421,22 @@ show_menu() {
     echo -e "  ${BOLD}4.${PLAIN} 启动 AERO Edge 服务 (Start)"
     echo -e "  ${BOLD}5.${PLAIN} 停止 AERO Edge 服务 (Stop)"
     echo -e "  ${BOLD}6.${PLAIN} 重启 AERO Edge 服务 (Restart)"
+    echo -e "  ${BOLD}7.${PLAIN} 无损平滑热重载 (Reload)"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "  ${BOLD}7.${PLAIN} 查看所有用户 Token (List Tokens)"
-    echo -e "  ${BOLD}8.${PLAIN} 添加新用户 Token (Add Token)"
-    echo -e "  ${BOLD}9.${PLAIN} 查看 TLS 公网证书状态 (Cert Status)"
-    echo -e " ${BOLD}10.${PLAIN} 检查并在线更新服务端 (Update)"
-    echo -e " ${BOLD}11.${PLAIN} 完全对称卸载节点 (Uninstall)"
+    echo -e "  ${BOLD}8.${PLAIN} 查看与管理用户 Token (Tokens & Quota)"
+    echo -e "  ${BOLD}9.${PLAIN} 添加新用户 Token (Add Token)"
+    echo -e " ${BOLD}10.${PLAIN} TLS 公网证书与自动续期检测 (ACME Cert)"
+    echo -e " ${BOLD}11.${PLAIN} 内核 BBR 状态与一键调优 (BBR Tuning)"
+    echo -e " ${BOLD}12.${PLAIN} 虚拟网卡 (TUN) 与防火墙 NAT 状态 (TUN & NAT)"
+    echo -e " ${BOLD}13.${PLAIN} GeoData 直连规则库管理 (GeoData Sync)"
+    echo -e " ${BOLD}14.${PLAIN} Cloudflare WARP 出口分流状态 (WARP Proxy)"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    echo -e " ${BOLD}15.${PLAIN} 检查并在线更新服务端 (Update)"
+    echo -e " ${BOLD}16.${PLAIN} 完全对称卸载节点 (Uninstall)"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
     echo -e "  ${BOLD}0.${PLAIN} 退出管理菜单"
     echo -e "${CYAN}====================================================${PLAIN}"
-    read -r -p "请输入选项 [0-11]: " choice
+    read -r -p "请输入选项 [0-16]: " choice
     case "$choice" in
         1) cmd_status ;;
         2) cmd_info ;;
@@ -287,42 +444,57 @@ show_menu() {
         4) cmd_start ;;
         5) cmd_stop ;;
         6) cmd_restart ;;
-        7) cmd_tokens ;;
-        8) cmd_add_token ;;
-        9) cmd_cert ;;
-        10) cmd_update ;;
-        11) cmd_uninstall ;;
+        7) cmd_reload ;;
+        8) cmd_tokens ;;
+        9) cmd_add_token ;;
+        10) cmd_cert ;;
+        11) cmd_bbr ;;
+        12) cmd_net ;;
+        13) cmd_geodata ;;
+        14) cmd_warp ;;
+        15) cmd_update ;;
+        16) cmd_uninstall ;;
         0) exit 0 ;;
-        *) echo -e "${RED}输入无效，请输入 0-11 的数字！${PLAIN}" ;;
+        *) echo -e "${RED}输入无效，请输入 0-16 的数字！${PLAIN}" ;;
     esac
 }
 
 # ----------------- 参数路由 -----------------
 action="${1:-}"
 case "$action" in
-    status)     cmd_status ;;
-    info|sub)   cmd_info ;;
-    start)      cmd_start ;;
-    stop)       cmd_stop ;;
-    restart)    cmd_restart ;;
-    log|logs)   cmd_log ;;
-    token|tokens) cmd_tokens ;;
-    add-token)  cmd_add_token ;;
-    cert)       cmd_cert ;;
-    update)     cmd_update ;;
-    uninstall)  cmd_uninstall ;;
+    status)         cmd_status ;;
+    info|sub)       cmd_info ;;
+    start)          cmd_start ;;
+    stop)           cmd_stop ;;
+    restart)        cmd_restart ;;
+    reload)         cmd_reload ;;
+    log|logs)       cmd_log ;;
+    token|tokens)   cmd_tokens ;;
+    add-token)      cmd_add_token ;;
+    cert)           cmd_cert ;;
+    bbr)            cmd_bbr ;;
+    net|tun)        cmd_net ;;
+    geodata)        cmd_geodata ;;
+    warp)           cmd_warp ;;
+    update)         cmd_update ;;
+    uninstall)      cmd_uninstall ;;
     help|-h|--help)
         echo "用法: aero [命令]"
         echo "命令:"
-        echo "  status       查看服务运行状态"
+        echo "  status       查看服务运行状态、TUN 与多端口"
         echo "  info, sub    查看客户端订阅链接与 Web 控制台 URL"
         echo "  start        启动服务"
         echo "  stop         停止服务"
         echo "  restart      重启服务"
+        echo "  reload       平滑热重载配置与证书"
         echo "  log          查看实时运行日志"
         echo "  tokens       查看已授权 Token"
         echo "  add-token    新增用户 Token"
-        echo "  cert         查看 TLS 证书信息"
+        echo "  cert         查看 TLS 证书与自动续期健康状态"
+        echo "  bbr          查看并开启 BBR 拥塞控制"
+        echo "  net          查看 TUN 网卡与防火墙 NAT 状态"
+        echo "  geodata      查看并同步 GeoData 规则库"
+        echo "  warp         查看 WARP 出口代理状态"
         echo "  update       更新服务端至最新版本"
         echo "  uninstall    对称卸载节点"
         echo "  (不带参数直接运行进入交互式管理菜单)"

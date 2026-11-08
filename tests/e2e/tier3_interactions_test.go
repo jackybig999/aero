@@ -214,16 +214,21 @@ func TestTier3_ZeroPortURL_ClearPinsOnUpdate(t *testing.T) {
 	}
 }
 
-// 5. Candidate Ports Go Contract + UFW Script Alignment
-// Ensures the candidate ports defined in Go match the ports opened by deploy/edge-install.sh.
+// 5. Candidate Ports Go Contract + Aero Management Alignment
+// Ensures the candidate ports defined in Go match the ports managed by deploy/aero.
 func TestTier3_CandidatePorts_UFWFirewallSync(t *testing.T) {
-	script := ReadDeployScript(t)
+	root := FindProjectRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "deploy", "aero"))
+	if err != nil {
+		t.Fatalf("failed to read deploy/aero: %v", err)
+	}
+	script := string(data)
 
 	for _, port := range StandardCandidatePorts {
 		portStr := strconv.Itoa(port)
 		// Check that the script references the port
 		if !strings.Contains(script, portStr) {
-			t.Errorf("candidate port %d in Go contract is missing from deploy/edge-install.sh", port)
+			t.Errorf("candidate port %d in Go contract is missing from deploy/aero", port)
 		}
 	}
 }

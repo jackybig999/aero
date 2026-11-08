@@ -1,663 +1,135 @@
-#!/bin/bash
-# AERO Edge — 一键安装
-#
-# 证书策略（生产）：
-#   1) 已有 /var/lib/aero/tls/{fullchain,privkey}.pem 且未过期 → 跳过
-#   2) 否则从 acme.sh / certbot 拷贝
-#   3) 否则 acme.sh 签发：Let's Encrypt 首选，ZeroSSL 备选
-#   4) 禁止自签证书；失败则退出
-#   5) cron 自动续签 + install-cert reload
-#
-# 端口：默认服务端 443（-p 可改）；客户端默认 55555 见 aero-ech -listen
-#
-# 用法:
-#   bash install.sh -d edge.example.com
-#   bash install.sh -d edge.example.com -p 443 -b ./aero-edge
-#   bash install.sh -d edge.example.com -e admin@example.com
-#
+#!/usr/bin/env bash
+# ==============================================================================
+# AERO Edge — 轻量级极简安装引导器 (Zero Server Coupling)
+# 职责边界：纯粹的二进制下载与 systemd 服务托管，绝不侵入任何网络/防火墙/证书逻辑
+# ==============================================================================
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-    echo "错误: 必须使用 root 用户执行安装程序 (请使用 sudo su - 或切换为 root)！"
+    echo "错误: 必须使用 root 用户执行安装程序！"
     exit 1
 fi
 
-TOKEN=""
-ADMIN_KEY=""
 DOMAIN=""
-ADVERTISE_IP=""
-EMAIL=""
-PORTS="443"
-SNI=""
-CUSTOM_CERT=""
-CUSTOM_KEY=""
-FORCE_CLEAN=0
-INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/aero"
-DATA_DIR="/var/lib/aero"
-TLS_DIR="/var/lib/aero/tls"
-CERT_DIR="/var/lib/aero/certs"
-LOG_DIR="/var/log"
-VERSION="1.2.34"
+ADMIN_KEY=""
+TOKEN=""
+PORT="443"
+LOCAL_BIN=""
 REPO="jackybig999/aero"
-
-usage() {
-    echo "AERO Edge 一键安装"
-    echo "  -d, --domain DOMAIN     域名（必须；ACME HTTP-01 需 :80 可达）"
-    echo "  -k, --admin-key KEY     管理员控制台与管控 API 密钥（可选，默认自动生成或复用已有配置）"
-    echo "  -i, --ip IP             写入订阅的备用公网 IP（有域名时可选）"
-    echo "  -t, --token TOKEN       可选，默认自动生成或复用已有配置"
-    echo "  -c, --cert FILE         已有 TLS 公网证书 fullchain.pem 路径（跳过 ACME 签发）"
-    echo "  -y, --key FILE          已有 TLS 私钥 privkey.pem 路径（配合 -c 使用）"
-    echo "  -e, --email EMAIL       ACME 邮箱（默认 admin@DOMAIN）"
-    echo "  -p, --ports PORTS       监听端口，默认 443（可改，如 443 或 8443）"
-    echo "  -s, --sni SNI           TLS SNI（默认 = 域名）"
-    echo "      --clean, --force    安装前先彻底清理旧版本残留环境与配置"
-    echo "  -h, --help              显示帮助信息"
-    exit 0
-}
+VERSION="1.2.35"
 
 while [[ $# -gt 0 ]]; do
-    trimmed=$(echo "$1" | tr -d '[:space:]')
-    if [[ -z "$trimmed" ]]; then
-        shift
-        continue
-    fi
-    case $1 in
-        -t|--token) TOKEN="$2"; shift 2 ;;
-        -k|--admin-key) ADMIN_KEY="$2"; shift 2 ;;
+    case "$1" in
         -d|--domain) DOMAIN="$2"; shift 2 ;;
-        -i|--ip) ADVERTISE_IP="$2"; shift 2 ;;
-        -e|--email) EMAIL="$2"; shift 2 ;;
-        -p|--ports) PORTS="$2"; shift 2 ;;
-        -s|--sni) SNI="$2"; shift 2 ;;
-        -c|--cert) CUSTOM_CERT="$2"; shift 2 ;;
-        -y|--key) CUSTOM_KEY="$2"; shift 2 ;;
-        --clean|--force) FORCE_CLEAN=1; shift ;;
-        -h|--help) usage ;;
-        *) echo "未知选项: $1"; usage ;;
+        -k|--admin-key) ADMIN_KEY="$2"; shift 2 ;;
+        -t|--token) TOKEN="$2"; shift 2 ;;
+        -p|--port) PORT="$2"; shift 2 ;;
+        -b|--binary) LOCAL_BIN="$2"; shift 2 ;;
+        -h|--help)
+            echo "用法: bash edge-install.sh -d <域名> [选项]"
+            echo "选项:"
+            echo "  -d, --domain DOMAIN     公网绑定域名 (必须)"
+            echo "  -k, --admin-key KEY     管理员 API / Web 控制台密钥"
+            echo "  -t, --token TOKEN       初始客户端连接 Token (可选，默认自动生成)"
+            echo "  -p, --port PORT         主监听端口 (默认 443)"
+            echo "  -b, --binary PATH       使用本地预编译二进制文件安装"
+            exit 0
+            ;;
+        *)
+            if [[ -z "$DOMAIN" ]]; then
+                DOMAIN="$1"
+            elif [[ -z "$ADMIN_KEY" ]]; then
+                ADMIN_KEY="$1"
+            fi
+            shift
+            ;;
     esac
 done
 
-# 若要求全新安装，先对称清理旧环境
-if [[ "$FORCE_CLEAN" -eq 1 ]]; then
-    echo "[clean] 正在执行前置彻底清理..."
-    if [[ -f "$INSTALL_DIR/edge-uninstall.sh" ]]; then
-        bash "$INSTALL_DIR/edge-uninstall.sh" --purge 2>/dev/null || true
-    fi
-fi
-
-# 优先复用已有 edge.conf 配置，杜绝重复安装时 token / admin-key 被无故刷新
-if [[ -f "$CONFIG_DIR/edge.conf" ]]; then
-    EXISTING_TOKEN=$(grep -E "^AERO_TOKEN=" "$CONFIG_DIR/edge.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
-    EXISTING_ADMIN_KEY=$(grep -E "^AERO_ADMIN_KEY=" "$CONFIG_DIR/edge.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
-    EXISTING_DOMAIN=$(grep -E "^AERO_DOMAIN=" "$CONFIG_DIR/edge.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
-    if [[ -z "$DOMAIN" && -n "$EXISTING_DOMAIN" ]]; then
-        DOMAIN="$EXISTING_DOMAIN"
-        echo "提示: 复用已有配置中的 domain: $DOMAIN"
-    fi
-    if [[ -z "$TOKEN" && -n "$EXISTING_TOKEN" ]]; then
-        TOKEN="$EXISTING_TOKEN"
-        echo "提示: 复用已有配置中的 token"
-    fi
-    if [[ -z "$ADMIN_KEY" && -n "$EXISTING_ADMIN_KEY" ]]; then
-        ADMIN_KEY="$EXISTING_ADMIN_KEY"
-        echo "提示: 复用已有配置中的 admin-key"
-    fi
-fi
-
 if [[ -z "$DOMAIN" ]]; then
-    echo "错误: 必须提供 -d DOMAIN（生产环境禁止自签，需公网证书）"
-    usage
+    read -r -p "请输入节点绑定的公网合法域名 (如 edge.example.com): " DOMAIN
 fi
-if [[ -z "$TOKEN" ]]; then
-    TOKEN="aero_$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    echo "提示: 已自动生成 token"
-fi
-if [[ -z "$ADMIN_KEY" ]]; then
-    ADMIN_KEY="aero_admin_$(openssl rand -hex 12 2>/dev/null || head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    echo "提示: 已自动生成 admin-key"
-fi
-if [[ -z "$SNI" ]]; then
-    SNI="$DOMAIN"
-fi
-if [[ -z "$EMAIL" ]]; then
-    EMAIL="admin@${DOMAIN}"
-fi
-
-detect_best_https_port() {
-    local preferred="$1"
-    local candidates=("$preferred" 2083 2087 8443 2053 2096 10443 24443 34443 44443)
-    local tested=" "
-    for p in "${candidates[@]}"; do
-        if [[ "$tested" =~ " ${p} " ]]; then
-            continue
-        fi
-        tested+="${p} "
-
-        local in_use=0
-        if command -v ss >/dev/null 2>&1; then
-            if ss -tuln 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge"; then
-                in_use=1
-            fi
-        elif command -v netstat >/dev/null 2>&1; then
-            if netstat -tuln 2>/dev/null | grep -E ":$p\b" | grep -qv "aero-edge"; then
-                in_use=1
-            fi
-        elif command -v fuser >/dev/null 2>&1; then
-            if fuser "$p/tcp" >/dev/null 2>&1 || fuser "$p/udp" >/dev/null 2>&1; then
-                in_use=1
-            fi
-        fi
-
-        if [[ "$in_use" -eq 0 ]]; then
-            echo "$p"
-            return 0
-        fi
-    done
-    echo "$preferred"
-}
-
-ADVERTISE_HOST="${DOMAIN:-$ADVERTISE_IP}"
-PRIMARY_PORT=$(echo "$PORTS" | cut -d, -f1 | tr -d ' ')
-if [[ "$PRIMARY_PORT" == "443" || "$PRIMARY_PORT" == "auto" || -z "$PRIMARY_PORT" ]]; then
-    systemctl stop aero-edge 2>/dev/null || true
-    BEST_PORT=$(detect_best_https_port 443)
-    if [[ "$BEST_PORT" != "443" ]]; then
-        echo "[port] 443 端口被其他服务占用 (如 sing-box/s-ui/nginx)，自动优选标准 HTTPS 备用端口: ${BEST_PORT}"
-        PRIMARY_PORT="$BEST_PORT"
-        PORTS="$BEST_PORT"
-    else
-        PRIMARY_PORT="443"
-        PORTS="443"
-    fi
-fi
-
-CERT="$TLS_DIR/fullchain.pem"
-KEY="$TLS_DIR/privkey.pem"
-
-echo "========================================="
-echo " AERO Edge v${VERSION}"
-echo " domain:    $DOMAIN"
-echo " advertise: $ADVERTISE_HOST"
-echo " ports:     $PORTS (active/selected)"
-echo " data:      $DATA_DIR"
-echo " tls:       $TLS_DIR"
-echo " cert:      LE first, ZeroSSL backup; no self-sign"
-echo "========================================="
-
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64)  ARCH="amd64" ;;
-    aarch64) ARCH="arm64" ;;
-    armv7l)  ARCH="armv7" ;;
-esac
-
-mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$CERT_DIR" "$TLS_DIR"
-
-# --- edge.conf ---
-cat > "$CONFIG_DIR/edge.conf" << CONF
-AERO_DATA_DIR=$DATA_DIR
-AERO_TOKEN=$TOKEN
-AERO_DOMAIN=$DOMAIN
-AERO_PORTS=$PORTS
-AERO_SNI=$SNI
-AERO_ADVERTISE=$ADVERTISE_HOST
-AERO_ADMIN_KEY=$ADMIN_KEY
-CONF
-chmod 600 "$CONFIG_DIR/edge.conf"
-
-# --- edge.yaml: 规范化注入跳频备用端口与 ECH 配置 ---
-cat > "$CONFIG_DIR/edge.yaml" << 'EOF'
-{
-  "alt_listen_ports": [2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443],
-  "global_tun_device": "aero-tun0",
-  "ech": ""
-}
-EOF
-chmod 644 "$CONFIG_DIR/edge.yaml"
-
-# --- binary: backup existing for rollback ---
-echo "[bin] install aeroprot-edge -> $INSTALL_DIR/aero-edge"
-if [[ -f "$INSTALL_DIR/aero-edge" ]]; then
-    cp -f "$INSTALL_DIR/aero-edge" "$INSTALL_DIR/aero-edge.bak" 2>/dev/null || true
-fi
-
-BINARY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/edge_linux_${ARCH}"
-LATEST_URL="https://github.com/${REPO}/releases/latest/download/edge_linux_${ARCH}"
-LEGACY_URL="https://github.com/${REPO}/releases/download/v${VERSION}/aeroprot-edge-linux-${ARCH}"
-installed_ok=0
-
-if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL "$BINARY_URL" -o "$INSTALL_DIR/aeroprot-edge" 2>/dev/null; then
-        echo "[bin] 成功从官方 Release (v${VERSION}) 拉取服务端二进制产物。"
-        installed_ok=1
-    elif curl -fsSL "$LATEST_URL" -o "$INSTALL_DIR/aeroprot-edge" 2>/dev/null; then
-        echo "[bin] 成功从官方最新 Release 拉取服务端二进制产物。"
-        installed_ok=1
-    elif curl -fsSL "$LEGACY_URL" -o "$INSTALL_DIR/aeroprot-edge" 2>/dev/null; then
-        echo "[bin] 成功从官方兼容 Release 拉取服务端二进制产物。"
-        installed_ok=1
-    fi
-fi
-
-if [[ "$installed_ok" -eq 0 ]]; then
-    echo "[bin] 官方 Release 资产未就绪，正在从官方公开仓库源码构建..."
-    TMP_SRC=$(mktemp -d /tmp/aero-src-XXXXXX)
-    if git clone --depth 1 "https://github.com/${REPO}.git" "$TMP_SRC"; then
-        if ! command -v go >/dev/null 2>&1; then
-            echo "[bin] 目标主机缺少 go 编译器，正在自动安装..."
-            apt-get update -y && apt-get install -y golang-go >/dev/null 2>&1 || yum install -y golang >/dev/null 2>&1 || true
-        fi
-        if [[ -d "$TMP_SRC/aeroprot/cmd/edge" ]]; then
-            (cd "$TMP_SRC" && go build -v -ldflags="-s -w" -o "$INSTALL_DIR/aeroprot-edge" ./aeroprot/cmd/edge)
-        elif [[ -d "$TMP_SRC/cmd/edge" ]]; then
-            (cd "$TMP_SRC" && go build -v -ldflags="-s -w" -o "$INSTALL_DIR/aeroprot-edge" ./cmd/edge)
-        elif [[ -d "$TMP_SRC/protocol/server/vps" ]]; then
-            (cd "$TMP_SRC/protocol/server/vps" && go build -v -ldflags="-s -w" -o "$INSTALL_DIR/aeroprot-edge" .)
-        fi
-        rm -rf "$TMP_SRC"
-        echo "[bin] 官方公开源直接构建完成。"
-        installed_ok=1
-    else
-        echo "[bin] 错误: 无法从官方公开源拉取发布包或源码: https://github.com/${REPO}"
-        rm -rf "$TMP_SRC"
-        exit 1
-    fi
-fi
-chmod 755 "$INSTALL_DIR/aeroprot-edge"
-ln -sf "$INSTALL_DIR/aeroprot-edge" "$INSTALL_DIR/aero-edge"
-
-# --- CLI & 运维工具: 安装 aero 交互式管理菜单 (类 x-ui / s-ui) ---
-AERO_CLI_URL="https://raw.githubusercontent.com/${REPO}/main/deploy/aero"
-UNINSTALL_URL="https://raw.githubusercontent.com/${REPO}/main/deploy/edge-uninstall.sh"
-IS_LOCAL=0
-if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && -f "${BASH_SOURCE[0]}" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
-    if [[ -f "$SCRIPT_DIR/deploy/aero" ]]; then
-        SCRIPT_DIR="$SCRIPT_DIR/deploy"
-    fi
-    if [[ -f "$SCRIPT_DIR/aero" ]]; then
-        IS_LOCAL=1
-    fi
-fi
-
-if [[ "$IS_LOCAL" -eq 1 ]]; then
-    cp -f "$SCRIPT_DIR/aero" "$INSTALL_DIR/aero"
-    cp -f "$SCRIPT_DIR/edge-uninstall.sh" "$INSTALL_DIR/edge-uninstall.sh" 2>/dev/null || true
-elif command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$AERO_CLI_URL" -o "$INSTALL_DIR/aero" 2>/dev/null || true
-    curl -fsSL "$UNINSTALL_URL" -o "$INSTALL_DIR/edge-uninstall.sh" 2>/dev/null || true
-fi
-
-if [[ -f "$INSTALL_DIR/aero" ]]; then
-    chmod 755 "$INSTALL_DIR/aero"
-    ln -sf "$INSTALL_DIR/aero" "/usr/bin/aero" 2>/dev/null || true
-    echo "[cli] 终端交互管理工具已就绪: 输入 'aero' 即可呼出管理菜单"
-fi
-if [[ -f "$INSTALL_DIR/edge-uninstall.sh" ]]; then
-    chmod 755 "$INSTALL_DIR/edge-uninstall.sh"
-fi
-
-# --- TLS: detect → custom → copy → issue (LE → ZeroSSL) → never self-sign ---
-need_issue=1
-
-# 1. 优先使用用户命令行通过 -c / -y 显式传入的公网证书
-if [[ -n "$CUSTOM_CERT" && -n "$CUSTOM_KEY" ]]; then
-    if [[ -f "$CUSTOM_CERT" && -f "$CUSTOM_KEY" ]]; then
-        cp -f "$CUSTOM_CERT" "$CERT"
-        cp -f "$CUSTOM_KEY" "$KEY"
-        chmod 644 "$CERT"; chmod 600 "$KEY"
-        echo "[cert] CERT_STATUS=custom_provided (成功加载用户指定外部证书: $CUSTOM_CERT)"
-        need_issue=0
-    else
-        echo "错误: 指定的外部证书或私钥文件未找到: $CUSTOM_CERT 或 $CUSTOM_KEY"
-        exit 1
-    fi
-fi
-
-# 2. 检查现有证书是否有效
-if [[ "$need_issue" -eq 1 && -f "$CERT" && -f "$KEY" ]]; then
-    if openssl x509 -in "$CERT" -noout -checkend 86400 >/dev/null 2>&1; then
-        echo "[cert] CERT_STATUS=existing_ok (已有公网证书未过期，跳过 ACME 签发)"
-        need_issue=0
-    else
-        echo "[cert] CERT_STATUS=existing_expiring"
-    fi
-fi
-
-# 3. 检查系统常见路径下是否有该域名的有效证书
-if [[ "$need_issue" -eq 1 ]]; then
-    for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}" "/etc/letsencrypt/live/${DOMAIN}" "/root/cert/${DOMAIN}" "/root/certs/${DOMAIN}" "/root/cert" "/root/certs" "/etc/cert/${DOMAIN}" "/etc/certs/${DOMAIN}" "/etc/nginx/ssl/${DOMAIN}" "/etc/nginx/ssl" "/etc/ssl/${DOMAIN}"; do
-        FC=""
-        [[ -f "$d/fullchain.cer" ]] && FC="$d/fullchain.cer"
-        [[ -f "$d/fullchain.pem" ]] && FC="$d/fullchain.pem"
-        [[ -f "$d/${DOMAIN}.cer" ]] && FC="$d/${DOMAIN}.cer"
-        KY=""
-        [[ -f "$d/privkey.pem" ]] && KY="$d/privkey.pem"
-        [[ -f "$d/${DOMAIN}.key" ]] && KY="$d/${DOMAIN}.key"
-        if [[ -z "$KY" ]]; then
-            KY=$(ls "$d"/*.key 2>/dev/null | head -1 || true)
-        fi
-        if [[ -n "$FC" && -n "$KY" && -f "$FC" && -f "$KY" ]]; then
-            cp -f "$FC" "$CERT"
-            cp -f "$KY" "$KEY"
-            chmod 644 "$CERT"; chmod 600 "$KEY"
-            echo "[cert] CERT_STATUS=copied_from $d"
-            need_issue=0
-            break
-        fi
-    done
-fi
-
-# 4. 需要在线签发时，先检测 DNS 解析与解除 80 端口占用
-if [[ "$need_issue" -eq 1 ]]; then
-    echo "[cert] CERT_STATUS=issuing (启动 ACME HTTP-01 验证，需要 80 端口)"
-
-    # 探测域名 DNS 是否已指向本机 IP
-    RESOLVED_IP=""
-    if command -v getent >/dev/null 2>&1; then
-        RESOLVED_IP=$(getent ahosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -n1 || true)
-    fi
-    if [[ -z "$RESOLVED_IP" ]] && command -v ping >/dev/null 2>&1; then
-        RESOLVED_IP=$(ping -c 1 -W 2 "$DOMAIN" 2>/dev/null | grep -oE "\([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)" | tr -d '()' | head -n1 || true)
-    fi
-    if [[ -n "$RESOLVED_IP" ]]; then
-        echo "[cert] 域名 DNS 解析探测: $DOMAIN -> $RESOLVED_IP"
-    fi
-
-    # 解除可能占用 80 端口的 Web 进程 (如 nginx/caddy/apache2)
-    systemctl stop aero-edge nginx caddy apache2 httpd 2>/dev/null || true
-    if command -v fuser >/dev/null 2>&1; then
-        fuser -k 80/tcp 2>/dev/null || true
-    fi
-    sleep 1
-
-    export HOME=/root
-    if [[ ! -f /root/.acme.sh/acme.sh ]]; then
-        echo "[cert] installing acme.sh…"
-        curl -fsSL https://get.acme.sh | sh -s email="$EMAIL" || true
-    fi
-    ACME=/root/.acme.sh/acme.sh
-    if [[ ! -x "$ACME" ]]; then
-        echo "[cert] ERROR: acme.sh 缺失且自动安装失败；拒绝自签"
-        exit 1
-    fi
-
-    # Primary: Let's Encrypt
-    echo "[cert] try Let's Encrypt…"
-    "$ACME" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-    "$ACME" --issue -d "$DOMAIN" --standalone --keylength ec-256 --force 2>&1 | tail -30 || true
-
-    if [[ ! -f "/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer" && ! -f "/root/.acme.sh/${DOMAIN}/fullchain.cer" ]]; then
-        echo "[cert] LE failed → try ZeroSSL (backup CA)…"
-        "$ACME" --set-default-ca --server zerossl >/dev/null 2>&1 || true
-        "$ACME" --register-account -m "$EMAIL" >/dev/null 2>&1 || true
-        "$ACME" --issue -d "$DOMAIN" --standalone --keylength ec-256 --force 2>&1 | tail -30 || true
-    fi
-
-    issued=0
-    for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}"; do
-        if [[ -f "$d/fullchain.cer" ]]; then
-            cp -f "$d/fullchain.cer" "$CERT"
-            cp -f "$(ls "$d"/*.key | head -1)" "$KEY"
-            chmod 644 "$CERT"; chmod 600 "$KEY"
-            echo "[cert] CERT_STATUS=issued_ok from $d"
-            "$ACME" --install-cert -d "$DOMAIN" --ecc \
-                --fullchain-file "$CERT" --key-file "$KEY" \
-                --reloadcmd "systemctl reload aero-edge 2>/dev/null || systemctl restart aero-edge" 2>/dev/null \
-              || "$ACME" --install-cert -d "$DOMAIN" \
-                --fullchain-file "$CERT" --key-file "$KEY" \
-                --reloadcmd "systemctl restart aero-edge" 2>/dev/null || true
-            issued=1
-            break
-        fi
-    done
-    if [[ "$issued" != "1" ]]; then
-        echo "[cert] CERT_STATUS=FAILED_no_public_cert"
-        echo "=================================================================="
-        echo "ERROR: 无法为域名 $DOMAIN 签发公网证书！请严格核实以下关键项："
-        echo "  1. 域名解析: 请确认域名 $DOMAIN 的 A 记录已指向本机公网 IP (当前探测解析: ${RESOLVED_IP:-未解析})"
-        echo "  2. CDN 代理: 若使用 Cloudflare，请务必将代理状态关闭 (改为仅 DNS / 灰色云朵)，否则 HTTP-01 验证无法直达本机"
-        echo "  3. 防火墙安全组: 请确认服务商后台防火墙 / 安全组已放行 TCP 80 与业务端口 ${PRIMARY_PORT}"
-        echo "  4. 外部已有证书: 若您已有可用证书，可使用参数跳过 ACME: -c <fullchain.pem> -y <privkey.pem>"
-        echo "  5. 或手动将公网证书放置于: $CERT 与 $KEY"
-        echo "=================================================================="
-        if [[ -f /root/.acme.sh/acme.sh.log ]]; then
-            echo "--- acme.sh 详细执行日志 (末尾 20 行) ---"
-            tail -n 20 /root/.acme.sh/acme.sh.log || true
-            echo "----------------------------------------"
-        fi
-        exit 1
-    fi
-fi
-
-if [[ -f "$CERT" ]]; then
-    openssl x509 -in "$CERT" -noout -issuer -subject -dates 2>/dev/null | sed 's/^/[cert] /' || true
-fi
-
-# cron renew（acme.sh 自带；再保险一条）
-crontab -l 2>/dev/null | grep -q "aero-edge" || (
-    crontab -l 2>/dev/null
-    echo "0 3 * * * /root/.acme.sh/acme.sh --cron --home /root/.acme.sh > /dev/null 2>&1 # aero-edge-renew"
-) | crontab - 2>/dev/null || true
-
-# --- systemd: static LE/ZeroSSL PEMs only（-cert/-key），不走 -autocert 自签回退 ---
-cat > /etc/systemd/system/aero-edge.service << SERVICE
-[Unit]
-Description=AERO Edge Server
-After=network.target
-
-[Service]
-Type=simple
-Restart=always
-RestartSec=5
-WorkingDirectory=$DATA_DIR
-Environment=AERO_DATA_DIR=$DATA_DIR
-EnvironmentFile=-$CONFIG_DIR/edge.conf
-ExecStart=$INSTALL_DIR/aero-edge \\
-  -token $TOKEN \\
-  -admin-key $ADMIN_KEY \\
-  -listen :${PRIMARY_PORT} \\
-  -profile small \\
-  -data-dir $DATA_DIR \\
-  -domain $DOMAIN \\
-  -advertise-host $ADVERTISE_HOST \\
-  -global-tun aero-tun0 \\
-  -cert $CERT \\
-  -key $KEY \\
-  -config $CONFIG_DIR/edge.yaml
-LimitNOFILE=65535
-LimitNPROC=65535
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-# --- firewall: open PRIMARY_PORT (TCP+UDP), 80, and secondary ports 2083/2087/8443 ---
-echo "[firewall] 放行业务端口 TCP/UDP ${PRIMARY_PORT} 与 ACME TCP 80，及备用端口池"
-CANDIDATE_POOL="2083,2087,8443,2053,2096,10443,24443,34443,44443"
-if command -v ufw >/dev/null 2>&1; then
-    ufw allow "${PRIMARY_PORT}/tcp" 2>/dev/null || true
-    ufw allow "${PRIMARY_PORT}/udp" 2>/dev/null || true
-    ufw allow 80/tcp 2>/dev/null || true
-    for cp in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
-        ufw allow "${cp}/tcp" 2>/dev/null || true
-        ufw allow "${cp}/udp" 2>/dev/null || true
-    done
-fi
-# --- 虚拟 TUN 接口与网络转发 (落地方案 §7.1，幂等创建与探测) ---
-OUT_IF=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
-if [[ -z "$OUT_IF" ]]; then
-    OUT_IF=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $5}' | head -n1)
-fi
-
-if ! ip link show aero-tun0 >/dev/null 2>&1; then
-    echo "[network] 幂等探测与创建 aero-tun0 TUN 接口..."
-    ip tuntap add mode tun dev aero-tun0 2>/dev/null || true
-fi
-ip addr replace 10.88.0.1/16 dev aero-tun0 2>/dev/null || true
-ip addr replace fd88:ae80::1/64 dev aero-tun0 2>/dev/null || true
-ip link set dev aero-tun0 up mtu 1360 2>/dev/null || true
-ethtool -K aero-tun0 gro off gso off tso off 2>/dev/null || true
-
-if command -v iptables >/dev/null 2>&1; then
-    # 强制 TCPMSS 钳制为 1200，杜绝外部 1500 字节大包引发的 QUIC Datagram 分片黑洞
-    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 -m comment --comment "aero_edge_default" 2>/dev/null || \
-        iptables -t mangle -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1200 -m comment --comment "aero_edge_default" 2>/dev/null || true
-
-    # 幂等放行基础端口并打上 aero_edge_default Tag (先使用 -C 探测)
-    iptables -C INPUT -p tcp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p tcp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-    iptables -C INPUT -p udp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p udp --dport "${PRIMARY_PORT}" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-    iptables -C INPUT -p tcp --dport 80 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p tcp --dport 80 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-    iptables -C INPUT -p udp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p udp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-    iptables -C INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p tcp -m multiport --dports "$CANDIDATE_POOL" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-
-    # aero-tun0 转发与 MASQUERADE 规则（严格对齐方案 §7.1，出口网卡 SNAT 与受控转发）
-    iptables -C FORWARD -i aero-tun0 -o aero-tun0 -m comment --comment "aero_edge_default" -j DROP 2>/dev/null || \
-        iptables -I FORWARD -i aero-tun0 -o aero-tun0 -m comment --comment "aero_edge_default" -j DROP 2>/dev/null || true
-
-    if [[ -n "$OUT_IF" ]]; then
-        iptables -C FORWARD -i aero-tun0 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -i aero-tun0 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-        iptables -C FORWARD -i "$OUT_IF" -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -i "$OUT_IF" -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-        iptables -t nat -C POSTROUTING -s 10.88.0.0/16 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || \
-            iptables -t nat -A POSTROUTING -s 10.88.0.0/16 -o "$OUT_IF" -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || true
-    fi
-
-    # 清理历史反向错误残留规则
-    iptables -t nat -D POSTROUTING -o aero-tun0 -m comment --comment "aero_edge_default" -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -i aero-tun0 -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -o aero-tun0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "aero_edge_default" -j ACCEPT 2>/dev/null || true
-
-    # 彻底杜绝内核级 NAT PREROUTING REDIRECT，保障服务端物理多端口原生监听
-    # 主动清理历史版本残留的 PREROUTING REDIRECT 规则 (防止 NAT 劫持)
-    iptables -t nat -D PREROUTING -p udp -m multiport --dports "$CANDIDATE_POOL" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
-    iptables -t nat -D PREROUTING -p udp -m multiport --dports "$CANDIDATE_POOL" -j REDIRECT --to-ports 443 2>/dev/null || true
-    for cp in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
-        iptables -t nat -D PREROUTING -p udp --dport "$cp" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
-        iptables -t nat -D PREROUTING -p tcp --dport "$cp" -j REDIRECT --to-ports "${PRIMARY_PORT}" 2>/dev/null || true
-        iptables -t nat -D PREROUTING -p udp --dport "$cp" -j REDIRECT --to-ports 443 2>/dev/null || true
-        iptables -t nat -D PREROUTING -p tcp --dport "$cp" -j REDIRECT --to-ports 443 2>/dev/null || true
-    done
-    while read -r rule; do
-        if [[ -n "$rule" && "$rule" =~ -A\ PREROUTING.*-j\ REDIRECT ]]; then
-            del_rule="${rule/-A/-D}"
-            iptables -t nat $del_rule 2>/dev/null || true
-        fi
-    done < <(iptables -t nat -S PREROUTING 2>/dev/null | grep -E "(2083|2087|8443|2053|2096|10443|24443|34443|44443)" | grep "REDIRECT" || true)
-fi
-if command -v nft >/dev/null 2>&1; then
-    nft delete table inet aero_nat 2>/dev/null || true
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
-    if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/edge.nft" ]]; then
-        nft -f "$SCRIPT_DIR/edge.nft" 2>/dev/null || true
-    fi
-fi
-# --- sysctl: 备份并固化 BBRv3、FQ 队列与 128MB TCP/UDP 跨洋流控窗口 (Rule Phase 4.5 & L6 & §7.1) ---
-echo "[sysctl] 备份原有配置并优化 BBR 拥塞控制与 128MB TCP/UDP 缓冲区"
-BACKUP_DIR="${CONFIG_DIR}"
-mkdir -p "${BACKUP_DIR}"
-if [[ ! -f "${BACKUP_DIR}/sysctl_orig.conf" ]]; then
-    echo "net.ipv4.ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" > "${BACKUP_DIR}/sysctl_orig.conf"
-    echo "net.ipv6.conf.all.forwarding=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo 0)" >> "${BACKUP_DIR}/sysctl_orig.conf"
-    echo "net.netfilter.nf_conntrack_max=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 65536)" >> "${BACKUP_DIR}/sysctl_orig.conf"
-fi
-if [[ -f "/etc/sysctl.d/99-aero-sysctl.conf" && ! -f "/etc/sysctl.d/99-aero-sysctl.conf.bak" ]]; then
-    cp -f "/etc/sysctl.d/99-aero-sysctl.conf" "/etc/sysctl.d/99-aero-sysctl.conf.bak"
-fi
-if [[ -f "/etc/sysctl.d/99-aero-bbr.conf" && ! -f "/etc/sysctl.d/99-aero-bbr.conf.bak" ]]; then
-    cp -f "/etc/sysctl.d/99-aero-bbr.conf" "/etc/sysctl.d/99-aero-bbr.conf.bak"
-fi
-cat > /etc/sysctl.d/99-aero-sysctl.conf << 'EOF'
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-net.ipv4.tcp_mtu_probing = 1
-net.core.netdev_max_backlog = 10000
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 600
-net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 60
-EOF
-cp -f /etc/sysctl.d/99-aero-sysctl.conf /etc/sysctl.d/99-aero-bbr.conf 2>/dev/null || true
-sysctl --system >/dev/null 2>&1 || true
-
-systemctl daemon-reload
-systemctl enable aero-edge
-systemctl restart aero-edge
-
-# --- health check & auto-rollback ---
-sleep 2
-if ! systemctl is-active --quiet aero-edge; then
-    echo "[rollback] 启动失败，触发自动回滚..."
-    if [[ -f "$INSTALL_DIR/aero-edge.bak" ]]; then
-        cp -f "$INSTALL_DIR/aero-edge.bak" "$INSTALL_DIR/aero-edge"
-        systemctl restart aero-edge
-        echo "[rollback] 已成功回滚至上一版本并恢复运行"
-    else
-        echo "[rollback] 无备份可回滚"
-        journalctl -u aero-edge -n 30 --no-pager || true
-        exit 1
-    fi
-fi
-
-echo "[wait] edge writing subscription..."
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    if [[ -f "$DATA_DIR/sub_meta.json" && -f "$DATA_DIR/client-sub.json" ]]; then
-        break
-    fi
-    sleep 1
-done
-
-if [[ ! -f "$DATA_DIR/sub_meta.json" ]]; then
-    echo "错误: 未生成 $DATA_DIR/sub_meta.json"
-    journalctl -u aero-edge -n 40 --no-pager || true
+if [[ -z "$DOMAIN" ]]; then
+    echo "错误: 必须提供公网域名！"
     exit 1
 fi
 
-cp -f "$DATA_DIR/client-sub.json" "$CONFIG_DIR/client-sub.json" 2>/dev/null || true
+ARCH="amd64"
+[ "$(uname -m)" = "aarch64" ] && ARCH="arm64"
 
-# 零端口订阅链接绝对红线（Zero-Port Mandate: 严禁携带非 443 端口，由客户端并发探测自愈穿透）
-ADMIN_SUB_URL="https://${ADVERTISE_HOST}/sub/admin"
-CONSOLE_URL="https://${ADVERTISE_HOST}:${PRIMARY_PORT}/console?key=${ADMIN_KEY}"
+mkdir -p /usr/local/bin /etc/aero /var/lib/aero
 
-echo ""
-echo "========================================="
-echo " 安装完成 — 客户端一键导入"
-echo "========================================="
-echo " Token:       $TOKEN"
-echo " Admin Key:   $ADMIN_KEY"
-echo " Web Console: $CONSOLE_URL"
-echo " Listen:      :${PRIMARY_PORT} (QUIC+TLS 双栈)"
-echo " Cert:        $CERT (public CA, auto-renew)"
-echo " Data dir:    $DATA_DIR"
-echo " Admin Sub:   $ADMIN_SUB_URL (零端口管理员全量订阅)"
-echo ""
-echo " 订阅规范说明 (严格零端口红线):"
-echo "   1. 管理员全量订阅: $ADMIN_SUB_URL"
-echo "   2. 用户专属订阅:   https://${ADVERTISE_HOST}/sub/{用户名}{6位随机码}"
-echo "      (登录 Web 控制台为指定用户一键签发专属零端口链接)"
-echo ""
-echo " 客户端（本机混合口默认 55555，可 -listen 改）:"
-echo "   aero-ech -sub $ADMIN_SUB_URL -listen 127.0.0.1:55555"
-echo "   浏览器/软件代理设为 127.0.0.1:55555（HTTP 或 SOCKS5）"
-echo "   不改 Windows 注册表 / 系统代理"
-echo ""
-echo " 终端管理: 输入 'aero' 呼出交互式管理后台 (类似 x-ui / s-ui)"
-echo " 服务状态: systemctl status aero-edge | journalctl -u aero-edge -f"
-echo "========================================="
+# 1. 部署二进制产物
+echo "[1/4] 安装 AERO Edge 核心服务..."
+if [[ -n "$LOCAL_BIN" && -f "$LOCAL_BIN" ]]; then
+    cp -f "$LOCAL_BIN" /usr/local/bin/aero-edge
+else
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/edge_linux_${ARCH}"
+    echo "正在从 GitHub Release 下载最新二进制: ${DOWNLOAD_URL}"
+    curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/aero-edge || {
+        echo "从 latest 下载失败，尝试从当前版本 v${VERSION} 下载..."
+        curl -fsSL "https://github.com/${REPO}/releases/download/v${VERSION}/edge_linux_${ARCH}" -o /usr/local/bin/aero-edge
+    }
+fi
+chmod +x /usr/local/bin/aero-edge
+
+# 部署命令行管理工具
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+if [[ -f "${SCRIPT_DIR}/aero" ]]; then
+    cp -f "${SCRIPT_DIR}/aero" /usr/local/bin/aero
+    chmod +x /usr/local/bin/aero
+elif [[ -f "/usr/local/bin/aero-edge" ]]; then
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/deploy/aero" -o /usr/local/bin/aero 2>/dev/null || true
+    chmod +x /usr/local/bin/aero 2>/dev/null || true
+fi
+
+# 2. 写入标准化启动配置 (所有网络、防火墙、ACME、BBR 由服务端 Go 二进制内部自驱)
+PRIMARY_PORT="${PORT}"
+echo "[2/4] 写入服务基础配置..."
+cat > /etc/aero/edge.json <<EOF
+{
+  "listen": ":${PRIMARY_PORT}",
+  "domain": "${DOMAIN}",
+  "admin_key": "${ADMIN_KEY}",
+  "token": "${TOKEN}",
+  "data_dir": "/var/lib/aero"
+}
+EOF
+
+cat > /etc/aero/edge.conf <<EOF
+AERO_DOMAIN="${DOMAIN}"
+AERO_PORTS="${PRIMARY_PORT}"
+AERO_ADMIN_KEY="${ADMIN_KEY}"
+EOF
+chmod 600 /etc/aero/edge.json /etc/aero/edge.conf
+
+# 防火墙与网络：由服务端 Go 二进制内部自驱治理 (nat_linux.go 动态挂载并保证进程退出时完全对称清理)
+
+# 3. 注册并启动 systemd 系统服务
+echo "[3/4] 注册并启动 systemd 守护进程..."
+cat > /etc/systemd/system/aero-edge.service <<EOF
+[Unit]
+Description=AERO Edge High-Performance Protocol Daemon
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aero-edge -config /etc/aero/edge.json -listen :${PRIMARY_PORT}
+Restart=always
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now aero-edge
+
+# 4. 输出就绪信息
+echo "[4/4] AERO Edge 服务安装已完成并启动！"
+sleep 1
+if [[ -x "/usr/local/bin/aero" ]]; then
+    /usr/local/bin/aero info || true
+fi

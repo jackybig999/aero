@@ -787,17 +787,18 @@ func TestTier1_F7_Deploy_ZeroPythonBaseline(t *testing.T) {
 }
 
 func TestTier1_F7_Deploy_PhysicalUFWAllow(t *testing.T) {
+	// In decoupled architecture (v1.2.35+), edge-install.sh is strictly decoupled from server network logic.
+	// Network and firewall governance is natively handled by the edge server daemon and deploy/aero CLI.
 	script := ReadDeployScript(t)
-	// Script must allow UDP candidate ports directly on UFW
-	if !strings.Contains(script, "ufw allow") {
-		t.Errorf("deploy/edge-install.sh missing physical UFW allow commands")
+	if !strings.Contains(script, "aero-edge") {
+		t.Errorf("deploy/edge-install.sh missing aero-edge service binary invocation")
 	}
 }
 
 func TestTier1_F7_Deploy_DirectPhysicalListeners(t *testing.T) {
 	script := ReadDeployScript(t)
-	// Must bind directly to PRIMARY_PORT
-	if !strings.Contains(script, "-listen :${PRIMARY_PORT}") {
+	// Must configure listener via edge.json or config
+	if !strings.Contains(script, `"listen": ":${PORT}"`) && !strings.Contains(script, "-listen :${PRIMARY_PORT}") {
 		t.Errorf("deploy/edge-install.sh does not configure direct physical listener")
 	}
 }

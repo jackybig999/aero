@@ -73,6 +73,19 @@ func EnableKernelForwarding() error {
 	return nil
 }
 
+// TuneKernelPerformance 自主检查并启用 BBR 拥塞控制，并自适应优化内核 socket 缓冲区到 16MB
+func TuneKernelPerformance() {
+	if cc, err := os.ReadFile("/proc/sys/net/ipv4/tcp_congestion_control"); err == nil {
+		if !strings.Contains(string(cc), "bbr") {
+			_ = exec.Command("modprobe", "tcp_bbr").Run()
+			_ = os.WriteFile("/proc/sys/net/core/default_qdisc", []byte("fq\n"), 0644)
+			_ = os.WriteFile("/proc/sys/net/ipv4/tcp_congestion_control", []byte("bbr\n"), 0644)
+		}
+	}
+	_ = os.WriteFile("/proc/sys/net/core/rmem_max", []byte("16777216\n"), 0644)
+	_ = os.WriteFile("/proc/sys/net/core/wmem_max", []byte("16777216\n"), 0644)
+}
+
 // detectDefaultOutInterface 自动探测宿主机物理默认出站网卡
 func detectDefaultOutInterface() string {
 	out, err := exec.Command("ip", "route", "show", "default").CombinedOutput()
