@@ -44,15 +44,6 @@ load_config() {
     if [[ -z "$ADMIN_KEY" && -f "/etc/systemd/system/aero-edge.service" ]]; then
         ADMIN_KEY=$(grep -o "\-admin-key[[:space:]]\+[^[:space:]]\+" /etc/systemd/system/aero-edge.service 2>/dev/null | awk '{print $2}' || true)
     fi
-    
-    # 获取随机订阅 Secret
-    SUB_SECRET=""
-    if [[ -f "$SUB_META" ]]; then
-        SUB_SECRET=$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SUB_META" 2>/dev/null | head -n 1 || true)
-        if [[ -z "$SUB_SECRET" ]]; then
-            SUB_SECRET=$(grep -o '"secret"[[:space:]]*:[[:space:]]*"[^"]*"' "$SUB_META" 2>/dev/null | head -n 1 | sed 's/.*"secret"[[:space:]]*:[[:space:]]*"//;s/"//' 2>/dev/null || true)
-        fi
-    fi
 }
 
 get_status() {
@@ -98,16 +89,15 @@ cmd_info() {
     echo -e " 连接 Token:     ${YELLOW}${TOKEN}${PLAIN}"
     echo -e " 管理密钥:       ${YELLOW}${ADMIN_KEY:-未设置}${PLAIN}"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    if [[ -n "$SUB_SECRET" && -n "$DOMAIN" ]]; then
-        SUB_URL="https://${DOMAIN}/sub/${SUB_SECRET}"
+    if [[ -n "$DOMAIN" ]]; then
         ADMIN_SUB_URL="https://${DOMAIN}/sub/admin"
         CONSOLE_URL="https://${DOMAIN}:${PRIMARY_PORT}/console?key=${ADMIN_KEY}"
         
-        echo -e " 客户端订阅链接: ${GREEN}${SUB_URL}${PLAIN}"
-        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN}"
+        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN} (零端口规范)"
+        echo -e " 用户专属订阅:   ${GREEN}https://${DOMAIN}/sub/{用户名}{6位随机码}${PLAIN}"
         echo -e " Web 管理控制台: ${GREEN}${CONSOLE_URL}${PLAIN}"
     else
-        echo -e "${YELLOW}提示: 订阅元数据未就绪，请先启动 aero-edge 服务${PLAIN}"
+        echo -e "${YELLOW}提示: 节点配置未就绪，请先启动 aero-edge 服务${PLAIN}"
     fi
     echo -e "${CYAN}====================================================${PLAIN}"
 }

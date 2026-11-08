@@ -630,19 +630,9 @@ if [[ ! -f "$DATA_DIR/sub_meta.json" ]]; then
     exit 1
 fi
 
-# 纯 Shell 原生解析 JSON（严格遵守 L0 生产零外部解释器依赖铁律）
-SUB_SECRET=$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DATA_DIR/sub_meta.json" 2>/dev/null | head -n 1)
-if [[ -z "$SUB_SECRET" ]]; then
-    SUB_SECRET=$(grep -o '"secret"[[:space:]]*:[[:space:]]*"[^"]*"' "$DATA_DIR/sub_meta.json" 2>/dev/null | head -n 1 | sed 's/.*"secret"[[:space:]]*:[[:space:]]*"//;s/"//' 2>/dev/null || true)
-fi
 cp -f "$DATA_DIR/client-sub.json" "$CONFIG_DIR/client-sub.json" 2>/dev/null || true
 
 # 零端口订阅链接绝对红线（Zero-Port Mandate: 严禁携带非 443 端口，由客户端并发探测自愈穿透）
-if [[ -n "$SUB_SECRET" ]]; then
-    SUB_URL="https://${ADVERTISE_HOST}/sub/${SUB_SECRET}"
-else
-    SUB_URL="(见 $DATA_DIR/sub_meta.json)"
-fi
 ADMIN_SUB_URL="https://${ADVERTISE_HOST}/sub/admin"
 CONSOLE_URL="https://${ADVERTISE_HOST}:${PRIMARY_PORT}/console?key=${ADMIN_KEY}"
 
@@ -653,14 +643,18 @@ echo "========================================="
 echo " Token:       $TOKEN"
 echo " Admin Key:   $ADMIN_KEY"
 echo " Web Console: $CONSOLE_URL"
-echo " Listen:      :${PRIMARY_PORT} (可 -p 自定义)"
+echo " Listen:      :${PRIMARY_PORT} (QUIC+TLS 双栈)"
 echo " Cert:        $CERT (public CA, auto-renew)"
 echo " Data dir:    $DATA_DIR"
-echo " Admin Sub:   $ADMIN_SUB_URL"
-echo " Sub URL:     $SUB_URL"
+echo " Admin Sub:   $ADMIN_SUB_URL (零端口管理员全量订阅)"
+echo ""
+echo " 订阅规范说明 (严格零端口红线):"
+echo "   1. 管理员全量订阅: $ADMIN_SUB_URL"
+echo "   2. 用户专属订阅:   https://${ADVERTISE_HOST}/sub/{用户名}{6位随机码}"
+echo "      (登录 Web 控制台为指定用户一键签发专属零端口链接)"
 echo ""
 echo " 客户端（本机混合口默认 55555，可 -listen 改）:"
-echo "   aero-ech -sub $SUB_URL -listen 127.0.0.1:55555"
+echo "   aero-ech -sub $ADMIN_SUB_URL -listen 127.0.0.1:55555"
 echo "   浏览器/软件代理设为 127.0.0.1:55555（HTTP 或 SOCKS5）"
 echo "   不改 Windows 注册表 / 系统代理"
 echo ""
