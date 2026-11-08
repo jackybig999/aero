@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	Version  = "1.2.33"
+	Version  = "1.2.34"
 	Protocol = "aero/3.0"
 	APILevel = 3
 )
