@@ -5353,6 +5353,35 @@ func TestEdge_M2_ACME_AutoDiscovery(t *testing.T) {
 	}
 }
 
+func TestEdge_DiscoverAnyValidACMECert_AutoDomain(t *testing.T) {
+	tmpDir := t.TempDir()
+	domain := "autoadapt.example.com"
+	eccDir := filepath.Join(tmpDir, ".acme.sh", domain+"_ecc")
+	if err := os.MkdirAll(eccDir, 0755); err != nil {
+		t.Fatalf("mkdir acme dir: %v", err)
+	}
+
+	certPath := filepath.Join(eccDir, "fullchain.cer")
+	keyPath := filepath.Join(eccDir, domain+".key")
+	certPEM, keyPEM := generateTestCertPEMForEdge(t, domain, "ACME Test CA")
+	_ = os.WriteFile(certPath, certPEM, 0644)
+	_ = os.WriteFile(keyPath, keyPEM, 0600)
+
+	foundCert, foundKey, foundDom, ok := DiscoverAnyValidACMECertIn([]string{filepath.Join(tmpDir, ".acme.sh")})
+	if !ok {
+		t.Fatalf("expected DiscoverAnyValidACMECertIn to find valid cert")
+	}
+	if foundCert != certPath {
+		t.Errorf("expected cert %s, got %s", certPath, foundCert)
+	}
+	if foundKey != keyPath {
+		t.Errorf("expected key %s, got %s", keyPath, foundKey)
+	}
+	if foundDom != domain {
+		t.Errorf("expected domain %s, got %s", domain, foundDom)
+	}
+}
+
 func TestEdge_M2_Production_SelfSignedBan(t *testing.T) {
 	cfg := ServerConfig{
 		Listen:                     ":2083",

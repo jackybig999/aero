@@ -48,6 +48,8 @@ func main() {
 		return
 	}
 
+	raiseFileLimits()
+
 	cfg := edge.ServerConfig{
 		Listen:                     *listen,
 		Domain:                     *domain,
@@ -69,18 +71,25 @@ func main() {
 		GlobalTUNDevice:            *globalTUNDevice,
 	}
 
-	if *configPath != "" {
-		data, err := os.ReadFile(*configPath)
+	targetConfig := *configPath
+	if targetConfig == "" {
+		if _, err := os.Stat("/etc/aero/edge.json"); err == nil {
+			targetConfig = "/etc/aero/edge.json"
+		}
+	}
+
+	if targetConfig != "" {
+		data, err := os.ReadFile(targetConfig)
 		if err != nil {
-			log.Fatalf("failed to read config file %s: %v", *configPath, err)
+			log.Fatalf("failed to read config file %s: %v", targetConfig, err)
 		}
 		if err := json.Unmarshal(data, &cfg); err != nil {
-			log.Fatalf("failed to parse config file %s: %v", *configPath, err)
+			log.Fatalf("failed to parse config file %s: %v", targetConfig, err)
 		}
 		if *globalTUNDevice != "" {
 			cfg.GlobalTUNDevice = *globalTUNDevice
 		}
-		log.Printf("[CONFIG] loaded configuration from %s", *configPath)
+		log.Printf("[CONFIG] loaded configuration from %s", targetConfig)
 	}
 
 	// Apply profiles if not explicitly overridden

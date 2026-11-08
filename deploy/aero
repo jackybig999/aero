@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.35)
+# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.36)
 # 支持交互式终端菜单与非交互式快捷命令调用
 # ==============================================================================
 set -e
@@ -231,17 +231,30 @@ with open('$TOKENS_FILE', 'w') as f:
 
 find_cert_path() {
     load_config
-    local cand_paths=(
-        "/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
-        "/root/.acme.sh/${DOMAIN}/fullchain.cer"
-        "${HOME}/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
-        "${HOME}/.acme.sh/${DOMAIN}/fullchain.cer"
-        "$CERT_FILE"
-    )
-    for p in "${cand_paths[@]}"; do
-        if [[ -f "$p" && -s "$p" ]]; then
-            echo "$p"
-            return 0
+    if [[ -n "$DOMAIN" ]]; then
+        local cand_paths=(
+            "/root/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
+            "/root/.acme.sh/${DOMAIN}/fullchain.cer"
+            "${HOME}/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
+            "${HOME}/.acme.sh/${DOMAIN}/fullchain.cer"
+            "$CERT_FILE"
+        )
+        for p in "${cand_paths[@]}"; do
+            if [[ -f "$p" && -s "$p" ]]; then
+                echo "$p"
+                return 0
+            fi
+        done
+    fi
+    # 若未指定 DOMAIN 或未找到指定证书，扫描 ACME 默认目录下的有效证书
+    for d in /root/.acme.sh "${HOME}/.acme.sh"; do
+        if [[ -d "$d" ]]; then
+            for cert_f in "$d"/*_ecc/fullchain.cer "$d"/*/fullchain.cer; do
+                if [[ -f "$cert_f" && -s "$cert_f" ]]; then
+                    echo "$cert_f"
+                    return 0
+                fi
+            done
         fi
     done
     return 1
@@ -250,13 +263,14 @@ find_cert_path() {
 cmd_cert() {
     load_config
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BOLD}       TLS 公网权威证书与 ACME 自动续期检测        ${PLAIN}"
+    echo -e "${BOLD}       TLS 公网权威证书与 ACME 自动续期管理        ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
     
     ACTUAL_CERT=$(find_cert_path || true)
     if [[ -n "$ACTUAL_CERT" ]]; then
         echo -e " 证书路径:       ${GREEN}${ACTUAL_CERT}${PLAIN}"
-        echo -e " 绑定域名 (SAN): $(openssl x509 -in "$ACTUAL_CERT" -noout -subject 2>/dev/null | sed 's/subject= //')"
+        CERT_SAN=$(openssl x509 -in "$ACTUAL_CERT" -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[^, ]*' | head -1 | cut -d: -f2 || openssl x509 -in "$ACTUAL_CERT" -noout -subject 2>/dev/null | sed 's/subject= //')
+        echo -e " 绑定域名 (SAN): ${GREEN}${CERT_SAN}${PLAIN}"
         echo -e " 权威签发者:     $(openssl x509 -in "$ACTUAL_CERT" -noout -issuer 2>/dev/null | sed 's/issuer= //')"
         echo -e " 生效时间:       $(openssl x509 -in "$ACTUAL_CERT" -noout -startdate 2>/dev/null | cut -d= -f2)"
         EXPIRE_DATE=$(openssl x509 -in "$ACTUAL_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)
@@ -271,7 +285,7 @@ cmd_cert() {
             echo -e " 证书有效状态:   ${RED}[已过期] 请立即检查 DNS 与网络并重新签发！${PLAIN}"
         fi
     else
-        echo -e " 证书状态:       ${RED}未在 ACME 默认目录检测到 ${DOMAIN} 的已签发证书！${PLAIN}"
+        echo -e " 证书状态:       ${RED}未在 ACME 默认目录检测到已签发证书！${PLAIN}"
     fi
 
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
@@ -282,6 +296,81 @@ cmd_cert() {
         echo -e " 自动续期机制:   ${YELLOW}[提示] 未在系统 crontab 检测到 acme.sh 调度，由服务端内置计时器巡检${PLAIN}"
     fi
     echo -e "${CYAN}====================================================${PLAIN}"
+
+    # 询问是否签发新证书或更新
+    read -r -p "是否现在签发/更新 Let's Encrypt 公网权威证书? [y/N]: " do_issue
+    if [[ ! "$do_issue" =~ ^[yY]$ ]]; then
+        return 0
+    fi
+
+    check_root
+
+    # 1. 检测系统是否安装了 acme.sh
+    ACME_BIN=""
+    if [[ -x "/root/.acme.sh/acme.sh" ]]; then
+        ACME_BIN="/root/.acme.sh/acme.sh"
+    elif [[ -x "${HOME}/.acme.sh/acme.sh" ]]; then
+        ACME_BIN="${HOME}/.acme.sh/acme.sh"
+    elif command -v acme.sh >/dev/null 2>&1; then
+        ACME_BIN="$(command -v acme.sh)"
+    fi
+
+    if [[ -z "$ACME_BIN" ]]; then
+        echo -e "${RED}[错误] 未在系统中检测到 acme.sh 证书管理工具！${PLAIN}"
+        echo -e "${YELLOW}请先在终端执行以下官方命令安装 acme.sh，然后重新执行本命令：${PLAIN}"
+        echo -e "  ${GREEN}curl https://get.acme.sh | sh -s email=your_email@example.com${PLAIN}"
+        echo -e "  ${GREEN}source ~/.bashrc${PLAIN}"
+        echo -e "安装完成后，请重新运行: ${CYAN}aero cert${PLAIN}"
+        return 1
+    fi
+
+    echo -e "${GREEN}[OK] 已检测到系统 acme.sh: ${ACME_BIN}${PLAIN}"
+    read -r -p "请输入节点绑定的公网合法域名 (如 edge.example.com): " req_domain
+    req_domain=$(echo "$req_domain" | tr -d ' ')
+    if [[ -z "$req_domain" ]]; then
+        echo -e "${RED}错误: 域名不能为空！${PLAIN}"
+        return 1
+    fi
+
+    echo -e "正在调用 acme.sh 为 ${CYAN}${req_domain}${PLAIN} 签发 Let's Encrypt 证书..."
+    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+    if "$ACME_BIN" --issue -d "$req_domain" --standalone --keylength ec-256; then
+        echo -e "${GREEN}Let's Encrypt 权威证书签发成功！${PLAIN}"
+        
+        # 直接配置，实时生效
+        mkdir -p /etc/aero
+        if [[ -f "$JSON_CONFIG" ]]; then
+            python3 -c "
+import json
+try:
+    with open('$JSON_CONFIG', 'r') as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data['domain'] = '$req_domain'
+with open('$JSON_CONFIG', 'w') as f:
+    json.dump(data, f, indent=2)
+" 2>/dev/null || sed -i "s/\"domain\": *\"[^\"]*\"/\"domain\": \"$req_domain\"/g" "$JSON_CONFIG"
+        else
+            cat > "$JSON_CONFIG" <<EOF
+{
+  "listen": ":443",
+  "domain": "$req_domain",
+  "data_dir": "/var/lib/aero"
+}
+EOF
+            chmod 600 "$JSON_CONFIG"
+        fi
+
+        echo -e "正在向 AERO 服务端触发平滑热重载 (Live Reload)..."
+        systemctl reload aero-edge 2>/dev/null || systemctl restart aero-edge 2>/dev/null || true
+        echo -e "${GREEN}证书已直接配置并实时生效！${PLAIN}"
+        cmd_cert
+    else
+        echo -e "${RED}证书签发失败！请检查 80 端口是否被占用，以及 DNS 解析是否已正确生效！${PLAIN}"
+        return 1
+    fi
 }
 
 cmd_bbr() {
@@ -409,7 +498,7 @@ show_menu() {
     clear
     load_config
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.35)        ${PLAIN}"
+    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.36)        ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e " 服务状态: [ $(get_status) ]"
     echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  主端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"

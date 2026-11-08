@@ -16,6 +16,7 @@ import (
 	"crypto/x509/pkix"
 	_ "embed"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -194,6 +195,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			cfg.KeyFile = keyPath
 			if cfg.Domain == "" && len(candidates) > 0 {
 				cfg.Domain = candidates[0]
+			}
+		} else if cfg.Domain == "" {
+			// Auto-adapt domain and certificate from any valid ACME certificate on the host
+			if certPath, keyPath, autoDomain, found := DiscoverAnyValidACMECert(); found {
+				log.Printf("[EDGE] Auto-discovered valid ACME certificate for domain %s: cert=%s, key=%s", autoDomain, certPath, keyPath)
+				cfg.CertFile = certPath
+				cfg.KeyFile = keyPath
+				cfg.Domain = autoDomain
 			}
 		}
 	}
@@ -1010,6 +1019,124 @@ func DiscoverACMECertIn(baseDirs []string, domains ...string) (certFile, keyFile
 	}
 
 	return "", "", false
+}
+
+// DiscoverAnyValidACMECert scans ACME directories for any valid certificate and returns its cert, key, and SAN/CN domain.
+func DiscoverAnyValidACMECert() (certFile, keyFile, domain string, found bool) {
+	var baseDirs []string
+	if custom := strings.TrimSpace(os.Getenv("ACME_HOME")); custom != "" {
+		baseDirs = append(baseDirs, custom, filepath.Join(custom, ".acme.sh"))
+	}
+	baseDirs = append(baseDirs, "/root/.acme.sh")
+	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+		baseDirs = append(baseDirs, filepath.Join(home, ".acme.sh"), home)
+	}
+	if userHome, err := os.UserHomeDir(); err == nil && strings.TrimSpace(userHome) != "" {
+		baseDirs = append(baseDirs, filepath.Join(userHome, ".acme.sh"))
+	}
+	return DiscoverAnyValidACMECertIn(baseDirs)
+}
+
+// DiscoverAnyValidACMECertIn searches base directories for any valid X.509 certificate and extracts its domain.
+func DiscoverAnyValidACMECertIn(baseDirs []string) (certFile, keyFile, domain string, found bool) {
+	seenBases := make(map[string]bool)
+	now := time.Now()
+
+	for _, base := range baseDirs {
+		base = strings.TrimSpace(base)
+		if base == "" || seenBases[base] {
+			continue
+		}
+		seenBases[base] = true
+
+		entries, err := os.ReadDir(base)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			dirPath := filepath.Join(base, entry.Name())
+
+			// Look for cert candidates
+			certCandidates := []string{
+				filepath.Join(dirPath, "fullchain.cer"),
+				filepath.Join(dirPath, "fullchain.pem"),
+				filepath.Join(dirPath, "cert.pem"),
+			}
+			var foundCert string
+			for _, cp := range certCandidates {
+				if cfi, err := os.Stat(cp); err == nil && !cfi.IsDir() && cfi.Size() > 0 {
+					foundCert = cp
+					break
+				}
+			}
+			if foundCert == "" {
+				continue
+			}
+
+			// Look for key candidates
+			domName := strings.TrimSuffix(entry.Name(), "_ecc")
+			keyCandidates := []string{
+				filepath.Join(dirPath, domName+".key"),
+				filepath.Join(dirPath, entry.Name()+".key"),
+				filepath.Join(dirPath, "privkey.key"),
+				filepath.Join(dirPath, "privkey.pem"),
+				filepath.Join(dirPath, "key.pem"),
+			}
+			var foundKey string
+			for _, kp := range keyCandidates {
+				if kfi, err := os.Stat(kp); err == nil && !kfi.IsDir() && kfi.Size() > 0 {
+					foundKey = kp
+					break
+				}
+			}
+			if foundKey == "" {
+				continue
+			}
+
+			// Read and parse the cert to ensure validity and extract SAN / CN
+			certData, err := os.ReadFile(foundCert)
+			if err != nil {
+				continue
+			}
+			block, _ := pem.Decode(certData)
+			if block == nil {
+				continue
+			}
+			x509Cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				continue
+			}
+			// Check expiration
+			if now.Before(x509Cert.NotBefore) || now.After(x509Cert.NotAfter) {
+				continue
+			}
+
+			// Extract domain
+			extractedDomain := ""
+			for _, san := range x509Cert.DNSNames {
+				san = strings.TrimSpace(san)
+				if san != "" && !strings.Contains(san, "*") {
+					extractedDomain = san
+					break
+				}
+			}
+			if extractedDomain == "" && len(x509Cert.DNSNames) > 0 {
+				extractedDomain = x509Cert.DNSNames[0]
+			}
+			if extractedDomain == "" && x509Cert.Subject.CommonName != "" {
+				extractedDomain = x509Cert.Subject.CommonName
+			}
+
+			if extractedDomain != "" {
+				return foundCert, foundKey, extractedDomain, true
+			}
+		}
+	}
+	return "", "", "", false
 }
 
 var httpsRRChecker func(domain string) bool

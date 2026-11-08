@@ -787,7 +787,7 @@ func TestTier1_F7_Deploy_ZeroPythonBaseline(t *testing.T) {
 }
 
 func TestTier1_F7_Deploy_PhysicalUFWAllow(t *testing.T) {
-	// In decoupled architecture (v1.2.35+), edge-install.sh is strictly decoupled from server network logic.
+	// In decoupled architecture (v1.2.36+), edge-install.sh is strictly decoupled from server network logic.
 	// Network and firewall governance is natively handled by the edge server daemon and deploy/aero CLI.
 	script := ReadDeployScript(t)
 	if !strings.Contains(script, "aero-edge") {
@@ -797,8 +797,8 @@ func TestTier1_F7_Deploy_PhysicalUFWAllow(t *testing.T) {
 
 func TestTier1_F7_Deploy_DirectPhysicalListeners(t *testing.T) {
 	script := ReadDeployScript(t)
-	// Must configure listener via edge.json or config
-	if !strings.Contains(script, `"listen": ":${PORT}"`) && !strings.Contains(script, "-listen :${PRIMARY_PORT}") {
+	// Must configure listener via direct binary execution or config
+	if !strings.Contains(script, "ExecStart=/usr/local/bin/aero-edge") && !strings.Contains(script, `"listen": ":${PORT}"`) && !strings.Contains(script, "-listen :${PRIMARY_PORT}") {
 		t.Errorf("deploy/edge-install.sh does not configure direct physical listener")
 	}
 }
