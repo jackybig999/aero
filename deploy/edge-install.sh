@@ -17,6 +17,11 @@
 #
 set -euo pipefail
 
+if [[ $EUID -ne 0 ]]; then
+    echo "错误: 必须使用 root 用户执行安装程序 (请使用 sudo su - 或切换为 root)！"
+    exit 1
+fi
+
 TOKEN=""
 ADMIN_KEY=""
 DOMAIN=""
@@ -24,6 +29,9 @@ ADVERTISE_IP=""
 EMAIL=""
 PORTS="443"
 SNI=""
+CUSTOM_CERT=""
+CUSTOM_KEY=""
+FORCE_CLEAN=0
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/aero"
 DATA_DIR="/var/lib/aero"
@@ -36,13 +44,16 @@ REPO="jackybig999/aero"
 usage() {
     echo "AERO Edge 一键安装"
     echo "  -d, --domain DOMAIN     域名（必须；ACME HTTP-01 需 :80 可达）"
-    echo "  -k, --admin-key KEY     管理员控制台与管控 API 密钥（可选，默认自动生成）"
+    echo "  -k, --admin-key KEY     管理员控制台与管控 API 密钥（可选，默认自动生成或复用已有配置）"
     echo "  -i, --ip IP             写入订阅的备用公网 IP（有域名时可选）"
-    echo "  -t, --token TOKEN       可选，默认自动生成"
+    echo "  -t, --token TOKEN       可选，默认自动生成或复用已有配置"
+    echo "  -c, --cert FILE         已有 TLS 公网证书 fullchain.pem 路径（跳过 ACME 签发）"
+    echo "  -y, --key FILE          已有 TLS 私钥 privkey.pem 路径（配合 -c 使用）"
     echo "  -e, --email EMAIL       ACME 邮箱（默认 admin@DOMAIN）"
     echo "  -p, --ports PORTS       监听端口，默认 443（可改，如 443 或 8443）"
     echo "  -s, --sni SNI           TLS SNI（默认 = 域名）"
-    echo "  -h, --help"
+    echo "      --clean, --force    安装前先彻底清理旧版本残留环境与配置"
+    echo "  -h, --help              显示帮助信息"
     exit 0
 }
 
@@ -60,10 +71,40 @@ while [[ $# -gt 0 ]]; do
         -e|--email) EMAIL="$2"; shift 2 ;;
         -p|--ports) PORTS="$2"; shift 2 ;;
         -s|--sni) SNI="$2"; shift 2 ;;
+        -c|--cert) CUSTOM_CERT="$2"; shift 2 ;;
+        -y|--key) CUSTOM_KEY="$2"; shift 2 ;;
+        --clean|--force) FORCE_CLEAN=1; shift ;;
         -h|--help) usage ;;
         *) echo "未知选项: $1"; usage ;;
     esac
 done
+
+# 若要求全新安装，先对称清理旧环境
+if [[ "$FORCE_CLEAN" -eq 1 ]]; then
+    echo "[clean] 正在执行前置彻底清理..."
+    if [[ -f "$INSTALL_DIR/edge-uninstall.sh" ]]; then
+        bash "$INSTALL_DIR/edge-uninstall.sh" --purge 2>/dev/null || true
+    fi
+fi
+
+# 优先复用已有 edge.conf 配置，杜绝重复安装时 token / admin-key 被无故刷新
+if [[ -f "$CONFIG_DIR/edge.conf" ]]; then
+    EXISTING_TOKEN=$(grep -E "^AERO_TOKEN=" "$CONFIG_DIR/edge.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
+    EXISTING_ADMIN_KEY=$(grep -E "^AERO_ADMIN_KEY=" "$CONFIG_DIR/edge.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
+    EXISTING_DOMAIN=$(grep -E "^AERO_DOMAIN=" "$CONFIG_DIR/edge.conf" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]' || true)
+    if [[ -z "$DOMAIN" && -n "$EXISTING_DOMAIN" ]]; then
+        DOMAIN="$EXISTING_DOMAIN"
+        echo "提示: 复用已有配置中的 domain: $DOMAIN"
+    fi
+    if [[ -z "$TOKEN" && -n "$EXISTING_TOKEN" ]]; then
+        TOKEN="$EXISTING_TOKEN"
+        echo "提示: 复用已有配置中的 token"
+    fi
+    if [[ -z "$ADMIN_KEY" && -n "$EXISTING_ADMIN_KEY" ]]; then
+        ADMIN_KEY="$EXISTING_ADMIN_KEY"
+        echo "提示: 复用已有配置中的 admin-key"
+    fi
+fi
 
 if [[ -z "$DOMAIN" ]]; then
     echo "错误: 必须提供 -d DOMAIN（生产环境禁止自签，需公网证书）"
@@ -231,12 +272,23 @@ ln -sf "$INSTALL_DIR/aeroprot-edge" "$INSTALL_DIR/aero-edge"
 # --- CLI & 运维工具: 安装 aero 交互式管理菜单 (类 x-ui / s-ui) ---
 AERO_CLI_URL="https://raw.githubusercontent.com/${REPO}/main/deploy/aero"
 UNINSTALL_URL="https://raw.githubusercontent.com/${REPO}/main/deploy/edge-uninstall.sh"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+IS_LOCAL=0
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" && -f "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+    if [[ -f "$SCRIPT_DIR/deploy/aero" ]]; then
+        SCRIPT_DIR="$SCRIPT_DIR/deploy"
+    fi
+    if [[ -f "$SCRIPT_DIR/aero" ]]; then
+        IS_LOCAL=1
+    fi
+fi
 
-if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/aero" ]]; then
+if [[ "$IS_LOCAL" -eq 1 ]]; then
     cp -f "$SCRIPT_DIR/aero" "$INSTALL_DIR/aero"
+    cp -f "$SCRIPT_DIR/edge-uninstall.sh" "$INSTALL_DIR/edge-uninstall.sh" 2>/dev/null || true
 elif command -v curl >/dev/null 2>&1; then
     curl -fsSL "$AERO_CLI_URL" -o "$INSTALL_DIR/aero" 2>/dev/null || true
+    curl -fsSL "$UNINSTALL_URL" -o "$INSTALL_DIR/edge-uninstall.sh" 2>/dev/null || true
 fi
 
 if [[ -f "$INSTALL_DIR/aero" ]]; then
@@ -244,29 +296,40 @@ if [[ -f "$INSTALL_DIR/aero" ]]; then
     ln -sf "$INSTALL_DIR/aero" "/usr/bin/aero" 2>/dev/null || true
     echo "[cli] 终端交互管理工具已就绪: 输入 'aero' 即可呼出管理菜单"
 fi
-
-if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/edge-uninstall.sh" ]]; then
-    cp -f "$SCRIPT_DIR/edge-uninstall.sh" "$INSTALL_DIR/edge-uninstall.sh"
-elif command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$UNINSTALL_URL" -o "$INSTALL_DIR/edge-uninstall.sh" 2>/dev/null || true
-fi
 if [[ -f "$INSTALL_DIR/edge-uninstall.sh" ]]; then
     chmod 755 "$INSTALL_DIR/edge-uninstall.sh"
 fi
 
-# --- TLS: detect → copy → issue (LE → ZeroSSL) → never self-sign ---
+# --- TLS: detect → custom → copy → issue (LE → ZeroSSL) → never self-sign ---
 need_issue=1
-if [[ -f "$CERT" && -f "$KEY" ]]; then
+
+# 1. 优先使用用户命令行通过 -c / -y 显式传入的公网证书
+if [[ -n "$CUSTOM_CERT" && -n "$CUSTOM_KEY" ]]; then
+    if [[ -f "$CUSTOM_CERT" && -f "$CUSTOM_KEY" ]]; then
+        cp -f "$CUSTOM_CERT" "$CERT"
+        cp -f "$CUSTOM_KEY" "$KEY"
+        chmod 644 "$CERT"; chmod 600 "$KEY"
+        echo "[cert] CERT_STATUS=custom_provided (成功加载用户指定外部证书: $CUSTOM_CERT)"
+        need_issue=0
+    else
+        echo "错误: 指定的外部证书或私钥文件未找到: $CUSTOM_CERT 或 $CUSTOM_KEY"
+        exit 1
+    fi
+fi
+
+# 2. 检查现有证书是否有效
+if [[ "$need_issue" -eq 1 && -f "$CERT" && -f "$KEY" ]]; then
     if openssl x509 -in "$CERT" -noout -checkend 86400 >/dev/null 2>&1; then
-        echo "[cert] CERT_STATUS=existing_ok (skip ACME)"
+        echo "[cert] CERT_STATUS=existing_ok (已有公网证书未过期，跳过 ACME 签发)"
         need_issue=0
     else
         echo "[cert] CERT_STATUS=existing_expiring"
     fi
 fi
 
-if [[ "$need_issue" = "1" ]]; then
-    for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}" "/etc/letsencrypt/live/${DOMAIN}" "/root/cert/${DOMAIN}" "/root/certs/${DOMAIN}" "/root/cert" "/root/certs" "/etc/cert/${DOMAIN}" "/etc/certs/${DOMAIN}"; do
+# 3. 检查系统常见路径下是否有该域名的有效证书
+if [[ "$need_issue" -eq 1 ]]; then
+    for d in "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/${DOMAIN}" "/etc/letsencrypt/live/${DOMAIN}" "/root/cert/${DOMAIN}" "/root/certs/${DOMAIN}" "/root/cert" "/root/certs" "/etc/cert/${DOMAIN}" "/etc/certs/${DOMAIN}" "/etc/nginx/ssl/${DOMAIN}" "/etc/nginx/ssl" "/etc/ssl/${DOMAIN}"; do
         FC=""
         [[ -f "$d/fullchain.cer" ]] && FC="$d/fullchain.cer"
         [[ -f "$d/fullchain.pem" ]] && FC="$d/fullchain.pem"
@@ -288,13 +351,28 @@ if [[ "$need_issue" = "1" ]]; then
     done
 fi
 
-if [[ "$need_issue" = "1" ]]; then
-    echo "[cert] CERT_STATUS=issuing (need :80 free for HTTP-01)"
-    systemctl stop aero-edge 2>/dev/null || true
-    # free :80 if something else holds it briefly (best-effort)
+# 4. 需要在线签发时，先检测 DNS 解析与解除 80 端口占用
+if [[ "$need_issue" -eq 1 ]]; then
+    echo "[cert] CERT_STATUS=issuing (启动 ACME HTTP-01 验证，需要 80 端口)"
+
+    # 探测域名 DNS 是否已指向本机 IP
+    RESOLVED_IP=""
+    if command -v getent >/dev/null 2>&1; then
+        RESOLVED_IP=$(getent ahosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -n1 || true)
+    fi
+    if [[ -z "$RESOLVED_IP" ]] && command -v ping >/dev/null 2>&1; then
+        RESOLVED_IP=$(ping -c 1 -W 2 "$DOMAIN" 2>/dev/null | grep -oE "\([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)" | tr -d '()' | head -n1 || true)
+    fi
+    if [[ -n "$RESOLVED_IP" ]]; then
+        echo "[cert] 域名 DNS 解析探测: $DOMAIN -> $RESOLVED_IP"
+    fi
+
+    # 解除可能占用 80 端口的 Web 进程 (如 nginx/caddy/apache2)
+    systemctl stop aero-edge nginx caddy apache2 httpd 2>/dev/null || true
     if command -v fuser >/dev/null 2>&1; then
         fuser -k 80/tcp 2>/dev/null || true
     fi
+    sleep 1
 
     export HOME=/root
     if [[ ! -f /root/.acme.sh/acme.sh ]]; then
@@ -303,7 +381,7 @@ if [[ "$need_issue" = "1" ]]; then
     fi
     ACME=/root/.acme.sh/acme.sh
     if [[ ! -x "$ACME" ]]; then
-        echo "[cert] ERROR: acme.sh missing; refuse self-signed"
+        echo "[cert] ERROR: acme.sh 缺失且自动安装失败；拒绝自签"
         exit 1
     fi
 
@@ -338,11 +416,19 @@ if [[ "$need_issue" = "1" ]]; then
     done
     if [[ "$issued" != "1" ]]; then
         echo "[cert] CERT_STATUS=FAILED_no_public_cert"
-        echo "ERROR: 无法签发公网证书。请确认："
-        echo "  - 域名 $DOMAIN A 记录指向本机"
-        echo "  - 防火墙放行 TCP 80（ACME）与 $PRIMARY_PORT（业务）"
-        echo "  - 或手动放置 PEM: $CERT + $KEY"
-        echo "禁止使用自签证书。"
+        echo "=================================================================="
+        echo "ERROR: 无法为域名 $DOMAIN 签发公网证书！请严格核实以下关键项："
+        echo "  1. 域名解析: 请确认域名 $DOMAIN 的 A 记录已指向本机公网 IP (当前探测解析: ${RESOLVED_IP:-未解析})"
+        echo "  2. CDN 代理: 若使用 Cloudflare，请务必将代理状态关闭 (改为仅 DNS / 灰色云朵)，否则 HTTP-01 验证无法直达本机"
+        echo "  3. 防火墙安全组: 请确认服务商后台防火墙 / 安全组已放行 TCP 80 与业务端口 ${PRIMARY_PORT}"
+        echo "  4. 外部已有证书: 若您已有可用证书，可使用参数跳过 ACME: -c <fullchain.pem> -y <privkey.pem>"
+        echo "  5. 或手动将公网证书放置于: $CERT 与 $KEY"
+        echo "=================================================================="
+        if [[ -f /root/.acme.sh/acme.sh.log ]]; then
+            echo "--- acme.sh 详细执行日志 (末尾 20 行) ---"
+            tail -n 20 /root/.acme.sh/acme.sh.log || true
+            echo "----------------------------------------"
+        fi
         exit 1
     fi
 fi
@@ -352,9 +438,9 @@ if [[ -f "$CERT" ]]; then
 fi
 
 # cron renew（acme.sh 自带；再保险一条）
-crontab -l 2>/dev/null | grep -q acme.sh || (
+crontab -l 2>/dev/null | grep -q "aero-edge" || (
     crontab -l 2>/dev/null
-    echo "0 3 * * * /root/.acme.sh/acme.sh --cron --home /root/.acme.sh > /dev/null"
+    echo "0 3 * * * /root/.acme.sh/acme.sh --cron --home /root/.acme.sh > /dev/null 2>&1 # aero-edge-renew"
 ) | crontab - 2>/dev/null || true
 
 # --- systemd: static LE/ZeroSSL PEMs only（-cert/-key），不走 -autocert 自签回退 ---

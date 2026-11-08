@@ -248,11 +248,11 @@ cmd_uninstall() {
     echo -e "${RED}====================================================${PLAIN}"
     echo -e "${RED}${BOLD}             警告: 即将卸载 AERO Edge 节点         ${PLAIN}"
     echo -e "${RED}====================================================${PLAIN}"
-    read -r -p "是否同时彻底清除全部数据目录与配置 (/var/lib/aero, /etc/aero)? [y/N]: " confirm_purge
+    read -r -p "是否同时彻底清除全部数据目录与配置 (/var/lib/aero, /etc/aero)? [Y/n]: " confirm_purge
     
-    PURGE_FLAG=""
-    if [[ "$confirm_purge" =~ ^[yY]$ ]]; then
-        PURGE_FLAG="--purge"
+    PURGE_FLAG="--purge"
+    if [[ "$confirm_purge" =~ ^[nN]$ ]]; then
+        PURGE_FLAG=""
     fi
     
     if [[ -f "/usr/local/bin/edge-uninstall.sh" ]]; then
@@ -260,7 +260,8 @@ cmd_uninstall() {
     else
         curl -fsSL "$UNINSTALL_SCRIPT_URL" | bash -s -- $PURGE_FLAG
     fi
-    echo -e "${GREEN}AERO Edge 卸载完成。${PLAIN}"
+    echo -e "${GREEN}AERO Edge 卸载完成，脚本产物与运行环境已清理。${PLAIN}"
+    exit 0
 }
 
 show_menu() {

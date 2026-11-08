@@ -3,27 +3,34 @@
 #
 # 严格对称清理：
 #   1) 停用并移除 systemd 守护进程
-#   2) 原子销毁 nftables 表 (table inet aero_edge_default)
-#   3) 按注释 Tag (aero_edge_default) 精准清理 iptables 规则
-#   4) 幂等销毁 aero-tun0 虚拟网络接口
+#   2) 原子销毁 nftables 表 (table inet aero_edge_default / aero_nat)
+#   3) 按注释 Tag (aero_edge_default / AERO_V2_*) 精准清理 iptables 规则
+#   4) 幂等销毁 aero-tun0 / aero-tun-* 虚拟网络接口
 #   5) 还原原始 sysctl 内核参数备份并 reload，保障协议栈零污染残留
+#   6) 彻底清理所有可执行产物、软链接、管理脚本与 CLI 终端工具
+#   7) 清除 crontab 定时续签任务
 #
 set -euo pipefail
 
 PURGE_DATA=0
 INSTANCE_ID="default"
 
+if [[ $EUID -ne 0 ]]; then
+    echo "错误: 必须使用 root 用户执行卸载程序！"
+    exit 1
+fi
+
 usage() {
     echo "AERO Edge 卸载程序"
     echo "用法: bash edge-uninstall.sh [INSTANCE_ID] [选项]"
-    echo "  --purge        连同配置与数据目录 (/etc/aero, /var/lib/aero) 一并完全清除"
-    echo "  -h, --help     显示帮助信息"
+    echo "  --purge, --all, -f  连同配置与数据目录 (/etc/aero, /var/lib/aero) 一并完全清除"
+    echo "  -h, --help          显示帮助信息"
     exit 0
 }
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --purge) PURGE_DATA=1; shift ;;
+        --purge|--all|-a|-f|--force) PURGE_DATA=1; shift ;;
         -h|--help) usage ;;
         -*) echo "未知选项: $1"; usage ;;
         *) INSTANCE_ID="$1"; shift ;;
@@ -53,7 +60,7 @@ fi
 
 # 2. 清理 nftables 规则
 if command -v nft >/dev/null 2>&1; then
-    for table_name in "aero_edge_${INSTANCE_ID}" "aero_edge_default"; do
+    for table_name in "aero_edge_${INSTANCE_ID}" "aero_edge_default" "aero_nat"; do
         if nft list tables inet 2>/dev/null | grep -qw "$table_name"; then
             echo "[nftables] 原子销毁 table inet ${table_name}..."
             nft delete table inet "$table_name" 2>/dev/null || true
@@ -125,20 +132,29 @@ fi
 
 sysctl --system >/dev/null 2>&1 || true
 
-# 6. 清理可执行二进制
-if [[ -f "/usr/local/bin/aero-edge" ]]; then
-    rm -f "/usr/local/bin/aero-edge"
-fi
-if [[ -f "/usr/local/bin/aero-edge.bak" ]]; then
-    rm -f "/usr/local/bin/aero-edge.bak"
+# 6. 清理可执行产物、软链接、管理脚本与全局 CLI 工具 (杜绝陈旧脚本残留)
+echo "[bin] 清理可执行产物与全局管理工具..."
+for b in "/usr/local/bin/aeroprot-edge" "/usr/local/bin/aero-edge" "/usr/local/bin/aero-edge.bak" \
+         "/usr/local/bin/aero" "/usr/bin/aero" \
+         "/usr/local/bin/edge-uninstall.sh" "/usr/local/bin/edge-install.sh"; do
+    if [[ -f "$b" || -L "$b" ]]; then
+        rm -f "$b"
+        echo "[bin] 已彻底清理: $b"
+    fi
+done
+
+# 7. 清理由 AERO 注册的 crontab 续签定时任务
+if crontab -l 2>/dev/null | grep -q "aero-edge"; then
+    echo "[cron] 清理 crontab 定时任务..."
+    (crontab -l 2>/dev/null | grep -v "aero-edge" || true) | crontab - 2>/dev/null || true
 fi
 
-# 7. 可选数据清理
+# 8. 可选数据清理
 if [[ "$PURGE_DATA" -eq 1 ]]; then
-    echo "[data] 完全清除 /etc/aero 与 /var/lib/aero..."
+    echo "[data] 完全清除配置与运行时数据目录 (/etc/aero, /var/lib/aero)..."
     rm -rf /etc/aero /var/lib/aero
 fi
 
 echo "========================================="
-echo " AERO Edge 对称卸载完成，协议栈已还原"
+echo " AERO Edge 对称卸载完成，宿主机环境与协议栈已彻底还原"
 echo "========================================="
