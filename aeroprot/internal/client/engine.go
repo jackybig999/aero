@@ -1102,7 +1102,9 @@ func (e *Engine) startLocked(ticket uint64) error {
 	}
 	e.tunDevice = dev
 
-	ipConn, prefixStr, err := dialIPFn(e.rootCtx, e.sessionMgr)
+	dialIPCtx, dialIPCancel := context.WithTimeout(e.rootCtx, 8*time.Second)
+	ipConn, prefixStr, err := dialIPFn(dialIPCtx, e.sessionMgr)
+	dialIPCancel()
 	if err != nil {
 		_ = dev.Close()
 		e.tunDevice = nil

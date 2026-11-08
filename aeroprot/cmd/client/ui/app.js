@@ -474,7 +474,8 @@ async function pollConnectStatus() {
         await api('POST', '/api/v1/cancel')
       } catch {}
       setState('err', t('ready'))
-      msg(t('connTimeout') || '连接超时，请重试', 'err')
+      const detail = st && st.last_error ? ` (${st.last_error})` : ''
+      msg((t('connTimeout') || '连接超时，请重试') + detail, 'err')
       return
     }
   }
