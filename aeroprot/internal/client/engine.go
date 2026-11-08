@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.30"
+	ClientVersion = "1.2.31"
 	Protocol      = "aero/3.0"
 )
 
@@ -55,6 +55,9 @@ var (
 		cfg, err := NewRouteConfig(ipv4, nil, 1224)
 		if err != nil {
 			return err
+		}
+		if GlobalDefaultChinaMatcher != nil {
+			cfg.ExcludedCIDRs = GlobalDefaultChinaMatcher.ExportCIDRs()
 		}
 		return SetupRoutesWithConfig(devName, cfg)
 	}
@@ -148,6 +151,8 @@ type Engine struct {
 	rootCancel        context.CancelFunc
 	netMon            NetworkMonitor
 	activeConns       sync.Map
+	residentConns     sync.Map
+	mixedStarting     bool
 	killSwitch        atomic.Bool
 	sentinel          *nodeSentinel
 	packetConnFactory PacketConnFactory
@@ -1058,6 +1063,9 @@ func (e *Engine) startLocked(ticket uint64) error {
 
 	e.rootCtx, e.rootCancel = context.WithCancel(context.Background())
 	e.stopMixed = make(chan struct{})
+	if e.dnsHandler != nil {
+		SetGlobalMobileDNSHandler(e.dnsHandler)
+	}
 
 	if mode == "sysproxy" {
 		go func() {
@@ -1318,11 +1326,19 @@ func (e *Engine) Close() error {
 		e.daemonCancel()
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.mixedListener != nil {
 		_ = e.mixedListener.Close()
 		e.mixedListener = nil
 	}
+	e.mixedStarting = false
+	e.mu.Unlock()
+	e.residentConns.Range(func(key, value any) bool {
+		if c, ok := key.(net.Conn); ok {
+			_ = c.Close()
+		}
+		e.residentConns.Delete(key)
+		return true
+	})
 	return nil
 }
 
@@ -1724,8 +1740,26 @@ func (e *Engine) SetListenAddr(addr string) {
 	e.listenAddr = addr
 }
 
+type residentConnContextKey struct{}
+
 // DialTCP 导出供外部使用的 TCP 拨号接口，并注册至活跃连接池
 func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
+	isResident := ctx.Value(residentConnContextKey{}) != nil
+	storeConn := func(c net.Conn) {
+		if isResident {
+			e.residentConns.Store(c, struct{}{})
+		} else {
+			e.activeConns.Store(c, struct{}{})
+		}
+	}
+	deleteConn := func(c net.Conn) {
+		if isResident {
+			e.residentConns.Delete(c)
+		} else {
+			e.activeConns.Delete(c)
+		}
+	}
+
 	e.mu.RLock()
 	dialer := e.tcpDialer
 	split := e.splitEngine
@@ -1736,11 +1770,11 @@ func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		e.activeConns.Store(conn, struct{}{})
+		storeConn(conn)
 		return &trackedConn{
 			Conn: conn,
 			onClose: func() {
-				e.activeConns.Delete(conn)
+				deleteConn(conn)
 			},
 		}, nil
 	}
@@ -1764,11 +1798,11 @@ func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		e.activeConns.Store(conn, struct{}{})
+		storeConn(conn)
 		return &trackedConn{
 			Conn: conn,
 			onClose: func() {
-				e.activeConns.Delete(conn)
+				deleteConn(conn)
 			},
 		}, nil
 	}
@@ -1784,11 +1818,11 @@ func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	e.activeConns.Store(conn, struct{}{})
+	storeConn(conn)
 	return &trackedConn{
 		Conn: conn,
 		onClose: func() {
-			e.activeConns.Delete(conn)
+			deleteConn(conn)
 		},
 	}, nil
 }
@@ -1819,23 +1853,34 @@ func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 		e.listenAddr = addr[0]
 	}
 	targetAddr := e.listenAddr
-	existingLn := e.mixedListener
-	e.mu.Unlock()
-
-	if existingLn != nil {
-		return nil
-	}
-
 	if targetAddr == "" {
 		targetAddr = "127.0.0.1:55555"
 	}
+	if e.mixedListener != nil || e.mixedStarting {
+		e.mu.Unlock()
+		return nil
+	}
+	e.mixedStarting = true
+	e.mu.Unlock()
+
 	ln, err := net.Listen("tcp", targetAddr)
 	if err != nil {
+		e.mu.Lock()
+		e.mixedStarting = false
+		e.mu.Unlock()
 		log.Printf("[PROXY] resident mixed proxy listen on %s failed: %v", targetAddr, err)
 		return err
 	}
+
 	e.mu.Lock()
+	if e.mixedListener != nil {
+		e.mixedStarting = false
+		e.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
 	e.mixedListener = ln
+	e.mixedStarting = false
 	if strings.HasSuffix(targetAddr, ":0") {
 		e.listenAddr = ln.Addr().String()
 	}
@@ -1855,11 +1900,11 @@ func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 				continue
 			}
 
-			e.activeConns.Store(conn, struct{}{})
+			e.residentConns.Store(conn, struct{}{})
 			go func(c net.Conn) {
 				defer func() {
 					_ = c.Close()
-					e.activeConns.Delete(c)
+					e.residentConns.Delete(c)
 				}()
 				e.serveMixedConn(c)
 			}(conn)
@@ -1983,7 +2028,8 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 
 	target := fmt.Sprintf("%s:%d", host, port)
 
-	ctx, cancel := context.WithTimeout(e.getContext(), 10*time.Second)
+	residentCtx := context.WithValue(e.daemonCtx, residentConnContextKey{}, true)
+	ctx, cancel := context.WithTimeout(residentCtx, 10*time.Second)
 	remote, err := e.DialTCP(ctx, target)
 	cancel()
 	if err != nil {
@@ -1995,7 +2041,7 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 	// 成功响应
 	_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0})
 
-	relayTraffic(conn, remote, e.getContext())
+	relayTraffic(conn, remote, residentCtx)
 }
 
 func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
@@ -2008,7 +2054,8 @@ func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
 	}
 
 	target := req.RequestURI
-	ctx, cancel := context.WithTimeout(e.getContext(), 10*time.Second)
+	residentCtx := context.WithValue(e.daemonCtx, residentConnContextKey{}, true)
+	ctx, cancel := context.WithTimeout(residentCtx, 10*time.Second)
 	remote, err := e.DialTCP(ctx, target)
 	cancel()
 	if err != nil {
@@ -2018,7 +2065,7 @@ func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
 	defer remote.Close()
 
 	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	relayTraffic(conn, remote, e.getContext())
+	relayTraffic(conn, remote, residentCtx)
 }
 
 func readSocks5Target(br *bufio.Reader, atyp byte) (string, uint16, error) {

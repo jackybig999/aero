@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -328,5 +329,50 @@ func TestFinalGate_MobileBufPool(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("CopyTunnel did not exit in time")
+	}
+}
+
+func TestClampTCPMSS(t *testing.T) {
+	// 构造一个 44 字节的 IPv4 TCP SYN 报文 (20 字节 IP + 24 字节 TCP 包含 4 字节 MSS 选项)
+	pkt := make([]byte, 44)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], 44)
+	pkt[8] = 64
+	pkt[9] = 6 // TCP
+	copy(pkt[12:16], net.ParseIP("10.0.0.1").To4())
+	copy(pkt[16:20], net.ParseIP("1.1.1.1").To4())
+
+	// TCP
+	binary.BigEndian.PutUint16(pkt[20:22], 12345) // srcPort
+	binary.BigEndian.PutUint16(pkt[22:24], 443)   // dstPort
+	pkt[32] = 0x60                                // dataOffset = 6 (24 字节)
+	pkt[33] = 0x02                                // SYN flag
+	binary.BigEndian.PutUint16(pkt[34:36], 65535) // window
+	binary.BigEndian.PutUint16(pkt[36:38], 0x1234) // checksum
+
+	// MSS Option: Kind=2, Length=4, Value=1460 (0x05B4)
+	pkt[40] = 2
+	pkt[41] = 4
+	binary.BigEndian.PutUint16(pkt[42:44], 1460)
+
+	clamped := clampTCPMSS(pkt, 1200)
+	newMSS := binary.BigEndian.Uint16(clamped[42:44])
+	if newMSS != 1200 {
+		t.Fatalf("expected MSS clamped to 1200, got %d", newMSS)
+	}
+	newCsum := binary.BigEndian.Uint16(clamped[36:38])
+	if newCsum == 0x1234 {
+		t.Fatalf("expected TCP checksum updated via RFC 1624")
+	}
+
+	// 再次调用对小于 1200 的 MSS (如 1000) 不做改变
+	binary.BigEndian.PutUint16(clamped[42:44], 1000)
+	csumBefore := binary.BigEndian.Uint16(clamped[36:38])
+	clamped2 := clampTCPMSS(clamped, 1200)
+	if binary.BigEndian.Uint16(clamped2[42:44]) != 1000 {
+		t.Fatalf("expected MSS 1000 unchanged, got %d", binary.BigEndian.Uint16(clamped2[42:44]))
+	}
+	if binary.BigEndian.Uint16(clamped2[36:38]) != csumBefore {
+		t.Fatalf("expected checksum unchanged when MSS not clamped")
 	}
 }

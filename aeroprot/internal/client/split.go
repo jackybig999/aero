@@ -8,6 +8,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sort"
 	"strings"
@@ -62,6 +63,9 @@ type ipRange struct {
 type ChinaIPMatcher struct {
 	ranges []ipRange
 }
+
+// GlobalDefaultChinaMatcher 全局单例中国大陆 IP 匹配器
+var GlobalDefaultChinaMatcher = NewChinaIPMatcher()
 
 // NewChinaIPMatcher 创建并初始化中国大陆 IP 匹配器
 func NewChinaIPMatcher() *ChinaIPMatcher {
@@ -137,6 +141,50 @@ func (m *ChinaIPMatcher) Contains(ip net.IP) bool {
 	return false
 }
 
+// ExportCIDRs 将基于 APNIC 权威统计并经区间合并后的全部网段转换为标准 CIDR 前缀列表
+func (m *ChinaIPMatcher) ExportCIDRs() []string {
+	if m == nil {
+		return nil
+	}
+	var res []string
+	for _, r := range m.ranges {
+		res = append(res, rangeToCIDRs(r.start, r.end)...)
+	}
+	return res
+}
+
+func rangeToCIDRs(start, end uint32) []string {
+	var cidrs []string
+	cur := start
+	for cur <= end {
+		// 寻找不越界且对齐于 cur 的最大 2 的幂
+		maxSize := uint32(1)
+		for {
+			next := maxSize << 1
+			if next == 0 {
+				break
+			}
+			if cur+next-1 <= end && (cur&(next-1)) == 0 {
+				maxSize = next
+			} else {
+				break
+			}
+		}
+		prefixLen := 32
+		for s := maxSize; s > 1; s >>= 1 {
+			prefixLen--
+		}
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, cur)
+		cidrs = append(cidrs, fmt.Sprintf("%s/%d", ip.String(), prefixLen))
+		if cur+maxSize < cur || cur+maxSize > end {
+			break
+		}
+		cur += maxSize
+	}
+	return cidrs
+}
+
 // SplitEngine 智能分流规则引擎
 type SplitEngine struct {
 	mu              sync.RWMutex
@@ -159,6 +207,14 @@ func NewSplitEngine() *SplitEngine {
 	}
 	e.loadBuiltinRules()
 	return e
+}
+
+// ChinaMatcher 获取底层的中国 IP 匹配器
+func (e *SplitEngine) ChinaMatcher() *ChinaIPMatcher {
+	if e == nil {
+		return nil
+	}
+	return e.chinaMatcher
 }
 
 // SetDefaultStrategy 设置默认策略

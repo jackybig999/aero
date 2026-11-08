@@ -6,14 +6,28 @@ package client
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 
 	"github.com/quic-go/connect-ip-go"
 )
+
+var globalMobileDNSHandler atomic.Pointer[DNSHandler]
+
+// SetGlobalMobileDNSHandler 设置供移动端 TUN 隧道拦截使用的全局 DNS 处理器
+func SetGlobalMobileDNSHandler(h *DNSHandler) {
+	globalMobileDNSHandler.Store(h)
+}
+
+// GetGlobalMobileDNSHandler 获取移动端全局 DNS 处理器
+func GetGlobalMobileDNSHandler() *DNSHandler {
+	return globalMobileDNSHandler.Load()
+}
 
 // mobileBufPool provides a zero-heap-allocation 1500-byte buffer pool for mobile TUN processing.
 var mobileBufPool = sync.Pool{
@@ -180,6 +194,64 @@ func CopyTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn io.ReadWrite
 	return retErr
 }
 
+// clampTCPMSS 检查是否为 IPv4 TCP SYN/SYN-ACK 报文，若 MSS 选项大于 maxMSS 则原子原地缩减并更新增量校验和 (RFC 1624)
+func clampTCPMSS(raw []byte, maxMSS uint16) []byte {
+	if len(raw) < 40 || (raw[0]>>4) != 4 || raw[9] != 6 {
+		return raw
+	}
+	ihl := int(raw[0]&0x0F) * 4
+	if len(raw) < ihl+20 {
+		return raw
+	}
+	tcpHdr := raw[ihl:]
+	tcpFlags := tcpHdr[13]
+	if (tcpFlags & 0x02) == 0 { // 仅 SYN 或 SYN+ACK 携带 MSS 选项
+		return raw
+	}
+	dataOffset := int(tcpHdr[12]>>4) * 4
+	if dataOffset < 20 || len(tcpHdr) < dataOffset {
+		return raw
+	}
+	optIdx := 20
+	for optIdx < dataOffset {
+		kind := tcpHdr[optIdx]
+		if kind == 0 {
+			break
+		}
+		if kind == 1 {
+			optIdx++
+			continue
+		}
+		if optIdx+1 >= dataOffset {
+			break
+		}
+		length := int(tcpHdr[optIdx+1])
+		if length < 2 || optIdx+length > dataOffset {
+			break
+		}
+		if kind == 2 && length == 4 { // MSS 选项 (Kind=2, Length=4)
+			currentMSS := binary.BigEndian.Uint16(tcpHdr[optIdx+2 : optIdx+4])
+			if currentMSS > maxMSS {
+				binary.BigEndian.PutUint16(tcpHdr[optIdx+2:optIdx+4], maxMSS)
+				// RFC 1624 增量校验和公式：~C' = ~(~C + ~m + m')
+				oldCsum := binary.BigEndian.Uint16(tcpHdr[16:18])
+				sum := uint32(^oldCsum) + uint32(^currentMSS) + uint32(maxMSS)
+				for sum > 0xFFFF {
+					sum = (sum & 0xFFFF) + (sum >> 16)
+				}
+				newCsum := ^uint16(sum)
+				if newCsum == 0 {
+					newCsum = 0xFFFF
+				}
+				binary.BigEndian.PutUint16(tcpHdr[16:18], newCsum)
+			}
+			break
+		}
+		optIdx += length
+	}
+	return raw
+}
+
 // CopyCONNECTIPTunnel bridges an OS TUN device (io.ReadWriteCloser) directly with an RFC 9484 CONNECT-IP tunnel.
 func CopyCONNECTIPTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn *connectip.Conn) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -211,6 +283,23 @@ func CopyCONNECTIPTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn *co
 				if n >= 20 && raw[0]>>4 == 4 {
 					ihl := int(raw[0]&0x0F) * 4
 					if len(raw) >= ihl+8 && raw[9] == 17 {
+						dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
+						if dstPort == 53 {
+							dnsH := globalMobileDNSHandler.Load()
+							if dnsH != nil {
+								srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
+								srcIP := net.IP(raw[12:16])
+								dstIP := net.IP(raw[16:20])
+								dnsPayload := raw[ihl+8:]
+								if resp := dnsH.HandleQuery(dnsPayload, srcIP, srcPort); resp != nil {
+									respPkt := buildIPv4UDPResponsePacket(dstIP, srcIP, dstPort, srcPort, resp)
+									if len(respPkt) > 0 {
+										_, _ = tun.Write(respPkt)
+									}
+								}
+								continue
+							}
+						}
 						if isSTUNPacket(raw[ihl+8:]) {
 							continue
 						}
@@ -220,6 +309,7 @@ func CopyCONNECTIPTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn *co
 						continue
 					}
 				}
+				raw = clampTCPMSS(raw, 1200)
 				if _, werr := ipConn.WritePacket(raw); werr != nil {
 					select {
 					case errCh <- werr:
@@ -247,7 +337,8 @@ func CopyCONNECTIPTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn *co
 		for {
 			n, err := ipConn.ReadPacket(buf)
 			if n > 0 {
-				if _, werr := tun.Write(buf[:n]); werr != nil {
+				pkt := clampTCPMSS(buf[:n], 1200)
+				if _, werr := tun.Write(pkt); werr != nil {
 					select {
 					case errCh <- werr:
 					default:

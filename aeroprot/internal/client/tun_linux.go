@@ -207,6 +207,16 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	_ = runLinux("ip", "route", "replace", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "replace", "128.0.0.0/1", "dev", devName)
 
+	if len(cfg.ExcludedCIDRs) > 0 {
+		gw, ifName, err := PhysicalDefaultGateway()
+		if err == nil && gw != "" && ifName != "" {
+			for _, cidr := range cfg.ExcludedCIDRs {
+				_ = runLinux("ip", "route", "replace", cidr, "via", gw, "dev", ifName)
+			}
+			log.Printf("[TUN] Configured %d excluded direct routes via physical %s dev %s", len(cfg.ExcludedCIDRs), gw, ifName)
+		}
+	}
+
 	if cfg.EnableIPv6 || cfg.EnableIPv6Blackhole {
 		_ = runLinux("ip", "-6", "route", "replace", "::/1", "dev", devName)
 		_ = runLinux("ip", "-6", "route", "replace", "8000::/1", "dev", devName)

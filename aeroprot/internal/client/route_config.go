@@ -14,6 +14,7 @@ type RouteConfig struct {
 	EnableIPv6          bool
 	EnableIPv6Blackhole bool
 	InitialMTU          int
+	ExcludedCIDRs       []string
 }
 
 var activeRouteConfig struct {

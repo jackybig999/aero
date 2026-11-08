@@ -110,6 +110,7 @@ func (e *StackEngine) RestartWithConn(newConn IPPacketConn, prefixes []netip.Pre
 	e.conn = newConn
 	if newConn != nil && e.device != nil {
 		e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+		e.pump.SetWebRTCActive(e.webrtcRelayEnabled.Load())
 		if e.onDisconnect != nil {
 			e.pump.SetOnDisconnect(e.onDisconnect)
 		}
@@ -125,6 +126,7 @@ func (e *StackEngine) Start() error {
 
 	if e.conn != nil && e.device != nil {
 		e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+		e.pump.SetWebRTCActive(e.webrtcRelayEnabled.Load())
 		if e.onDisconnect != nil {
 			e.pump.SetOnDisconnect(e.onDisconnect)
 		}
@@ -144,8 +146,6 @@ func (e *StackEngine) Start() error {
 
 func (e *StackEngine) Stop() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	if e.cancel != nil {
 		e.cancel()
 	}
@@ -155,9 +155,16 @@ func (e *StackEngine) Stop() {
 	}
 	if e.closeDevice && e.device != nil {
 		_ = e.device.Close()
+	}
+	e.mu.Unlock()
+
+	e.wg.Wait()
+
+	e.mu.Lock()
+	if e.closeDevice {
 		e.device = nil
 	}
-	e.wg.Wait()
+	e.mu.Unlock()
 }
 
 func (e *StackEngine) SetKillSwitch(active bool) {
@@ -173,6 +180,12 @@ func (e *StackEngine) KillSwitch() bool {
 
 func (e *StackEngine) SetWebRTCActive(active bool) {
 	e.webrtcRelayEnabled.Store(active)
+	e.mu.Lock()
+	pump := e.pump
+	e.mu.Unlock()
+	if pump != nil {
+		pump.SetWebRTCActive(active)
+	}
 }
 
 func (e *StackEngine) WebRTCActive() bool {
@@ -194,13 +207,19 @@ func (e *StackEngine) SetICMPOutboundHookForTest(hook func(pkt []byte)) {
 // runLegacyDispatcher 单测兼容纯 Go 报文分发器 (无需 gVisor)
 func (e *StackEngine) runLegacyDispatcher() {
 	defer e.wg.Done()
+	e.mu.Lock()
+	dev := e.device
+	e.mu.Unlock()
+	if dev == nil {
+		return
+	}
 	buf := make([]byte, 65535)
 
 	for {
 		if e.ctx.Err() != nil {
 			return
 		}
-		n, err := e.device.Read(buf)
+		n, err := dev.Read(buf)
 		if err != nil {
 			return
 		}

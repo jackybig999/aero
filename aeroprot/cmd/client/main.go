@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -80,6 +81,12 @@ func main() {
 	tokenBytes := make([]byte, 16)
 	_, _ = rand.Read(tokenBytes)
 	sessionToken := hex.EncodeToString(tokenBytes)
+
+	// 将 sessionToken 写入系统标准临时/运行时目录，权限 0644 允许非 root 套壳 UI 读取鉴权
+	tokenDir := filepath.Join(os.TempDir(), "aeroprot")
+	_ = os.MkdirAll(tokenDir, 0755)
+	tokenPath := filepath.Join(tokenDir, fmt.Sprintf("session-%d.token", os.Getpid()))
+	_ = os.WriteFile(tokenPath, []byte(sessionToken), 0644)
 
 	mux := http.NewServeMux()
 
@@ -515,7 +522,9 @@ func main() {
 			"timestamp": time.Now().Unix(),
 			"state":     st,
 		})
-		_, _ = fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
+		if _, err := fmt.Fprintf(w, "event: status\ndata: %s\n\n", data); err != nil {
+			return
+		}
 		flusher.Flush()
 
 		for {
@@ -573,6 +582,7 @@ func main() {
 
 	shutdown := func() {
 		log.Println("[CLIENT] stopping engine and api server...")
+		_ = os.Remove(tokenPath)
 		_ = eng.Close()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()

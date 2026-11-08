@@ -44,6 +44,7 @@ type IPDataPump struct {
 	bytesOut       atomic.Uint64
 	currentMTU     atomic.Int32
 	ipv6Blackhole  atomic.Bool
+	webrtcActive   atomic.Bool
 }
 
 // SetOnDisconnect registers the single asynchronous disconnect callback.
@@ -117,6 +118,16 @@ func (p *IPDataPump) IPv6Blackhole() bool {
 	return p.ipv6Blackhole.Load()
 }
 
+// SetWebRTCActive 动态设置 WebRTC STUN 报文放行门控状态
+func (p *IPDataPump) SetWebRTCActive(active bool) {
+	p.webrtcActive.Store(active)
+}
+
+// WebRTCActive 返回当前 WebRTC STUN 报文放行门控状态
+func (p *IPDataPump) WebRTCActive() bool {
+	return p.webrtcActive.Load()
+}
+
 // Start 启动双向转发 Goroutine
 func (p *IPDataPump) Start() {
 	p.wg.Add(2)
@@ -185,7 +196,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 				}
 
 				// 3. 阻断 WebRTC STUN 穿透报文 (IPv4 Protocol 17 = UDP)
-				if isSTUNPacket(raw[ihl+8:]) {
+				if isSTUNPacket(raw[ihl+8:]) && !p.webrtcActive.Load() {
 					continue
 				}
 			}
@@ -218,7 +229,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 				}
 
 				// 阻断 IPv6 WebRTC STUN 穿透报文
-				if isSTUNPacket(raw[48:]) {
+				if isSTUNPacket(raw[48:]) && !p.webrtcActive.Load() {
 					continue
 				}
 			}
