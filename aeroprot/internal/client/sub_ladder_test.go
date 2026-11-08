@@ -542,3 +542,24 @@ func TestWebRTC_STUNPhysicalBlocking(t *testing.T) {
 		t.Errorf("packet with leading bits 11 should not be identified as STUN")
 	}
 }
+
+func TestFetchSubscription_PrivateIPBlocked(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	privateURLs := []string{
+		"http://127.0.0.1:8080/sub",
+		"http://192.168.1.1/sub",
+		"http://10.0.0.1:80/sub",
+		"http://169.254.169.254/latest/meta-data",
+	}
+
+	for _, u := range privateURLs {
+		_, err := FetchSubscription(ctx, u, SubFetchOptions{DisableCache: true})
+		if err == nil {
+			t.Errorf("expected subscription request to private IP %s to be forbidden, but got nil error", u)
+		} else if !strings.Contains(err.Error(), "forbidden") {
+			t.Errorf("expected error containing 'forbidden', got: %v", err)
+		}
+	}
+}

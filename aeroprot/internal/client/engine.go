@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.2.31"
+	ClientVersion = "1.2.32"
 	Protocol      = "aero/3.0"
 )
 
@@ -146,7 +146,6 @@ type Engine struct {
 	lifecycleMu       sync.Mutex
 	startCancel       context.CancelFunc
 	tcpDialer         func(ctx context.Context, target string) (net.Conn, error)
-	stopMixed         chan struct{}
 	rootCtx           context.Context
 	rootCancel        context.CancelFunc
 	netMon            NetworkMonitor
@@ -205,7 +204,6 @@ func NewEngine() *Engine {
 		sessionMgr:        sessMgr,
 		mode:              "tun",
 		listenAddr:        "127.0.0.1:55555",
-		stopMixed:         make(chan struct{}),
 		netMon:            NewNetworkMonitor(),
 		packetConnFactory: ListenPhysicalPacket,
 	}
@@ -1062,7 +1060,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 	e.mu.Unlock()
 
 	e.rootCtx, e.rootCancel = context.WithCancel(context.Background())
-	e.stopMixed = make(chan struct{})
 	if e.dnsHandler != nil {
 		SetGlobalMobileDNSHandler(e.dnsHandler)
 	}
@@ -1144,6 +1141,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 
 	// WebRTC 生产激活：探测成功且 stackEngine 启动后，显式激活 WebRTC
 	e.stackEngine.SetWebRTCActive(true)
+	SetGlobalMobileWebRTCActive(true)
 
 	if err := setupRoutesFn(dev.Name(), prefixStr); err != nil {
 		if e.stackEngine != nil {
@@ -1203,6 +1201,7 @@ func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice,
 
 	if e.stackEngine != nil {
 		e.stackEngine.SetWebRTCActive(false)
+		SetGlobalMobileWebRTCActive(false)
 		e.stackEngine.Stop()
 		e.stackEngine = nil
 	}
@@ -1244,6 +1243,7 @@ func (e *Engine) onNetworkChange(newGW, ifName string) {
 	if stackEng != nil {
 		stackEng.SetWebRTCActive(false)
 	}
+	SetGlobalMobileWebRTCActive(false)
 
 	if sentinel != nil {
 		sentinel.wakeup()
@@ -1294,6 +1294,7 @@ func (e *Engine) onNetworkChange(newGW, ifName string) {
 		if _, err := e.sessionPool.Get(ctx, cfg); err == nil {
 			if stackEng != nil && e.running.Load() {
 				stackEng.SetWebRTCActive(true)
+				SetGlobalMobileWebRTCActive(true)
 			}
 		}
 	}()
@@ -1389,14 +1390,9 @@ func (e *Engine) stopLocked() error {
 
 	e.closeActiveConns()
 
-	select {
-	case <-e.stopMixed:
-	default:
-		close(e.stopMixed)
-	}
-
 	if e.stackEngine != nil {
 		e.stackEngine.SetWebRTCActive(false)
+		SetGlobalMobileWebRTCActive(false)
 		e.stackEngine.Stop()
 		e.stackEngine = nil
 	}
@@ -1827,8 +1823,32 @@ func (e *Engine) DialTCP(ctx context.Context, target string) (net.Conn, error) {
 	}, nil
 }
 
-// DialUDP 导出供外部使用的 UDP 拨号接口 (MASQUE CONNECT-UDP)
+// DialUDP 导出供外部使用的 UDP 拨号接口 (MASQUE CONNECT-UDP / 本地物理直连)
 func (e *Engine) DialUDP(ctx context.Context, target string) (net.Conn, error) {
+	e.mu.RLock()
+	split := e.splitEngine
+	dnsH := e.dnsHandler
+	e.mu.RUnlock()
+
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+	}
+	var ip net.IP
+	if dnsH != nil && dnsH.FakeIP() != nil {
+		if parsedIP := net.ParseIP(host); parsedIP != nil && dnsH.FakeIP().Contains(parsedIP) {
+			if domain, _ := dnsH.FakeIP().Acquire(parsedIP); domain != "" {
+				host = domain
+			}
+		}
+	}
+	ip = net.ParseIP(host)
+
+	// 分流匹配：如果目标属于 DIRECT，直接走物理网卡 DialPhysicalDirect
+	if split != nil && split.Match(host, ip) == DIRECT {
+		return DialPhysicalDirect(ctx, "udp", target)
+	}
+
 	if e.sessionMgr != nil {
 		return e.sessionMgr.DialUDP(ctx, target)
 	}

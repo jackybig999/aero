@@ -253,6 +253,20 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	_ = runMac("route", "add", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "add", "-net", "128.0.0.0/1", "-interface", devName)
 
+	if len(cfg.ExcludedCIDRs) > 0 {
+		gw, ifName, err := PhysicalDefaultGateway()
+		if err == nil && gw != "" {
+			for _, cidr := range cfg.ExcludedCIDRs {
+				if ifName != "" {
+					_ = runMac("route", "add", "-net", cidr, gw, "-interface", ifName)
+				} else {
+					_ = runMac("route", "add", "-net", cidr, gw)
+				}
+			}
+			log.Printf("[TUN] Darwin configured %d excluded direct routes via physical gw %s", len(cfg.ExcludedCIDRs), gw)
+		}
+	}
+
 	if cfg.EnableIPv6 || cfg.EnableIPv6Blackhole {
 		_ = runMac("route", "add", "-inet6", "::/1", "-interface", devName)
 		_ = runMac("route", "add", "-inet6", "8000::/1", "-interface", devName)
@@ -284,6 +298,11 @@ func TeardownRoutes(devName string) {
 	}
 	_ = runMac("route", "delete", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "delete", "-net", "128.0.0.0/1", "-interface", devName)
+	if len(cfg.ExcludedCIDRs) > 0 {
+		for _, cidr := range cfg.ExcludedCIDRs {
+			_ = runMac("route", "delete", "-net", cidr)
+		}
+	}
 	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
 }

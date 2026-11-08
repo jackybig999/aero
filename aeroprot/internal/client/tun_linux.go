@@ -248,6 +248,16 @@ func TeardownRoutes(devName string) {
 	}
 	_ = runLinux("ip", "route", "del", "0.0.0.0/1", "dev", devName)
 	_ = runLinux("ip", "route", "del", "128.0.0.0/1", "dev", devName)
+	if len(cfg.ExcludedCIDRs) > 0 {
+		gw, ifName, _ := PhysicalDefaultGateway()
+		for _, cidr := range cfg.ExcludedCIDRs {
+			if gw != "" && ifName != "" {
+				_ = runLinux("ip", "route", "del", cidr, "via", gw, "dev", ifName)
+			} else {
+				_ = runLinux("ip", "route", "del", cidr)
+			}
+		}
+	}
 	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
 }

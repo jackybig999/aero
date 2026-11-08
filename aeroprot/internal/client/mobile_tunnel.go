@@ -17,7 +17,10 @@ import (
 	"github.com/quic-go/connect-ip-go"
 )
 
-var globalMobileDNSHandler atomic.Pointer[DNSHandler]
+var (
+	globalMobileDNSHandler   atomic.Pointer[DNSHandler]
+	globalMobileWebRTCActive atomic.Bool
+)
 
 // SetGlobalMobileDNSHandler 设置供移动端 TUN 隧道拦截使用的全局 DNS 处理器
 func SetGlobalMobileDNSHandler(h *DNSHandler) {
@@ -27,6 +30,16 @@ func SetGlobalMobileDNSHandler(h *DNSHandler) {
 // GetGlobalMobileDNSHandler 获取移动端全局 DNS 处理器
 func GetGlobalMobileDNSHandler() *DNSHandler {
 	return globalMobileDNSHandler.Load()
+}
+
+// SetGlobalMobileWebRTCActive 设置供移动端 TUN 隧道拦截使用的全局 WebRTC 激活门控
+func SetGlobalMobileWebRTCActive(active bool) {
+	globalMobileWebRTCActive.Store(active)
+}
+
+// GetGlobalMobileWebRTCActive 获取移动端全局 WebRTC 激活门控
+func GetGlobalMobileWebRTCActive() bool {
+	return globalMobileWebRTCActive.Load()
 }
 
 // mobileBufPool provides a zero-heap-allocation 1500-byte buffer pool for mobile TUN processing.
@@ -194,16 +207,35 @@ func CopyTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn io.ReadWrite
 	return retErr
 }
 
-// clampTCPMSS 检查是否为 IPv4 TCP SYN/SYN-ACK 报文，若 MSS 选项大于 maxMSS 则原子原地缩减并更新增量校验和 (RFC 1624)
+// clampTCPMSS 检查是否为 TCP SYN/SYN-ACK 报文 (IPv4 或 IPv6)，若 MSS 选项大于 maxMSS 则原子原地缩减并更新增量校验和 (RFC 1624)
 func clampTCPMSS(raw []byte, maxMSS uint16) []byte {
-	if len(raw) < 40 || (raw[0]>>4) != 4 || raw[9] != 6 {
+	if len(raw) < 40 {
 		return raw
 	}
-	ihl := int(raw[0]&0x0F) * 4
-	if len(raw) < ihl+20 {
+	ver := raw[0] >> 4
+	var tcpHdr []byte
+
+	if ver == 4 {
+		if raw[9] != 6 {
+			return raw
+		}
+		ihl := int(raw[0]&0x0F) * 4
+		if len(raw) < ihl+20 {
+			return raw
+		}
+		tcpHdr = raw[ihl:]
+	} else if ver == 6 {
+		if raw[6] != 6 { // Next Header == 6 (TCP)
+			return raw
+		}
+		if len(raw) < 40+20 {
+			return raw
+		}
+		tcpHdr = raw[40:]
+	} else {
 		return raw
 	}
-	tcpHdr := raw[ihl:]
+
 	tcpFlags := tcpHdr[13]
 	if (tcpFlags & 0x02) == 0 { // 仅 SYN 或 SYN+ACK 携带 MSS 选项
 		return raw
@@ -300,11 +332,39 @@ func CopyCONNECTIPTunnel(ctx context.Context, tun io.ReadWriteCloser, ipConn *co
 								continue
 							}
 						}
-						if isSTUNPacket(raw[ihl+8:]) {
+						if isSTUNPacket(raw[ihl+8:]) && !globalMobileWebRTCActive.Load() {
 							continue
 						}
 					}
 					dstIP := net.IP(raw[16:20])
+					if isLocalOrPrivateIP("", dstIP) {
+						continue
+					}
+				} else if n >= 40 && raw[0]>>4 == 6 {
+					// 移动端 IPv6 双栈防御拦截 (RFC 8200)
+					if len(raw) >= 48 && raw[6] == 17 { // Next Header == 17 (UDP)
+						dstPort := binary.BigEndian.Uint16(raw[42:44])
+						if dstPort == 53 {
+							dnsH := globalMobileDNSHandler.Load()
+							if dnsH != nil {
+								srcPort := binary.BigEndian.Uint16(raw[40:42])
+								srcIP := net.IP(raw[8:24])
+								dstIP := net.IP(raw[24:40])
+								dnsPayload := raw[48:]
+								if resp := dnsH.HandleQuery(dnsPayload, srcIP, srcPort); resp != nil {
+									respPkt := buildIPv6UDPResponsePacket(dstIP, srcIP, dstPort, srcPort, resp)
+									if len(respPkt) > 0 {
+										_, _ = tun.Write(respPkt)
+									}
+								}
+								continue
+							}
+						}
+						if isSTUNPacket(raw[48:]) && !globalMobileWebRTCActive.Load() {
+							continue
+						}
+					}
+					dstIP := net.IP(raw[24:40])
 					if isLocalOrPrivateIP("", dstIP) {
 						continue
 					}

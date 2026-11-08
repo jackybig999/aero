@@ -376,3 +376,48 @@ func TestClampTCPMSS(t *testing.T) {
 		t.Fatalf("expected checksum unchanged when MSS not clamped")
 	}
 }
+
+func TestClampTCPMSS_IPv6(t *testing.T) {
+	// 构造一个 64 字节的 IPv6 TCP SYN 报文 (40 字节 IPv6 + 24 字节 TCP 包含 4 字节 MSS 选项)
+	pkt := make([]byte, 64)
+	pkt[0] = 0x60 // IPv6
+	binary.BigEndian.PutUint16(pkt[4:6], 24) // Payload length = 24 (TCP)
+	pkt[6] = 6 // Next Header: TCP
+	pkt[7] = 64 // Hop Limit
+	copy(pkt[8:24], net.ParseIP("2001:db8::1"))
+	copy(pkt[24:40], net.ParseIP("2001:db8::2"))
+
+	// TCP
+	binary.BigEndian.PutUint16(pkt[40:42], 12345) // srcPort
+	binary.BigEndian.PutUint16(pkt[42:44], 443)   // dstPort
+	pkt[52] = 0x60                                // dataOffset = 6 (24 字节)
+	pkt[53] = 0x02                                // SYN flag
+	binary.BigEndian.PutUint16(pkt[54:56], 65535) // window
+	binary.BigEndian.PutUint16(pkt[56:58], 0xabcd) // checksum
+
+	// MSS Option: Kind=2, Length=4, Value=1440
+	pkt[60] = 2
+	pkt[61] = 4
+	binary.BigEndian.PutUint16(pkt[62:64], 1440)
+
+	clamped := clampTCPMSS(pkt, 1200)
+	newMSS := binary.BigEndian.Uint16(clamped[62:64])
+	if newMSS != 1200 {
+		t.Fatalf("expected IPv6 TCP MSS clamped to 1200, got %d", newMSS)
+	}
+	newCsum := binary.BigEndian.Uint16(clamped[56:58])
+	if newCsum == 0xabcd {
+		t.Fatalf("expected IPv6 TCP checksum updated via RFC 1624")
+	}
+}
+
+func TestGlobalMobileWebRTCActive(t *testing.T) {
+	SetGlobalMobileWebRTCActive(false)
+	if GetGlobalMobileWebRTCActive() {
+		t.Fatal("expected false")
+	}
+	SetGlobalMobileWebRTCActive(true)
+	if !GetGlobalMobileWebRTCActive() {
+		t.Fatal("expected true")
+	}
+}

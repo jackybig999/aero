@@ -253,3 +253,40 @@ func TestStackEngine_NilDialerGracefulDrop(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 }
+
+func TestEngine_DialUDP_DirectSplit(t *testing.T) {
+	eng := NewEngine()
+	defer eng.Close()
+
+	// 监听一个本地 UDP 测试服务器
+	lConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen UDP failed: %v", err)
+	}
+	defer lConn.Close()
+
+	target := lConn.LocalAddr().String()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// 127.0.0.1 属于 DIRECT，DialUDP 应该直接物理直连成功
+	conn, err := eng.DialUDP(ctx, target)
+	if err != nil {
+		t.Fatalf("expected direct DialUDP to succeed for loopback/direct target, got: %v", err)
+	}
+	defer conn.Close()
+
+	msg := []byte("hello-udp-direct")
+	if _, werr := conn.Write(msg); werr != nil {
+		t.Fatalf("write failed: %v", werr)
+	}
+
+	buf := make([]byte, 64)
+	n, _, rerr := lConn.ReadFrom(buf)
+	if rerr != nil {
+		t.Fatalf("read failed: %v", rerr)
+	}
+	if string(buf[:n]) != string(msg) {
+		t.Fatalf("payload mismatch: got %s, want %s", string(buf[:n]), string(msg))
+	}
+}

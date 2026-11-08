@@ -391,6 +391,25 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	addSplitDefault("0.0.0.0", "128.0.0.0")
 	addSplitDefault("128.0.0.0", "128.0.0.0")
 
+	// 2b. 下发国内直连排除路由 (LPM 优先直连物理网卡，彻底消除黑洞断网)
+	if len(cfg.ExcludedCIDRs) > 0 {
+		gw, physIdx, err := PhysicalDefaultGateway()
+		if err == nil && gw != "" {
+			for _, cidr := range cfg.ExcludedCIDRs {
+				if _, ipNet, parseErr := net.ParseCIDR(cidr); parseErr == nil && ipNet != nil {
+					maskStr := net.IP(ipNet.Mask).String()
+					networkStr := ipNet.IP.String()
+					args := []string{"add", networkStr, "mask", maskStr, gw, "metric", "1"}
+					if physIdx != "" {
+						args = append(args, "if", physIdx)
+					}
+					_ = runCmd("route", args...)
+				}
+			}
+			log.Printf("[TUN] Windows configured %d excluded direct routes via physical gw %s if %s", len(cfg.ExcludedCIDRs), gw, physIdx)
+		}
+	}
+
 	// 3. IPv6 全局接管或黑洞路由：不修改宿主防火墙。
 	if cfg.EnableIPv6 || cfg.EnableIPv6Blackhole {
 		_ = runCmd("netsh", "interface", "ipv6", "delete", "route", "::/1", devName)
@@ -461,6 +480,13 @@ func TeardownRoutes(devName string) {
 	_ = runCmd("netsh", "interface", "ip", "set", "dnsservers", "name="+devName, "source=dhcp")
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
+	if len(cfg.ExcludedCIDRs) > 0 {
+		for _, cidr := range cfg.ExcludedCIDRs {
+			if _, ipNet, err := net.ParseCIDR(cidr); err == nil && ipNet != nil {
+				_ = runCmd("route", "delete", ipNet.IP.String(), "mask", net.IP(ipNet.Mask).String())
+			}
+		}
+	}
 	_ = runCmd("ipconfig", "/flushdns")
 	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes and DNS removed for %s", devName)

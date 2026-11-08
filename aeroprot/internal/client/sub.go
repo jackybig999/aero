@@ -793,9 +793,15 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 		Proxy: nil,
 		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
-			if err == nil && net.ParseIP(host) == nil && getPhysicalDialerHook() == nil {
-				if ip, rerr := resolvePhysicalIPv4(host); rerr == nil && ip != nil {
-					addr = net.JoinHostPort(ip.String(), port)
+			if err == nil {
+				if parsedIP := net.ParseIP(host); parsedIP != nil {
+					if isLocalOrPrivateIP(host, parsedIP) {
+						return nil, fmt.Errorf("subscription to private or loopback IP %s is forbidden", host)
+					}
+				} else if getPhysicalDialerHook() == nil {
+					if ip, rerr := resolvePhysicalIPv4(host); rerr == nil && ip != nil {
+						addr = net.JoinHostPort(ip.String(), port)
+					}
 				}
 			}
 			return DialPhysicalDirect(c, network, addr)

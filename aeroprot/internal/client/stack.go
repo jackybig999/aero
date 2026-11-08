@@ -340,31 +340,7 @@ func (e *StackEngine) runLegacyDispatcher() {
 // --- 纯净网络工具函数 (零外部 gVisor 依赖) ---
 
 func buildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) []byte {
-	totalLen := 20 + 8 + len(payload)
-	b := make([]byte, totalLen)
-
-	// IPv4 Header (20 bytes)
-	b[0] = 0x45
-	binary.BigEndian.PutUint16(b[2:4], uint16(totalLen))
-	b[8] = 64
-	b[9] = 17 // UDP
-	copy(b[12:16], srcIP.To4())
-	copy(b[16:20], dstIP.To4())
-	var ipCsum uint32
-	for i := 0; i < 20; i += 2 {
-		ipCsum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
-	}
-	for ipCsum > 0xffff {
-		ipCsum = (ipCsum & 0xffff) + (ipCsum >> 16)
-	}
-	binary.BigEndian.PutUint16(b[10:12], ^uint16(ipCsum))
-
-	// UDP Header (8 bytes)
-	binary.BigEndian.PutUint16(b[20:22], srcPort)
-	binary.BigEndian.PutUint16(b[22:24], dstPort)
-	binary.BigEndian.PutUint16(b[24:26], uint16(8+len(payload)))
-	copy(b[28:], payload)
-	return b
+	return buildIPv4UDPResponsePacket(srcIP, dstIP, srcPort, dstPort, payload)
 }
 
 func isSTUNPacket(payload []byte) bool {
@@ -388,10 +364,6 @@ func (c *prefixedUDPConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 	return c.Conn.Read(b)
-}
-
-func joinHostPort(host string, port uint16) string {
-	return net.JoinHostPort(host, strconv.Itoa(int(port)))
 }
 
 func isPrivateOrLoopbackAddr(v any) bool {
@@ -578,10 +550,10 @@ func relayTraffic(a, b net.Conn, ctxs ...context.Context) {
 		buf := *bufPtr
 
 		for {
-			_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
+			_ = src.SetReadDeadline(time.Now().Add(300 * time.Second))
 			n, err := src.Read(buf)
 			if n > 0 {
-				_ = src.SetReadDeadline(time.Now().Add(60 * time.Second))
+				_ = src.SetReadDeadline(time.Now().Add(300 * time.Second))
 				payload := buf[:n]
 				if bytes.Contains(payload, []byte("candidate")) || bytes.Contains(payload, []byte("c=IN IP6")) || isSTUNPacket(payload) {
 					payload = SanitizeWebRTCPayload(payload)
