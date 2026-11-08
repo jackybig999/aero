@@ -391,22 +391,12 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	addSplitDefault("0.0.0.0", "128.0.0.0")
 	addSplitDefault("128.0.0.0", "128.0.0.0")
 
-	// 2b. 下发国内直连排除路由 (LPM 优先直连物理网卡，彻底消除黑洞断网)
+	// 2b. 下发国内直连排除路由 (批量注入物理网卡，彻底消除117秒启动卡死与黑洞)
 	if len(cfg.ExcludedCIDRs) > 0 {
 		gw, physIdx, err := PhysicalDefaultGateway()
 		if err == nil && gw != "" {
-			for _, cidr := range cfg.ExcludedCIDRs {
-				if _, ipNet, parseErr := net.ParseCIDR(cidr); parseErr == nil && ipNet != nil {
-					maskStr := net.IP(ipNet.Mask).String()
-					networkStr := ipNet.IP.String()
-					args := []string{"add", networkStr, "mask", maskStr, gw, "metric", "1"}
-					if physIdx != "" {
-						args = append(args, "if", physIdx)
-					}
-					_ = runCmd("route", args...)
-				}
-			}
-			log.Printf("[TUN] Windows configured %d excluded direct routes via physical gw %s if %s", len(cfg.ExcludedCIDRs), gw, physIdx)
+			batchWindowsExcludedRoutes("add", cfg.ExcludedCIDRs, gw, physIdx)
+			log.Printf("[TUN] Windows configured %d excluded direct routes via physical gw %s if %s (batch)", len(cfg.ExcludedCIDRs), gw, physIdx)
 		}
 	}
 
@@ -481,15 +471,64 @@ func TeardownRoutes(devName string) {
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/1", devName)
 	_ = runCmd("netsh", "interface", "ipv4", "delete", "route", "128.0.0.0/1", devName)
 	if len(cfg.ExcludedCIDRs) > 0 {
-		for _, cidr := range cfg.ExcludedCIDRs {
-			if _, ipNet, err := net.ParseCIDR(cidr); err == nil && ipNet != nil {
-				_ = runCmd("route", "delete", ipNet.IP.String(), "mask", net.IP(ipNet.Mask).String())
-			}
-		}
+		batchWindowsExcludedRoutes("delete", cfg.ExcludedCIDRs, "", "")
 	}
 	_ = runCmd("ipconfig", "/flushdns")
 	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes and DNS removed for %s", devName)
+}
+
+func batchWindowsExcludedRoutes(op string, cidrs []string, gw, physIdx string) {
+	if len(cidrs) == 0 {
+		return
+	}
+	cmdExecutorMu.RLock()
+	execFn := cmdExecutor
+	cmdExecutorMu.RUnlock()
+	if execFn != nil {
+		for _, cidr := range cidrs {
+			if _, ipNet, err := net.ParseCIDR(cidr); err == nil && ipNet != nil {
+				maskStr := net.IP(ipNet.Mask).String()
+				netStr := ipNet.IP.String()
+				if op == "add" {
+					args := []string{"add", netStr, "mask", maskStr, gw, "metric", "1"}
+					if physIdx != "" {
+						args = append(args, "if", physIdx)
+					}
+					_ = execFn("route", args...)
+				} else {
+					_ = execFn("route", "delete", netStr, "mask", maskStr)
+				}
+			}
+		}
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("@echo off\r\n")
+	for _, cidr := range cidrs {
+		if _, ipNet, err := net.ParseCIDR(cidr); err == nil && ipNet != nil {
+			maskStr := net.IP(ipNet.Mask).String()
+			netStr := ipNet.IP.String()
+			if op == "add" {
+				if physIdx != "" {
+					sb.WriteString(fmt.Sprintf("route add %s mask %s %s metric 1 if %s >nul 2>&1\r\n", netStr, maskStr, gw, physIdx))
+				} else {
+					sb.WriteString(fmt.Sprintf("route add %s mask %s %s metric 1 >nul 2>&1\r\n", netStr, maskStr, gw))
+				}
+			} else {
+				sb.WriteString(fmt.Sprintf("route delete %s mask %s >nul 2>&1\r\n", netStr, maskStr))
+			}
+		}
+	}
+
+	tmpFile := filepath.Join(os.TempDir(), fmt.Sprintf("aero_routes_%s_%d.bat", op, time.Now().UnixNano()))
+	if err := os.WriteFile(tmpFile, []byte(sb.String()), 0600); err == nil {
+		defer os.Remove(tmpFile)
+		cmd := exec.Command("cmd.exe", "/c", tmpFile)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+		_ = cmd.Run()
+	}
 }
 
 // CleanAero0StaleRoutes 仅删除归属于 aero0 接口的 0.0.0.0/1 和 128.0.0.0/1 及 DNS，碰不到任何其他网卡

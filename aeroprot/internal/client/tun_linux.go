@@ -210,10 +210,8 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	if len(cfg.ExcludedCIDRs) > 0 {
 		gw, ifName, err := PhysicalDefaultGateway()
 		if err == nil && gw != "" && ifName != "" {
-			for _, cidr := range cfg.ExcludedCIDRs {
-				_ = runLinux("ip", "route", "replace", cidr, "via", gw, "dev", ifName)
-			}
-			log.Printf("[TUN] Configured %d excluded direct routes via physical %s dev %s", len(cfg.ExcludedCIDRs), gw, ifName)
+			batchLinuxExcludedRoutes("replace", cfg.ExcludedCIDRs, gw, ifName)
+			log.Printf("[TUN] Configured %d excluded direct routes via physical %s dev %s (batch)", len(cfg.ExcludedCIDRs), gw, ifName)
 		}
 	}
 
@@ -250,16 +248,35 @@ func TeardownRoutes(devName string) {
 	_ = runLinux("ip", "route", "del", "128.0.0.0/1", "dev", devName)
 	if len(cfg.ExcludedCIDRs) > 0 {
 		gw, ifName, _ := PhysicalDefaultGateway()
-		for _, cidr := range cfg.ExcludedCIDRs {
-			if gw != "" && ifName != "" {
-				_ = runLinux("ip", "route", "del", cidr, "via", gw, "dev", ifName)
-			} else {
-				_ = runLinux("ip", "route", "del", cidr)
-			}
-		}
+		batchLinuxExcludedRoutes("del", cfg.ExcludedCIDRs, gw, ifName)
 	}
 	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
+}
+
+func batchLinuxExcludedRoutes(op string, cidrs []string, gw, ifName string) {
+	if len(cidrs) == 0 {
+		return
+	}
+	var sb strings.Builder
+	for _, cidr := range cidrs {
+		if gw != "" && ifName != "" {
+			sb.WriteString(fmt.Sprintf("route %s %s via %s dev %s\n", op, cidr, gw, ifName))
+		} else {
+			sb.WriteString(fmt.Sprintf("route %s %s\n", op, cidr))
+		}
+	}
+	cmd := exec.Command("ip", "-batch", "-")
+	cmd.Stdin = strings.NewReader(sb.String())
+	if err := cmd.Run(); err != nil {
+		for _, cidr := range cidrs {
+			if gw != "" && ifName != "" {
+				_ = runLinux("ip", "route", op, cidr, "via", gw, "dev", ifName)
+			} else {
+				_ = runLinux("ip", "route", op, cidr)
+			}
+		}
+	}
 }
 
 // ProtectHostRoute 保护海外节点路由

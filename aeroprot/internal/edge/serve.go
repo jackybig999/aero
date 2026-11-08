@@ -340,6 +340,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			log.Printf("[EDGE] [WARN] Auto-detected global TUN %s could not be attached: %v (CONNECT-IP proxy may be disabled)", tunDevice, err)
 		} else {
 			log.Printf("[EDGE] Global TUN device %s attached and active for CONNECT-IP data plane", tunDevice)
+			_ = ConfigureGlobalTunnelDevice(tunDevice, "10.88.0.1/16", "fd88:ae80::1/64", 1360)
+			_ = EnableKernelForwarding()
+			_ = ApplyEdgeFirewall(tunDevice)
 		}
 	}
 
@@ -635,6 +638,7 @@ func (s *Server) Close() {
 	if s.quicServer != nil {
 		s.quicServer.Close()
 	}
+	CleanupEdgeFirewall(s.cfg.GlobalTUNDevice)
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = s.httpServer.Shutdown(ctx)

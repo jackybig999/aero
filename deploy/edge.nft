@@ -18,6 +18,7 @@ table inet aero_edge_default {
 
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        iifname "aero-tun0" masquerade comment "aero_edge_default"
+        ip saddr 10.88.0.0/16 oifname != "aero-tun0" masquerade comment "aero_edge_default"
+        ip6 saddr fd88:ae80::/64 oifname != "aero-tun0" masquerade comment "aero_edge_default"
     }
 }

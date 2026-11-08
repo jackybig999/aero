@@ -256,14 +256,8 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	if len(cfg.ExcludedCIDRs) > 0 {
 		gw, ifName, err := PhysicalDefaultGateway()
 		if err == nil && gw != "" {
-			for _, cidr := range cfg.ExcludedCIDRs {
-				if ifName != "" {
-					_ = runMac("route", "add", "-net", cidr, gw, "-interface", ifName)
-				} else {
-					_ = runMac("route", "add", "-net", cidr, gw)
-				}
-			}
-			log.Printf("[TUN] Darwin configured %d excluded direct routes via physical gw %s", len(cfg.ExcludedCIDRs), gw)
+			batchDarwinExcludedRoutes("add", cfg.ExcludedCIDRs, gw, ifName)
+			log.Printf("[TUN] Darwin configured %d excluded direct routes via physical gw %s (batch)", len(cfg.ExcludedCIDRs), gw)
 		}
 	}
 
@@ -299,12 +293,41 @@ func TeardownRoutes(devName string) {
 	_ = runMac("route", "delete", "-net", "0.0.0.0/1", "-interface", devName)
 	_ = runMac("route", "delete", "-net", "128.0.0.0/1", "-interface", devName)
 	if len(cfg.ExcludedCIDRs) > 0 {
-		for _, cidr := range cfg.ExcludedCIDRs {
-			_ = runMac("route", "delete", "-net", cidr)
-		}
+		batchDarwinExcludedRoutes("delete", cfg.ExcludedCIDRs, "", "")
 	}
 	deleteActiveRouteConfig(devName)
 	log.Printf("[TUN] Routes removed for %s", devName)
+}
+
+func batchDarwinExcludedRoutes(op string, cidrs []string, gw, ifName string) {
+	if len(cidrs) == 0 {
+		return
+	}
+	var sb strings.Builder
+	for _, cidr := range cidrs {
+		if op == "add" && ifName != "" {
+			sb.WriteString(fmt.Sprintf("route -q add -net %s %s -interface %s 2>/dev/null\n", cidr, gw, ifName))
+		} else if op == "add" {
+			sb.WriteString(fmt.Sprintf("route -q add -net %s %s 2>/dev/null\n", cidr, gw))
+		} else {
+			sb.WriteString(fmt.Sprintf("route -q delete -net %s 2>/dev/null\n", cidr))
+		}
+	}
+	cmd := exec.Command("/bin/sh")
+	cmd.Stdin = strings.NewReader(sb.String())
+	if err := cmd.Run(); err != nil {
+		for _, cidr := range cidrs {
+			if op == "add" {
+				if ifName != "" {
+					_ = runMac("route", "add", "-net", cidr, gw, "-interface", ifName)
+				} else {
+					_ = runMac("route", "add", "-net", cidr, gw)
+				}
+			} else {
+				_ = runMac("route", "delete", "-net", cidr)
+			}
+		}
+	}
 }
 
 // ProtectHostRoute 保护海外节点路由
