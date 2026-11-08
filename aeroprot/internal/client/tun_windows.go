@@ -339,12 +339,14 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	gwIP := "10.88.0.1"
 	mask := "255.255.255.0"
 	tunIP := cfg.IPv4.Addr().String()
-	if bits := cfg.IPv4.Bits(); bits >= 0 {
+	if bits := cfg.IPv4.Bits(); bits > 0 && bits < 31 {
 		mask = cidrToMask(fmt.Sprintf("%d", bits))
 	}
 
-	_ = runCmd("netsh", "interface", "ip", "set", "address",
-		"name="+devName, "source=static", "address="+tunIP, "mask="+mask, "gateway="+gwIP, "gwmetric=1")
+	if err := runCmd("netsh", "interface", "ip", "set", "address",
+		"name="+devName, "source=static", "address="+tunIP, "mask="+mask, "gateway="+gwIP, "gwmetric=1"); err != nil {
+		log.Printf("[TUN] Windows set IPv4 address on %s failed: %v", devName, err)
+	}
 	_ = runCmd("netsh", "interface", "set", "interface", "name="+devName, "admin=ENABLED")
 
 	clientIPv6 := ""

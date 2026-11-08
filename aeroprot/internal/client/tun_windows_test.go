@@ -198,6 +198,36 @@ func TestSetupRoutesDNSGatewayAlignment(t *testing.T) {
 	}
 }
 
+func TestSetupRoutesSubnetMaskCalculation(t *testing.T) {
+	var executedCommands [][]string
+	restore := SetCmdExecutorForTest(func(name string, args ...string) error {
+		executedCommands = append(executedCommands, append([]string{name}, args...))
+		return nil
+	})
+	t.Cleanup(restore)
+
+	// 当服务端按 RFC 9484 CONNECT-IP 分配 /32 主机前缀时，
+	// Windows netsh 要求网关在同一子网内，因此子网掩码必须自动归一化为 255.255.255.0
+	err := SetupRoutes("aero0", "10.88.0.2/32")
+	if err != nil {
+		t.Fatalf("unexpected error from SetupRoutes: %v", err)
+	}
+
+	foundSetAddress := false
+	for _, cmd := range executedCommands {
+		if len(cmd) >= 5 && cmd[0] == "netsh" && cmd[2] == "ip" && cmd[3] == "set" && cmd[4] == "address" {
+			foundSetAddress = true
+			expected := []string{"netsh", "interface", "ip", "set", "address", "name=aero0", "source=static", "address=10.88.0.2", "mask=255.255.255.0", "gateway=10.88.0.1", "gwmetric=1"}
+			if !reflect.DeepEqual(cmd, expected) {
+				t.Fatalf("expected command %v, got %v", expected, cmd)
+			}
+		}
+	}
+	if !foundSetAddress {
+		t.Fatal("expected netsh set address command not executed")
+	}
+}
+
 func TestRotatePhysicalDNSRoute(t *testing.T) {
 	origCmd := routeCmd
 	origDNSFn := getPhysicalDNSServersFn

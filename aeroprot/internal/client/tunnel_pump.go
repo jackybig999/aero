@@ -206,6 +206,12 @@ func (p *IPDataPump) pumpTunToRemote() {
 			if isLocalOrPrivateIP("", dstIP) || (p.dnsHandler != nil && p.dnsHandler.split != nil && p.dnsHandler.split.MatchIP(dstIP) == DIRECT) {
 				continue
 			}
+
+			// 3c. 宿主局域网源 IP 串流拦截：若源 IP 为物理局域网私有网段 (192.168.0.0/16, 172.16.0.0/12)，严禁送入远端 CONNECT-IP 隧道
+			srcIP := net.IP(raw[12:16])
+			if (srcIP[0] == 192 && srcIP[1] == 168) || (srcIP[0] == 172 && srcIP[1] >= 16 && srcIP[1] <= 31) {
+				continue
+			}
 		} else if version == 6 {
 			if len(raw) < 40 {
 				continue
