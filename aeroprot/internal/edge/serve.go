@@ -16,6 +16,7 @@ import (
 	"crypto/x509/pkix"
 	_ "embed"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -234,6 +235,31 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		certLoader = NewDynamicCertLoader("", "", c)
 	}
 	cert := certLoader.CurrentCert()
+
+	// 2b. Port pre-check and conflict auto-avoidance (服务端端口自主冲突检测与智能避让)
+	// 如果目标主端口 (如 :443) 已经被现有服务 (如 x-ui / nginx) 占用，服务端自动避让至空闲可用标准端口
+	if !checkPortAvailable(cfg.Listen) {
+		host, _, _ := net.SplitHostPort(cfg.Listen)
+		candidates := []int{8443, 2083, 2087, 2053, 2096, 10443, 24443, 34443, 44443}
+		for _, cand := range candidates {
+			candAddr := net.JoinHostPort(host, strconv.Itoa(cand))
+			if checkPortAvailable(candAddr) {
+				log.Printf("[EDGE] [PORT] Requested listen address %s is occupied (e.g. x-ui / nginx in use). Intelligently auto-avoiding to available port %s", cfg.Listen, candAddr)
+				cfg.Listen = candAddr
+				break
+			}
+		}
+	}
+
+	// 2c. AdminKey 自治生成与持久化保底
+	if cfg.AdminKey == "" {
+		if existingKey := loadExistingAdminKey(); existingKey != "" {
+			cfg.AdminKey = existingKey
+		} else {
+			cfg.AdminKey = generateSecureAdminKey()
+			log.Printf("[EDGE] [AUTH] No AdminKey configured. Generated secure Web Console key: %s", cfg.AdminKey)
+		}
+	}
 
 	// 3. Subscriptions (sub_meta.json & client-sub.json)
 	_, portStr, _ := net.SplitHostPort(cfg.Listen)
@@ -1268,8 +1294,8 @@ func tryPortFallbackTCP(initialListen string, tlsCfg *tls.Config) (net.Listener,
 	}
 	initPort, _ := strconv.Atoi(portStr)
 
-	// Tier 1 (标准 HTTPS 候选池，优先 2083/2087) + Tier 2 (自治高位避让候选池)
-	candidates := StandardCandidatePorts
+	// 优先避让标准 HTTPS 备用端口 8443，然后按候选池顺序探测
+	candidates := []int{8443, 2083, 2087, 2053, 2096, 10443, 24443, 34443, 44443}
 	for _, cand := range candidates {
 		if cand == initPort {
 			continue
@@ -1337,3 +1363,48 @@ func persistServerConfig(cfg ServerConfig) {
 	}
 	_ = os.Rename(tmpFile, configFile)
 }
+
+// checkPortAvailable 预检目标地址是否未被占用 (TCP与UDP双栈均空闲)
+func checkPortAvailable(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+
+	uconn, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return false
+	}
+	_ = uconn.Close()
+	return true
+}
+
+// generateSecureAdminKey 自动生成 32 字符的加密安全 Web 管理密钥
+func generateSecureAdminKey() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("aero_%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// loadExistingAdminKey 从配置文件中尝试装载已存在的 admin_key
+func loadExistingAdminKey() string {
+	data, err := os.ReadFile("/etc/aero/edge.json")
+	if err != nil {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return ""
+	}
+	if k, ok := m["admin_key"].(string); ok && strings.TrimSpace(k) != "" {
+		return strings.TrimSpace(k)
+	}
+	return ""
+}
+

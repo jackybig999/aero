@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.38)
+# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.39)
 # 支持交互式终端菜单与非交互式快捷命令调用
 # ==============================================================================
 set -e
@@ -30,38 +30,69 @@ check_root() {
 }
 
 load_config() {
+    DOMAIN=""
+    PRIMARY_PORT=""
+    ADMIN_KEY=""
+    TOKEN=""
+
+    # 1. 优先从权威配置 /etc/aero/edge.json 读取服务端自闭环生效配置
+    if [[ -f "$JSON_CONFIG" ]]; then
+        DOMAIN=$(grep -o '"domain":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
+        ADMIN_KEY=$(grep -o '"admin_key":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
+        P_STR=$(grep -o '"listen":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
+        if [[ -n "$P_STR" ]]; then
+            PRIMARY_PORT="${P_STR#:}"
+        fi
+    fi
+
+    # 2. 从订阅元数据 /var/lib/aero/sub_meta.json 回退读取
+    if [[ -f "$SUB_META" ]]; then
+        if [[ -z "$DOMAIN" ]]; then
+            DOMAIN=$(grep -o '"sni":[^,]*' "$SUB_META" 2>/dev/null | cut -d'"' -f4 || true)
+            if [[ "$DOMAIN" == "localhost" || "$DOMAIN" == "127.0.0.1" ]]; then
+                DOMAIN=""
+            fi
+        fi
+        if [[ -z "$PRIMARY_PORT" ]]; then
+            PRIMARY_PORT=$(grep -o '"primary_port":[^,]*' "$SUB_META" 2>/dev/null | grep -o '[0-9]*' || true)
+        fi
+        if [[ -z "$ADMIN_KEY" ]]; then
+            ADMIN_KEY=$(grep -o '"admin_key":[^,]*' "$SUB_META" 2>/dev/null | cut -d'"' -f4 || true)
+        fi
+    fi
+
+    # 3. 从系统正在运行的 aero-edge 进程实际监听端口推导真实物理状态
+    if [[ -z "$PRIMARY_PORT" ]] && systemctl is-active --quiet aero-edge 2>/dev/null; then
+        PID=$(systemctl show aero-edge --property=MainPID 2>/dev/null | cut -d= -f2 || true)
+        if [[ -n "$PID" && "$PID" -gt 0 ]]; then
+            REAL_PORT=$(ss -tulpn 2>/dev/null | grep "pid=${PID}," | grep -o ':[0-9]\+' | head -1 | tr -d ':' || true)
+            if [[ -n "$REAL_PORT" ]]; then
+                PRIMARY_PORT="$REAL_PORT"
+            fi
+        fi
+    fi
+
+    # 4. 从历史 shell 配置文件 /etc/aero/edge.conf 兼容读取
     if [[ -f "$CONFIG_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$CONFIG_FILE"
-    fi
-    DOMAIN="${AERO_DOMAIN:-}"
-    TOKEN="${AERO_TOKEN:-}"
-    PORTS="${AERO_PORTS:-443}"
-    PRIMARY_PORT=$(echo "$PORTS" | cut -d, -f1 | tr -d ' ')
-    ADMIN_KEY="${AERO_ADMIN_KEY:-}"
-    
-    if [[ -z "$DOMAIN" && -f "$JSON_CONFIG" ]]; then
-        DOMAIN=$(grep -o '"domain":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
-    fi
-    if [[ -z "$DOMAIN" && -f "$SUB_META" ]]; then
-        DOMAIN=$(grep -o '"sni":[^,]*' "$SUB_META" 2>/dev/null | cut -d'"' -f4 || true)
-        if [[ "$DOMAIN" == "localhost" || "$DOMAIN" == "127.0.0.1" ]]; then
-            DOMAIN=""
+        [[ -z "$DOMAIN" ]] && DOMAIN="${AERO_DOMAIN:-}"
+        [[ -z "$TOKEN" ]] && TOKEN="${AERO_TOKEN:-}"
+        [[ -z "$ADMIN_KEY" ]] && ADMIN_KEY="${AERO_ADMIN_KEY:-}"
+        if [[ -z "$PRIMARY_PORT" && -n "${AERO_PORTS:-}" ]]; then
+            PRIMARY_PORT=$(echo "$AERO_PORTS" | cut -d, -f1 | tr -d ' ')
         fi
     fi
+
+    # 5. 从公网证书 SAN 自动提取域名
     if [[ -z "$DOMAIN" ]]; then
         ACTUAL_C=$(find_cert_path 2>/dev/null || true)
         if [[ -n "$ACTUAL_C" ]]; then
             DOMAIN=$(openssl x509 -in "$ACTUAL_C" -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[^, ]*' | head -1 | cut -d: -f2 || openssl x509 -in "$ACTUAL_C" -noout -subject 2>/dev/null | sed 's/subject= //' || true)
         fi
     fi
-    if [[ -z "$ADMIN_KEY" && -f "$JSON_CONFIG" ]]; then
-        ADMIN_KEY=$(grep -o '"admin_key":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
-    fi
-    if [[ -z "$PRIMARY_PORT" && -f "$JSON_CONFIG" ]]; then
-        P_STR=$(grep -o '"listen":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
-        PRIMARY_PORT="${P_STR#:}"
-    fi
+
+    # 6. 默认兜底主端口
     if [[ -z "$PRIMARY_PORT" ]]; then
         PRIMARY_PORT="443"
     fi
@@ -123,21 +154,121 @@ cmd_info() {
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${BOLD}            AERO Edge 订阅与接入信息               ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e " 节点域名:       ${GREEN}${DOMAIN}${PLAIN}"
+    echo -e " 节点域名:       ${GREEN}${DOMAIN:-未配置}${PLAIN}"
     echo -e " 监听主端口:     ${GREEN}:${PRIMARY_PORT}${PLAIN}"
     echo -e " 管理密钥:       ${YELLOW}${ADMIN_KEY:-未设置}${PLAIN}"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
     if [[ -n "$DOMAIN" ]]; then
-        ADMIN_SUB_URL="https://${DOMAIN}/sub/admin"
-        CONSOLE_URL="https://${DOMAIN}:${PRIMARY_PORT}/console?key=${ADMIN_KEY}"
+        PORT_SUFFIX=""
+        if [[ -n "$PRIMARY_PORT" && "$PRIMARY_PORT" != "443" ]]; then
+            PORT_SUFFIX=":${PRIMARY_PORT}"
+        fi
+        ADMIN_SUB_URL="https://${DOMAIN}${PORT_SUFFIX}/sub/admin"
+        CONSOLE_URL="https://${DOMAIN}${PORT_SUFFIX}/console?key=${ADMIN_KEY}"
         
-        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN} (零端口权威规范)"
-        echo -e " 用户专属订阅:   ${GREEN}https://${DOMAIN}/sub/{用户名}{6位随机码}${PLAIN}"
+        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN}"
+        echo -e " 用户专属订阅:   ${GREEN}https://${DOMAIN}${PORT_SUFFIX}/sub/{用户名}{6位随机码}${PLAIN}"
         echo -e " Web 管理控制台: ${GREEN}${CONSOLE_URL}${PLAIN}"
     else
         echo -e "${YELLOW}提示: 节点配置未就绪，请先启动 aero-edge 服务${PLAIN}"
     fi
     echo -e "${CYAN}====================================================${PLAIN}"
+}
+
+cmd_set_key() {
+    check_root
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}       修改 Web 管理控制台密钥 (Admin Key)        ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e " 当前管理密钥: ${GREEN}${ADMIN_KEY:-未设置}${PLAIN}"
+    echo -e " 密钥格式规范: 建议 8-64 位字母、数字或字符，禁止包含空格"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    new_key="${1:-}"
+    if [[ -z "$new_key" ]]; then
+        read -r -p "请输入新的管理密钥 (直接回车生成 32 位安全随机密钥): " new_key
+    fi
+    if [[ -z "$new_key" ]]; then
+        new_key=$(tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32 || openssl rand -hex 16 2>/dev/null || date +%s%N | md5sum | head -c 32)
+        echo -e "已自动生成安全密钥: ${GREEN}${new_key}${PLAIN}"
+    fi
+
+    mkdir -p /etc/aero
+    if [[ -f "$JSON_CONFIG" ]]; then
+        if grep -q '"admin_key"' "$JSON_CONFIG"; then
+            sed -i 's/"admin_key": *"[^"]*"/"admin_key": "'"${new_key}"'"/' "$JSON_CONFIG"
+        else
+            sed -i 's/{/{\n  "admin_key": "'"${new_key}"'",/' "$JSON_CONFIG"
+        fi
+    else
+        cat > "$JSON_CONFIG" <<EOF
+{
+  "admin_key": "${new_key}"
+}
+EOF
+        chmod 600 "$JSON_CONFIG"
+    fi
+
+    echo -e "${CYAN}正在平滑应用新密钥...${PLAIN}"
+    if systemctl is-active --quiet aero-edge 2>/dev/null; then
+        systemctl restart aero-edge 2>/dev/null || true
+    fi
+    load_config
+    echo -e "${GREEN}Web 控制台管理密钥已成功更新！${PLAIN}"
+    PORT_SUFFIX=""
+    if [[ -n "$PRIMARY_PORT" && "$PRIMARY_PORT" != "443" ]]; then
+        PORT_SUFFIX=":${PRIMARY_PORT}"
+    fi
+    echo -e "新控制台直达链接: ${GREEN}https://${DOMAIN:-<域名>}${PORT_SUFFIX}/console?key=${new_key}${PLAIN}"
+}
+
+cmd_set_port() {
+    check_root
+    load_config
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e "${BOLD}            修改 AERO Edge 主监听端口              ${PLAIN}"
+    echo -e "${CYAN}====================================================${PLAIN}"
+    echo -e " 当前监听主端口: ${GREEN}:${PRIMARY_PORT}${PLAIN}"
+    echo -e " 备用标准端口池: 8443, 2083, 2087, 2053, 2096, 10443"
+    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+    new_port="${1:-}"
+    if [[ -z "$new_port" ]]; then
+        read -r -p "请输入新的主监听端口 (例如 8443 / 2083): " new_port
+    fi
+    new_port=$(echo "$new_port" | tr -d ' :' )
+    if [[ ! "$new_port" =~ ^[0-9]+$ ]] || [[ "$new_port" -le 0 ]] || [[ "$new_port" -gt 65535 ]]; then
+        echo -e "${RED}错误: 端口必须为 1-65535 的数字！${PLAIN}"
+        return 1
+    fi
+
+    mkdir -p /etc/aero
+    if [[ -f "$JSON_CONFIG" ]]; then
+        if grep -q '"listen"' "$JSON_CONFIG"; then
+            sed -i 's/"listen": *"[^"]*"/"listen": ":'"${new_port}"'"/' "$JSON_CONFIG"
+        else
+            sed -i 's/{/{\n  "listen": ":'"${new_port}"'",/' "$JSON_CONFIG"
+        fi
+    else
+        cat > "$JSON_CONFIG" <<EOF
+{
+  "listen": ":${new_port}"
+}
+EOF
+        chmod 600 "$JSON_CONFIG"
+    fi
+
+    echo -e "${CYAN}正在重启 AERO Edge 服务端应用新端口...${PLAIN}"
+    if systemctl is-active --quiet aero-edge 2>/dev/null; then
+        systemctl restart aero-edge 2>/dev/null || true
+    fi
+    sleep 1
+    load_config
+    echo -e "${GREEN}主监听端口已成功配置为 :${PRIMARY_PORT}！${PLAIN}"
+    PORT_SUFFIX=""
+    if [[ -n "$PRIMARY_PORT" && "$PRIMARY_PORT" != "443" ]]; then
+        PORT_SUFFIX=":${PRIMARY_PORT}"
+    fi
+    echo -e "新控制台直达链接: ${GREEN}https://${DOMAIN:-<域名>}${PORT_SUFFIX}/console?key=${ADMIN_KEY}${PLAIN}"
 }
 
 cmd_start() {
@@ -520,7 +651,7 @@ show_menu() {
         clear
         load_config
         echo -e "${CYAN}====================================================${PLAIN}"
-        echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.38)        ${PLAIN}"
+        echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.39)        ${PLAIN}"
         echo -e "${CYAN}====================================================${PLAIN}"
         echo -e " 服务状态: [ $(get_status) ]"
         echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  主端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"
@@ -536,18 +667,20 @@ show_menu() {
         echo -e "${CYAN}----------------------------------------------------${PLAIN}"
         echo -e "  ${BOLD}8.${PLAIN} 查看与管理用户 Token (Tokens & Quota)"
         echo -e "  ${BOLD}9.${PLAIN} 添加新用户 Token (Add Token)"
-        echo -e " ${BOLD}10.${PLAIN} TLS 公网证书与自动续期检测 (ACME Cert)"
-        echo -e " ${BOLD}11.${PLAIN} 内核 BBR 状态与一键调优 (BBR Tuning)"
-        echo -e " ${BOLD}12.${PLAIN} 虚拟网卡 (TUN) 与防火墙 NAT 状态 (TUN & NAT)"
-        echo -e " ${BOLD}13.${PLAIN} GeoData 直连规则库管理 (GeoData Sync)"
-        echo -e " ${BOLD}14.${PLAIN} Cloudflare WARP 出口分流状态 (WARP Proxy)"
+        echo -e " ${BOLD}10.${PLAIN} 修改 Web 控制台访问密钥 (Admin Key)"
+        echo -e " ${BOLD}11.${PLAIN} 修改服务端主监听端口 (Listen Port)"
+        echo -e " ${BOLD}12.${PLAIN} TLS 公网证书与自动续期检测 (ACME Cert)"
+        echo -e " ${BOLD}13.${PLAIN} 内核 BBR 状态与一键调优 (BBR Tuning)"
+        echo -e " ${BOLD}14.${PLAIN} 虚拟网卡 (TUN) 与防火墙 NAT 状态 (TUN & NAT)"
+        echo -e " ${BOLD}15.${PLAIN} GeoData 直连规则库管理 (GeoData Sync)"
+        echo -e " ${BOLD}16.${PLAIN} Cloudflare WARP 出口分流状态 (WARP Proxy)"
         echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-        echo -e " ${BOLD}15.${PLAIN} 检查并在线更新服务端 (Update)"
-        echo -e " ${BOLD}16.${PLAIN} 完全对称卸载节点 (Uninstall)"
+        echo -e " ${BOLD}17.${PLAIN} 检查并在线更新服务端 (Update)"
+        echo -e " ${BOLD}18.${PLAIN} 完全对称卸载节点 (Uninstall)"
         echo -e "${CYAN}----------------------------------------------------${PLAIN}"
         echo -e "  ${BOLD}0.${PLAIN} 退出管理菜单"
         echo -e "${CYAN}====================================================${PLAIN}"
-        read -r -p "请输入选项 [0-16]: " choice
+        read -r -p "请输入选项 [0-18]: " choice
         case "$choice" in
             1) cmd_status ;;
             2) cmd_info ;;
@@ -558,15 +691,17 @@ show_menu() {
             7) cmd_reload ;;
             8) cmd_tokens ;;
             9) cmd_add_token ;;
-            10) cmd_cert ;;
-            11) cmd_bbr ;;
-            12) cmd_net ;;
-            13) cmd_geodata ;;
-            14) cmd_warp ;;
-            15) cmd_update ;;
-            16) cmd_uninstall ;;
+            10) cmd_set_key ;;
+            11) cmd_set_port ;;
+            12) cmd_cert ;;
+            13) cmd_bbr ;;
+            14) cmd_net ;;
+            15) cmd_geodata ;;
+            16) cmd_warp ;;
+            17) cmd_update ;;
+            18) cmd_uninstall ;;
             0) echo -e "${GREEN}已安全退出 AERO 管理菜单。${PLAIN}"; exit 0 ;;
-            *) echo -e "${RED}输入无效，请输入 0-16 的数字！${PLAIN}" ;;
+            *) echo -e "${RED}输入无效，请输入 0-18 的数字！${PLAIN}" ;;
         esac
         echo ""
         read -n 1 -s -r -p "按任意键返回主菜单..."
@@ -586,6 +721,8 @@ case "$action" in
     log|logs)       cmd_log ;;
     token|tokens)   cmd_tokens ;;
     add-token)      cmd_add_token ;;
+    key|set-key|admin-key) cmd_set_key "${2:-}" ;;
+    port|set-port)  cmd_set_port "${2:-}" ;;
     cert)           cmd_cert ;;
     bbr)            cmd_bbr ;;
     net|tun)        cmd_net ;;
@@ -605,6 +742,8 @@ case "$action" in
         echo "  log          查看实时运行日志"
         echo "  tokens       查看已授权 Token"
         echo "  add-token    新增用户 Token"
+        echo "  key          修改 Web 控制台管理密钥"
+        echo "  port         修改服务端主监听端口"
         echo "  cert         查看 TLS 证书与自动续期健康状态"
         echo "  bbr          查看并开启 BBR 拥塞控制"
         echo "  net          查看 TUN 网卡与防火墙 NAT 状态"
