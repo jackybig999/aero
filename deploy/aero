@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.37)
+# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.38)
 # 支持交互式终端菜单与非交互式快捷命令调用
 # ==============================================================================
 set -e
@@ -42,6 +42,18 @@ load_config() {
     
     if [[ -z "$DOMAIN" && -f "$JSON_CONFIG" ]]; then
         DOMAIN=$(grep -o '"domain":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
+    fi
+    if [[ -z "$DOMAIN" && -f "$SUB_META" ]]; then
+        DOMAIN=$(grep -o '"sni":[^,]*' "$SUB_META" 2>/dev/null | cut -d'"' -f4 || true)
+        if [[ "$DOMAIN" == "localhost" || "$DOMAIN" == "127.0.0.1" ]]; then
+            DOMAIN=""
+        fi
+    fi
+    if [[ -z "$DOMAIN" ]]; then
+        ACTUAL_C=$(find_cert_path 2>/dev/null || true)
+        if [[ -n "$ACTUAL_C" ]]; then
+            DOMAIN=$(openssl x509 -in "$ACTUAL_C" -noout -ext subjectAltName 2>/dev/null | grep -o 'DNS:[^, ]*' | head -1 | cut -d: -f2 || openssl x509 -in "$ACTUAL_C" -noout -subject 2>/dev/null | sed 's/subject= //' || true)
+        fi
     fi
     if [[ -z "$ADMIN_KEY" && -f "$JSON_CONFIG" ]]; then
         ADMIN_KEY=$(grep -o '"admin_key":[^,]*' "$JSON_CONFIG" 2>/dev/null | cut -d'"' -f4 || true)
@@ -298,9 +310,18 @@ cmd_cert() {
     echo -e "${CYAN}====================================================${PLAIN}"
 
     # 询问是否签发新证书或更新
-    read -r -p "是否现在签发/更新 Let's Encrypt 公网权威证书? [y/N]: " do_issue
-    if [[ ! "$do_issue" =~ ^[yY]$ ]]; then
-        return 0
+    if [[ -n "$ACTUAL_CERT" ]]; then
+        echo -e "${GREEN}[OK] 检测到宿主机已存在有效公网证书！服务端已自驱动完成该证书与域名的自动绑定。${PLAIN}"
+        echo -e "${YELLOW}如需为新域名重新签发或强制覆盖当前证书，请继续；否则可直接返回。${PLAIN}"
+        read -r -p "是否需要为新域名签发/覆盖证书? [y/N]: " do_issue
+        if [[ ! "$do_issue" =~ ^[yY]$ ]]; then
+            return 0
+        fi
+    else
+        read -r -p "是否现在调用 acme.sh 签发 Let's Encrypt 公网权威证书? [y/N]: " do_issue
+        if [[ ! "$do_issue" =~ ^[yY]$ ]]; then
+            return 0
+        fi
     fi
 
     check_root
@@ -495,57 +516,62 @@ cmd_uninstall() {
 }
 
 show_menu() {
-    clear
-    load_config
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.37)        ${PLAIN}"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e " 服务状态: [ $(get_status) ]"
-    echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  主端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "  ${BOLD}1.${PLAIN} 查看节点运行状态 (Status)"
-    echo -e "  ${BOLD}2.${PLAIN} 查看客户端订阅与控制台链接 (Info / Sub URL)"
-    echo -e "  ${BOLD}3.${PLAIN} 查看实时运行日志 (Live Logs)"
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "  ${BOLD}4.${PLAIN} 启动 AERO Edge 服务 (Start)"
-    echo -e "  ${BOLD}5.${PLAIN} 停止 AERO Edge 服务 (Stop)"
-    echo -e "  ${BOLD}6.${PLAIN} 重启 AERO Edge 服务 (Restart)"
-    echo -e "  ${BOLD}7.${PLAIN} 无损平滑热重载 (Reload)"
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "  ${BOLD}8.${PLAIN} 查看与管理用户 Token (Tokens & Quota)"
-    echo -e "  ${BOLD}9.${PLAIN} 添加新用户 Token (Add Token)"
-    echo -e " ${BOLD}10.${PLAIN} TLS 公网证书与自动续期检测 (ACME Cert)"
-    echo -e " ${BOLD}11.${PLAIN} 内核 BBR 状态与一键调优 (BBR Tuning)"
-    echo -e " ${BOLD}12.${PLAIN} 虚拟网卡 (TUN) 与防火墙 NAT 状态 (TUN & NAT)"
-    echo -e " ${BOLD}13.${PLAIN} GeoData 直连规则库管理 (GeoData Sync)"
-    echo -e " ${BOLD}14.${PLAIN} Cloudflare WARP 出口分流状态 (WARP Proxy)"
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e " ${BOLD}15.${PLAIN} 检查并在线更新服务端 (Update)"
-    echo -e " ${BOLD}16.${PLAIN} 完全对称卸载节点 (Uninstall)"
-    echo -e "${CYAN}----------------------------------------------------${PLAIN}"
-    echo -e "  ${BOLD}0.${PLAIN} 退出管理菜单"
-    echo -e "${CYAN}====================================================${PLAIN}"
-    read -r -p "请输入选项 [0-16]: " choice
-    case "$choice" in
-        1) cmd_status ;;
-        2) cmd_info ;;
-        3) cmd_log ;;
-        4) cmd_start ;;
-        5) cmd_stop ;;
-        6) cmd_restart ;;
-        7) cmd_reload ;;
-        8) cmd_tokens ;;
-        9) cmd_add_token ;;
-        10) cmd_cert ;;
-        11) cmd_bbr ;;
-        12) cmd_net ;;
-        13) cmd_geodata ;;
-        14) cmd_warp ;;
-        15) cmd_update ;;
-        16) cmd_uninstall ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}输入无效，请输入 0-16 的数字！${PLAIN}" ;;
-    esac
+    while true; do
+        clear
+        load_config
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.38)        ${PLAIN}"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        echo -e " 服务状态: [ $(get_status) ]"
+        echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  主端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${BOLD}1.${PLAIN} 查看节点运行状态 (Status)"
+        echo -e "  ${BOLD}2.${PLAIN} 查看客户端订阅与控制台链接 (Info / Sub URL)"
+        echo -e "  ${BOLD}3.${PLAIN} 查看实时运行日志 (Live Logs)"
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${BOLD}4.${PLAIN} 启动 AERO Edge 服务 (Start)"
+        echo -e "  ${BOLD}5.${PLAIN} 停止 AERO Edge 服务 (Stop)"
+        echo -e "  ${BOLD}6.${PLAIN} 重启 AERO Edge 服务 (Restart)"
+        echo -e "  ${BOLD}7.${PLAIN} 无损平滑热重载 (Reload)"
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${BOLD}8.${PLAIN} 查看与管理用户 Token (Tokens & Quota)"
+        echo -e "  ${BOLD}9.${PLAIN} 添加新用户 Token (Add Token)"
+        echo -e " ${BOLD}10.${PLAIN} TLS 公网证书与自动续期检测 (ACME Cert)"
+        echo -e " ${BOLD}11.${PLAIN} 内核 BBR 状态与一键调优 (BBR Tuning)"
+        echo -e " ${BOLD}12.${PLAIN} 虚拟网卡 (TUN) 与防火墙 NAT 状态 (TUN & NAT)"
+        echo -e " ${BOLD}13.${PLAIN} GeoData 直连规则库管理 (GeoData Sync)"
+        echo -e " ${BOLD}14.${PLAIN} Cloudflare WARP 出口分流状态 (WARP Proxy)"
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e " ${BOLD}15.${PLAIN} 检查并在线更新服务端 (Update)"
+        echo -e " ${BOLD}16.${PLAIN} 完全对称卸载节点 (Uninstall)"
+        echo -e "${CYAN}----------------------------------------------------${PLAIN}"
+        echo -e "  ${BOLD}0.${PLAIN} 退出管理菜单"
+        echo -e "${CYAN}====================================================${PLAIN}"
+        read -r -p "请输入选项 [0-16]: " choice
+        case "$choice" in
+            1) cmd_status ;;
+            2) cmd_info ;;
+            3) cmd_log ;;
+            4) cmd_start ;;
+            5) cmd_stop ;;
+            6) cmd_restart ;;
+            7) cmd_reload ;;
+            8) cmd_tokens ;;
+            9) cmd_add_token ;;
+            10) cmd_cert ;;
+            11) cmd_bbr ;;
+            12) cmd_net ;;
+            13) cmd_geodata ;;
+            14) cmd_warp ;;
+            15) cmd_update ;;
+            16) cmd_uninstall ;;
+            0) echo -e "${GREEN}已安全退出 AERO 管理菜单。${PLAIN}"; exit 0 ;;
+            *) echo -e "${RED}输入无效，请输入 0-16 的数字！${PLAIN}" ;;
+        esac
+        echo ""
+        read -n 1 -s -r -p "按任意键返回主菜单..."
+        echo ""
+    done
 }
 
 # ----------------- 参数路由 -----------------

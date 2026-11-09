@@ -16,6 +16,7 @@ import (
 	"crypto/x509/pkix"
 	_ "embed"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -261,6 +262,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap subscription: %w", err)
 	}
+	persistServerConfig(cfg)
 
 	// 3b. Sync user tokens from subStore into tokenStore and validator
 	if subStore != nil && tokenStore != nil {
@@ -514,6 +516,7 @@ func (s *Server) Start() error {
 				log.Printf("[EDGE] [WARN] Listen address %s already in use (e.g. 443/8443 occupied), in-process auto-fallback switched to %s", s.cfg.Listen, newAddr)
 				ln = rotatedLn
 				s.cfg.Listen = newAddr
+				persistServerConfig(s.cfg)
 				if h, pStr, herr := net.SplitHostPort(newAddr); herr == nil {
 					if pNum, perr := strconv.Atoi(pStr); perr == nil && s.subStore != nil {
 						_ = s.subStore.UpdatePrimaryPort(pNum, h)
@@ -1286,4 +1289,51 @@ func tryPortFallbackTCP(initialListen string, tlsCfg *tls.Config) (net.Listener,
 		}
 	}
 	return nil, "", fmt.Errorf("all fallback candidate ports %v are in use", candidates)
+}
+
+// persistServerConfig 原子持久化同步当前生效配置至 /etc/aero/edge.json，实现全功能服务端完全自闭环
+func persistServerConfig(cfg ServerConfig) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return
+	}
+	const configDir = "/etc/aero"
+	const configFile = "/etc/aero/edge.json"
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return
+	}
+	existing := make(map[string]any)
+	if data, err := os.ReadFile(configFile); err == nil {
+		_ = json.Unmarshal(data, &existing)
+	}
+	if cfg.Listen != "" {
+		existing["listen"] = cfg.Listen
+	}
+	if cfg.Domain != "" {
+		existing["domain"] = cfg.Domain
+	}
+	if cfg.CertFile != "" {
+		existing["cert"] = cfg.CertFile
+	}
+	if cfg.KeyFile != "" {
+		existing["key"] = cfg.KeyFile
+	}
+	if cfg.DataDir != "" {
+		existing["data_dir"] = cfg.DataDir
+	}
+	if cfg.AdminKey != "" {
+		existing["admin_key"] = cfg.AdminKey
+	}
+	if cfg.Token != "" {
+		existing["token"] = cfg.Token
+	}
+
+	data, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		return
+	}
+	tmpFile := configFile + fmt.Sprintf(".tmp.%d", time.Now().UnixNano())
+	if err := os.WriteFile(tmpFile, data, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmpFile, configFile)
 }
