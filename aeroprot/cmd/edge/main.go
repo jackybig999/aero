@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 
 	"github.com/aero-protocol/aero/aeroprot/internal/edge"
 )
@@ -21,7 +22,11 @@ func main() {
 	token := flag.String("token", "", "initial bootstrap token (auto-generated if empty)")
 	certFile := flag.String("cert", "", "path to TLS cert PEM")
 	keyFile := flag.String("key", "", "path to TLS key PEM")
-	dataDir := flag.String("data-dir", "./data", "data directory for tokens.json and client-sub.json")
+	defaultDataDir := "./data"
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		defaultDataDir = "/var/lib/aero"
+	}
+	dataDir := flag.String("data-dir", defaultDataDir, "data directory for tokens.json and client-sub.json")
 	adminKey := flag.String("admin-key", "", "remote Admin API key (X-Aero-Admin-Key)")
 	profile := flag.String("profile", "small", "performance profile: tiny|small|medium")
 	maxConn := flag.Int("max-conn", 0, "max active tunnels global (0=default)")

@@ -18,7 +18,7 @@ mkdir -p /usr/local/bin /etc/aero /var/lib/aero
 
 # 1. 部署二进制产物
 REPO="jackybig999/aero"
-VERSION="1.2.36"
+VERSION="1.2.37"
 
 echo "[1/3] 下载并安装 AERO Edge 核心程序..."
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/edge_linux_${ARCH}"

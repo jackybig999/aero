@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.36)
+# AERO Edge — 命令行终端后台管理工具 (全功能配齐版 v1.2.37)
 # 支持交互式终端菜单与非交互式快捷命令调用
 # ==============================================================================
 set -e
@@ -363,9 +363,9 @@ EOF
             chmod 600 "$JSON_CONFIG"
         fi
 
-        echo -e "正在向 AERO 服务端触发平滑热重载 (Live Reload)..."
-        systemctl reload aero-edge 2>/dev/null || systemctl restart aero-edge 2>/dev/null || true
-        echo -e "${GREEN}证书已直接配置并实时生效！${PLAIN}"
+        echo -e "正在应用新证书并重启 AERO 边缘服务..."
+        systemctl restart aero-edge 2>/dev/null || true
+        echo -e "${GREEN}证书与域名配置已生效，服务已重新加载！${PLAIN}"
         cmd_cert
     else
         echo -e "${RED}证书签发失败！请检查 80 端口是否被占用，以及 DNS 解析是否已正确生效！${PLAIN}"
@@ -498,7 +498,7 @@ show_menu() {
     clear
     load_config
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.36)        ${PLAIN}"
+    echo -e "${BOLD}       AERO Edge 服务端终端管理工具 (v1.2.37)        ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e " 服务状态: [ $(get_status) ]"
     echo -e " 绑定域名: ${GREEN}${DOMAIN:-未配置}${PLAIN}  |  主端口: ${GREEN}:${PRIMARY_PORT:-443}${PLAIN}"

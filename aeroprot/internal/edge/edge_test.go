@@ -29,6 +29,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -5881,5 +5882,38 @@ func TestConnectUDP_DomainResolutionUsesUDP4(t *testing.T) {
 	_, _ = srv.quicServer.resolveUDP(resolveNet, "example.com:443")
 	if recordedNetwork != "udp4" {
 		t.Errorf("expected resolution network udp4 for domain, got %s", recordedNetwork)
+	}
+}
+
+func TestEdge_DefaultDataDir_And_TUN_FailFast(t *testing.T) {
+	// 1. DataDir 自适应
+	srv, err := NewServer(ServerConfig{
+		Listen:                     "127.0.0.1:0",
+		Domain:                     "127.0.0.1",
+		Token:                      "test-token",
+		AllowSelfSignedCertForTest: true,
+	})
+	if err != nil {
+		t.Fatalf("NewServer with default DataDir: %v", err)
+	}
+	defer srv.Close()
+
+	if srv.cfg.DataDir == "" {
+		t.Fatal("DataDir should be automatically populated")
+	}
+
+	// 2. 生产模式下 TUN 挂载失败必须 Fail-Fast
+	if runtime.GOOS == "linux" {
+		_, errProd := NewServer(ServerConfig{
+			Listen:                     "127.0.0.1:0",
+			Domain:                     "127.0.0.1",
+			Token:                      "test-token",
+			DataDir:                    t.TempDir(),
+			GlobalTUNDevice:            "nonexistent-test-tun-xyz99",
+			AllowSelfSignedCertForTest: false, // 模拟生产模式
+		})
+		if errProd == nil {
+			t.Fatal("expected NewServer to fail-fast on nonexistent TUN device in production mode, but got nil error")
+		}
 	}
 }

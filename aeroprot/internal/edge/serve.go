@@ -146,7 +146,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.Listen = ":443"
 	}
 	if cfg.DataDir == "" {
-		cfg.DataDir = "./data"
+		if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+			cfg.DataDir = "/var/lib/aero"
+		} else {
+			cfg.DataDir = "./data"
+		}
 	}
 	absDataDir, err := filepath.Abs(cfg.DataDir)
 	if err != nil {
@@ -346,9 +350,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		TuneKernelPerformance()
 		_ = EnableKernelForwarding()
 		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
-			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" {
+			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" || !cfg.AllowSelfSignedCertForTest {
 				quicServer.Close()
-				return nil, fmt.Errorf("attach configured global TUN %s: %w", tunDevice, err)
+				return nil, fmt.Errorf("attach global TUN %s failed: %w (production CONNECT-IP requires functional TUN interface)", tunDevice, err)
 			}
 			log.Printf("[EDGE] [WARN] Auto-configured global TUN %s could not be attached: %v (CONNECT-IP proxy may be disabled)", tunDevice, err)
 		} else {

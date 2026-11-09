@@ -1064,7 +1064,23 @@ func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Co
 	}
 
 	// 生产真实链路：通过 MASQUE CONNECT-UDP 向上游下一跳中继建立隧道 (NEW-01)
-	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}
+	sni := ""
+	if s.cfg != nil && s.cfg.NextHopSNI != "" {
+		sni = s.cfg.NextHopSNI
+	} else {
+		host, _, err := net.SplitHostPort(nextHopAddr)
+		if err == nil && host != "" {
+			sni = host
+		} else {
+			sni = nextHopAddr
+		}
+	}
+
+	tlsConf := &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: s.allowLoopbackForTest,
+		NextProtos:         []string{"h3"},
+	}
 	qConn, err := quic.DialAddr(context.Background(), nextHopAddr, tlsConf, &quic.Config{EnableDatagrams: true})
 	if err != nil {
 		return nil, fmt.Errorf("dial next hop quic: %w", err)
