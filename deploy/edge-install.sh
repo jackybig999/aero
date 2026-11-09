@@ -16,16 +16,23 @@ ARCH="amd64"
 
 mkdir -p /usr/local/bin /etc/aero /var/lib/aero
 
-# 1. 部署二进制产物
+# 0. 平滑暂停可能正在运行的旧服务，避免 Linux ETXTBSY 写保护
+if systemctl is-active --quiet aero-edge 2>/dev/null; then
+    systemctl stop aero-edge 2>/dev/null || true
+fi
+
+# 1. 部署二进制产物 (采用 POSIX 原子临时文件替换，杜绝任何进程占用导致 curl 23 错误)
 REPO="jackybig999/aero"
-VERSION="1.2.39"
+VERSION="1.2.40"
 
 echo "[1/3] 下载并安装 AERO Edge 核心程序..."
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/edge_linux_${ARCH}"
-curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/aero-edge 2>/dev/null || {
-    curl -fsSL "https://github.com/${REPO}/releases/download/v${VERSION}/edge_linux_${ARCH}" -o /usr/local/bin/aero-edge
+TMP_EDGE="/usr/local/bin/aero-edge.tmp.$$"
+curl -fsSL "$DOWNLOAD_URL" -o "$TMP_EDGE" 2>/dev/null || {
+    curl -fsSL "https://github.com/${REPO}/releases/download/v${VERSION}/edge_linux_${ARCH}" -o "$TMP_EDGE"
 }
-chmod +x /usr/local/bin/aero-edge
+chmod +x "$TMP_EDGE"
+mv -f "$TMP_EDGE" /usr/local/bin/aero-edge
 
 # 部署命令行管理工具
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
@@ -33,8 +40,10 @@ if [[ -f "${SCRIPT_DIR}/aero" ]]; then
     cp -f "${SCRIPT_DIR}/aero" /usr/local/bin/aero
     chmod +x /usr/local/bin/aero
 else
-    curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/deploy/aero" -o /usr/local/bin/aero 2>/dev/null || true
-    chmod +x /usr/local/bin/aero 2>/dev/null || true
+    TMP_CLI="/usr/local/bin/aero.tmp.$$"
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/deploy/aero" -o "$TMP_CLI" 2>/dev/null || true
+    chmod +x "$TMP_CLI" 2>/dev/null || true
+    mv -f "$TMP_CLI" /usr/local/bin/aero 2>/dev/null || true
 fi
 
 # 2. 注册 Linux 最简标准 systemd 托管服务
