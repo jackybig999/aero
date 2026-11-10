@@ -751,6 +751,7 @@ func TestServerCoverAndHealth(t *testing.T) {
 
 	// 1. Healthz endpoint test (探活端点：纯文本 ok，无硬编码 Server)
 	reqHz := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	reqHz.RemoteAddr = "127.0.0.1:5555" // 探针只对本机开放
 	recHz := httptest.NewRecorder()
 	srv.ServeHTTP(recHz, reqHz)
 	if recHz.Code != http.StatusOK {

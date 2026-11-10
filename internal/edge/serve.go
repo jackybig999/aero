@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -115,6 +116,19 @@ type Server struct {
 	startedAt time.Time
 
 	instanceLock *instanceLock
+
+	// ready 为真表示可以接流量：Start 完成后置位，排空开始时清除（/readyz）。
+	ready atomic.Bool
+}
+
+// isLoopbackRemote 判断请求来源是否为本机回环地址。
+func isLoopbackRemote(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // MaskToken masks a token for safe logging (never print plaintext tokens)
@@ -602,6 +616,7 @@ func (s *Server) Start() error {
 		s.metricsCollector.Start(s.ctx)
 	}
 
+	s.ready.Store(true)
 	log.Printf("[EDGE] Server started on %s (TLS + QUIC)", s.cfg.Listen)
 	log.Printf("[EDGE] Subscriptions ready: Admin(/sub/<secret>, see console), User(/sub/{username}{6random}) (client-sub: %s/client-sub.json)", s.subStore.Dir())
 	log.Printf("[EDGE] Tokens loaded from %s (count: %d)", s.tokenStore.Path(), s.tokenStore.v.Count())
@@ -647,8 +662,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.subHandler != nil && s.subHandler.TryServe(w, r) {
 		return
 	}
-	if r.URL.Path == "/healthz" {
+	// 探针只对本机开放（PROJECT_RULES 收紧项）；其他来源看到的是伪装站。
+	// /healthz：进程存活；/readyz：Start 完成且未在排空中才可接流量（L0 §8.7）。
+	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+		if !isLoopbackRemote(r.RemoteAddr) {
+			s.serveCover(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if r.URL.Path == "/readyz" && !s.ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not ready"))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 		return
