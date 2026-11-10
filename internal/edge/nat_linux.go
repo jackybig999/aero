@@ -8,6 +8,7 @@ package edge
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,13 +18,37 @@ import (
 	"sync"
 )
 
+// 宿主状态（PROJECT_RULES §8.10 清单）：edge 只添加带 aero_edge_default 标记、
+// 且限定在自身 TUN 接口或自身地址池的规则；只清理本进程实际添加过的规则。
+const (
+	edgeFirewallTag  = "aero_edge_default"
+	edgeIPv4PoolCIDR = "10.88.0.0/16"
+	edgeIPv6PoolCIDR = "fd88:ae80::/64"
+)
+
+// legacyHostWideMSSRule 是 v1.2.40 及以前添加到 mangle/FORWARD 的不限接口 MSS 钳制，
+// 会改写宿主上所有转发连接（如 docker）的 MSS，升级后需要移除。
+var legacyHostWideMSSRule = []string{"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200", "-m", "comment", "--comment", edgeFirewallTag}
+
+type firewallRule struct {
+	tool, table, chain string
+	spec               []string
+}
+
 var (
-	appliedFirewallMu sync.Mutex
-	appliedFirewallDev string
-	appliedOutInterface string
+	appliedFirewallMu    sync.Mutex
+	appliedFirewallRules []firewallRule
+
+	// linuxCmdRunner 与 defaultOutInterfaceFn 可在测试中替换，避免触碰真实宿主。
+	linuxCmdRunner        = runLinuxCmdExec
+	defaultOutInterfaceFn = detectDefaultOutInterface
 )
 
 func runLinuxCmd(name string, args ...string) error {
+	return linuxCmdRunner(name, args...)
+}
+
+func runLinuxCmdExec(name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -109,105 +134,120 @@ func detectDefaultOutInterface() string {
 	return ""
 }
 
-// ensureRule 仅在规则不存在时才添加，保证严格幂等，避免重复添加
-func ensureRule(tool string, table string, addFlag string, chain string, spec ...string) {
-	var checkArgs []string
-	if table != "" {
-		checkArgs = append(checkArgs, "-t", table)
+func ruleArgs(r firewallRule, op string) []string {
+	var args []string
+	if r.table != "" {
+		args = append(args, "-t", r.table)
 	}
-	checkArgs = append(checkArgs, "-C", chain)
-	checkArgs = append(checkArgs, spec...)
-
-	if err := runLinuxCmd(tool, checkArgs...); err != nil {
-		var addArgs []string
-		if table != "" {
-			addArgs = append(addArgs, "-t", table)
-		}
-		addArgs = append(addArgs, addFlag, chain)
-		addArgs = append(addArgs, spec...)
-		_ = runLinuxCmd(tool, addArgs...)
-	}
+	args = append(args, op, r.chain)
+	return append(args, r.spec...)
 }
 
-// deleteRuleIfExists 删除指定规则（循环直至全部删除，防止历史残留重复项）
-func deleteRuleIfExists(tool string, table string, chain string, spec ...string) {
+// ensureRule 仅在规则不存在时添加（幂等），返回添加失败的错误。
+func ensureRule(r firewallRule, addOp string) error {
+	if err := runLinuxCmd(r.tool, ruleArgs(r, "-C")...); err == nil {
+		return nil
+	}
+	return runLinuxCmd(r.tool, ruleArgs(r, addOp)...)
+}
+
+// deleteRuleIfExists 删除规则的全部重复副本（上限 5 次，防止无限循环）。
+func deleteRuleIfExists(r firewallRule) {
 	for i := 0; i < 5; i++ {
-		var checkArgs []string
-		if table != "" {
-			checkArgs = append(checkArgs, "-t", table)
+		if err := runLinuxCmd(r.tool, ruleArgs(r, "-C")...); err != nil {
+			return
 		}
-		checkArgs = append(checkArgs, "-C", chain)
-		checkArgs = append(checkArgs, spec...)
-		if err := runLinuxCmd(tool, checkArgs...); err != nil {
-			break
+		if err := runLinuxCmd(r.tool, ruleArgs(r, "-D")...); err != nil {
+			return
 		}
-		var delArgs []string
-		if table != "" {
-			delArgs = append(delArgs, "-t", table)
-		}
-		delArgs = append(delArgs, "-D", chain)
-		delArgs = append(delArgs, spec...)
-		_ = runLinuxCmd(tool, delArgs...)
 	}
 }
 
-// ApplyEdgeFirewall 为服务端 TUN 虚拟网卡配置双栈 MASQUERADE、转发放行与 TCP MSS 钳制
+func tagged(spec ...string) []string {
+	return append(spec, "-m", "comment", "--comment", edgeFirewallTag)
+}
+
+// ApplyEdgeFirewall 为 edge 的 TUN 配置转发放行、NAT 与 MSS 钳制。全部规则限定在
+// devName 或 edge 地址池，不改变宿主其他流量。IPv4 规则失败返回错误；IPv6 规则失败
+// 只记录（内层 IPv6 默认关闭，见 ADR-0007）。
 func ApplyEdgeFirewall(devName string) error {
+	if devName == "" {
+		return fmt.Errorf("apply edge firewall: empty device name")
+	}
 	appliedFirewallMu.Lock()
 	defer appliedFirewallMu.Unlock()
 
-	outIf := detectDefaultOutInterface()
+	outIf := defaultOutInterfaceFn()
 	if outIf == "" || outIf == devName {
-		log.Printf("[EDGE-NET] [WARN] Could not detect valid physical outbound interface (outIf=%q)", outIf)
-		return nil
+		return fmt.Errorf("apply edge firewall: no physical outbound interface detected (outIf=%q)", outIf)
 	}
 
-	appliedFirewallDev = devName
-	appliedOutInterface = outIf
+	// 移除旧版本遗留的全局 MSS 钳制，它会影响宿主上所有转发连接。
+	deleteRuleIfExists(firewallRule{tool: "iptables", table: "mangle", chain: "FORWARD", spec: legacyHostWideMSSRule})
 
-	// 1. TCP MSS 双向钳制至 1200
-	ensureRule("iptables", "mangle", "-I", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200", "-m", "comment", "--comment", "aero_edge_default")
+	mss := func(dir string) []string {
+		return tagged(dir, devName, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200")
+	}
+	v4 := []struct {
+		rule firewallRule
+		op   string
+	}{
+		{firewallRule{"iptables", "mangle", "FORWARD", mss("-i")}, "-I"},
+		{firewallRule{"iptables", "mangle", "FORWARD", mss("-o")}, "-I"},
+		{firewallRule{"iptables", "", "FORWARD", tagged("-i", devName, "-o", outIf, "-j", "ACCEPT")}, "-I"},
+		{firewallRule{"iptables", "", "FORWARD", tagged("-i", outIf, "-o", devName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT")}, "-I"},
+		{firewallRule{"iptables", "nat", "POSTROUTING", tagged("-s", edgeIPv4PoolCIDR, "-o", outIf, "-j", "MASQUERADE")}, "-A"},
+	}
+	v6 := []struct {
+		rule firewallRule
+		op   string
+	}{
+		{firewallRule{"ip6tables", "", "FORWARD", tagged("-i", devName, "-o", outIf, "-j", "ACCEPT")}, "-I"},
+		{firewallRule{"ip6tables", "", "FORWARD", tagged("-i", outIf, "-o", devName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT")}, "-I"},
+		{firewallRule{"ip6tables", "nat", "POSTROUTING", tagged("-s", edgeIPv6PoolCIDR, "-o", outIf, "-j", "MASQUERADE")}, "-A"},
+	}
 
-	// 2. IPv4 转发与 MASQUERADE
-	ensureRule("iptables", "", "-I", "FORWARD", "-i", devName, "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-	ensureRule("iptables", "", "-I", "FORWARD", "-i", outIf, "-o", devName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-	ensureRule("iptables", "nat", "-A", "POSTROUTING", "-s", "10.88.0.0/16", "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "MASQUERADE")
-
-	// 3. IPv6 转发与 MASQUERADE (解决双栈黑洞)
-	ensureRule("ip6tables", "", "-I", "FORWARD", "-i", devName, "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-	ensureRule("ip6tables", "", "-I", "FORWARD", "-i", outIf, "-o", devName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-	ensureRule("ip6tables", "nat", "-A", "POSTROUTING", "-s", "fd88:ae80::/64", "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "MASQUERADE")
-
-	log.Printf("[EDGE-NET] Applied dual-stack firewall for %s -> %s (IPv4+IPv6 MASQUERADE, MSS=1200)", devName, outIf)
+	var errs []error
+	for _, r := range v4 {
+		if err := ensureRule(r.rule, r.op); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		appliedFirewallRules = append(appliedFirewallRules, r.rule)
+	}
+	for _, r := range v6 {
+		if err := ensureRule(r.rule, r.op); err != nil {
+			log.Printf("[EDGE-NET] [WARN] IPv6 rule not applied (inner IPv6 stays disabled): %v", err)
+			continue
+		}
+		appliedFirewallRules = append(appliedFirewallRules, r.rule)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("apply edge firewall for %s: %w", devName, errors.Join(errs...))
+	}
+	log.Printf("[EDGE-NET] Firewall rules applied for %s -> %s (scoped to the tunnel interface and edge pools)", devName, outIf)
 	return nil
 }
 
-// CleanupEdgeFirewall 服务端退出时对称清理注入的防火墙与 NAT 规则
+// CleanupEdgeFirewall 删除本进程通过 ApplyEdgeFirewall 添加的规则。本进程未添加过
+// 规则时不执行任何宿主命令。devName 参数保留以兼容非 Linux 占位签名。
 func CleanupEdgeFirewall(devName string) {
+	_ = devName
 	appliedFirewallMu.Lock()
 	defer appliedFirewallMu.Unlock()
-
-	outIf := appliedOutInterface
-	if outIf == "" {
-		outIf = detectDefaultOutInterface()
+	if len(appliedFirewallRules) == 0 {
+		return
 	}
-	if devName == "" {
-		devName = appliedFirewallDev
+	for i := len(appliedFirewallRules) - 1; i >= 0; i-- {
+		deleteRuleIfExists(appliedFirewallRules[i])
 	}
-	if devName == "" {
-		devName = "aero-tun0"
-	}
+	appliedFirewallRules = nil
+	log.Printf("[EDGE-NET] Firewall rules added by this process were removed")
+}
 
-	if outIf != "" {
-		deleteRuleIfExists("iptables", "", "FORWARD", "-i", devName, "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-		deleteRuleIfExists("iptables", "", "FORWARD", "-i", outIf, "-o", devName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-		deleteRuleIfExists("iptables", "nat", "POSTROUTING", "-s", "10.88.0.0/16", "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "MASQUERADE")
-
-		deleteRuleIfExists("ip6tables", "", "FORWARD", "-i", devName, "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-		deleteRuleIfExists("ip6tables", "", "FORWARD", "-i", outIf, "-o", devName, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-m", "comment", "--comment", "aero_edge_default", "-j", "ACCEPT")
-		deleteRuleIfExists("ip6tables", "nat", "POSTROUTING", "-s", "fd88:ae80::/64", "-o", outIf, "-m", "comment", "--comment", "aero_edge_default", "-j", "MASQUERADE")
-	}
-	deleteRuleIfExists("iptables", "mangle", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", "1200", "-m", "comment", "--comment", "aero_edge_default")
-
-	log.Printf("[EDGE-NET] Cleaned up firewall rules for %s dev %s", outIf, devName)
+// resetAppliedFirewallForTest 清空本进程的规则记录（仅测试使用）。
+func resetAppliedFirewallForTest() {
+	appliedFirewallMu.Lock()
+	appliedFirewallRules = nil
+	appliedFirewallMu.Unlock()
 }

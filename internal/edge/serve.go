@@ -386,7 +386,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		} else {
 			log.Printf("[EDGE] Global TUN device %s attached and active for CONNECT-IP data plane", tunDevice)
 			_ = ConfigureGlobalTunnelDevice(tunDevice, "10.88.0.1/16", "fd88:ae80::1/64", 1360)
-			_ = ApplyEdgeFirewall(tunDevice)
+			if err := ApplyEdgeFirewall(tunDevice); err != nil {
+				log.Printf("[EDGE] [ERROR] CONNECT-IP NAT/forwarding rules incomplete, tunnel egress may fail: %v", err)
+			}
 		}
 	} else if tunDevice != "" {
 		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
