@@ -26,54 +26,57 @@ jobs:
           go-version: 'stable'
           cache: false
 
+      - name: Component Isolation Gate (ADR-0009)
+        run: bash tools/check-imports.sh
+
       - name: Vet & Test Edge & Mid
         run: |
-          go vet ./aeroprot/internal/edge ./aeroprot/cmd/edge ./aerosub/internal/mid ./aerosub/cmd/mid
-          go test -race -shuffle=on -v ./aeroprot/internal/edge ./aerosub/internal/mid
+          go vet ./internal/edge ./cmd/edge ./internal/sub ./cmd/sub
+          go test -race -shuffle=on -v ./internal/edge ./internal/sub
 
       - name: Build Edge Server (linux/amd64 & linux/arm64)
         run: |
           mkdir -p dist/server
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/edge_linux_amd64 ./aeroprot/cmd/edge
+            -o dist/server/edge_linux_amd64 ./cmd/edge
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/edge_linux_arm64 ./aeroprot/cmd/edge
+            -o dist/server/edge_linux_arm64 ./cmd/edge
 
       - name: Build Midplatform Control Plane (linux/amd64 & linux/arm64)
         run: |
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/mid_linux_amd64 ./aerosub/cmd/mid
+            -o dist/server/mid_linux_amd64 ./cmd/sub
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/mid_linux_arm64 ./aerosub/cmd/mid
+            -o dist/server/mid_linux_arm64 ./cmd/sub
 
       - name: Build Linux Client CLI (linux/amd64 & linux/arm64)
         run: |
           GOOS=linux GOARCH=amd64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aeroprot_linux_amd64 ./aeroprot/cmd/client
+            -o dist/server/aeroprot_linux_amd64 ./cmd/client
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aeroprot_linux_arm64 ./aeroprot/cmd/client
+            -o dist/server/aeroprot_linux_arm64 ./cmd/client
 
       - name: Build Android Client (arm64 & amd64)
         run: |
           GOOS=android GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
-            -o dist/server/aeroprot_android_arm64 ./aeroprot/cmd/client
+            -o dist/server/aeroprot_android_arm64 ./cmd/client
 
           NDK_CLANG=$(find /usr/local/lib/android/sdk/ndk/ "$ANDROID_HOME/ndk" -name "x86_64-linux-android*-clang" 2>/dev/null | sort -V | tail -1 || true)
           if [ -n "$NDK_CLANG" ] && [ -x "$NDK_CLANG" ]; then
             CGO_ENABLED=1 CC="$NDK_CLANG" GOOS=android GOARCH=amd64 go build -v \
               -ldflags="-s -w" \
-              -o dist/server/aeroprot_android_amd64 ./aeroprot/cmd/client
+              -o dist/server/aeroprot_android_amd64 ./cmd/client
           else
             GOOS=android GOARCH=amd64 go build -v \
               -ldflags="-s -w" \
-              -o dist/server/aeroprot_android_amd64 ./aeroprot/cmd/client || true
+              -o dist/server/aeroprot_android_amd64 ./cmd/client || true
           fi
 
       - name: Upload Server & Linux/Android Client Artifacts
@@ -100,20 +103,20 @@ jobs:
 
       - name: Vet & Test Client & Desk
         run: |
-          go vet ./aeroprot/internal/client ./aeroprot/cmd/client ./aeroprot/cmd/guard ./aeroos/internal/desk ./aeroos/cmd/desk
-          go test -v -short -shuffle=on ./aeroprot/internal/client ./aeroos/internal/desk
+          go vet ./internal/client ./cmd/client ./cmd/guard ./internal/desk ./cmd/desk
+          go test -v -short -shuffle=on ./internal/client ./internal/desk
 
       - name: Build Windows Client & Desk
         run: |
           mkdir -p dist/client-windows
           mkdir -p dist/aeroprot-win-bundle
-          go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/aeroprot.exe ./aeroprot/cmd/client
-          go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/guard.exe ./aeroprot/cmd/guard
+          go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/aeroprot.exe ./cmd/client
+          go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/guard.exe ./cmd/guard
           curl.exe -fsSL "https://www.wintun.net/builds/wintun-0.14.1.zip" -o wintun.zip
           tar.exe -xf wintun.zip
           Copy-Item wintun/bin/amd64/wintun.dll dist/aeroprot-win-bundle/wintun.dll
           Compress-Archive -Path dist/aeroprot-win-bundle/* -DestinationPath dist/client-windows/aeroprot_win_amd64.zip
-          go build -v -ldflags="-H windowsgui -s -w" -o dist/client-windows/aeroos_win_amd64.exe ./aeroos/cmd/desk
+          go build -v -ldflags="-H windowsgui -s -w" -o dist/client-windows/aeroos_win_amd64.exe ./cmd/desk
 
       - name: Upload Windows Client Artifacts
         uses: actions/upload-artifact@v4
@@ -139,23 +142,23 @@ jobs:
 
       - name: Vet Client & Desk
         run: |
-          go vet ./aeroprot/internal/client ./aeroprot/cmd/client ./aeroos/internal/desk ./aeroos/cmd/desk
+          go vet ./internal/client ./cmd/client ./internal/desk ./cmd/desk
 
       - name: Build macOS Client & Desk
         run: |
           mkdir -p dist/client-macos
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_mac_arm64 ./aeroprot/cmd/client
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_mac_amd64 ./aeroprot/cmd/client
-          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroos_mac_arm64 ./aeroos/cmd/desk
-          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroos_mac_amd64 ./aeroos/cmd/desk
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_mac_arm64 ./cmd/client
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_mac_amd64 ./cmd/client
+          GOOS=darwin GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroos_mac_arm64 ./cmd/desk
+          GOOS=darwin GOARCH=amd64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroos_mac_amd64 ./cmd/desk
 
       - name: Build iOS Client (arm64)
         run: |
           SDKPATH=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)
           if [ -n "$SDKPATH" ]; then
-            CGO_ENABLED=1 CC="$(xcrun --sdk iphoneos --find clang) -isysroot $SDKPATH -target arm64-apple-ios14.0" GOOS=ios GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_ios_arm64 ./aeroprot/cmd/client
+            CGO_ENABLED=1 CC="$(xcrun --sdk iphoneos --find clang) -isysroot $SDKPATH -target arm64-apple-ios14.0" GOOS=ios GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_ios_arm64 ./cmd/client
           else
-            GOOS=ios GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_ios_arm64 ./aeroprot/cmd/client || true
+            GOOS=ios GOARCH=arm64 go build -v -ldflags="-s -w" -o dist/client-macos/aeroprot_ios_arm64 ./cmd/client || true
           fi
 
       - name: Upload macOS & iOS Client Artifacts

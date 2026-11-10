@@ -480,17 +480,17 @@ func TestTier1_F4_CandidatePorts_RangeCheck(t *testing.T) {
 func TestTier1_F4_CandidatePorts_DecoupledContract(t *testing.T) {
 	// Rule 4: Edge and Client must define StandardCandidatePorts independently without cross-imports
 	root := FindProjectRoot(t)
-	edgePortsPath := filepath.Join(root, "aeroprot", "internal", "edge", "ports.go")
-	clientPortsPath := filepath.Join(root, "aeroprot", "internal", "client", "ports.go")
+	edgePortsPath := filepath.Join(root, "internal", "edge", "ports.go")
+	clientPortsPath := filepath.Join(root, "internal", "client", "ports.go")
 
 	edgeContent, edgeErr := os.ReadFile(edgePortsPath)
 	clientContent, clientErr := os.ReadFile(clientPortsPath)
 
 	if edgeErr == nil && clientErr == nil {
-		if strings.Contains(string(edgeContent), "aeroprot/internal/client") {
+		if strings.Contains(string(edgeContent), "aero/internal/client") {
 			t.Errorf("edge/ports.go cross-imports internal/client (Rule 4 violation)")
 		}
-		if strings.Contains(string(clientContent), "aeroprot/internal/edge") {
+		if strings.Contains(string(clientContent), "aero/internal/edge") {
 			t.Errorf("client/ports.go cross-imports internal/edge (Rule 4 violation)")
 		}
 	} else {

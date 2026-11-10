@@ -23,8 +23,8 @@ elif [ -f "../aero-mid" ]; then
     chmod +x "$BIN"
 else
     echo ">> Building aero-mid from source..."
-    if [ -d "./aerosub/cmd/mid" ]; then
-        go build -o "$BIN" ./aerosub/cmd/mid
+    if [ -d "./cmd/sub" ]; then
+        go build -o "$BIN" ./cmd/sub
     elif [ -d "./cmd/mid" ]; then
         go build -o "$BIN" ./cmd/mid
     fi
@@ -39,9 +39,9 @@ elif [ -f "./sni_matrix.json" ]; then
 fi
 
 # Copy web UI assets if present
-if [ -d "./aerosub/cmd/mid/web" ]; then
+if [ -d "./cmd/sub/web" ]; then
     mkdir -p /opt/aero/web
-    cp -rf ./aerosub/cmd/mid/web/* /opt/aero/web/
+    cp -rf ./cmd/sub/web/* /opt/aero/web/
 elif [ -d "./cmd/mid/web" ]; then
     mkdir -p /opt/aero/web
     cp -rf ./cmd/mid/web/* /opt/aero/web/
