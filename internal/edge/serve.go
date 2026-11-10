@@ -592,7 +592,7 @@ func (s *Server) Start() error {
 	}
 	s.quicListener = quicLn
 
-	// 2b. Multi-port Hopping Alternative Listeners (严格去重并跳过主端口，防止 SO_REUSEPORT 分流冲突)
+	// 2b. Multi-port Hopping Alternative Listeners（严格去重并跳过主端口；独占绑定，被占用的端口直接跳过）
 	host := ""
 	primaryPort := 0
 	if h, pStr, herr := net.SplitHostPort(s.cfg.Listen); herr == nil {

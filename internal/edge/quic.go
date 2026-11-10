@@ -1505,7 +1505,8 @@ func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx conte
 	if strings.Contains(addr, "[") || strings.HasPrefix(addr, "::") {
 		network = "udp6"
 	}
-	lc := net.ListenConfig{Control: setReusePortControl}
+	// 独占绑定（不设 SO_REUSEPORT）：端口被占用时由系统报错，供端口轮试避开（ADR-0005）。
+	var lc net.ListenConfig
 	conn, err := lc.ListenPacket(ctx, network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("quic listen packet %s: %w", addr, err)

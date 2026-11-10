@@ -6,7 +6,7 @@ package edge
 
 import (
 	"context"
-	"net"
+	"crypto/tls"
 	"net/netip"
 	"sync"
 	"testing"
@@ -30,25 +30,29 @@ func TestKernelPerfGate_BufferPoolZeroAlloc(t *testing.T) {
 	tunnelBufPool.Put(ptr2)
 }
 
-// TestKernelPerfGate_ReusePortListen 门禁 2: 验证 SO_REUSEPORT 控制函数跨平台有效性
-func TestKernelPerfGate_ReusePortListen(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+// 回归（ADR-0005）：QUIC 监听曾设置 SO_REUSEPORT，第二个实例可静默绑定同一 UDP 端口，
+// 内核把报文随机分给两个进程导致 QUIC 连接损坏。同一地址第二次监听必须失败。
+func TestKernelPerfGate_ExclusiveUDPBind(t *testing.T) {
+	cert, err := generateSelfSignedCert("localhost")
+	if err != nil {
+		t.Fatalf("cert: %v", err)
+	}
+	tlsCfg := &tls.Config{Certificates: []tls.Certificate{*cert}}
+	server := NewQUICServer(nil, nil, nil, nil, nil)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	lc := net.ListenConfig{Control: setReusePortControl}
-	conn1, err := lc.ListenPacket(ctx, "udp4", "127.0.0.1:0")
+	ln1, err := StartQUIC("127.0.0.1:0", tlsCfg, server, ctx)
 	if err != nil {
-		t.Fatalf("first ListenPacket failed: %v", err)
+		t.Fatalf("first StartQUIC: %v", err)
 	}
-	defer conn1.Close()
+	defer ln1.Close()
 
-	addr := conn1.LocalAddr().String()
-
-	// 尝试二次绑定相同端口（仅在支持 SO_REUSEPORT 平台生效）
-	conn2, err := lc.ListenPacket(ctx, "udp4", addr)
+	ln2, err := StartQUIC(ln1.Addr().String(), tlsCfg, server, ctx)
 	if err == nil {
-		// 支持 SO_REUSEPORT
-		defer conn2.Close()
+		_ = ln2.Close()
+		t.Fatalf("second StartQUIC on %s succeeded; the UDP port must not be shared", ln1.Addr())
 	}
 }
 
