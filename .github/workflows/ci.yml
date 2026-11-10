@@ -26,6 +26,9 @@ jobs:
           go-version: 'stable'
           cache: false
 
+      - name: Format Gate (L0 §15.1)
+        run: test -z "$(gofmt -l cmd internal tools)" || { gofmt -l cmd internal tools; exit 1; }
+
       - name: Component Isolation Gate (ADR-0009)
         run: bash tools/check-imports.sh
 
