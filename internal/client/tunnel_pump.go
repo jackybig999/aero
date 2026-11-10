@@ -45,7 +45,54 @@ type IPDataPump struct {
 	currentMTU     atomic.Int32
 	ipv6Blackhole  atomic.Bool
 	webrtcActive   atomic.Bool
+
+	// devMu 串行化对虚拟网卡的写入（DNS 应答协程与下行协程并发写；Wintun 等驱动
+	// 不保证并发写安全）。dnsSlots 限制同时进行的 DNS 查询数（L0 §9.2）。
+	devMu    sync.Mutex
+	dnsSlots chan struct{}
 }
+
+// maxConcurrentDNS 是同时处理的 DNS 查询上限；超出时丢弃该查询，由系统解析器重试。
+const maxConcurrentDNS = 64
+
+// writeDev 串行化写入虚拟网卡；数据泵关闭后不再写入。
+func (p *IPDataPump) writeDev(b []byte) (int, error) {
+	if p.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	p.devMu.Lock()
+	defer p.devMu.Unlock()
+	return p.dev.Write(b)
+}
+
+// handleDNSAsync 在独立协程中处理 DNS 查询并回写应答，读循环立即继续转发其他流量
+// （DoH 最长 2.5 秒，同步处理会阻塞整机上行，审查 P0-7）。参数均为已复制的数据。
+// 协程数量受 dnsSlots 限制，生命周期受 DNSHandler 内部超时限制。
+func (p *IPDataPump) handleDNSAsync(query []byte, clientIP, resolverIP net.IP, clientPort, resolverPort uint16, ipv6 bool) {
+	select {
+	case p.dnsSlots <- struct{}{}:
+	default:
+		return // 并发上限：丢弃本次查询
+	}
+	go func() {
+		defer func() { <-p.dnsSlots }()
+		resp := p.dnsHandler.HandleQuery(query, clientIP, clientPort)
+		if resp == nil {
+			return
+		}
+		var pkt []byte
+		if ipv6 {
+			pkt = buildIPv6UDPResponsePacket(resolverIP, clientIP, resolverPort, clientPort, resp)
+		} else {
+			pkt = buildIPv4UDPResponsePacket(resolverIP, clientIP, resolverPort, clientPort, resp)
+		}
+		if len(pkt) > 0 {
+			_, _ = p.writeDev(pkt)
+		}
+	}()
+}
+
+func cloneIP(ip net.IP) net.IP { return append(net.IP(nil), ip...) }
 
 // SetOnDisconnect registers the single asynchronous disconnect callback.
 func (p *IPDataPump) SetOnDisconnect(callback func(error)) {
@@ -83,6 +130,7 @@ func NewIPDataPump(parentCtx context.Context, dev TunDevice, conn IPPacketConn, 
 		cancel:     cancel,
 		killSwitch: killSwitch,
 		dnsHandler: dnsHandler,
+		dnsSlots:   make(chan struct{}, maxConcurrentDNS),
 	}
 	p.currentMTU.Store(1224)
 	return p
@@ -183,15 +231,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 				dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
 				if dstPort == 53 && p.dnsHandler != nil {
 					srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
-					srcIP := net.IP(raw[12:16])
-					dstIP := net.IP(raw[16:20])
-					dnsPayload := raw[ihl+8:]
-					if resp := p.dnsHandler.HandleQuery(dnsPayload, srcIP, srcPort); resp != nil {
-						respPkt := buildIPv4UDPResponsePacket(dstIP, srcIP, dstPort, srcPort, resp)
-						if len(respPkt) > 0 {
-							_, _ = p.dev.Write(respPkt)
-						}
-					}
+					p.handleDNSAsync(append([]byte(nil), raw[ihl+8:]...), cloneIP(raw[12:16]), cloneIP(raw[16:20]), srcPort, dstPort, false)
 					continue
 				}
 
@@ -222,15 +262,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 				dstPort := binary.BigEndian.Uint16(raw[42:44])
 				if dstPort == 53 && p.dnsHandler != nil {
 					srcPort := binary.BigEndian.Uint16(raw[40:42])
-					srcIP := net.IP(raw[8:24])
-					dstIP := net.IP(raw[24:40])
-					dnsPayload := raw[48:]
-					if resp := p.dnsHandler.HandleQuery(dnsPayload, srcIP, srcPort); resp != nil {
-						respPkt := buildIPv6UDPResponsePacket(dstIP, srcIP, dstPort, srcPort, resp)
-						if len(respPkt) > 0 {
-							_, _ = p.dev.Write(respPkt)
-						}
-					}
+					p.handleDNSAsync(append([]byte(nil), raw[48:]...), cloneIP(raw[8:24]), cloneIP(raw[24:40]), srcPort, dstPort, true)
 					continue
 				}
 
@@ -243,7 +275,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 			// 第 3 重防泄漏 (方案 §3.2)：若开启 IPv6 黑洞模式，拒绝非 DNS 的 IPv6 报文，原生回写 ICMPv6 Type 1 Code 3
 			if p.ipv6Blackhole.Load() {
 				if unreach := buildICMPv6AddressUnreachable(raw); len(unreach) > 0 {
-					_, _ = p.dev.Write(unreach)
+					_, _ = p.writeDev(unreach)
 				}
 				continue
 			}
@@ -253,7 +285,7 @@ func (p *IPDataPump) pumpTunToRemote() {
 		icmpPkt, werr := p.conn.WritePacket(raw)
 		if len(icmpPkt) > 0 {
 			// 回写本地虚拟网卡 (使操作系统/上层应用收到 Destination Unreachable / PTB 差错)
-			_, _ = p.dev.Write(icmpPkt)
+			_, _ = p.writeDev(icmpPkt)
 			if nextMTU := parseICMPNextHopMTU(icmpPkt); nextMTU > 0 {
 				p.applyNextHopMTU(nextMTU)
 			}
@@ -295,7 +327,7 @@ func (p *IPDataPump) pumpRemoteToTun() {
 		raw := buf[:n]
 
 		// 写入 Wintun 虚拟网卡
-		_, werr := p.dev.Write(raw)
+		_, werr := p.writeDev(raw)
 		if werr != nil {
 			if !p.closed.Load() {
 				log.Printf("[PUMP] write tun error: %v", werr)
@@ -492,8 +524,8 @@ func buildICMPv6AddressUnreachable(origPkt []byte) []byte {
 	// 1. IPv6 首部
 	resp[0] = 0x60
 	binary.BigEndian.PutUint16(resp[4:6], uint16(payloadLen))
-	resp[6] = 58 // Next Header: ICMPv6
-	resp[7] = 64 // Hop Limit
+	resp[6] = 58                     // Next Header: ICMPv6
+	resp[7] = 64                     // Hop Limit
 	copy(resp[8:24], origPkt[24:40]) // Src = 原 Dst
 	copy(resp[24:40], origPkt[8:24]) // Dst = 原 Src
 
