@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -285,12 +286,17 @@ func (p *IPPool) AllocateFor(key string) (netip.Prefix, error) {
 			return netip.PrefixFrom(l.addr, 32), nil
 		}
 	}
-	for i := uint32(0); i < p.maxHost-1; i++ {
-		host := p.nextHost
-		p.nextHost++
-		if p.nextHost > p.maxHost {
-			p.nextHost = 2
-		}
+	// 主机号范围 [2, maxHost]。带 token 的分配从 token 哈希位置开始探测，edge 重启（租约丢失）
+	// 后同一 token 仍大概率拿回同一地址；无 token 的分配沿用顺序指针。
+	span := p.maxHost - 1
+	start := p.nextHost - 2
+	if key != "" {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(key))
+		start = h.Sum32() % span
+	}
+	for i := uint32(0); i < span; i++ {
+		host := 2 + (start+i)%span
 		var a [4]byte
 		binary.BigEndian.PutUint32(a[:], p.base+host)
 		cand := netip.AddrFrom4(a)
@@ -304,6 +310,9 @@ func (p *IPPool) AllocateFor(key string) (netip.Prefix, error) {
 			p.dropLease(owner, cand)
 		}
 		p.used[cand] = struct{}{}
+		if key == "" {
+			p.nextHost = 2 + (host-1)%span // 下一个主机号，越过上界回到 2
+		}
 		return netip.PrefixFrom(cand, 32), nil
 	}
 	return netip.Prefix{}, errors.New("ip pool exhausted")
