@@ -79,8 +79,12 @@ func TestConsoleAuth_ValidKey(t *testing.T) {
 	if foundCookie == nil {
 		t.Fatalf("expected aero_key cookie to be set")
 	}
-	if foundCookie.Value != "secret_key_123" {
-		t.Errorf("expected cookie value 'secret_key_123', got %q", foundCookie.Value)
+	// Cookie 不得携带原始管理密钥（PROJECT_RULES §5.3）
+	if foundCookie.Value == "" || foundCookie.Value == "secret_key_123" || strings.Contains(foundCookie.Value, "secret_key_123") {
+		t.Errorf("cookie must hold a derived session value, not the admin key; got %q", foundCookie.Value)
+	}
+	if !foundCookie.Secure {
+		t.Errorf("expected cookie Secure to be true")
 	}
 	if !foundCookie.HttpOnly {
 		t.Errorf("expected cookie HttpOnly to be true")
@@ -144,7 +148,19 @@ func TestConsoleAuth_CookieAuth(t *testing.T) {
 	// Access with cookie only, no query param
 	req := httptest.NewRequest(http.MethodGet, "/console", nil)
 	req.RemoteAddr = "203.0.113.195:48920"
-	req.AddCookie(&http.Cookie{Name: "aero_key", Value: "secret_key_123"})
+	// 先用密钥登录拿到服务端下发的会话 Cookie，再只凭该 Cookie 访问
+	login := httptest.NewRecorder()
+	srv.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "/console?key=secret_key_123", nil))
+	var session *http.Cookie
+	for _, c := range login.Result().Cookies() {
+		if c.Name == "aero_key" {
+			session = c
+		}
+	}
+	if session == nil {
+		t.Fatal("login did not set a session cookie")
+	}
+	req.AddCookie(&http.Cookie{Name: "aero_key", Value: session.Value})
 	rec := httptest.NewRecorder()
 
 	srv.ServeHTTP(rec, req)
@@ -154,6 +170,15 @@ func TestConsoleAuth_CookieAuth(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "AERO Edge Console") {
 		t.Errorf("expected console HTML with valid cookie auth")
+	}
+
+	// 把原始密钥直接放进 Cookie 不得通过鉴权（Cookie 只接受派生会话值）
+	raw := httptest.NewRequest(http.MethodGet, "/console/api/status", nil)
+	raw.AddCookie(&http.Cookie{Name: "aero_key", Value: "secret_key_123"})
+	rawRec := httptest.NewRecorder()
+	srv.ServeHTTP(rawRec, raw)
+	if rawRec.Code != http.StatusForbidden {
+		t.Fatalf("raw admin key in cookie: status %d, want 403", rawRec.Code)
 	}
 }
 

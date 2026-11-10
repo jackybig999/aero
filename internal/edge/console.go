@@ -6,10 +6,13 @@ package edge
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,9 +107,9 @@ func (h *ConsoleHandler) authenticate(r *http.Request) bool {
 			return true
 		}
 	}
-	// 4. Session cookie: aero_key=...
+	// 4. 会话 Cookie：值为由管理密钥派生的会话值，不是原始密钥
 	if c, err := r.Cookie("aero_key"); err == nil && c.Value != "" {
-		if h.checkKey(c.Value) {
+		if h.checkSession(c.Value) {
 			return true
 		}
 	}
@@ -123,6 +126,20 @@ func (h *ConsoleHandler) checkKey(key string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(key), []byte(h.adminKey)) == 1
+}
+
+// sessionValue 由管理密钥派生控制台会话 Cookie 值（HMAC-SHA256），Cookie 不携带原始密钥。
+func (h *ConsoleHandler) sessionValue() string {
+	mac := hmac.New(sha256.New, []byte(h.adminKey))
+	mac.Write([]byte("aero-console-session-v1"))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (h *ConsoleHandler) checkSession(value string) bool {
+	if h.adminKey == "" || value == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(value), []byte(h.sessionValue())) == 1
 }
 
 func (h *ConsoleHandler) isLoopback(r *http.Request) bool {
@@ -165,8 +182,9 @@ func (h *ConsoleHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		if key := r.URL.Query().Get("key"); key != "" && h.checkKey(key) {
 			http.SetCookie(w, &http.Cookie{
 				Name:     "aero_key",
-				Value:    key,
+				Value:    h.sessionValue(),
 				Path:     "/console",
+				Secure:   true,
 				HttpOnly: true,
 				SameSite: http.SameSiteStrictMode,
 				MaxAge:   86400,

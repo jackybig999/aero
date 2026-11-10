@@ -259,8 +259,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		if existingKey := loadExistingAdminKey(cfg.ConfigPath); existingKey != "" {
 			cfg.AdminKey = existingKey
 		} else {
-			cfg.AdminKey = generateSecureAdminKey()
-			log.Printf("[EDGE] [AUTH] No AdminKey configured. Generated secure Web Console key: %s", cfg.AdminKey)
+			key, err := generateSecureAdminKey()
+			if err != nil {
+				return nil, fmt.Errorf("generate admin key: %w", err)
+			}
+			cfg.AdminKey = key
+			// 不在日志中打印密钥（PROJECT_RULES：密钥与凭据不得写入日志）。
+			if cfg.ConfigPath != "" {
+				log.Printf("[EDGE] [AUTH] No AdminKey configured; generated one (%s) and stored it in %s", MaskToken(key), cfg.ConfigPath)
+			} else {
+				log.Printf("[EDGE] [AUTH] No AdminKey configured; generated an ephemeral key (%s). Set --admin-key to make it persistent", MaskToken(key))
+			}
 		}
 	}
 
@@ -1444,13 +1453,14 @@ func checkPortAvailable(addr string) bool {
 	return true
 }
 
-// generateSecureAdminKey 自动生成 32 字符的加密安全 Web 管理密钥
-func generateSecureAdminKey() string {
+// generateSecureAdminKey 生成 128 位随机管理密钥（32 个十六进制字符）。随机源失败时
+// 返回错误，不退化为可预测的值（L0 §7.4）。
+func generateSecureAdminKey() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("aero_%d", time.Now().UnixNano())
+		return "", fmt.Errorf("read crypto random: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // loadExistingAdminKey 从显式配置文件中装载已存在的 admin_key；path 为空时不读取。

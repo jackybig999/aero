@@ -32,8 +32,11 @@ func TestCheckPortAvailable_FreeAndBound(t *testing.T) {
 }
 
 func TestGenerateSecureAdminKey(t *testing.T) {
-	k1 := generateSecureAdminKey()
-	k2 := generateSecureAdminKey()
+	k1, err1 := generateSecureAdminKey()
+	k2, err2 := generateSecureAdminKey()
+	if err1 != nil || err2 != nil {
+		t.Fatalf("generateSecureAdminKey errors: %v, %v", err1, err2)
+	}
 
 	if len(k1) != 32 || len(k2) != 32 {
 		t.Fatalf("expected 32-char hex admin key, got len(k1)=%d len(k2)=%d", len(k1), len(k2))
