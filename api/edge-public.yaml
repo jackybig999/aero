@@ -1,0 +1,115 @@
+openapi: 3.1.0
+info:
+  title: AERO edge public read-only API (C6)
+  version: 0.1.0-draft
+  description: |
+    状态：draft（2026-11-10），待用户审。flag `usage_api` 保持 OFF。
+    sub 只读取本接口（ADR-0001）；edge 不向 sub 推送任何数据。
+    未鉴权或鉴权失败的请求一律返回与伪装站相同的响应，不暴露本接口的存在（PROJECT_RULES 收紧项）。
+    认证使用独立的计量只读密钥（metering read key），与管理密钥分离；持有者无法修改 edge 任何状态。
+servers:
+  - url: https://{node}
+    variables:
+      node:
+        default: node.example.com
+security:
+  - meteringKey: []
+paths:
+  /v1/usage:
+    get:
+      operationId: listUsage
+      summary: 按游标分页读取计量记录（按小时聚合、累计值、幂等）
+      description: |
+        每条记录是某用户在某个小时内的**累计**字节数。同一 (node_id, uid, period_start) 在该小时内会以更大的
+        seq 重复出现，消费方按该三元组覆盖写入（幂等），不得累加。
+        记录保留 90 天（PROJECT_RULES §6.11）；游标早于保留期时返回 410。
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          description: 上一页返回的 next_cursor；省略表示从最早的保留记录开始。
+          schema: { type: string, maxLength: 64 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        "200":
+          description: 一页计量记录
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UsagePage" }
+        "410":
+          description: 游标早于保留期，需从头读取
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "429":
+          description: 超过限流（每个密钥 60 次/分钟）
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+  /v1/status:
+    get:
+      operationId: getStatus
+      summary: 节点健康与容量（不含任何个人信息）
+      responses:
+        "200":
+          description: 节点状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeStatus" }
+components:
+  securitySchemes:
+    meteringKey:
+      type: http
+      scheme: bearer
+      description: 计量只读密钥（edge 生成，32 字节随机，十六进制）；与管理密钥、用户 token 互不复用。
+  schemas:
+    UsagePage:
+      type: object
+      required: [node_id, records, next_cursor]
+      properties:
+        node_id: { type: string, description: 节点稳定标识（不是域名，避免泄露节点地址）。 }
+        records:
+          type: array
+          items: { $ref: "#/components/schemas/UsageRecord" }
+        next_cursor: { type: string, description: 下一页游标；没有新记录时与请求游标相同。 }
+    UsageRecord:
+      type: object
+      required: [seq, uid, period_start, bytes_up, bytes_down]
+      properties:
+        seq: { type: integer, minimum: 1, description: 节点内单调递增的序号。 }
+        uid: { type: string, description: 来自 C3 token 的 uid。 }
+        iss: { type: string, enum: [sub, edge], description: token 签发方；sub 只需处理 iss=sub 的记录。 }
+        period_start: { type: integer, description: 小时起点，Unix 秒（UTC 整点）。 }
+        bytes_up: { type: integer, minimum: 0, description: 该小时客户端上行累计字节（IP 层）。 }
+        bytes_down: { type: integer, minimum: 0, description: 该小时客户端下行累计字节（IP 层）。 }
+        final: { type: boolean, description: 该小时已结束，之后不会再出现更大的 seq。 }
+    NodeStatus:
+      type: object
+      required: [node_id, version, ready, active_sessions]
+      properties:
+        node_id: { type: string }
+        version: { type: string }
+        ready: { type: boolean, description: 与 /readyz 一致（L0 §8.7）。 }
+        active_sessions: { type: integer, minimum: 0 }
+        classes:
+          type: array
+          items: { type: string, enum: [default, ai, browser, game] }
+          description: 本节点当前可用的流量场景（取决于出口模块健康）。
+    Problem:
+      type: object
+      description: RFC 9457 problem details；code 取自 api/errors.yaml。
+      required: [type, title, code]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        code: { type: string }
+        detail: { type: string }
+x-aero-open-questions:
+  - 计量口径按 IP 层字节（含 IP/UDP/TCP 头）还是按应用负载？草稿按 IP 层，与运营商计费口径一致。
+  - 节点本地配额（token 的 quota_bytes）由每个节点独立执行；跨节点合计由 sub 汇总后通过吊销列表处理。是否接受“跨节点超额最多延迟一个拉取周期”？
+  - sub 的拉取间隔：草稿建议 60 秒。

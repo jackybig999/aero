@@ -11,7 +11,7 @@
 | C3 | 用户 token | sub、edge（本地签发）→ edge、client | JSON Schema + Ed25519 签名规范 | `api/token.md`、`api/token.schema.json` | 线上格式 `aero1.<payload>.<sig>`（签原始字节，无需规范化）、两个签发方、校验顺序与错误码、`kid` 轮换、迁移 | — |
 | C4 | 吊销列表 | sub → edge | OpenAPI（edge 拉取） | `api/sub-revocation.yaml` | 签名、版本号、增量游标 | — |
 | C5 | 订阅文档 | edge → client | JSON Schema | `api/subscription.schema.json` | 节点、候选端口、档位（标准 / 混淆）、ECH 配置、IPv6 声明、场景能力；签名由 edge 节点密钥完成（不再用 token 当 HMAC 密钥） | — |
-| C6 | edge 只读外部接口 | edge → sub | OpenAPI `/v1/usage`、`/v1/status` | `api/edge-public.yaml` | 计量游标分页、计量只读密钥鉴权、限流 | — |
+| C6 | edge 只读外部接口 | edge → sub（sub 拉取） | OpenAPI 3.1 `/v1/usage`、`/v1/status` | `api/edge-public.yaml` | 按小时聚合的累计值（按 node_id+uid+period_start 覆盖写入，幂等）、游标分页、独立计量只读密钥、未鉴权返回伪装站、限流 60 次/分钟 | — |
 | C7 | edge 本地管理接口 | edge → CLI、控制台 | OpenAPI（unix socket） | `api/edge-admin.yaml` | 配置、端口、证书、用户会话查询与强制断开、cleanup-host | 端口选择、证书续期 |
 | C8 | geo 数据 | edge → client | OpenAPI + 文件格式 | `api/geo.yaml` | 域名列表 + CN IP 段、ETag、签名、鉴权 | — |
 | C9 | 出口模块 | aero-egress → edge | OpenAPI（unix socket） | `api/egress.yaml` | 出口列表、健康分、场景 → 出口映射、环境粘性绑定 | 出口：未就绪 → 健康 → 降级 → 摘除 |
