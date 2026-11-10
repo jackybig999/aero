@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: AERO edge local admin API (C7)
-  version: 0.1.0-draft
+  version: 1.0.0
   description: |
-    状态：draft（2026-11-10），待用户审。flag `local_admin_api` 保持 OFF。
+    状态：final（2026-11-10，用户确认）。flag `local_admin_api` 默认 OFF，实现通过 §4.3 校验后方可 ON。
     用途：运维 CLI（deploy/aero）与本机工具管理 edge。CLI **不得**再直接读写 edge 的配置或数据文件
     （ADR-0001；现有 cmd_add_token 会把 tokens.json 写成错误格式，导致 edge 无法启动）。
     传输：仅 unix socket `/run/aero/edge.sock`（目录 0700、socket 0600，属主 root）；不监听任何 TCP 端口。
@@ -231,6 +231,6 @@ components:
         username: { type: string, pattern: "^[A-Za-z0-9_@.-]{2,64}$" }
         expire_days: { type: integer, minimum: 1 }
         traffic_limit_gb: { type: integer, minimum: 0 }
-x-aero-open-questions:
-  - 控制台（浏览器）现有的 /console/api/* 是否改为调用与本契约相同的处理逻辑（同一实现、两种入口）？草稿建议是。
-  - 本地用户在 C3 签名 token 上线后是否由 edge 本地签发（iss=edge）？草稿建议是（见 api/token.md）。
+x-aero-decisions:
+  - 控制台 /console/api/* 与本接口共用同一实现（两个入口，一套逻辑）。
+  - C3 上线后，本地用户的 token 由 edge 本地签发（iss=edge）。

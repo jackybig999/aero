@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: AERO edge public read-only API (C6)
-  version: 0.1.0-draft
+  version: 1.0.0
   description: |
-    状态：draft（2026-11-10），待用户审。flag `usage_api` 保持 OFF。
+    状态：final（2026-11-10，用户确认）。flag `usage_api` 默认 OFF，实现通过 §4.3 校验后方可 ON。
     sub 只读取本接口（ADR-0001）；edge 不向 sub 推送任何数据。
     未鉴权或鉴权失败的请求一律返回与伪装站相同的响应，不暴露本接口的存在（PROJECT_RULES 收紧项）。
     认证使用独立的计量只读密钥（metering read key），与管理密钥分离；持有者无法修改 edge 任何状态。
@@ -96,6 +96,16 @@ components:
         version: { type: string }
         ready: { type: boolean, description: 与 /readyz 一致（L0 §8.7）。 }
         active_sessions: { type: integer, minimum: 0 }
+        sessions_by_uid:
+          type: array
+          description: 每个用户在本节点的在线 QUIC 连接数，供 sub 跨节点汇总设备数（C3 §7）。
+          items:
+            type: object
+            required: [uid, sessions]
+            properties:
+              uid: { type: string }
+              iss: { type: string, enum: [sub, edge] }
+              sessions: { type: integer, minimum: 1 }
         classes:
           type: array
           items: { type: string, enum: [default, ai, browser, game] }
@@ -109,7 +119,7 @@ components:
         title: { type: string }
         code: { type: string }
         detail: { type: string }
-x-aero-open-questions:
-  - 计量口径按 IP 层字节（含 IP/UDP/TCP 头）还是按应用负载？草稿按 IP 层，与运营商计费口径一致。
-  - 节点本地配额（token 的 quota_bytes）由每个节点独立执行；跨节点合计由 sub 汇总后通过吊销列表处理。是否接受“跨节点超额最多延迟一个拉取周期”？
-  - sub 的拉取间隔：草稿建议 60 秒。
+x-aero-decisions:
+  - 计量口径：IP 层字节（含 IP/UDP/TCP 头），与运营商口径一致。
+  - 跨节点超额允许延迟一个拉取周期后由吊销处理（C3 §7）。
+  - sub 拉取间隔 60 秒。

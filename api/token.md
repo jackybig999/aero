@@ -1,6 +1,6 @@
 # C3 用户 token（draft）
 
-状态：`draft`（2026-11-10）。未定稿前不得用于生产构建（L0 §4.1），flag `auth_signed_token` 保持 `OFF`。依据：ADR-0002。
+状态：`final`（2026-11-10，用户确认）。变更须按 L0 §4.6 进行。flag `auth_signed_token` 默认 `OFF`，实现通过 §4.3 校验后方可 `ON`。依据：ADR-0002。
 
 ## 1. 线上格式
 
@@ -55,10 +55,25 @@ aero1.<payload>.<signature>
 
 1. 本契约定稿后实现校验与 `iss=edge` 签发；flag `auth_signed_token` 默认 `OFF`。
 2. `OFF` 时继续接受旧的不透明 token（`aero_<hex>`），同时 **立即** 停止要求与记录 `Aero-Timestamp`/`Aero-Nonce`（不改变客户端行为，属于兼容变更）。
-3. `ON` 后同时接受新旧两种 token 一个过渡期（时长待定），过渡期结束后删除旧 token 路径与 `tokens.json`。
+3. `ON` 后同时接受新旧两种 token 30 天（§8），过渡期结束后删除旧 token 路径与 `tokens.json`。
 
-## 6. 待用户确认的问题
+## 6. 档位与执行参数（用户决定，2026-11-10）
 
-1. `tier` 枚举是否就是 `admin`、`standard`、`trial` 三种？
-2. `max_devices` 按“同一节点上的并发 QUIC 连接数”计算是否可接受？（跨节点合计需要节点间通信，与“sub 只读、节点独立”冲突，因此不做。）
-3. 过渡期时长。
+- 档位（`tier`）由中台定义和命名，edge **不解析**、不保存档位表；`tier` 仅用于展示与日志。
+- 中台签发 token 时把执行所需的全部参数写入载荷：`classes`、`max_devices`、`quota_bytes`、`bw_bps`。edge 只执行这些数字。
+- 中台修改档位参数后：新参数随用户下一次 token 刷新（≤ 24 小时）生效；需立即生效时，中台吊销旧 token（C4）。
+- 新增限制项 = 在载荷中新增字段（兼容变更，L0 §4.6）；edge 不认识的字段忽略。
+
+## 7. 多节点下的限制执行
+
+| 限制 | 单节点（立即，硬限制） | 跨节点（延迟一个拉取周期，软限制） |
+|---|---|---|
+| 设备数 `max_devices` | 本节点同一 `uid` 并发 QUIC 连接原子计数 | sub 汇总各节点 `/v1/status` 的每用户在线会话数，超限则吊销最早签发的 `jti` |
+| 流量 `quota_bytes` | 本节点累计计量达到即断开 | sub 汇总 `/v1/usage`，跨节点合计超限即吊销 |
+| 带宽 `bw_bps` | 本节点按 `uid` 令牌桶 | 不做跨节点合计 |
+
+节点之间不互相通信（ADR-0001）；跨节点一致性只经 sub 的只读拉取与吊销列表实现。
+
+## 8. 过渡期
+
+`auth_signed_token` 打开后，新旧 token 并存 **30 天**，之后删除旧 token 路径与 `tokens.json`。
