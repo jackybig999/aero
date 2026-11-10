@@ -1,0 +1,236 @@
+openapi: 3.1.0
+info:
+  title: AERO edge local admin API (C7)
+  version: 0.1.0-draft
+  description: |
+    状态：draft（2026-11-10），待用户审。flag `local_admin_api` 保持 OFF。
+    用途：运维 CLI（deploy/aero）与本机工具管理 edge。CLI **不得**再直接读写 edge 的配置或数据文件
+    （ADR-0001；现有 cmd_add_token 会把 tokens.json 写成错误格式，导致 edge 无法启动）。
+    传输：仅 unix socket `/run/aero/edge.sock`（目录 0700、socket 0600，属主 root）；不监听任何 TCP 端口。
+    鉴权：socket 文件权限 + 内核对端凭据（Linux SO_PEERCRED），只接受 uid 0 或 edge 自身 uid。
+    配置类修改由 edge 自己原子写入 ConfigPath（L0 §8.8）；需要重启才生效的项在响应中返回 restart_required=true，
+    由 CLI 调用 systemctl 重启（服务管理不属于修改服务端数据）。
+    错误响应：application/problem+json（RFC 9457），code 取自 api/errors.yaml。
+    不提供：整机内核调参（原 cmd_bbr 修改全机 BBR/缓冲，违反“不影响宿主其他服务”）；宿主清理改为
+    `aero-edge cleanup-host` 子命令（进程不运行时也可执行，PROJECT_RULES §8.10）。
+servers:
+  - url: http://unix/run/aero/edge.sock
+paths:
+  /v1/status:
+    get:
+      operationId: getStatus
+      summary: 节点状态（cmd_status / cmd_info / cmd_net / cmd_cert / cmd_warp）
+      responses:
+        "200":
+          description: 状态快照；不含任何密钥或用户 token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+  /v1/config:
+    get:
+      operationId: getConfig
+      summary: 当前生效配置（不含密钥）
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Config" }
+    patch:
+      operationId: patchConfig
+      summary: 修改配置（cmd_set_port、域名、WARP）；未知字段拒绝，值经校验后原子写入
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConfigPatch" }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [config, restart_required]
+                properties:
+                  config: { $ref: "#/components/schemas/Config" }
+                  restart_required: { type: boolean }
+        "400": { $ref: "#/components/responses/Problem" }
+  /v1/admin-key:
+    post:
+      operationId: rotateAdminKey
+      summary: 轮换控制台管理密钥（cmd_set_key）；新密钥只在本响应中出现一次，旧会话 Cookie 立即失效
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                key: { type: string, minLength: 32, maxLength: 128, description: 指定密钥；省略则由 edge 生成 128 位随机密钥。 }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key]
+                properties:
+                  key: { type: string }
+        "400": { $ref: "#/components/responses/Problem" }
+  /v1/users:
+    get:
+      operationId: listUsers
+      summary: 本节点本地用户（cmd_tokens）；不返回 token
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/User" }
+    post:
+      operationId: createUser
+      summary: 创建本地用户（cmd_add_token）；订阅 URL 只在本响应中返回一次
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UserCreate" }
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/User"
+                  - type: object
+                    required: [sub_url]
+                    properties:
+                      sub_url: { type: string }
+        "400": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+  /v1/users/{slug}:
+    delete:
+      operationId: deleteUser
+      summary: 删除本地用户；其在线会话在 10 秒内断开
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: 已删除 }
+        "404": { $ref: "#/components/responses/Problem" }
+  /v1/subscription/admin:
+    get:
+      operationId: getAdminSubscription
+      summary: 管理员订阅 URL（不可猜测路径，免端口）
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url: { type: string }
+  /v1/geodata/update:
+    post:
+      operationId: updateGeoData
+      summary: 立即从上游刷新 geo 规则（cmd_geodata；原 CLI 调用的 HTTP 路径不存在）
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rules_count, etag, updated_at]
+                properties:
+                  rules_count: { type: integer }
+                  etag: { type: string }
+                  updated_at: { type: integer, description: Unix 秒 }
+        "502": { $ref: "#/components/responses/Problem" }
+components:
+  responses:
+    Problem:
+      description: RFC 9457 problem details
+      content:
+        application/problem+json:
+          schema:
+            type: object
+            required: [type, title, code]
+            properties:
+              type: { type: string }
+              title: { type: string }
+              code: { type: string }
+              detail: { type: string }
+  schemas:
+    Status:
+      type: object
+      required: [version, ready, listen, domain, active_sessions, cert, tun, warp]
+      properties:
+        version: { type: string }
+        ready: { type: boolean }
+        listen: { type: string }
+        domain: { type: string }
+        active_sessions: { type: integer }
+        cert:
+          type: object
+          required: [not_after, days_left]
+          properties:
+            not_after: { type: integer, description: Unix 秒 }
+            days_left: { type: integer }
+        tun:
+          type: object
+          required: [device, up, forwarding, firewall_rules]
+          properties:
+            device: { type: string }
+            up: { type: boolean }
+            forwarding: { type: boolean }
+            firewall_rules: { type: integer, description: 本进程添加且仍存在的规则数 }
+        warp:
+          type: object
+          required: [configured]
+          properties:
+            configured: { type: boolean }
+            proxy: { type: string }
+            all: { type: boolean }
+            healthy: { type: boolean }
+    Config:
+      type: object
+      properties:
+        listen: { type: string }
+        domain: { type: string }
+        cert_file: { type: string }
+        key_file: { type: string }
+        warp_proxy: { type: string }
+        warp_all: { type: boolean }
+        drain_timeout: { type: integer }
+    ConfigPatch:
+      type: object
+      additionalProperties: false
+      description: 只允许下列字段；listen 端口必须在契约候选列表（443 + StandardCandidatePorts）内
+      properties:
+        listen: { type: string }
+        domain: { type: string }
+        warp_proxy: { type: string }
+        warp_all: { type: boolean }
+        drain_timeout: { type: integer, minimum: 1, maximum: 600 }
+    User:
+      type: object
+      required: [username, slug, created_at, status]
+      properties:
+        username: { type: string }
+        slug: { type: string }
+        expire_at: { type: integer, description: Unix 秒；0 表示不限期 }
+        traffic_limit_bytes: { type: integer }
+        traffic_used_bytes: { type: integer }
+        created_at: { type: integer }
+        status: { type: string, enum: [active, expired, quota_exceeded] }
+    UserCreate:
+      type: object
+      additionalProperties: false
+      required: [username]
+      properties:
+        username: { type: string, pattern: "^[A-Za-z0-9_@.-]{2,64}$" }
+        expire_days: { type: integer, minimum: 1 }
+        traffic_limit_gb: { type: integer, minimum: 0 }
+x-aero-open-questions:
+  - 控制台（浏览器）现有的 /console/api/* 是否改为调用与本契约相同的处理逻辑（同一实现、两种入口）？草稿建议是。
+  - 本地用户在 C3 签名 token 上线后是否由 edge 本地签发（iss=edge）？草稿建议是（见 api/token.md）。
