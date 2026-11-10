@@ -266,4 +266,3 @@ func (m *mockNATPacketConn) Close() error {
 	})
 	return nil
 }
-

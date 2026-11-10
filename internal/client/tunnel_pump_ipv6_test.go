@@ -296,8 +296,8 @@ func TestIPDataPump_ICMPExtractAndMTUClamping(t *testing.T) {
 	v4ICMP[9] = 1 // ICMP
 	copy(v4ICMP[12:16], net.ParseIP("192.0.2.1").To4())
 	copy(v4ICMP[16:20], net.ParseIP("10.88.0.2").To4())
-	v4ICMP[20] = 3 // Type 3: Destination Unreachable
-	v4ICMP[21] = 4 // Code 4: Fragmentation Needed
+	v4ICMP[20] = 3                                  // Type 3: Destination Unreachable
+	v4ICMP[21] = 4                                  // Code 4: Fragmentation Needed
 	binary.BigEndian.PutUint16(v4ICMP[26:28], 1360) // Next-Hop MTU at offset 6..8 of ICMP header
 
 	if mtu := parseICMPNextHopMTU(v4ICMP); mtu != 1360 {
@@ -312,8 +312,8 @@ func TestIPDataPump_ICMPExtractAndMTUClamping(t *testing.T) {
 	v6ICMP[7] = 64
 	copy(v6ICMP[8:24], net.ParseIP("2606:4700::1").To16())
 	copy(v6ICMP[24:40], net.ParseIP("fd88::2").To16())
-	v6ICMP[40] = 2 // Type 2: Packet Too Big
-	v6ICMP[41] = 0 // Code 0
+	v6ICMP[40] = 2                                  // Type 2: Packet Too Big
+	v6ICMP[41] = 0                                  // Code 0
 	binary.BigEndian.PutUint32(v6ICMP[44:48], 1280) // MTU at offset 4..8 of ICMPv6 header
 
 	if mtu := parseICMPNextHopMTU(v6ICMP); mtu != 1280 {

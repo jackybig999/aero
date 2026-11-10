@@ -96,28 +96,28 @@ func TestDNS_ParseFirstIPv4_CNAME_And_EDNS0(t *testing.T) {
 	pkt = append(pkt, 0x00, 0x01, 0x00, 0x01)
 
 	// Answer 1: CNAME prod-api.openai.com
-	pkt = append(pkt, 0xC0, 0x0C)                               // Name pointer to api.openai.com
-	pkt = append(pkt, 0x00, 0x05)                               // Type CNAME
-	pkt = append(pkt, 0x00, 0x01)                               // Class IN
-	pkt = append(pkt, 0x00, 0x00, 0x01, 0x2C)                   // TTL 300
+	pkt = append(pkt, 0xC0, 0x0C)             // Name pointer to api.openai.com
+	pkt = append(pkt, 0x00, 0x05)             // Type CNAME
+	pkt = append(pkt, 0x00, 0x01)             // Class IN
+	pkt = append(pkt, 0x00, 0x00, 0x01, 0x2C) // TTL 300
 	cnameTarget := encodeDNSName("prod-api.openai.com")
 	pkt = append(pkt, byte(len(cnameTarget)>>8), byte(len(cnameTarget)))
 	pkt = append(pkt, cnameTarget...)
 
 	// Answer 2: Type A 104.18.32.100
-	pkt = append(pkt, 0xC0, 0x0C)                               // Name pointer
-	pkt = append(pkt, 0x00, 0x01)                               // Type A
-	pkt = append(pkt, 0x00, 0x01)                               // Class IN
-	pkt = append(pkt, 0x00, 0x00, 0x01, 0x2C)                   // TTL 300
-	pkt = append(pkt, 0x00, 0x04)                               // rdlength=4
-	pkt = append(pkt, 104, 18, 32, 100)                         // RDATA IPv4
+	pkt = append(pkt, 0xC0, 0x0C)             // Name pointer
+	pkt = append(pkt, 0x00, 0x01)             // Type A
+	pkt = append(pkt, 0x00, 0x01)             // Class IN
+	pkt = append(pkt, 0x00, 0x00, 0x01, 0x2C) // TTL 300
+	pkt = append(pkt, 0x00, 0x04)             // rdlength=4
+	pkt = append(pkt, 104, 18, 32, 100)       // RDATA IPv4
 
 	// Additional: EDNS0 OPT record (11 bytes)
-	pkt = append(pkt, 0x00)                                     // Root domain
-	pkt = append(pkt, 0x00, 0x29)                               // Type OPT (41)
-	pkt = append(pkt, 0x10, 0x00)                               // Payload size 4096
-	pkt = append(pkt, 0x00, 0x00, 0x00, 0x00)                   // Flags
-	pkt = append(pkt, 0x00, 0x00)                               // RDLENGTH 0
+	pkt = append(pkt, 0x00)                   // Root domain
+	pkt = append(pkt, 0x00, 0x29)             // Type OPT (41)
+	pkt = append(pkt, 0x10, 0x00)             // Payload size 4096
+	pkt = append(pkt, 0x00, 0x00, 0x00, 0x00) // Flags
+	pkt = append(pkt, 0x00, 0x00)             // RDLENGTH 0
 
 	ip := parseFirstIPv4FromDNSResponse(pkt)
 	if ip == nil {

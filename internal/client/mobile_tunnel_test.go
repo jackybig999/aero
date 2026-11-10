@@ -343,11 +343,11 @@ func TestClampTCPMSS(t *testing.T) {
 	copy(pkt[16:20], net.ParseIP("1.1.1.1").To4())
 
 	// TCP
-	binary.BigEndian.PutUint16(pkt[20:22], 12345) // srcPort
-	binary.BigEndian.PutUint16(pkt[22:24], 443)   // dstPort
-	pkt[32] = 0x60                                // dataOffset = 6 (24 字节)
-	pkt[33] = 0x02                                // SYN flag
-	binary.BigEndian.PutUint16(pkt[34:36], 65535) // window
+	binary.BigEndian.PutUint16(pkt[20:22], 12345)  // srcPort
+	binary.BigEndian.PutUint16(pkt[22:24], 443)    // dstPort
+	pkt[32] = 0x60                                 // dataOffset = 6 (24 字节)
+	pkt[33] = 0x02                                 // SYN flag
+	binary.BigEndian.PutUint16(pkt[34:36], 65535)  // window
 	binary.BigEndian.PutUint16(pkt[36:38], 0x1234) // checksum
 
 	// MSS Option: Kind=2, Length=4, Value=1460 (0x05B4)
@@ -380,19 +380,19 @@ func TestClampTCPMSS(t *testing.T) {
 func TestClampTCPMSS_IPv6(t *testing.T) {
 	// 构造一个 64 字节的 IPv6 TCP SYN 报文 (40 字节 IPv6 + 24 字节 TCP 包含 4 字节 MSS 选项)
 	pkt := make([]byte, 64)
-	pkt[0] = 0x60 // IPv6
+	pkt[0] = 0x60                            // IPv6
 	binary.BigEndian.PutUint16(pkt[4:6], 24) // Payload length = 24 (TCP)
-	pkt[6] = 6 // Next Header: TCP
-	pkt[7] = 64 // Hop Limit
+	pkt[6] = 6                               // Next Header: TCP
+	pkt[7] = 64                              // Hop Limit
 	copy(pkt[8:24], net.ParseIP("2001:db8::1"))
 	copy(pkt[24:40], net.ParseIP("2001:db8::2"))
 
 	// TCP
-	binary.BigEndian.PutUint16(pkt[40:42], 12345) // srcPort
-	binary.BigEndian.PutUint16(pkt[42:44], 443)   // dstPort
-	pkt[52] = 0x60                                // dataOffset = 6 (24 字节)
-	pkt[53] = 0x02                                // SYN flag
-	binary.BigEndian.PutUint16(pkt[54:56], 65535) // window
+	binary.BigEndian.PutUint16(pkt[40:42], 12345)  // srcPort
+	binary.BigEndian.PutUint16(pkt[42:44], 443)    // dstPort
+	pkt[52] = 0x60                                 // dataOffset = 6 (24 字节)
+	pkt[53] = 0x02                                 // SYN flag
+	binary.BigEndian.PutUint16(pkt[54:56], 65535)  // window
 	binary.BigEndian.PutUint16(pkt[56:58], 0xabcd) // checksum
 
 	// MSS Option: Kind=2, Length=4, Value=1440

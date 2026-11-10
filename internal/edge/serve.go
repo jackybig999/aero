@@ -1454,7 +1454,6 @@ func loadExistingAdminKey(path string) string {
 	return ""
 }
 
-
 // Shutdown 优雅停机（L0 §8.6）：先清除 readiness（/readyz 503，/healthz 仍 200），
 // 再向已鉴权的在线连接发送 CONNECTION_CLOSE，使客户端立即重连而不是等待空闲超时，
 // 最后释放全部资源。ctx 为排空上限；超时则直接 Close 并返回 ctx 的错误。
