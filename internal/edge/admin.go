@@ -250,15 +250,19 @@ func (h *AdminHandler) handleDelToken(w http.ResponseWriter, r *http.Request) {
 
 func (h *AdminHandler) handleListSubs(w http.ResponseWriter) {
 	if h.subStore == nil {
-		writeJSON(w, map[string]any{"subs": []any{}, "count": 0, "admin_sub": "/sub/admin"})
+		writeJSON(w, map[string]any{"subs": []any{}, "count": 0, "admin_sub": ""})
 		return
 	}
 	subs := h.subStore.ListUserSubs()
+	adminSub := ""
+	if secret := h.subStore.Secret(); secret != "" {
+		adminSub = "/sub/" + secret
+	}
 	writeJSON(w, map[string]any{
 		"subs":       subs,
 		"count":      len(subs),
-		"legacy_sub": "/sub/" + h.subStore.Secret(),
-		"admin_sub":  "/sub/admin",
+		"legacy_sub": adminSub,
+		"admin_sub":  adminSub,
 	})
 }
 

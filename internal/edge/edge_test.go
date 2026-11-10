@@ -4974,10 +4974,18 @@ func TestEdge_M2_AdminSub_PermanentAndUnlimited(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	// 1. Fetch /sub/admin
-	resp, err := http.Get(srv.URL + "/sub/admin")
+	// 1. 匿名 /sub/admin 必须 404；管理员订阅经 /sub/{secret} 获取
+	anon, err := http.Get(srv.URL + "/sub/admin")
 	if err != nil {
 		t.Fatalf("GET /sub/admin: %v", err)
+	}
+	_ = anon.Body.Close()
+	if anon.StatusCode != http.StatusNotFound {
+		t.Fatalf("anonymous GET /sub/admin expected 404, got %d", anon.StatusCode)
+	}
+	resp, err := http.Get(srv.URL + "/sub/" + store.Secret())
+	if err != nil {
+		t.Fatalf("GET /sub/{secret}: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -5260,8 +5268,8 @@ func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
 	defer respGet.Body.Close()
 	var listResp map[string]any
 	_ = json.NewDecoder(respGet.Body).Decode(&listResp)
-	if listResp["admin_sub"] != "/sub/admin" {
-		t.Errorf("expected admin_sub '/sub/admin', got %v", listResp["admin_sub"])
+	if want := expectedAdminSubPath(subStore); listResp["admin_sub"] != want {
+		t.Errorf("expected admin_sub %q, got %v", want, listResp["admin_sub"])
 	}
 }
 

@@ -20,4 +20,5 @@
 | C12 | 候选端口列表 | 共享常量 | 生成代码 | `api/ports.yaml` | 端口顺序 | — |
 
 ## 删除的旧接口
+- M1 过渡（2026-11-10）：`/sub/admin` 匿名访问已关闭（返回 404，与未知路径不可区分）；管理员订阅暂由不可猜测的 `/sub/{secret}` 提供，M3 由 C3 签名 token + C5 订阅契约取代。
 - `/sub/admin` 匿名访问、`/sub/{secret}`、`/admin/subs`（sub 写 edge）、`/admin/ech` 写入、`/console/api/warp/install|uninstall`、`Aero-Timestamp`/`Aero-Nonce`。

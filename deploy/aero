@@ -163,10 +163,9 @@ cmd_info() {
         if [[ -n "$PRIMARY_PORT" && "$PRIMARY_PORT" != "443" ]]; then
             PORT_SUFFIX=":${PRIMARY_PORT}"
         fi
-        ADMIN_SUB_URL="https://${DOMAIN}${PORT_SUFFIX}/sub/admin"
         CONSOLE_URL="https://${DOMAIN}${PORT_SUFFIX}/console?key=${ADMIN_KEY}"
         
-        echo -e " 管理员全量订阅: ${CYAN}${ADMIN_SUB_URL}${PLAIN}"
+        echo -e " 管理员全量订阅: ${CYAN}登录 Web 控制台查看（链接含不可猜测的密钥路径）${PLAIN}"
         echo -e " 用户专属订阅:   ${GREEN}https://${DOMAIN}${PORT_SUFFIX}/sub/{用户名}{6位随机码}${PLAIN}"
         echo -e " Web 管理控制台: ${GREEN}${CONSOLE_URL}${PLAIN}"
     else

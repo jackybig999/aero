@@ -786,23 +786,7 @@ func (h *SubHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
-	// 1. Intercept dedicated /sub/admin returning permanent validity & unlimited quota
-	if secret == "admin" {
-		body, err := h.Store.AdminDocumentJSON()
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return true
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		if r.Method != http.MethodHead {
-			_, _ = w.Write(body)
-		}
-		return true
-	}
-
-	// 2. Check user slug (/sub/{username}{6random})
+	// 1. Check user slug (/sub/{username}{6random})
 	if userSub, found := h.Store.GetUserSub(secret); found {
 		if userSub.IsExpired() {
 			http.Error(w, "subscription expired", http.StatusForbidden)
@@ -826,12 +810,13 @@ func (h *SubHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
-	// 3. Check node secret (/sub/{secret}) with constant-time comparison (SEC-10)
+	// 2. 管理员订阅（永久、不限量）只经不可猜测的 /sub/{secret} 提供，恒定时间比较。
+	// 不存在匿名的管理员订阅路径：/sub/admin 与任意未知路径同样返回 404。
 	if subtle.ConstantTimeCompare([]byte(secret), []byte(h.Store.Secret())) != 1 {
 		http.NotFound(w, r)
 		return true
 	}
-	body, err := h.Store.DocumentJSON()
+	body, err := h.Store.AdminDocumentJSON()
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return true

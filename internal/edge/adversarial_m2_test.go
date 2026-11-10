@@ -483,13 +483,22 @@ func TestAdversarial_ZeroPort_URL_Enforcement_And_SubscriptionContract(t *testin
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	// 2a. GET /sub/admin: must return 200, userId=admin, expireAt=0, trafficLimitBytes=0
-	respAdmin, err := http.Get(ts.URL + "/sub/admin")
+	// 2a. 匿名 GET /sub/admin 必须 404；管理员订阅只经 /sub/{secret} 提供：
+	// 200，userId=admin，expireAt=0，trafficLimitBytes=0
+	respAnon, err := http.Get(ts.URL + "/sub/admin")
 	if err != nil {
 		t.Fatalf("GET /sub/admin: %v", err)
 	}
+	_ = respAnon.Body.Close()
+	if respAnon.StatusCode != http.StatusNotFound {
+		t.Fatalf("anonymous GET /sub/admin expected 404, got %d", respAnon.StatusCode)
+	}
+	respAdmin, err := http.Get(ts.URL + "/sub/" + store.Secret())
+	if err != nil {
+		t.Fatalf("GET /sub/{secret}: %v", err)
+	}
 	if respAdmin.StatusCode != http.StatusOK {
-		t.Fatalf("GET /sub/admin expected 200, got %d", respAdmin.StatusCode)
+		t.Fatalf("GET /sub/{secret} expected 200, got %d", respAdmin.StatusCode)
 	}
 	bodyAdmin, _ := io.ReadAll(respAdmin.Body)
 	_ = respAdmin.Body.Close()
@@ -660,7 +669,7 @@ func TestAdversarial_AdminSubsAPI_DualFieldCompatibility(t *testing.T) {
 		t.Fatalf("camelCase unmarshaling error: %+v", savedBob)
 	}
 
-	// GET /admin/subs lists users and contains admin_sub: "/sub/admin"
+	// GET /admin/subs lists users; admin_sub is the unguessable /sub/{secret} (never /sub/admin)
 	reqList, _ := http.NewRequest(http.MethodGet, srv.URL+"/admin/subs", nil)
 	reqList.Header.Set("X-Aero-Admin-Key", adminKey)
 	respList, err := http.DefaultClient.Do(reqList)
@@ -674,7 +683,7 @@ func TestAdversarial_AdminSubsAPI_DualFieldCompatibility(t *testing.T) {
 	if err := json.Unmarshal(bodyList, &listResp); err != nil {
 		t.Fatalf("unmarshal list response: %v", err)
 	}
-	if listResp["admin_sub"] != "/sub/admin" {
-		t.Fatalf("expected admin_sub='/sub/admin', got %v", listResp["admin_sub"])
+	if want := expectedAdminSubPath(subStore); listResp["admin_sub"] != want {
+		t.Fatalf("expected admin_sub=%q, got %v", want, listResp["admin_sub"])
 	}
 }

@@ -352,8 +352,11 @@ func (h *ConsoleHandler) handleAPIStatus(w http.ResponseWriter, r *http.Request)
 		warpProxy, warpAll, warpEnabled, warpHealthy = h.dialGuard.GetWarpStatus()
 	}
 
-	// Admin Sub URL (strictly zero-port)
-	adminURL := FormatZeroPortSubURL(domain, "admin")
+	// 管理员订阅 URL（免端口）：仅在已鉴权的控制台返回，路径为不可猜测的 secret。
+	adminURL := ""
+	if h.subStore != nil && h.subStore.Secret() != "" {
+		adminURL = FormatZeroPortSubURL(domain, h.subStore.Secret())
+	}
 
 	var userCount int
 	if h.subStore != nil {

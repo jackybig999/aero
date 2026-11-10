@@ -614,7 +614,7 @@ func (s *Server) Start() error {
 	}
 
 	log.Printf("[EDGE] Server started on %s (TLS + QUIC)", s.cfg.Listen)
-	log.Printf("[EDGE] Subscriptions ready: Admin(/sub/admin), User(/sub/{username}{6random}) (client-sub: %s/client-sub.json)", s.subStore.Dir())
+	log.Printf("[EDGE] Subscriptions ready: Admin(/sub/<secret>, see console), User(/sub/{username}{6random}) (client-sub: %s/client-sub.json)", s.subStore.Dir())
 	log.Printf("[EDGE] Tokens loaded from %s (count: %d)", s.tokenStore.Path(), s.tokenStore.v.Count())
 	if s.cfg.AdminKey != "" {
 		log.Printf("[EDGE] Web Console ready at /console?key=%s", MaskToken(s.cfg.AdminKey))

@@ -214,8 +214,12 @@ func TestConsoleAPI_Status_ZeroPortUrls(t *testing.T) {
 	if !strings.HasPrefix(adminURL, "https://") {
 		t.Errorf("admin_sub_url must start with https://, got %q", adminURL)
 	}
-	if !strings.HasSuffix(adminURL, "/sub/admin") {
-		t.Errorf("admin_sub_url must end with /sub/admin, got %q", adminURL)
+	wantSuffix := "/sub/" + srv.subStore.Secret()
+	if srv.subStore.Secret() == "" || !strings.HasSuffix(adminURL, wantSuffix) {
+		t.Errorf("admin_sub_url must end with the unguessable %q, got %q", wantSuffix, adminURL)
+	}
+	if strings.HasSuffix(adminURL, "/sub/admin") {
+		t.Errorf("admin_sub_url must not use the anonymous /sub/admin path, got %q", adminURL)
 	}
 
 	// Verify cert countdown info is present
