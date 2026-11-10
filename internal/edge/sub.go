@@ -953,12 +953,3 @@ func FormatDirectSubURL(domainOrHost string, port int, slug string) string {
 	}
 	return fmt.Sprintf("https://%s:%d/sub/%s", raw, port, cleanSlug)
 }
-
-// ExtractSPKIPinFromCert extracts SPKI SHA-256 base64 pin directly from parsed x509.Certificate
-func ExtractSPKIPinFromCert(parsed *x509.Certificate) string {
-	if parsed == nil {
-		return ""
-	}
-	sum := sha256.Sum256(parsed.RawSubjectPublicKeyInfo)
-	return base64.StdEncoding.EncodeToString(sum[:])
-}

@@ -15,7 +15,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	_ "embed"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -1201,67 +1200,6 @@ func DiscoverAnyValidACMECertIn(baseDirs []string) (certFile, keyFile, domain st
 		}
 	}
 	return "", "", "", false
-}
-
-var httpsRRChecker func(domain string) bool
-
-// SetHTTPSRRCheckerForTest 允许单元测试注入 HTTPS RR 记录探测模拟器
-func SetHTTPSRRCheckerForTest(fn func(domain string) bool) {
-	httpsRRChecker = fn
-}
-
-func checkDomainHasHTTPSRR(domain string) bool {
-	if httpsRRChecker != nil {
-		return httpsRRChecker(domain)
-	}
-	domain = strings.TrimSpace(domain)
-	if domain == "" || domain == "localhost" || net.ParseIP(domain) != nil {
-		return false
-	}
-	return queryHTTPSRR(domain)
-}
-
-func queryHTTPSRR(domain string) bool {
-	c, err := net.DialTimeout("udp", "8.8.8.8:53", 1*time.Second)
-	if err != nil {
-		return false
-	}
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(1 * time.Second))
-
-	req := buildType65Query(domain)
-	if req == nil {
-		return false
-	}
-	if _, err := c.Write(req); err != nil {
-		return false
-	}
-	resp := make([]byte, 512)
-	n, err := c.Read(resp)
-	if err != nil || n < 12 {
-		return false
-	}
-	ancount := binary.BigEndian.Uint16(resp[6:8])
-	return ancount > 0
-}
-
-func buildType65Query(domain string) []byte {
-	labels := strings.Split(strings.TrimSuffix(domain, "."), ".")
-	if len(labels) == 0 {
-		return nil
-	}
-	var buf bytes.Buffer
-	buf.Write([]byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-	for _, l := range labels {
-		if len(l) == 0 || len(l) > 63 {
-			return nil
-		}
-		buf.WriteByte(byte(len(l)))
-		buf.WriteString(l)
-	}
-	buf.WriteByte(0x00)
-	buf.Write([]byte{0x00, 0x41, 0x00, 0x01}) // Type 65 (HTTPS), Class 1 (IN)
-	return buf.Bytes()
 }
 
 func isGo126OrLater(ver string) bool {
