@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -753,82 +752,6 @@ func (m *SNIMatrixManager) LoadFile(path string) error {
 	m.path = path
 	m.config = cfg
 	return nil
-}
-
-func (m *SNIMatrixManager) SaveFile(path string) error {
-	m.mu.RLock()
-	data, err := json.MarshalIndent(m.config, "", "  ")
-	m.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func (m *SNIMatrixManager) Match(isp, region string) string {
-	candidates := m.ListCandidates(isp, region)
-	if len(candidates) > 0 && candidates[0] != "" {
-		return candidates[0]
-	}
-	return "edge.microsoft.com"
-}
-
-func (m *SNIMatrixManager) ListCandidates(isp, region string) []string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	normISP := normalizeISP(isp)
-	normRegion := normalizeRegion(region)
-
-	prov, ok := m.config.Providers[normISP]
-	if !ok {
-		prov, ok = m.config.Providers["default"]
-	}
-	if !ok {
-		return []string{"edge.microsoft.com", "gateway.icloud.com"}
-	}
-
-	if routes, ok := prov.Routes[normRegion]; ok && len(routes) > 0 {
-		return append([]string(nil), routes...)
-	}
-	if defRoutes, ok := prov.Routes["DEFAULT"]; ok && len(defRoutes) > 0 {
-		return append([]string(nil), defRoutes...)
-	}
-	if prov.DefaultSNI != "" {
-		return []string{prov.DefaultSNI}
-	}
-	return []string{"edge.microsoft.com"}
-}
-
-func normalizeISP(raw string) string {
-	s := strings.ToLower(strings.TrimSpace(raw))
-	switch {
-	case strings.Contains(s, "telecom") || strings.Contains(s, "ct") || strings.Contains(s, "电信"):
-		return "china_telecom"
-	case strings.Contains(s, "unicom") || strings.Contains(s, "cu") || strings.Contains(s, "联通"):
-		return "china_unicom"
-	case strings.Contains(s, "mobile") || strings.Contains(s, "cm") || strings.Contains(s, "移动"):
-		return "china_mobile"
-	default:
-		return "default"
-	}
-}
-
-func normalizeRegion(raw string) string {
-	s := strings.ToUpper(strings.TrimSpace(raw))
-	for _, code := range []string{"HK", "JP", "US", "SG", "DE", "FR", "KR", "TW", "GB"} {
-		if strings.Contains(s, code) {
-			return code
-		}
-	}
-	return "DEFAULT"
 }
 
 // ECH returns the Encrypted Client Hello configuration if present.

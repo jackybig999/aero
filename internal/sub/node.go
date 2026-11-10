@@ -1539,10 +1539,6 @@ func (s *VPSService) UpdateDomain(id uint64, domain string) error {
 	return err
 }
 
-func (s *VPSService) GetCredentials(id uint64) (*Credentials, error) {
-	return s.store.GetCredentials(id)
-}
-
 func CalculateCapacity(m *HostMetrics) (score int, tier int, state string) {
 	if m == nil || !m.ProbeOK {
 		return 0, 1, "offline"
@@ -1597,27 +1593,6 @@ func CalculateCapacity(m *HostMetrics) (score int, tier int, state string) {
 		state = "overload"
 	}
 	return score, tier, state
-}
-
-func (s *VPSService) VerifyOrSyncDomain(ctx context.Context, domain, ip string) error {
-	domain = strings.TrimSpace(domain)
-	ip = strings.TrimSpace(ip)
-	if domain == "" || ip == "" {
-		return fmt.Errorf("domain and ip required")
-	}
-	if domain == "localhost" || domain == "127.0.0.1" {
-		return nil
-	}
-	ips, err := resolveDomainAuthoritative(ctx, domain)
-	if err != nil {
-		return fmt.Errorf("域名 %s 尚未在公网解析，请添加 A 记录指向 %s: %w", domain, ip, err)
-	}
-	for _, resolved := range ips {
-		if resolved == ip {
-			return nil
-		}
-	}
-	return fmt.Errorf("域名 %s 当前解析出的 IP (%v) 与 VPS IP (%s) 不一致", domain, ips, ip)
 }
 
 // ----------------------------------------------------------------------

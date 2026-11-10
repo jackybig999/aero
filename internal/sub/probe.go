@@ -706,25 +706,6 @@ func (s *VPSService) VerifyDomain(ctx context.Context, id uint64) (map[string]an
 	}, nil
 }
 
-// SyncCFDNS provides a stub or direct sync for Cloudflare DNS.
-func (s *VPSService) SyncCFDNS(ctx context.Context, domain, ip string) (map[string]any, error) {
-	domain = strings.TrimSpace(domain)
-	ip = strings.TrimSpace(ip)
-	if domain == "" || ip == "" {
-		return nil, fmt.Errorf("domain and ip required")
-	}
-	if !s.CFReady() {
-		return map[string]any{
-			"domain": domain, "ip": ip, "synced": false, "proxied": false,
-			"status_text": "Cloudflare Token 未配置，请手动在 DNS 服务商处添加 A 记录",
-		}, nil
-	}
-	return map[string]any{
-		"domain": domain, "ip": ip, "synced": true, "proxied": false,
-		"status_text": "Cloudflare 灰云解析 (proxied: false) 已同步",
-	}, nil
-}
-
 // ProbeTLSCertificate performs real TLS handshake to extract certificate validity.
 // Candidate ports (e.g. 8443, 443) are probed sequentially.
 func ProbeTLSCertificate(domain, ip string, candidatePorts ...int) (map[string]any, bool) {

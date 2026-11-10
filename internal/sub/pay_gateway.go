@@ -154,13 +154,6 @@ func NewGatewayRegistry(payDB *AeroPayDB, box *SecretBox) *GatewayRegistry {
 	return r
 }
 
-// Register registers a gateway under its provider name.
-func (r *GatewayRegistry) Register(g PaymentGateway) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.gateways[g.ProviderName()] = g
-}
-
 // Get returns the gateway by provider name.
 func (r *GatewayRegistry) Get(provider string) (PaymentGateway, error) {
 	r.mu.RLock()
@@ -170,17 +163,6 @@ func (r *GatewayRegistry) Get(provider string) (PaymentGateway, error) {
 		return nil, fmt.Errorf("payment provider %q not configured or active", provider)
 	}
 	return g, nil
-}
-
-// ListActiveProviders returns the names of all currently registered and active providers.
-func (r *GatewayRegistry) ListActiveProviders() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	var list []string
-	for name := range r.gateways {
-		list = append(list, name)
-	}
-	return list
 }
 
 // Reload queries pay_channel_config from aeropay.db and instantiates Creem and Lemon Squeezy gateways.

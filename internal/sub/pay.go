@@ -903,14 +903,6 @@ func (s *SQLiteLedgerStore) Append(e *LedgerEntry) (uint64, error) {
 	return uint64(id), nil
 }
 
-func (s *SQLiteLedgerStore) Get(id uint64) (*LedgerEntry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	query := `SELECT id, ledger_no, user_id, amount_cents, direction, channel, channel_ref, settled, settled_at, settlement_no, created_at FROM ledger_entries WHERE id = ?`
-	row := s.db.QueryRow(query, id)
-	return scanLedgerRow(row)
-}
-
 func (s *SQLiteLedgerStore) GetByLedgerNo(no string) (*LedgerEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -941,94 +933,6 @@ func (s *SQLiteLedgerStore) List(offset, limit int) ([]*LedgerEntry, int64, erro
 		}
 	}
 	return out, total, nil
-}
-
-func (s *SQLiteLedgerStore) ListUnsettled(direction string) ([]*LedgerEntry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if direction == "" {
-		direction = "IN"
-	}
-	query := `SELECT id, ledger_no, user_id, amount_cents, direction, channel, channel_ref, settled, settled_at, settlement_no, created_at FROM ledger_entries WHERE settled = 0 AND direction = ? ORDER BY id DESC`
-	rows, err := s.db.Query(query, direction)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []*LedgerEntry
-	for rows.Next() {
-		e, err := scanLedgerRows(rows)
-		if err == nil {
-			out = append(out, e)
-		}
-	}
-	return out, nil
-}
-
-func (s *SQLiteLedgerStore) MarkSettled(ledgerNo, settlementNo string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now()
-	_, err := s.db.Exec(`UPDATE ledger_entries SET settled = 1, settled_at = ?, settlement_no = ? WHERE ledger_no = ?`, now.Format(time.RFC3339), settlementNo, ledgerNo)
-	return err
-}
-
-func (s *SQLiteLedgerStore) SettleBatch(channel, targetRef string) (*LedgerEntry, int, error) {
-	unsettled, err := s.ListUnsettled("IN")
-	if err != nil {
-		return nil, 0, err
-	}
-	if len(unsettled) == 0 {
-		return nil, 0, nil
-	}
-	var totalCents int64
-	for _, it := range unsettled {
-		totalCents += it.AmountCents
-	}
-	now := time.Now()
-	setNo := fmt.Sprintf("SET-%s-%04x", now.Format("20060102"), now.UnixNano()%0xffff)
-	for _, it := range unsettled {
-		_ = s.MarkSettled(it.LedgerNo, setNo)
-	}
-	if channel == "" {
-		channel = "PingPong"
-	}
-	if targetRef == "" {
-		targetRef = "资金归集结算: " + setNo
-	}
-	outEntry := &LedgerEntry{
-		LedgerNo:     fmt.Sprintf("LED-%s-OUT-%04x", now.Format("20060102"), now.UnixNano()%0xffff),
-		UserID:       0,
-		AmountCents:  totalCents,
-		Direction:    "OUT",
-		Channel:      channel,
-		ChannelRef:   targetRef,
-		Settled:      true,
-		SettledAt:    &now,
-		SettlementNo: setNo,
-		CreatedAt:    now,
-	}
-	if _, err := s.Append(outEntry); err != nil {
-		return nil, len(unsettled), err
-	}
-	return outEntry, len(unsettled), nil
-}
-
-func (s *SQLiteLedgerStore) GetDailySummary(date time.Time) (*LedgerSummary, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	summary := &LedgerSummary{}
-	dateStr := date.Format("2006-01-02")
-
-	_ = s.db.QueryRow(`SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_entries WHERE direction = 'IN' AND substr(created_at, 1, 10) = ?`, dateStr).Scan(&summary.TotalInCents)
-	_ = s.db.QueryRow(`SELECT COALESCE(SUM(amount_cents), 0) FROM ledger_entries WHERE direction = 'OUT' AND substr(created_at, 1, 10) = ?`, dateStr).Scan(&summary.TotalOutCents)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM ledger_entries WHERE substr(created_at, 1, 10) = ?`, dateStr).Scan(&summary.EntryCount)
-
-	return summary, nil
 }
 
 type rowScanner interface {
@@ -1228,12 +1132,6 @@ func NewBillingService(aeroDB ...*AeroDB) *BillingService {
 		}
 	}
 	return svc
-}
-
-func (s *BillingService) SetAeroDB(db *AeroDB) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.aeroDB = db
 }
 
 func (s *BillingService) CreatePlan(name string, months int32, bytes, price int64) (*BillingPlan, error) {

@@ -296,36 +296,6 @@ func FindWebDist() WebPaths {
 	return p
 }
 
-func NewWebHandler(p WebPaths, api http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
-
-		if upath == "/health" || upath == "/healthz" || upath == "/metrics" || upath == "/admin/metering" || strings.HasPrefix(upath, "/admin/metering") || strings.HasPrefix(upath, "/api/") || strings.HasPrefix(upath, "/sub/") {
-			api.ServeHTTP(w, r)
-			return
-		}
-
-		if r.URL.Path == "/admin" {
-			http.Redirect(w, r, "/admin/", http.StatusMovedPermanently)
-			return
-		}
-		if upath == "/admin" || strings.HasPrefix(upath, "/admin/") {
-			if p.AdminDist == "" {
-				http.Error(w, "admin UI not built — check web/admin/dist", http.StatusServiceUnavailable)
-				return
-			}
-			serveSPA(w, r, p.AdminDist, "/admin")
-			return
-		}
-
-		if p.UserDist == "" {
-			http.Error(w, "user UI not built — check web/user/dist", http.StatusServiceUnavailable)
-			return
-		}
-		serveSPA(w, r, p.UserDist, "")
-	})
-}
-
 func serveSPA(w http.ResponseWriter, r *http.Request, distDir, urlPrefix string) {
 	reqPath := r.URL.Path
 	if urlPrefix != "" {
@@ -653,22 +623,6 @@ func (h *AeroHandler) Uninstall(w http.ResponseWriter, r *http.Request) {
 	task := globalTaskManager.CreateTask("uninstall", vpsID, cred.Name, DefaultUninstallSteps())
 	go RunUninstallTask(task.ID, vpsID, h.svc)
 	writeJSON(w, 200, map[string]any{"code": 0, "data": task})
-}
-
-func (h *AeroHandler) Restart(w http.ResponseWriter, r *http.Request) {
-	vpsID, err := parseReqVPSID(r)
-	if err != nil {
-		writeJSON(w, 422, errResp(1002, "vps_id required"))
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
-	res, err := h.svc.RestartEdge(ctx, vpsID)
-	if err != nil {
-		writeJSON(w, 502, errResp(1006, err.Error()))
-		return
-	}
-	writeJSON(w, 200, map[string]any{"code": 0, "data": res})
 }
 
 func (h *AeroHandler) GetEndpoint(w http.ResponseWriter, r *http.Request) {
