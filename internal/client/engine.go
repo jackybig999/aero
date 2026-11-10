@@ -169,13 +169,6 @@ type Engine struct {
 	socksAuthToken string
 }
 
-// SetSocksAuthToken 配置本地 SOCKS5 可选安全认证令牌 (NEW-08)
-func (e *Engine) SetSocksAuthToken(token string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.socksAuthToken = token
-}
-
 // NewEngine 创建客户端引擎
 func NewEngine() *Engine {
 	split := NewSplitEngine()
@@ -270,31 +263,9 @@ func (e *Engine) SessionManager() *SessionManager {
 	return e.sessionMgr
 }
 
-// DrainingSessionCount 获取当前会话管理器中排空队列的深度
-func (e *Engine) DrainingSessionCount() int {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if e.sessionMgr != nil {
-		return e.sessionMgr.DrainingCount()
-	}
-	return 0
-}
-
-// SetPacketConnFactory 设置当前引擎的物理网卡 Socket 工厂
-func (e *Engine) SetPacketConnFactory(f PacketConnFactory) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.packetConnFactory = f
-}
-
 // IsRunning 查询引擎当前运行状态
 func (e *Engine) IsRunning() bool {
 	return e.running.Load() && e.state.Load() == stateRunning
-}
-
-// IsStarting 查询引擎是否正在启动中
-func (e *Engine) IsStarting() bool {
-	return e.state.Load() == stateStarting || e.startPending.Load()
 }
 
 // IsStopping 查询引擎是否正在停止中
@@ -369,16 +340,6 @@ func (e *Engine) SetLastError(msg string) {
 	e.lastErr = msg
 	e.lastErrCode = "CONNECT_ERROR"
 	e.lastErrMu.Unlock()
-}
-
-// CancelStart 取消正在进行的启动连接过程
-func (e *Engine) CancelStart() {
-	e.mu.Lock()
-	cancel := e.startCancel
-	e.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
 }
 
 // SetTCPDialer 允许在测试中注入自定义 TCP 拨号器
@@ -489,36 +450,6 @@ func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
 		return nil, err
 	}
 	return v.(*Applied), nil
-}
-
-// LoadAndApplySubscriptionBytes 解析字节流并应用订阅
-func (e *Engine) LoadAndApplySubscriptionBytes(data []byte) (*Applied, error) {
-	sub, err := ParseSubscriptionBytes(data)
-	if err != nil {
-		return nil, err
-	}
-	applied, err := ApplySubscription(sub)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := context.WithTimeout(e.getContext(), 2*time.Second)
-	defer cancel()
-	ispRes := DetectISP(ctx, 500*time.Millisecond)
-	bestISP := "DEFAULT"
-	if ispRes != nil && ispRes.BestISP != "" {
-		bestISP = ispRes.BestISP
-	}
-	sortServersByISP(applied.Servers, bestISP)
-
-	e.mu.Lock()
-	e.currentISP = bestISP
-	e.mu.Unlock()
-
-	if err := e.Apply(applied); err != nil {
-		return nil, err
-	}
-	return applied, nil
 }
 
 // SwitchActiveNode 切换激活节点

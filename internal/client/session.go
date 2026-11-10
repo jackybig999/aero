@@ -20,7 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/connect-ip-go"
+	connectip "github.com/quic-go/connect-ip-go"
 	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -483,15 +483,6 @@ func (m *SessionManager) DialUDP(ctx context.Context, target string) (net.Conn, 
 	return sess.DialUDP(ctx, target)
 }
 
-// DialMASQUE dials an outbound MASQUE UDP connection using the active session.
-func (m *SessionManager) DialMASQUE(ctx context.Context, target string) (*masque.Conn, error) {
-	sess, err := m.GetSession(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return sess.DialMASQUE(ctx, target)
-}
-
 // DialIP establishes a CONNECT-IP tunnel using the active session.
 func (m *SessionManager) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, error) {
 	sess, err := m.GetSession(ctx)
@@ -589,15 +580,6 @@ func (m *SessionManager) DrainingCount() int {
 	m.drainingMu.Lock()
 	defer m.drainingMu.Unlock()
 	return len(m.drainingSessions)
-}
-
-// DrainingSessions returns a snapshot of currently draining sessions.
-func (m *SessionManager) DrainingSessions() []*Session {
-	m.drainingMu.Lock()
-	defer m.drainingMu.Unlock()
-	res := make([]*Session, len(m.drainingSessions))
-	copy(res, m.drainingSessions)
-	return res
 }
 
 var (
