@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log"
@@ -132,6 +133,11 @@ func (r *GlobalTunnelReader) StartBinding(parent context.Context, binding Global
 			if n > 0 {
 				packet := buffer[:n]
 				if source, parseErr := packetSource(packet); parseErr == nil && r.router.IsCurrent(binding) && r.router.ValidateSource(binding, source) == nil {
+					// 统一目的地址 ACL：私网、元数据、本机、其他用户地址池、出站 SMTP 一律丢弃。
+					// 不记录目的地址（PROJECT_RULES：edge 不记录用户访问的目的地址）。
+					if !clientPacketAllowed(packet) {
+						continue
+					}
 					if len(packet) > 1360 && packet[0]>>4 == 6 {
 						gwIPv6 := net.ParseIP("fd88::1")
 						ptbPkt := buildICMPv6PacketTooBig(packet, gwIPv6, 1360)
@@ -213,4 +219,82 @@ func (r *GlobalTunnelReader) Close() error {
 	r.wg.Wait()
 	r.bindingWG.Wait()
 	return r.closeErr
+}
+
+// packetDestination 解析客户端报文的目的地址、传输层协议与目的端口。
+// IPv6 会跳过常见扩展头（逐跳、路由、分片、目的选项），防止借扩展头绕过端口策略。
+// 非首分片或无端口协议时 port 为 0。ok 为 false 表示报文无法解析，调用方必须丢弃。
+func packetDestination(packet []byte) (dst netip.Addr, proto uint8, port uint16, ok bool) {
+	if len(packet) < 20 {
+		return netip.Addr{}, 0, 0, false
+	}
+	var l4 int
+	switch packet[0] >> 4 {
+	case 4:
+		ihl := int(packet[0]&0x0f) * 4
+		if ihl < 20 || len(packet) < ihl {
+			return netip.Addr{}, 0, 0, false
+		}
+		dst = netip.AddrFrom4([4]byte{packet[16], packet[17], packet[18], packet[19]})
+		proto = packet[9]
+		if binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 { // 非首分片
+			return dst, proto, 0, true
+		}
+		l4 = ihl
+	case 6:
+		if len(packet) < 40 {
+			return netip.Addr{}, 0, 0, false
+		}
+		var d [16]byte
+		copy(d[:], packet[24:40])
+		dst = netip.AddrFrom16(d)
+		next := packet[6]
+		off := 40
+		for i := 0; i < 8; i++ { // 扩展头数量上限，防止构造的长链消耗 CPU
+			switch next {
+			case 0, 43, 60: // 逐跳、路由、目的选项
+				if len(packet) < off+8 {
+					return netip.Addr{}, 0, 0, false
+				}
+				next = packet[off]
+				off += (int(packet[off+1]) + 1) * 8
+			case 44: // 分片
+				if len(packet) < off+8 {
+					return netip.Addr{}, 0, 0, false
+				}
+				fragOffset := binary.BigEndian.Uint16(packet[off+2:off+4]) >> 3
+				next = packet[off]
+				off += 8
+				if fragOffset != 0 {
+					return dst, next, 0, true
+				}
+			default:
+				proto, l4 = next, off
+				goto ports
+			}
+		}
+		return netip.Addr{}, 0, 0, false // 扩展头过多
+	default:
+		return netip.Addr{}, 0, 0, false
+	}
+ports:
+	if (proto == 6 || proto == 17) && len(packet) >= l4+4 {
+		port = binary.BigEndian.Uint16(packet[l4+2 : l4+4])
+	}
+	return dst, proto, port, true
+}
+
+// clientPacketAllowed 判定客户端经 CONNECT-IP 发出的报文能否写入共享 TUN。
+func clientPacketAllowed(packet []byte) bool {
+	dst, proto, port, ok := packetDestination(packet)
+	if !ok {
+		return false
+	}
+	if blocked, _ := destinationBlocked(dst, edgeLocalAddrs()); blocked {
+		return false
+	}
+	if blocked, _ := destinationPortBlocked(proto, port); blocked {
+		return false
+	}
+	return true
 }

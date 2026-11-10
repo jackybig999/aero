@@ -958,41 +958,6 @@ func findTestAddr() (string, string) {
 	return "127.0.0.1:0", "localhost"
 }
 
-func findTCPTestTarget() net.IP {
-	// First probe IPv4 127.0.0.1
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err == nil {
-		c, err2 := net.DialTimeout("tcp4", ln.Addr().String(), 100*time.Millisecond)
-		if err2 == nil {
-			_ = c.Close()
-			_ = ln.Close()
-			return net.ParseIP("127.0.0.1")
-		}
-		_ = ln.Close()
-	}
-	// Fallback to local unicast non-loopback IPv4 (bypasses Windows WFP loopback interception)
-	addrs, err := net.InterfaceAddrs()
-	if err == nil {
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				if ip4 := ipnet.IP.To4(); ip4 != nil {
-					ln2, err2 := net.Listen("tcp4", net.JoinHostPort(ip4.String(), "0"))
-					if err2 == nil {
-						c2, err3 := net.DialTimeout("tcp4", ln2.Addr().String(), 100*time.Millisecond)
-						if err3 == nil {
-							_ = c2.Close()
-							_ = ln2.Close()
-							return ip4
-						}
-						_ = ln2.Close()
-					}
-				}
-			}
-		}
-	}
-	return net.ParseIP("127.0.0.1")
-}
-
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -2503,7 +2468,9 @@ func TestCONNECTIPRoundtrip(t *testing.T) {
 
 	// 2. Perform end-to-end payload roundtrip
 	payload := []byte("hello-aero-real-payload-roundtrip")
-	targetIP := findTCPTestTarget()
+	// 内存设备在本地回显 UDP，不产生真实网络请求。目的地址必须是公网地址：
+	// 生产路径的目的地址 ACL 不受测试开关影响，回环、私网会被丢弃（审查 P0-2）。
+	targetIP := net.IPv4(1, 1, 1, 1)
 	udpReq := make([]byte, 20+8+len(payload))
 	udpReq[0] = 0x45
 	binary.BigEndian.PutUint16(udpReq[2:4], uint16(len(udpReq)))

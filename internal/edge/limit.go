@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -241,29 +242,17 @@ func IsBlockedTarget(target string) (bool, string) {
 	return IsBlockedIP(ip)
 }
 
-// IsBlockedIP returns true if IP is loopback, private, link-local, unspecified, or CGNAT.
+// IsBlockedIP 判定 ip 是否禁止作为代理目的地址，委托统一 ACL（dest_acl.go），
+// 与 CONNECT-IP 路径同一套规则，并包含 edge 本机地址。
 func IsBlockedIP(ip net.IP) (bool, string) {
 	if ip == nil {
 		return true, "nil ip"
 	}
-	if ip.IsLoopback() {
-		return true, "loopback"
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true, "invalid"
 	}
-	if ip.IsPrivate() {
-		return true, "private"
-	}
-	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return true, "link-local"
-	}
-	if ip.IsUnspecified() {
-		return true, "unspecified"
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-			return true, "cgnat"
-		}
-	}
-	return false, ""
+	return destinationBlocked(addr, edgeLocalAddrs())
 }
 
 // WarpRouteConfig holds the upstream Cloudflare WARP proxy address and routing scope
