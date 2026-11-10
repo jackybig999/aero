@@ -7,8 +7,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +35,6 @@ type Session struct {
 	token         string
 	addr          string
 	sni           string
-	nonceSent     atomic.Bool
 	draining      atomic.Bool
 	closed        atomic.Bool
 	closeOnce     sync.Once
@@ -90,18 +87,9 @@ func (s *Session) IsDraining() bool {
 	return s.draining.Load()
 }
 
-// setAuthHeaders attaches authentication headers:
-// - Always: Authorization: Bearer <token>
-// - First request on connection: Aero-Timestamp (ms), Aero-Nonce (32 hex chars)
+// setAuthHeaders 只附加 Authorization: Bearer（C3 §5：Aero-Timestamp/Aero-Nonce 已废弃）。
 func (s *Session) setAuthHeaders(hdr http.Header) {
 	hdr.Set("Authorization", "Bearer "+s.token)
-	if s.nonceSent.CompareAndSwap(false, true) {
-		ts := time.Now().UnixMilli()
-		hdr.Set("Aero-Timestamp", strconv.FormatInt(ts, 10))
-		nonce := make([]byte, 32)
-		_, _ = rand.Read(nonce)
-		hdr.Set("Aero-Nonce", hex.EncodeToString(nonce))
-	}
 }
 
 // DialTCP dials an outbound TCP stream over HTTP/3 standard CONNECT (no :protocol).
