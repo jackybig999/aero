@@ -318,6 +318,13 @@ type Client struct {
 	config     *TransportConfig
 	actualPort int
 	lastActive atomic.Int64
+
+	// transport 与 pconn 由 Dial 创建并归 Client 所有；quic-go 不会关闭调用方传入的
+	// Conn，Close 必须自行释放，否则每次重连泄漏一个 UDP socket 与其后台协程。
+	transport *quic.Transport
+	pconn     net.PacketConn
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // ActualPort 返回当前连接实际建立的物理端口
@@ -432,6 +439,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 			conn:       conn,
 			config:     cfg,
 			actualPort: actualPort,
+			pconn:      pconn,
 		}
 		client.lastActive.Store(time.Now().UnixMilli())
 		return client, nil
@@ -465,12 +473,13 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 			err  error
 		}
 		resCh := make(chan dialRes, len(candidatePorts))
-		var activeDials atomic.Int32
+		// launched/finished 只在本循环中读写：全部已发起且全部已返回结果时即判定失败，
+		// 不依赖发送方 defer 的执行时机。
+		launched, finished := 0, 0
 
 		launchDial := func(port int) {
-			activeDials.Add(1)
+			launched++
 			go func() {
-				defer activeDials.Add(-1)
 				targetAddr := &net.UDPAddr{IP: udpAddr.IP, Port: port, Zone: udpAddr.Zone}
 				var c *quic.Conn
 				var dErr error
@@ -519,6 +528,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 				}
 
 			case res := <-resCh:
+				finished++
 				if res.conn != nil {
 					raceCancel()
 					conn = res.conn
@@ -541,7 +551,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 					if attemptIdx < len(candidatePorts) {
 						launchDial(candidatePorts[attemptIdx])
 						attemptIdx++
-					} else if activeDials.Load() == 0 {
+					} else if finished == launched {
 						err = fmt.Errorf("all %d candidate ports failed, primary error: %w", len(candidatePorts), firstErr)
 						goto dialDone
 					}
@@ -552,6 +562,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 
 dialDone:
 	if err != nil {
+		_ = tr.Close()
 		_ = pconn.Close()
 		return nil, fmt.Errorf("quic dial %s: %w", cfg.Address, err)
 	}
@@ -560,6 +571,8 @@ dialDone:
 		conn:       conn,
 		config:     cfg,
 		actualPort: actualPort,
+		transport:  tr,
+		pconn:      pconn,
 	}
 	client.lastActive.Store(time.Now().UnixMilli())
 	return client, nil
@@ -629,12 +642,27 @@ func (c *Client) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	return c.conn.ReceiveDatagram(ctx)
 }
 
-// Close 关闭连接
+// Close 关闭 QUIC 连接，并释放 Dial 创建的 Transport 与 UDP socket（可重复调用）。
 func (c *Client) Close() error {
-	if c.conn != nil {
-		return c.conn.CloseWithError(0, "client closed")
+	if c == nil {
+		return nil
 	}
-	return nil
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			c.closeErr = c.conn.CloseWithError(0, "client closed")
+		}
+		if c.transport != nil {
+			if err := c.transport.Close(); err != nil && c.closeErr == nil {
+				c.closeErr = err
+			}
+		}
+		if c.pconn != nil {
+			if err := c.pconn.Close(); err != nil && c.closeErr == nil && !errors.Is(err, net.ErrClosed) {
+				c.closeErr = err
+			}
+		}
+	})
+	return c.closeErr
 }
 
 // LocalAddr 本地地址
