@@ -323,26 +323,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		dialGuard.AllowLocal = true
 	}
 
-	// 4b. 智能探测/配置 Cloudflare WARP SOCKS5 代理
+	// 4b. WARP 只在显式配置时启用（ADR-0006）。不探测本机端口：本机上任何恰好监听
+	// 40000/1080 的服务都会被误当作出口并接管流量。
 	warpProxy := strings.TrimSpace(cfg.WarpProxy)
-	if warpProxy == "" {
-		for _, candWarp := range []string{"127.0.0.1:40000", "127.0.0.1:1080"} {
-			if c, err := net.DialTimeout("tcp", candWarp, 150*time.Millisecond); err == nil {
-				_ = c.Close()
-				warpProxy = candWarp
-				log.Printf("[WARP] Auto-detected local Cloudflare WARP SOCKS5 proxy at %s, AI & Google unblocking active!", candWarp)
-				break
-			}
-		}
-	} else {
-		log.Printf("[WARP] Explicit Cloudflare WARP SOCKS5 proxy configured at %s, AI unblocking active (all=%v)", warpProxy, cfg.WarpAll)
-	}
 	if warpProxy != "" {
-		warpAll := true
-		if !cfg.WarpAll && cfg.WarpProxy != "" {
-			warpAll = false
-		}
-		dialGuard.SetWarpProxy(warpProxy, warpAll)
+		log.Printf("[WARP] Configured WARP proxy %s (all=%v)", warpProxy, cfg.WarpAll)
+		dialGuard.SetWarpProxy(warpProxy, cfg.WarpAll)
 	}
 
 	rateLimit := NewRateLimiter(cfg.RateIP)
