@@ -27,7 +27,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/quic-go/connect-ip-go"
+	connectip "github.com/quic-go/connect-ip-go"
 	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -303,24 +303,6 @@ type IPv6Pool struct {
 	nextHost uint32
 	maxHost  uint32
 	used     map[netip.Addr]struct{}
-}
-
-// NewIPv6Pool creates an IPv6Pool with a configured routed IPv6 CIDR.
-func NewIPv6Pool(cidrStr string) (*IPv6Pool, error) {
-	if cidrStr == "" {
-		return nil, errors.New("IPv6 prefix is not configured")
-	}
-	prefix, err := netip.ParsePrefix(cidrStr)
-	if err != nil {
-		return nil, err
-	}
-	return &IPv6Pool{
-		baseIP:   prefix.Addr(),
-		prefix:   prefix.Bits(),
-		nextHost: 2,
-		maxHost:  65534,
-		used:     make(map[netip.Addr]struct{}),
-	}, nil
 }
 
 // Allocate returns an unused /128 IPv6 prefix from the pool.
@@ -1229,15 +1211,6 @@ func (c *nextHopUDPRelayConn) SetDeadline(t time.Time) error      { return nil }
 func (c *nextHopUDPRelayConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *nextHopUDPRelayConn) SetWriteDeadline(t time.Time) error { return nil }
 
-// NewQUICServer creates a test-compatible QUICServer with the legacy ULA pool.
-// Production construction must use NewQUICServerWithIPv6Prefix so an unverified
-// ULA is never advertised as public IPv6 capability.
-func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter) *QUICServer {
-	ipPool, _ := NewIPPool("10.88.0.0/16")
-	ipv6Pool, _ := newIPv6PoolForTests()
-	return newQUICServer(v, cl, bl, dg, rl, ipPool, ipv6Pool)
-}
-
 // NewQUICServerWithIPv6Prefix creates a production QUICServer. An empty prefix
 // deliberately disables IPv6 allocation until a routed public prefix is proven.
 func NewQUICServerWithIPv6Prefix(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter, ipv6CIDR string) *QUICServer {
@@ -1263,20 +1236,6 @@ func newRoutedIPv6Pool(cidrStr string) (*IPv6Pool, error) {
 	}
 	return &IPv6Pool{
 		baseIP:   addr,
-		prefix:   prefix.Bits(),
-		nextHost: 2,
-		maxHost:  65534,
-		used:     make(map[netip.Addr]struct{}),
-	}, nil
-}
-
-func newIPv6PoolForTests() (*IPv6Pool, error) {
-	prefix, err := netip.ParsePrefix("fd88::/64")
-	if err != nil {
-		return nil, err
-	}
-	return &IPv6Pool{
-		baseIP:   prefix.Addr(),
 		prefix:   prefix.Bits(),
 		nextHost: 2,
 		maxHost:  65534,

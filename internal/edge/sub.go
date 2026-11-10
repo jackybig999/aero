@@ -717,15 +717,6 @@ func SignSub(doc SubDocument, key []byte) string {
 	return base64.URLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// VerifySub verifies HMAC-SHA256 signature
-func VerifySub(doc SubDocument, key []byte) bool {
-	if doc.Signature == "" || len(key) == 0 {
-		return false
-	}
-	expected := SignSub(doc, key)
-	return hmac.Equal([]byte(expected), []byte(doc.Signature))
-}
-
 func randomHexSecret(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

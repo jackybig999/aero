@@ -150,12 +150,6 @@ func (h *GeoDataHandler) StartCronUpdate(ctx context.Context) {
 	}()
 }
 
-// fetchAndUpdate pulls China direct rules from upstream, calculates SHA256,
-// atomically writes to filePath (.tmp -> Rename) if changed, and updates memory.
-func (h *GeoDataHandler) fetchAndUpdate() error {
-	return h.fetchAndUpdateWithContext(context.Background())
-}
-
 func (h *GeoDataHandler) fetchAndUpdateWithContext(parentCtx context.Context) error {
 	urls := []string{h.fetchURL}
 	if h.fetchURL == "" || h.fetchURL == defaultGeoDataURL {

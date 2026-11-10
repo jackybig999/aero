@@ -1,7 +1,6 @@
 package edge
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -150,19 +149,6 @@ func (r *GlobalTunnelRouter) RoutePacket(packet []byte) (GlobalTunnelBinding, ne
 		return GlobalTunnelBinding{}, source, fmt.Errorf("no tunnel binding for destination %s", destination)
 	}
 	return binding, source, nil
-}
-
-func buildRouterTestIPv4(src, dst netip.Addr) []byte {
-	packet := make([]byte, 20)
-	packet[0] = 0x45
-	packet[8] = 64
-	packet[9] = 1
-	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
-	srcBytes := src.As4()
-	dstBytes := dst.As4()
-	copy(packet[12:16], srcBytes[:])
-	copy(packet[16:20], dstBytes[:])
-	return packet
 }
 
 func (r *GlobalTunnelRouter) Close() {
