@@ -209,21 +209,6 @@ func NewSplitEngine() *SplitEngine {
 	return e
 }
 
-// ChinaMatcher 获取底层的中国 IP 匹配器
-func (e *SplitEngine) ChinaMatcher() *ChinaIPMatcher {
-	if e == nil {
-		return nil
-	}
-	return e.chinaMatcher
-}
-
-// SetDefaultStrategy 设置默认策略
-func (e *SplitEngine) SetDefaultStrategy(s Strategy) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.defaultStrategy = s
-}
-
 // AddRule 添加规则
 func (e *SplitEngine) AddRule(r Rule) {
 	if len(r.parsedIPNets) == 0 && len(r.IPRanges) > 0 {

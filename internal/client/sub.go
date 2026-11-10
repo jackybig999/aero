@@ -9,7 +9,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -959,16 +958,6 @@ func ParseSubscriptionBytes(data []byte) (*Subscription, error) {
 		return nil, fmt.Errorf("subscription validation failed: %w", err)
 	}
 	return &sub, nil
-}
-
-// DeriveNodeToken 基于用户种子和目标域名派生单节点动态访问 Token
-func DeriveNodeToken(seed, domain string) string {
-	if seed == "" {
-		return ""
-	}
-	h := sha256.New()
-	h.Write([]byte(seed + ":" + strings.ToLower(strings.TrimSpace(domain))))
-	return "tok_" + hex.EncodeToString(h.Sum(nil))[:24]
 }
 
 var lastBodyMu sync.RWMutex

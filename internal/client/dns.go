@@ -248,15 +248,6 @@ func (t *FakeIPTable) Contains(ip net.IP) bool {
 	return t.cidr.Contains(ip)
 }
 
-// FormatDNSResponse 格式化 DNS A 记录响应
-func (t *FakeIPTable) FormatDNSResponse(host string) []byte {
-	ip := t.Allocate(host)
-	if ip == nil {
-		return nil
-	}
-	return buildAResponse(nil, host, ip)
-}
-
 // DefaultFakeIPTable 全局 Fake-IP 表
 var DefaultFakeIPTable = NewFakeIPTable("198.18.0.0/15")
 
