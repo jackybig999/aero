@@ -338,25 +338,48 @@ func (h *AdminHandler) handleUpsertSubs(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "upsert failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Mount user token into TokenStore and Validator immediately
+		// 挂载 token：有效期与订阅到期时间一致；订阅已过期则移除 token（在线会话由
+		// token 执行器断开），不得挂载成长期 token。
 		if item.Token != "" {
-			ttl := 365 * 24 * time.Hour
-			if item.ExpireAt > time.Now().Unix() {
-				ttl = time.Duration(item.ExpireAt-time.Now().Unix()) * time.Second
-			}
-			label := "user:" + item.Username
-			if item.Username == "" {
-				label = "user:" + item.Slug
-			}
-			if h.tokenStore != nil {
-				_, _ = h.tokenStore.AddReturn(item.Token, label, ttl)
-			} else if h.validator != nil {
-				h.validator.AddToken(item.Token, label, ttl)
+			if err := h.mountSubToken(item); err != nil {
+				http.Error(w, "mount token failed: "+err.Error(), http.StatusInternalServerError)
+				return
 			}
 		}
 		synced++
 	}
 	writeJSON(w, map[string]any{"ok": true, "synced_count": synced})
+}
+
+// mountSubToken 按订阅到期时间挂载或移除用户 token。ExpireAt 为 0 表示不限期，
+// 沿用一年有效期（启动时 Ensure 会续期）。
+func (h *AdminHandler) mountSubToken(item UserSub) error {
+	now := time.Now()
+	if item.ExpireAt > 0 && item.ExpireAt <= now.Unix() {
+		if h.tokenStore != nil {
+			return h.tokenStore.Remove(item.Token)
+		}
+		if h.validator != nil {
+			h.validator.RemoveToken(item.Token)
+		}
+		return nil
+	}
+	ttl := 365 * 24 * time.Hour
+	if item.ExpireAt > 0 {
+		ttl = time.Unix(item.ExpireAt, 0).Sub(now)
+	}
+	label := "user:" + item.Username
+	if item.Username == "" {
+		label = "user:" + item.Slug
+	}
+	if h.tokenStore != nil {
+		_, err := h.tokenStore.AddReturn(item.Token, label, ttl)
+		return err
+	}
+	if h.validator != nil {
+		h.validator.AddToken(item.Token, label, ttl)
+	}
+	return nil
 }
 
 func (h *AdminHandler) handleDeleteSub(w http.ResponseWriter, r *http.Request) {

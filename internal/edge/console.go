@@ -683,6 +683,12 @@ func (r *CreateUserRequest) ValidateAndNormalize() error {
 		}
 	}
 	now := time.Now().Unix()
+	if r.ExpireDays < 0 {
+		return fmt.Errorf("expire_days must not be negative")
+	}
+	if r.ExpireAt != 0 && r.ExpireAt <= now {
+		return fmt.Errorf("expire_at is in the past")
+	}
 	if r.ExpireAt == 0 && r.ExpireDays > 0 {
 		r.ExpireAt = now + int64(r.ExpireDays)*86400
 	}
