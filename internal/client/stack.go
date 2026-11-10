@@ -26,21 +26,6 @@ type TunDevice interface {
 	Name() string
 }
 
-// TunnelEngine 统一抽象客户端隧道门面接口 (方案 §2.1)
-type TunnelEngine interface {
-	Start() error
-	Stop()
-	SetKillSwitch(bool)
-	KillSwitch() bool
-	SetWebRTCActive(bool)
-	WebRTCActive() bool
-	SetDNSOnlyMode(bool)
-	DNSOnlyMode() bool
-	SetICMPOutboundHookForTest(func([]byte))
-}
-
-var _ TunnelEngine = (*StackEngine)(nil)
-
 // StackEngine 原生数据面引擎 (彻底下线 gVisor，全面由 IPDataPump 独占驱动)
 type StackEngine struct {
 	ctx                context.Context
@@ -53,7 +38,6 @@ type StackEngine struct {
 	gatewayIP          net.IP
 	closeDevice        bool
 	killSwitch         atomic.Bool
-	dnsOnlyMode        atomic.Bool
 	webrtcRelayEnabled atomic.Bool
 	icmpOutboundHook   func(pkt []byte)
 	onDisconnect       func(error)
@@ -190,14 +174,6 @@ func (e *StackEngine) SetWebRTCActive(active bool) {
 
 func (e *StackEngine) WebRTCActive() bool {
 	return e.webrtcRelayEnabled.Load()
-}
-
-func (e *StackEngine) SetDNSOnlyMode(active bool) {
-	e.dnsOnlyMode.Store(active)
-}
-
-func (e *StackEngine) DNSOnlyMode() bool {
-	return e.dnsOnlyMode.Load()
 }
 
 func (e *StackEngine) SetICMPOutboundHookForTest(hook func(pkt []byte)) {
@@ -638,20 +614,4 @@ func calcChecksum(data []byte) uint16 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 	return ^uint16(sum)
-}
-
-func isPublicDoHEndpoint(ipStr string, port uint16) bool {
-	if port != 443 && port != 853 {
-		return false
-	}
-	switch ipStr {
-	case "1.1.1.1", "1.0.0.1",
-		"8.8.8.8", "8.8.4.4",
-		"9.9.9.9", "149.112.112.112",
-		"208.67.222.222", "208.67.220.220",
-		"223.5.5.5", "223.6.6.6",
-		"119.29.29.29", "180.76.76.76":
-		return true
-	}
-	return false
 }

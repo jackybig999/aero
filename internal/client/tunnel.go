@@ -126,16 +126,6 @@ func getActiveEdge() (string, string, string, net.IP) {
 	return addr, tok, sni, ip
 }
 
-// RegisterInboundDatagramHandler 注册指定 ContextID 的数据报入站回调
-func RegisterInboundDatagramHandler(contextID uint32, handler func(payload []byte)) {
-	inboundDatagramHandlers.Store(contextID, handler)
-}
-
-// UnregisterInboundDatagramHandler 注销指定 ContextID 的数据报入站回调
-func UnregisterInboundDatagramHandler(contextID uint32) {
-	inboundDatagramHandlers.Delete(contextID)
-}
-
 func dispatchInboundDatagram(contextID uint32, payload []byte) {
 	if val, ok := inboundDatagramHandlers.Load(contextID); ok && val != nil {
 		handler := val.(func([]byte))
@@ -185,11 +175,6 @@ func isAITraffic(host string) bool {
 		}
 	}
 	return false
-}
-
-// ClassifyTarget 严格按 IP 报头与 AI 规则判定，结合 splitEngine 激活多通道
-func (tc *TunnelClient) ClassifyTarget(raw string) streamTarget {
-	return tc.classifyTarget(raw)
 }
 
 // classifyTarget 严格按 IP 报头与 AI 规则判定，结合 splitEngine 激活多通道
@@ -248,16 +233,6 @@ func (tc *TunnelClient) SetChainProxy(cfg *ChainProxyConfig) {
 	} else {
 		tc.chainProxy.Store(nil)
 	}
-}
-
-// GetChainProxy 获取当前配置的链式代理
-func (tc *TunnelClient) GetChainProxy() *ChainProxyConfig {
-	cp := tc.chainProxy.Load()
-	if cp != nil {
-		cCopy := *cp
-		return &cCopy
-	}
-	return nil
 }
 
 // SetSessionManager binds a SessionManager to TunnelClient

@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/connect-ip-go"
+	connectip "github.com/quic-go/connect-ip-go"
 )
 
 // IPPacketConn 抽象底层 IP 数据包传输连接（严格匹配 *connectip.Conn 导出方法）
@@ -148,32 +148,14 @@ func (p *IPDataPump) SetKillSwitch(active bool) {
 	}
 }
 
-// KillSwitch 返回当前 Kill Switch 激活状态
-func (p *IPDataPump) KillSwitch() bool {
-	if p.killSwitch != nil {
-		return p.killSwitch.Load()
-	}
-	return false
-}
-
 // SetIPv6Blackhole 动态设置第 3 重 IPv6 黑洞防泄漏拦截状态 (方案 §3.2)
 func (p *IPDataPump) SetIPv6Blackhole(active bool) {
 	p.ipv6Blackhole.Store(active)
 }
 
-// IPv6Blackhole 返回当前 IPv6 黑洞防泄漏状态
-func (p *IPDataPump) IPv6Blackhole() bool {
-	return p.ipv6Blackhole.Load()
-}
-
 // SetWebRTCActive 动态设置 WebRTC STUN 报文放行门控状态
 func (p *IPDataPump) SetWebRTCActive(active bool) {
 	p.webrtcActive.Store(active)
-}
-
-// WebRTCActive 返回当前 WebRTC STUN 报文放行门控状态
-func (p *IPDataPump) WebRTCActive() bool {
-	return p.webrtcActive.Load()
 }
 
 // Start 启动双向转发 Goroutine
