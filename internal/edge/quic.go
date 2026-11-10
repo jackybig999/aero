@@ -224,17 +224,29 @@ func (r *DNSResolver) Resolve(token, host string) ([]byte, error) {
 // 2. IP Pool & Dynamic Allocation (10.88.0.0/16)
 // ==========================================
 
-// IPPool dynamically allocates client IP prefixes within a CIDR pool.
+// IPPool 在 CIDR 内为 CONNECT-IP 会话分配 /32 地址。按 token 粘性分配：会话释放后，
+// 该地址为同一 token 保留 ipLeaseTTL，期间不分给其他会话；同一 token 重连优先拿回原地址，
+// 使客户端在网络切换或短暂断线后隧道 IP 不变。
 type IPPool struct {
 	mu       sync.Mutex
-	baseIP   netip.Addr
-	prefix   int
+	base     uint32 // 网络地址（已掩码）
 	nextHost uint32
-	maxHost  uint32
+	maxHost  uint32 // 可分配的最大主机号（不含广播）
 	used     map[netip.Addr]struct{}
+	leases   map[string]ipLease    // token → 释放后保留的地址
+	leasedBy map[netip.Addr]string // 地址 → 持有租约的 token
+	now      func() time.Time
 }
 
-// NewIPPool creates an IPPool with specified CIDR (default 10.88.0.0/16).
+type ipLease struct {
+	addr  netip.Addr
+	until time.Time
+}
+
+// ipLeaseTTL 是地址为原 token 保留的时长（估算，覆盖网络切换与 edge 平滑重启之外的短暂断线）。
+const ipLeaseTTL = 30 * time.Minute
+
+// NewIPPool 创建地址池（默认 10.88.0.0/16）。主机号从 2 开始（1 为网关）。
 func NewIPPool(cidrStr string) (*IPPool, error) {
 	if cidrStr == "" {
 		cidrStr = "10.88.0.0/16"
@@ -243,56 +255,95 @@ func NewIPPool(cidrStr string) (*IPPool, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !prefix.Addr().Is4() || prefix.Bits() > 29 {
+		return nil, fmt.Errorf("IPv4 pool %s must be an IPv4 prefix no smaller than /29", cidrStr)
+	}
+	b := prefix.Masked().Addr().As4()
 	return &IPPool{
-		baseIP:   prefix.Addr(),
-		prefix:   prefix.Bits(),
+		base:     binary.BigEndian.Uint32(b[:]),
 		nextHost: 2,
-		maxHost:  65534,
+		maxHost:  (uint32(1) << (32 - prefix.Bits())) - 2,
 		used:     make(map[netip.Addr]struct{}),
+		leases:   make(map[string]ipLease),
+		leasedBy: make(map[netip.Addr]string),
+		now:      time.Now,
 	}, nil
 }
 
-// Allocate returns an unused IP prefix from the pool.
-func (p *IPPool) Allocate() (netip.Prefix, error) {
+// Allocate 分配一个不绑定 token 的地址。
+func (p *IPPool) Allocate() (netip.Prefix, error) { return p.AllocateFor("") }
+
+// AllocateFor 为 key（token）分配地址：优先归还该 key 未过期租约中的地址。
+func (p *IPPool) AllocateFor(key string) (netip.Prefix, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	base4 := p.baseIP.As4()
-	baseVal := binary.BigEndian.Uint32(base4[:])
-
-	for i := uint32(0); i < p.maxHost; i++ {
+	now := p.now()
+	if l, ok := p.leases[key]; ok && key != "" {
+		p.dropLease(key, l.addr)
+		if _, inUse := p.used[l.addr]; !inUse && now.Before(l.until) {
+			p.used[l.addr] = struct{}{}
+			return netip.PrefixFrom(l.addr, 32), nil
+		}
+	}
+	for i := uint32(0); i < p.maxHost-1; i++ {
 		host := p.nextHost
 		p.nextHost++
-		if p.nextHost >= p.maxHost {
+		if p.nextHost > p.maxHost {
 			p.nextHost = 2
 		}
-		val := baseVal + host
-		var cand4 [4]byte
-		binary.BigEndian.PutUint32(cand4[:], val)
-		candAddr := netip.AddrFrom4(cand4)
-		if _, exists := p.used[candAddr]; !exists {
-			p.used[candAddr] = struct{}{}
-			return netip.PrefixFrom(candAddr, 32), nil
+		var a [4]byte
+		binary.BigEndian.PutUint32(a[:], p.base+host)
+		cand := netip.AddrFrom4(a)
+		if _, inUse := p.used[cand]; inUse {
+			continue
 		}
+		if owner, leased := p.leasedBy[cand]; leased {
+			if now.Before(p.leases[owner].until) {
+				continue // 为其他 token 保留中
+			}
+			p.dropLease(owner, cand)
+		}
+		p.used[cand] = struct{}{}
+		return netip.PrefixFrom(cand, 32), nil
 	}
 	return netip.Prefix{}, errors.New("ip pool exhausted")
 }
 
-// Release returns a prefix back to the pool.
-func (p *IPPool) Release(prefix netip.Prefix) {
+// Release 释放不绑定 token 的地址。
+func (p *IPPool) Release(prefix netip.Prefix) { p.ReleaseFor("", prefix) }
+
+// ReleaseFor 释放地址；key 非空时为该 key 保留 ipLeaseTTL。
+func (p *IPPool) ReleaseFor(key string, prefix netip.Prefix) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.used, prefix.Addr())
+	addr := prefix.Addr()
+	delete(p.used, addr)
+	if key == "" {
+		return
+	}
+	if old, ok := p.leases[key]; ok {
+		p.dropLease(key, old.addr)
+	}
+	p.leases[key] = ipLease{addr: addr, until: p.now().Add(ipLeaseTTL)}
+	p.leasedBy[addr] = key
 }
 
-// Available checks if there is any available IP address in the pool.
+// dropLease 删除 key 对 addr 的租约（调用方持锁）。
+func (p *IPPool) dropLease(key string, addr netip.Addr) {
+	delete(p.leases, key)
+	if p.leasedBy[addr] == key {
+		delete(p.leasedBy, addr)
+	}
+}
+
+// Available 报告是否还有未使用的地址（租约中的地址计为可能可用）。
 func (p *IPPool) Available() bool {
 	if p == nil {
 		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return uint32(len(p.used)) < p.maxHost
+	return uint32(len(p.used)) < p.maxHost-1
 }
 
 // IPv6Pool dynamically allocates client IPv6 addresses from a configured prefix.
@@ -2188,13 +2239,13 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assignedPrefix, err := s.ipPool.Allocate()
+	assignedPrefix, err := s.ipPool.AllocateFor(token)
 	if err != nil {
 		w.Header().Set("Proxy-Status", "aero; error=address_pool_exhausted; details=\"IP pool exhausted\"")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	defer s.ipPool.Release(assignedPrefix)
+	defer s.ipPool.ReleaseFor(token, assignedPrefix)
 
 	var assignedIPv6 netip.Prefix
 	if s.ipv6Pool != nil {

@@ -2774,29 +2774,34 @@ func TestAuthFailureJail(t *testing.T) {
 }
 
 func TestIPPoolAvailable(t *testing.T) {
-	pool, err := NewIPPool("10.88.0.0/16")
+	// /29：主机号 2..6 共 5 个可分配地址（1 为网关、7 为广播）
+	pool, err := NewIPPool("10.88.0.0/29")
 	if err != nil {
 		t.Fatalf("NewIPPool failed: %v", err)
 	}
-
 	if !pool.Available() {
 		t.Fatalf("expected freshly created pool to be available")
 	}
 
-	// Simulate pool exhaustion
-	pool.mu.Lock()
-	pool.maxHost = 2
-	pool.used[pool.baseIP] = struct{}{}
-	candAddr, _ := netip.ParseAddr("10.88.0.2")
-	pool.used[candAddr] = struct{}{}
-	pool.mu.Unlock()
-
+	var got []netip.Prefix
+	for i := 0; i < 5; i++ {
+		p, err := pool.Allocate()
+		if err != nil {
+			t.Fatalf("allocate %d: %v", i, err)
+		}
+		if a := p.Addr().As4(); a[3] < 2 || a[3] > 6 {
+			t.Fatalf("allocated %s outside the host range of 10.88.0.0/29", p)
+		}
+		got = append(got, p)
+	}
 	if pool.Available() {
 		t.Fatalf("expected exhausted pool not to be available")
 	}
+	if _, err := pool.Allocate(); err == nil {
+		t.Fatalf("expected allocation from an exhausted pool to fail")
+	}
 
-	// Release an address and check availability
-	pool.Release(netip.PrefixFrom(candAddr, 32))
+	pool.Release(got[0])
 	if !pool.Available() {
 		t.Fatalf("expected pool to be available after release")
 	}
@@ -2850,10 +2855,17 @@ func TestServeConnectIPPoolExhausted(t *testing.T) {
 	qs := NewQUICServer(v, nil, nil, nil, nil)
 	defer qs.Close()
 
-	// Exhaust the IP pool
-	qs.ipPool.mu.Lock()
-	qs.ipPool.maxHost = 0
-	qs.ipPool.mu.Unlock()
+	// 用一个真实分配满的小地址池（/29，5 个地址）模拟耗尽
+	small, err := NewIPPool("10.88.0.0/29")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := small.Allocate(); err != nil {
+			t.Fatalf("fill pool: %v", err)
+		}
+	}
+	qs.ipPool = small
 
 	req := httptest.NewRequest(http.MethodConnect, "https://example.com/.well-known/masque/ip/*/*/", nil)
 	req.Proto = "connect-ip"
