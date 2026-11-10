@@ -291,25 +291,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	persistServerConfig(cfg)
 
 	// 3b. Sync user tokens from subStore into tokenStore and validator
-	if subStore != nil && tokenStore != nil {
-		for _, u := range subStore.ListUserSubs() {
-			if u.Token == "" {
-				continue
-			}
-			ttl := 100 * 365 * 24 * time.Hour
-			if u.ExpireAt > 0 {
-				rem := time.Until(time.Unix(u.ExpireAt, 0))
-				if rem > 0 {
-					ttl = rem
-				} else {
-					continue
-				}
-			}
-			if err := tokenStore.Ensure(u.Token, "user:"+u.Slug, ttl); err != nil {
-				log.Printf("[EDGE] Warning: failed to sync user token %s (%s): %v", MaskToken(u.Token), u.Slug, err)
-			}
-		}
-	}
+	syncUserTokensFromSubs(subStore, tokenStore)
 
 	// 4. Traffic & Flow Limiters
 	maxConn := cfg.MaxConn
@@ -456,6 +438,34 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	return srv, nil
+}
+
+// syncUserTokensFromSubs 启动时按订阅同步用户 token：有效期总是覆盖为订阅当前的
+// 到期时间（续费后不会按旧到期时间被断开）；订阅已过期则移除其 token。
+// ExpireAt 为 0 表示不限期（与控制台创建用户一致，100 年）。
+func syncUserTokensFromSubs(subStore *SubStore, tokenStore *TokenStore) {
+	if subStore == nil || tokenStore == nil {
+		return
+	}
+	now := time.Now()
+	for _, u := range subStore.ListUserSubs() {
+		if u.Token == "" {
+			continue
+		}
+		if u.ExpireAt > 0 && !now.Before(time.Unix(u.ExpireAt, 0)) {
+			if err := tokenStore.Remove(u.Token); err != nil {
+				log.Printf("[EDGE] Warning: failed to remove expired user token %s (%s): %v", MaskToken(u.Token), u.Slug, err)
+			}
+			continue
+		}
+		ttl := 100 * 365 * 24 * time.Hour
+		if u.ExpireAt > 0 {
+			ttl = time.Unix(u.ExpireAt, 0).Sub(now)
+		}
+		if err := tokenStore.Add(u.Token, "user:"+u.Slug, ttl); err != nil {
+			log.Printf("[EDGE] Warning: failed to sync user token %s (%s): %v", MaskToken(u.Token), u.Slug, err)
+		}
+	}
 }
 
 // ConsoleHandler returns the Web Console handler

@@ -119,3 +119,48 @@ func TestSubExpiryConsoleRejectsPastExpiry(t *testing.T) {
 		t.Fatalf("valid request rejected: %v", err)
 	}
 }
+
+// 回归：续费后启动同步沿用旧到期时间（Ensure 见到有效 token 即跳过），用户会被提前断开；
+// 已过期订阅的 token 在启动时必须被移除。
+func TestSubExpiryStartupSyncRefreshesAndRemovesTokens(t *testing.T) {
+	dir := t.TempDir()
+	v := NewValidator()
+	defer v.Close()
+	ts, err := OpenTokenStore(dir, v)
+	if err != nil {
+		t.Fatalf("OpenTokenStore: %v", err)
+	}
+	ss, err := NewSubStore(dir)
+	if err != nil {
+		t.Fatalf("NewSubStore: %v", err)
+	}
+	// 旧状态：续费用户的 token 1 小时后到期；过期用户的 token 被旧版本挂载成长期有效。
+	if err := ts.Add("tok_renewed", "user:renewed", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.Add("tok_lapsed", "user:lapsed", 365*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	renewedUntil := time.Now().Add(30 * 24 * time.Hour).Unix()
+	if err := ss.UpsertUserSub(UserSub{Username: "renewed", Slug: "renewed123456", Token: "tok_renewed", ExpireAt: renewedUntil}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.UpsertUserSub(UserSub{Username: "lapsed", Slug: "lapsed123456", Token: "tok_lapsed", ExpireAt: time.Now().Add(-time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+
+	syncUserTokensFromSubs(ss, ts)
+
+	if v.Validate("tok_lapsed") {
+		t.Fatal("token of a lapsed subscription is still valid after startup sync")
+	}
+	for _, info := range v.ListTokens() {
+		if info.Token == "tok_renewed" {
+			if d := info.ExpiresAt.Unix() - renewedUntil; d < -5 || d > 5 {
+				t.Fatalf("renewed token expires at %v, want about %v", info.ExpiresAt, time.Unix(renewedUntil, 0))
+			}
+			return
+		}
+	}
+	t.Fatal("tok_renewed missing after startup sync")
+}
