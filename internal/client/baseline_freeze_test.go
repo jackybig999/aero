@@ -40,9 +40,10 @@ func TestBaselineFreeze_DNSAndSysproxy(t *testing.T) {
 	if respOpenAI == nil {
 		t.Fatalf("expected response for openai.com A query")
 	}
-	ipOpenAI := extractFirstAAnswer(respOpenAI)
-	if ipOpenAI == nil || !fakeCIDR.Contains(ipOpenAI) {
-		t.Fatalf("expected openai.com A query to return 198.18.0.0/15 Fake-IP, got %v", ipOpenAI)
+	// 无 DoH 上游时返回 SERVFAIL；绝不返回 198.18/15 假 IP（CONNECT-IP 下会黑洞）
+	requireServFail(t, respOpenAI, "openai.com A without DoH")
+	if ip := extractFirstAAnswer(respOpenAI); ip != nil && fakeCIDR.Contains(ip) {
+		t.Fatalf("openai.com must not receive a Fake-IP, got %v", ip)
 	}
 	if split.Decide("openai.com") == "direct" {
 		t.Fatalf("expected split.Decide(openai.com) != 'direct', got %q", split.Decide("openai.com"))
@@ -75,7 +76,8 @@ func TestBaselineFreeze_DNSAndSysproxy(t *testing.T) {
 		t.Fatalf("expected baidu.com and example.cn to hit physical DNS, got %d calls", physicalQueries.Load()-prevPhysicalCount)
 	}
 
-	// 3. platform.moonshot.cn、api.siliconflow.cn、api.sparkdesk.cn 的 A 查询改为假 IP，并且不再调用物理 DNS
+	// 3. platform.moonshot.cn、api.siliconflow.cn、api.sparkdesk.cn 的 A 查询（无 DoH 上游）返回 SERVFAIL，
+	// 不返回 198.18 假 IP，并且不调用物理 DNS
 	prevCountAI := physicalQueries.Load()
 	for _, aiDomain := range []string{"platform.moonshot.cn", "api.siliconflow.cn", "api.sparkdesk.cn"} {
 		req := buildDNSQuery(aiDomain, 0x0001)
@@ -83,10 +85,7 @@ func TestBaselineFreeze_DNSAndSysproxy(t *testing.T) {
 		if resp == nil {
 			t.Fatalf("expected response for %s A query", aiDomain)
 		}
-		ipAI := extractFirstAAnswer(resp)
-		if ipAI == nil || !fakeCIDR.Contains(ipAI) {
-			t.Fatalf("expected %s to return 198.18.0.0/15 Fake-IP, got %v", aiDomain, ipAI)
-		}
+		requireServFail(t, resp, aiDomain+" A without DoH")
 	}
 	if physicalQueries.Load() != prevCountAI {
 		t.Fatalf("expected AI domains to NOT query physical DNS, but physical count increased by %d", physicalQueries.Load()-prevCountAI)

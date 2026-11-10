@@ -397,13 +397,8 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 					return resp
 				}
 			}
-			if h.fakeIP != nil {
-				resp := h.fakeIP.FormatDNSResponse(qname)
-				if len(pkt) >= 2 && len(resp) >= 2 {
-					resp[0], resp[1] = pkt[0], pkt[1]
-				}
-				return resp
-			}
+			// 上游失败：SERVFAIL，不返回假 IP（CONNECT-IP 数据面无法翻译假 IP，只会黑洞）
+			return buildServFailResponse(pkt, qname, qtype)
 		}
 		return buildEmptyResponse(pkt, qname, qtype)
 	}
@@ -428,11 +423,8 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		if dnsResp != nil {
 			return dnsResp
 		}
-		// 物理 DNS 超时/失败：仅 Type A 回退到 Fake-IP 专线，非 A 类型返回空应答
-		if qtype == 0x0001 {
-			return h.respondFakeIP(pkt, qname)
-		}
-		return buildEmptyResponse(pkt, qname, qtype)
+		// 物理 DNS 超时/失败：SERVFAIL，由系统解析器重试
+		return buildServFailResponse(pkt, qname, qtype)
 	}
 
 	// 阶段三：境外站/非直连域名
@@ -446,7 +438,7 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 				return resp
 			}
 		}
-		return h.respondFakeIP(pkt, qname)
+		return buildServFailResponse(pkt, qname, qtype)
 	}
 
 	// AAAA 和其余查询类型 (Type 65 HTTPS RR, TXT, MX 等)：返回标准空应答 (NOERROR, 0 答案)
@@ -678,6 +670,17 @@ func buildEmptyResponse(req []byte, host string, qtype uint16) []byte {
 	return resp
 }
 
+// buildServFailResponse 构造 SERVFAIL（RCODE=2）应答：上游解析失败时使用，
+// 让系统解析器重试或让应用快速失败。
+func buildServFailResponse(req []byte, host string, qtype uint16) []byte {
+	resp := buildEmptyResponse(req, host, qtype)
+	if len(req) >= 3 {
+		resp[2] = 0x80 | (req[2] & 0x01) // QR=1，回显 RD
+	}
+	resp[3] = 0x80 | 0x02 // RA=1，RCODE=SERVFAIL
+	return resp
+}
+
 func encodeDNSName(domain string) []byte {
 	var buf []byte
 	parts := strings.Split(domain, ".")
@@ -690,18 +693,6 @@ func encodeDNSName(domain string) []byte {
 	}
 	buf = append(buf, 0x00)
 	return buf
-}
-
-// respondFakeIP 格式化并返回 Fake-IP (198.18.x.x) A 记录应答，并对齐请求 Transaction ID
-func (h *DNSHandler) respondFakeIP(pkt []byte, qname string) []byte {
-	if h.fakeIP == nil {
-		return buildEmptyResponse(pkt, qname, 0x0001)
-	}
-	resp := h.fakeIP.FormatDNSResponse(qname)
-	if len(pkt) >= 2 && len(resp) >= 2 {
-		resp[0], resp[1] = pkt[0], pkt[1]
-	}
-	return resp
 }
 
 // extractFirstIPv4FromResponse 从 DNS wire 响应报文中解析第一条 A 记录的 IPv4 地址

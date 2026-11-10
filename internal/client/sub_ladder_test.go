@@ -495,14 +495,7 @@ func TestDNSFunnel_TwoStageRouting(t *testing.T) {
 	if physicalDNSCalled.Load() {
 		t.Errorf("physical DNS should NOT be invoked for overseas domain (leak!)")
 	}
-	if len(respIntl) < 32 {
-		t.Fatalf("response too short: %d bytes", len(respIntl))
-	}
-	// Verify Fake-IP starts with 198.18
-	ip := net.IP(respIntl[len(respIntl)-4:])
-	if !strings.HasPrefix(ip.String(), "198.18.") {
-		t.Errorf("expected Fake-IP from 198.18.0.0/15 pool, got: %s", ip.String())
-	}
+	requireServFail(t, respIntl, "overseas A without DoH")
 }
 
 func TestWebRTC_STUNPhysicalBlocking(t *testing.T) {

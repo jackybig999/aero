@@ -66,7 +66,7 @@ func TestDNS_DoH_RealPublicIP_Over_FakeIP(t *testing.T) {
 }
 
 // TestDNS_DoH_NilFallbackToFakeIP 门禁: 验证未提供 DoH 时向下兼容回退 Fake-IP
-func TestDNS_DoH_NilFallbackToFakeIP(t *testing.T) {
+func TestDNS_DoH_NilResolverReturnsServFail(t *testing.T) {
 	split := NewSplitEngine()
 	dnsHandler := NewDNSHandler(split)
 	dnsHandler.SetDoHResolver(nil) // 显式置空
@@ -77,13 +77,7 @@ func TestDNS_DoH_NilFallbackToFakeIP(t *testing.T) {
 		t.Fatal("HandleQuery returned nil")
 	}
 
-	ip := extractFirstAAnswer(resp)
-	if ip == nil {
-		t.Fatal("expected Fake-IP answer")
-	}
-	if !dnsHandler.FakeIP().Contains(ip) {
-		t.Fatalf("expected fallback IP in 198.18.0.0/15, got %v", ip)
-	}
+	requireServFail(t, resp, "openai.com A with nil DoH resolver")
 }
 
 // TestDNS_ParseFirstIPv4_CNAME_And_EDNS0 门禁: 验证 RFC 1035 解析器跨越 CNAME 链、忽略 EDNS0 OPT 伪记录提取真实 IP

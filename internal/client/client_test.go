@@ -249,11 +249,8 @@ func TestTwoStageDNSFunnel(t *testing.T) {
 		t.Fatalf("CRITICAL SECURITY LEAK: google.com was sent to physical DNS (queryFastUDP)!")
 	}
 
-	// 检查返回的 IP 是否在 198.18.0.0/15 网段
-	fakeIP := extractFirstAAnswer(respGoogleA)
-	if fakeIP == nil || !dnsHandler.fakeIP.Contains(fakeIP) {
-		t.Fatalf("expected IP in 198.18.0.0/15 for google.com, got %v", fakeIP)
-	}
+	// 未建连（无 DoH 上游）：SERVFAIL，不返回 198.18 假 IP
+	requireServFail(t, respGoogleA, "google.com A without DoH")
 
 	// 3. 境外域名 0ms Fake-IP 测试：立即返回 198.18.0.0/15 Fake-IP（耗时 < 100ms），绝不先行同步等待 2.5 秒 DoH 往返
 	start := time.Now()
@@ -263,17 +260,7 @@ func TestTwoStageDNSFunnel(t *testing.T) {
 	if elapsed > 100*time.Millisecond {
 		t.Fatalf("expected DNS response within 100ms, took %v", elapsed)
 	}
-	if respOpenAI == nil {
-		t.Fatalf("expected Fake-IP response for openai.com, got nil")
-	}
-	fakeOpenAI := extractFirstAAnswer(respOpenAI)
-	if fakeOpenAI == nil || !dnsHandler.fakeIP.Contains(fakeOpenAI) {
-		t.Fatalf("expected Fake-IP in 198.18.0.0/15 for openai.com, got %v", fakeOpenAI)
-	}
-	// 验证 Fake-IP 能够反查出原始真实域名
-	if revDomain := dnsHandler.fakeIP.Lookup(fakeOpenAI); revDomain != "openai.com" {
-		t.Fatalf("expected reverse lookup 'openai.com', got %q", revDomain)
-	}
+	requireServFail(t, respOpenAI, "openai.com A without DoH")
 
 	// 再次确认 openai.com 绝对未进入物理 DNS
 	if _, leaked := fastUDPDomains.Load("openai.com"); leaked {
@@ -2215,19 +2202,8 @@ func TestStage1_OverseasDNS0msFakeIPAndReverseLookup(t *testing.T) {
 		t.Fatalf("expected non-nil DNS response for anthropic.com")
 	}
 
-	fakeIP := extractFirstAAnswer(resp)
-	if fakeIP == nil {
-		t.Fatalf("failed to extract A answer from response")
-	}
-	if !dnsHandler.fakeIP.Contains(fakeIP) {
-		t.Fatalf("expected Fake-IP in 198.18.0.0/15, got %v", fakeIP)
-	}
-
-	// 验证反查域名
-	origDomain := dnsHandler.fakeIP.Lookup(fakeIP)
-	if origDomain != "anthropic.com" {
-		t.Fatalf("expected reverse lookup 'anthropic.com', got %q", origDomain)
-	}
+	// HandleQuery 不再分配假 IP，故不再有反查映射（FakeIPTable 自身的反查另有测试覆盖）
+	requireServFail(t, resp, "anthropic.com A without DoH")
 }
 
 // 门禁 3：Start() 启动完毕后，断言 WebRTCActive() 为真，测试本身没有调用 SetWebRTCActive
@@ -4185,15 +4161,8 @@ func TestDNSVirtualGatewayInterception(t *testing.T) {
 		t.Errorf("mismatched transaction ID: got 0x%02x%02x, want 0x1234", dnsPayload[0], dnsPayload[1])
 	}
 
-	// 校验返回的 IP 地址落在 198.18.0.0/15 Fake-IP 网段
-	if len(dnsPayload) < 4 {
-		t.Fatalf("DNS payload too short")
-	}
-	// 尾部 4 字节为 Answer A 记录 IP
-	ansIP := net.IP(dnsPayload[len(dnsPayload)-4:])
-	if !fakeTable.Contains(ansIP) {
-		t.Errorf("expected Fake-IP in 198.18.0.0/15, got %s", ansIP)
-	}
+	// 无上游时经虚拟网关回写的是 SERVFAIL 应答，不是 198.18 假 IP
+	requireServFail(t, dnsPayload, "virtual gateway reply without DoH")
 }
 
 // 验证 Type 65 (HTTPS RR) 与非 A 查询返回纯净空应答，绝不塞入 Fake-IP Type A 造成报文畸变
@@ -4222,19 +4191,10 @@ func TestDNS_Type65_And_NonA_CleanResponse(t *testing.T) {
 		t.Fatalf("expected empty answer for TXT query")
 	}
 
-	// 3. 境外域名 Type A (0x0001) 查询：必须正常返回 198.18.0.0/15 Fake-IP
+	// 3. 境外域名 Type A (0x0001) 查询、无 DoH 上游：SERVFAIL，不返回 198.18 假 IP
 	reqA := buildDNSQuery("google.com", 0x0001)
 	respA := dnsHandler.HandleQuery(reqA, net.ParseIP("10.88.0.2"), 53)
-	if respA == nil {
-		t.Fatalf("expected non-nil response for Type A query")
-	}
-	if ansCount := binary.BigEndian.Uint16(respA[6:8]); ansCount != 1 {
-		t.Fatalf("expected 1 answer for Type A query, got %d", ansCount)
-	}
-	fakeIP := extractFirstAAnswer(respA)
-	if fakeIP == nil || !dnsHandler.fakeIP.Contains(fakeIP) {
-		t.Fatalf("expected Fake-IP in 198.18.0.0/15 for Type A, got %v", fakeIP)
-	}
+	requireServFail(t, respA, "google.com A without DoH")
 }
 
 // 验证系统连通性探针与本地保留域名放行机制
@@ -4387,10 +4347,7 @@ func TestThreeStageFunnel_DomesticNonCN_Direct(t *testing.T) {
 	if respGoogle == nil {
 		t.Fatalf("expected non-nil response for google")
 	}
-	googleResolvedIP := extractFirstIPv4FromResponse(respGoogle)
-	if googleResolvedIP == nil || !strings.HasPrefix(googleResolvedIP.String(), "198.18.") {
-		t.Fatalf("expected Fake-IP (198.18.x.x) for google, got %v", googleResolvedIP)
-	}
+	requireServFail(t, respGoogle, "www.google.com A without DoH")
 }
 
 type mockIPPacketConn struct {
