@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: AERO edge local admin API (C7)
-  version: 1.0.0
+  version: 1.1.0
   description: |
     状态：final（2026-11-10，用户确认）。flag `local_admin_api` 默认 OFF，实现通过 §4.3 校验后方可 ON。
     用途：运维 CLI（deploy/aero）与本机工具管理 edge。CLI **不得**再直接读写 edge 的配置或数据文件
@@ -215,7 +215,13 @@ components:
     User:
       type: object
       required: [username, slug, created_at, status]
+      description: 本地用户（iss=edge），字段语义与中台 subscription 对齐（ADR-0010）。
       properties:
+        uid: { type: string, description: 本地生成的不透明 ID；对应中台 user_uuid（1.1.0 追加） }
+        tier: { type: string, description: 档位名，仅展示；对应中台 plan_name（1.1.0 追加） }
+        classes: { type: array, items: { type: string, enum: [default, ai, browser, game] }, description: 1.1.0 追加 }
+        max_devices: { type: integer, minimum: 1, maximum: 64, description: 1.1.0 追加 }
+        bw_bps: { type: integer, minimum: 0, description: 每秒字节；0 不限（1.1.0 追加） }
         username: { type: string }
         slug: { type: string }
         expire_at: { type: integer, description: Unix 秒；0 表示不限期 }
@@ -231,6 +237,10 @@ components:
         username: { type: string, pattern: "^[A-Za-z0-9_@.-]{2,64}$" }
         expire_days: { type: integer, minimum: 1 }
         traffic_limit_gb: { type: integer, minimum: 0 }
+        tier: { type: string, pattern: "^[a-z0-9_-]{1,32}$", description: 1.1.0 追加；默认 local }
+        classes: { type: array, items: { type: string, enum: [default, ai, browser, game] }, description: 1.1.0 追加；默认 [default] }
+        max_devices: { type: integer, minimum: 1, maximum: 64, description: 1.1.0 追加；默认 3 }
+        bw_bps: { type: integer, minimum: 0, description: 1.1.0 追加；默认 0（不限） }
 x-aero-decisions:
   - 控制台 /console/api/* 与本接口共用同一实现（两个入口，一套逻辑）。
   - C3 上线后，本地用户的 token 由 edge 本地签发（iss=edge）。
