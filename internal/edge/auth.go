@@ -297,11 +297,20 @@ func (v *Validator) RemoveToken(token string) {
 	delete(v.tokens, token)
 }
 
-// Clear removes all tokens (used on reload)
-func (v *Validator) Clear() {
+// replaceTokens 原子替换全部 token（Reload 使用）。
+func (v *Validator) replaceTokens(tokens map[string]*TokenInfo) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.tokens = make(map[string]*TokenInfo)
+	v.tokens = tokens
+	v.mu.Unlock()
+}
+
+// mergeTokens 把 tokens 并入现有集合，同名覆盖。
+func (v *Validator) mergeTokens(tokens map[string]*TokenInfo) {
+	v.mu.Lock()
+	for k, info := range tokens {
+		v.tokens[k] = info
+	}
+	v.mu.Unlock()
 }
 
 // Count returns number of active tokens
@@ -365,61 +374,70 @@ func OpenTokenStore(dir string, v *Validator) (*TokenStore, error) {
 		path: filepath.Join(dir, "tokens.json"),
 		v:    v,
 	}
-	if err := s.loadInto(false); err != nil {
+	if err := s.loadInto(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// Reload reloads tokens from disk into Validator
+// Reload 从磁盘重载 token：完整解析成功后原子替换 Validator 中的集合。
+// 解析失败时返回错误并保留原有 token；替换过程中不存在“全部失效”的窗口。
 func (s *TokenStore) Reload() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.v.Clear()
-	if err := s.loadIntoLocked(true); err != nil {
+	tokens, err := s.readTokenFileLocked()
+	if err != nil {
 		return 0, err
 	}
+	s.v.replaceTokens(tokens)
 	return s.v.Count(), nil
 }
 
-func (s *TokenStore) loadInto(clearFirst bool) error {
+// loadInto 启动时把磁盘上的 token 并入 Validator（不清除已有 token）。
+func (s *TokenStore) loadInto() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if clearFirst {
-		s.v.Clear()
+	tokens, err := s.readTokenFileLocked()
+	if err != nil {
+		return err
 	}
-	return s.loadIntoLocked(false)
+	s.v.mergeTokens(tokens)
+	return nil
 }
 
-func (s *TokenStore) loadIntoLocked(alreadyCleared bool) error {
-	_ = alreadyCleared
-	now := time.Now()
-
+// readTokenFileLocked 解析 tokens.json 为新的集合；文件不存在时返回空集合。
+// 已过期的 token 跳过；未设置过期时间的 token 视为一年有效（与旧行为一致）。
+func (s *TokenStore) readTokenFileLocked() (map[string]*TokenInfo, error) {
+	tokens := make(map[string]*TokenInfo)
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return tokens, nil
 		}
-		return err
+		return nil, err
 	}
 	var doc tokenFileDoc
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return err
+		return nil, fmt.Errorf("parse %s: %w", s.path, err)
 	}
+	now := time.Now()
 	for _, r := range doc.Tokens {
 		if r.Token == "" {
 			continue
 		}
-		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+		expires := r.ExpiresAt
+		if expires.IsZero() {
+			expires = now.Add(365 * 24 * time.Hour)
+		} else if !now.Before(expires) {
 			continue
 		}
-		ttl := time.Until(r.ExpiresAt)
-		if r.ExpiresAt.IsZero() || ttl <= 0 {
-			ttl = 365 * 24 * time.Hour
+		created := r.CreatedAt
+		if created.IsZero() {
+			created = now
 		}
-		s.v.AddToken(r.Token, r.Label, ttl)
+		tokens[r.Token] = &TokenInfo{Token: r.Token, CreatedAt: created, ExpiresAt: expires, Label: r.Label}
 	}
-	return nil
+	return tokens, nil
 }
 
 func (s *TokenStore) saveLocked() error {
