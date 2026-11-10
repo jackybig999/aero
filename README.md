@@ -16,7 +16,7 @@
 | `docs/contract/readiness.md` | 接口就绪矩阵 |
 | `deploy/` | 安装脚本（只放置二进制与 systemd unit） |
 | `tools/` | 仓库检查脚本 |
-| `tests/` | 跨组件测试 |
+| `tests/` | 跨组件真实二进制测试（M1 新建） |
 
 组件之间 **不得** 互相 import，只通过 `api/` 契约通信；由 `tools/check-imports.sh` 在 CI 中强制。
 

@@ -31,3 +31,4 @@ target/
 *:Zone.Identifier
 *Zone.Identifier*
 
+!cmd/*/*.syso
