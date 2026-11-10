@@ -8,7 +8,7 @@
 |---|---|---|---|---|---|---|
 | C1 | 数据面 CONNECT-IP | edge → client | RFC 9484 + 扩展参数 | `api/dataplane.md` | URI 模板、`class`/`env` 参数、地址分配、路由通告、Proxy-Status 错误映射 | 会话：请求中 → 已分配 → 运行 → 断开（按原因细分：吊销 / 过期 / 超配额 / 超设备 / 出口失效 / 网络） |
 | C2 | DoH | edge → client | RFC 8484（POST + GET） | 同上 | 记录类型全覆盖、SERVFAIL/NXDOMAIN 语义、体积上限 | — |
-| C3 | 用户 token | sub → edge、client | JSON Schema + Ed25519 签名规范 | `api/token.schema.json` | 字段、`kid` 轮换、规范化序列化 | — |
+| C3 | 用户 token | sub、edge（本地签发）→ edge、client | JSON Schema + Ed25519 签名规范 | `api/token.md`、`api/token.schema.json` | 线上格式 `aero1.<payload>.<sig>`（签原始字节，无需规范化）、两个签发方、校验顺序与错误码、`kid` 轮换、迁移 | — |
 | C4 | 吊销列表 | sub → edge | OpenAPI（edge 拉取） | `api/sub-revocation.yaml` | 签名、版本号、增量游标 | — |
 | C5 | 订阅文档 | edge → client | JSON Schema | `api/subscription.schema.json` | 节点、候选端口、档位（标准 / 混淆）、ECH 配置、IPv6 声明、场景能力；签名由 edge 节点密钥完成（不再用 token 当 HMAC 密钥） | — |
 | C6 | edge 只读外部接口 | edge → sub | OpenAPI `/v1/usage`、`/v1/status` | `api/edge-public.yaml` | 计量游标分页、计量只读密钥鉴权、限流 | — |

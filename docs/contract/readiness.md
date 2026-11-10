@@ -7,7 +7,7 @@
 | C1 `class=game` | draft | 未开始 | 未执行 | `class_game` | OFF | |
 | C1 `class=browser` | draft | 未开始 | 未执行 | `class_browser` | OFF | 依赖 C9、C10 |
 | C2 DoH | draft | 已实现（需按 M2 修复） | 未执行 | `doh` | OFF | |
-| C3 签名 token | draft | 未开始 | 未执行 | `auth_signed_token` | OFF | |
+| C3 签名 token | draft（2026-11-10 起草，待用户审） | 未开始 | 未执行 | `auth_signed_token` | OFF | 见 api/token.md §6 待确认问题 |
 | C5 订阅 | draft | 已实现（需重写） | 未执行 | `subscription_v2` | OFF | |
 | C5 ECH | draft | 未开始 | 未执行 | `ech_enabled` | OFF | 先验证 quic-go 路径与国内网络 |
 | C5 内层 IPv6 | draft | 部分实现（需重写） | 未执行 | `ipv6_inner` | OFF | 启动自检门禁 |

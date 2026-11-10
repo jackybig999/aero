@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aero.invalid/api/token.schema.json",
+  "title": "AERO user token payload (C3, draft)",
+  "description": "Payload of an aero1 token. The signature covers the exact payload bytes (see api/token.md); verifiers must verify before parsing.",
+  "type": "object",
+  "required": ["v", "iss", "kid", "uid", "jti", "tier", "classes", "max_devices", "iat", "exp"],
+  "properties": {
+    "v": { "const": 1, "description": "Payload version." },
+    "iss": { "enum": ["sub", "edge"], "description": "Issuer: sub (commercial platform) or edge (node-local console)." },
+    "kid": { "type": "string", "pattern": "^[a-z0-9-]{1,32}$", "description": "Signing key id; selects the public key on the verifier." },
+    "uid": { "type": "string", "pattern": "^[A-Za-z0-9_-]{8,64}$", "description": "Opaque user id. MUST NOT contain email, phone or name (PII)." },
+    "jti": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,64}$", "description": "Unique token id, used by the revocation list (C4)." },
+    "tier": { "enum": ["admin", "standard", "trial"], "description": "Plan tier. admin = unlimited quota, still authenticated." },
+    "classes": {
+      "type": "array",
+      "items": { "enum": ["default", "ai", "browser", "game"] },
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Traffic classes this token may open (ADR-0003)."
+    },
+    "max_devices": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Concurrent QUIC connections allowed per uid on one edge." },
+    "quota_bytes": { "type": "integer", "minimum": 0, "description": "Traffic quota for the billing period; 0 or absent = unlimited." },
+    "iat": { "type": "integer", "minimum": 0, "description": "Issued at, Unix seconds." },
+    "exp": { "type": "integer", "minimum": 0, "description": "Expires at, Unix seconds. exp - iat <= 604800 (7 days)." }
+  },
+  "additionalProperties": true
+}
