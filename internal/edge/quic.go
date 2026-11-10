@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/connect-ip-go"
@@ -2079,6 +2080,9 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 					s.bandwidthLimiter.Take(token, len(payload))
 				}
 				if _, err := targetUDP.Write(payload); err != nil {
+					if isTransientUDPErr(err) {
+						continue // 目标端口暂不可达（ICMP），不终止会话
+					}
 					break
 				}
 			}
@@ -2090,8 +2094,8 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 		defer wg.Done()
 		defer closeSession()
 
-		buf := make([]byte, 2048)
-		buf[0] = 0x00 // contextID 0 in QUIC varint
+		buf := make([]byte, 1+65535) // 容纳最大 UDP 报文，不静默截断
+		buf[0] = 0x00                // contextID 0 in QUIC varint
 		for {
 			n, err := targetUDP.Read(buf[1:])
 			if n > 0 {
@@ -2103,10 +2107,16 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 					s.bandwidthLimiter.Take(token, n)
 				}
 				if serr := str.SendDatagram(buf[:1+n]); serr != nil {
+					if isDroppableDatagramErr(serr) {
+						continue // 单个报文超过 QUIC 数据报上限：丢弃该报文，会话继续
+					}
 					break
 				}
 			}
 			if err != nil {
+				if isTransientUDPErr(err) {
+					continue
+				}
 				break
 			}
 		}
@@ -2239,6 +2249,21 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
+// maxDoHQueryBytes 是 DoH 请求体上限（PROJECT_RULES §7.3）。
+const maxDoHQueryBytes = 4096
+
+// isDroppableDatagramErr 判定 SendDatagram 的错误是否只影响当前报文（超过数据报上限），
+// 此时应丢弃该报文而不是终止会话。
+func isDroppableDatagramErr(err error) bool {
+	var tooLarge *quic.DatagramTooLargeError
+	return errors.As(err, &tooLarge)
+}
+
+// isTransientUDPErr 判定已连接 UDP socket 上由 ICMP 端口不可达引起的暂时性错误。
+func isTransientUDPErr(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
 func (s *QUICServer) serveDoH(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.authRequest(w, r)
 	if !ok {
@@ -2250,7 +2275,11 @@ func (s *QUICServer) serveDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	queryBytes, err := io.ReadAll(r.Body)
+	queryBytes, err := io.ReadAll(io.LimitReader(r.Body, maxDoHQueryBytes+1))
+	if err == nil && len(queryBytes) > maxDoHQueryBytes {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
 	if err != nil || len(queryBytes) < 12 {
 		w.WriteHeader(http.StatusBadRequest)
 		return
