@@ -3,52 +3,50 @@
 package edge
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"syscall"
-	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
-const (
-	edgeTunDevice = "/dev/net/tun"
-	edgeIffTun    = 0x0001
-	edgeIffNoPi   = 0x1000
-	edgeTunSetIff = 0x400454CA
-)
+const edgeTunDevice = "/dev/net/tun"
 
 type linuxGlobalTunnelDevice struct {
 	name string
 	file *os.File
 }
 
-func openGlobalTunnelDevice(name string) (GlobalTunnelDevice, error) {
+// newEdgeTunIfreq 构造 TUNSETIFF 请求。必须使用 unix.Ifreq：其大小与内核
+// struct ifreq（40 字节）一致；内核会按该大小回写，自定义的短结构体会被越界写。
+func newEdgeTunIfreq(name string) (*unix.Ifreq, error) {
 	if name == "" {
-		return nil, fmt.Errorf("global TUN device name is empty")
+		return nil, errors.New("global TUN device name is empty")
+	}
+	ifr, err := unix.NewIfreq(name)
+	if err != nil {
+		return nil, fmt.Errorf("global TUN device name %q: %w", name, err)
+	}
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	return ifr, nil
+}
+
+func openGlobalTunnelDevice(name string) (GlobalTunnelDevice, error) {
+	ifr, err := newEdgeTunIfreq(name)
+	if err != nil {
+		return nil, err
 	}
 	file, err := os.OpenFile(edgeTunDevice, os.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", edgeTunDevice, err)
 	}
-	ifr := struct {
-		name  [16]byte
-		flags uint16
-	}{flags: edgeIffTun | edgeIffNoPi}
-	copy(ifr.name[:], name)
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(edgeTunSetIff), uintptr(unsafe.Pointer(&ifr)))
-	if errno != 0 {
+	if err := unix.IoctlIfreq(int(file.Fd()), unix.TUNSETIFF, ifr); err != nil {
 		if closeErr := file.Close(); closeErr != nil {
-			return nil, fmt.Errorf("TUNSETIFF: %v; close device: %w", errno, closeErr)
+			return nil, fmt.Errorf("TUNSETIFF: %v; close device: %w", err, closeErr)
 		}
-		return nil, fmt.Errorf("TUNSETIFF: %v", errno)
+		return nil, fmt.Errorf("TUNSETIFF: %w", err)
 	}
-	devName := string(ifr.name[:])
-	for i, value := range ifr.name {
-		if value == 0 {
-			devName = string(ifr.name[:i])
-			break
-		}
-	}
-	return &linuxGlobalTunnelDevice{name: devName, file: file}, nil
+	return &linuxGlobalTunnelDevice{name: ifr.Name(), file: file}, nil
 }
 
 func (d *linuxGlobalTunnelDevice) Read(packet []byte) (int, error)  { return d.file.Read(packet) }

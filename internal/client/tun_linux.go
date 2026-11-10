@@ -8,6 +8,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -17,17 +18,25 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-const (
-	tunDevice = "/dev/net/tun"
-	iffTun    = 0x0001
-	iffNoPi   = 0x1000
-	tunSetIff = 0x400454ca
-)
+const tunDevice = "/dev/net/tun"
+
+// newClientTunIfreq 构造 TUNSETIFF 请求。必须使用 unix.Ifreq：其大小与内核
+// struct ifreq（40 字节）一致；内核会按该大小回写，自定义的短结构体会被越界写。
+func newClientTunIfreq(name string) (*unix.Ifreq, error) {
+	if name == "" {
+		return nil, errors.New("TUN device name is empty")
+	}
+	ifr, err := unix.NewIfreq(name)
+	if err != nil {
+		return nil, fmt.Errorf("TUN device name %q: %w", name, err)
+	}
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	return ifr, nil
+}
 
 type linuxDevice struct {
 	name string
@@ -45,30 +54,20 @@ func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 		return nil, fmt.Errorf("open %s: %w", tunDevice, err)
 	}
 
-	ifr := struct {
-		name  [16]byte
-		flags uint16
-	}{flags: iffTun | iffNoPi}
-	copy(ifr.name[:], name)
-
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		file.Fd(),
-		uintptr(tunSetIff),
-		uintptr(unsafe.Pointer(&ifr)),
-	)
-	if errno != 0 {
-		file.Close()
-		return nil, fmt.Errorf("TUNSETIFF: %v", errno)
-	}
-
-	devName := string(ifr.name[:])
-	for i, b := range ifr.name {
-		if b == 0 {
-			devName = string(ifr.name[:i])
-			break
+	ifr, err := newClientTunIfreq(name)
+	if err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, fmt.Errorf("%v; close %s: %w", err, tunDevice, closeErr)
 		}
+		return nil, err
 	}
+	if err := unix.IoctlIfreq(int(file.Fd()), unix.TUNSETIFF, ifr); err != nil {
+		if closeErr := file.Close(); closeErr != nil {
+			return nil, fmt.Errorf("TUNSETIFF: %v; close %s: %w", err, tunDevice, closeErr)
+		}
+		return nil, fmt.Errorf("TUNSETIFF: %w", err)
+	}
+	devName := ifr.Name()
 
 	return &linuxDevice{name: devName, file: file, mtu: mtu}, nil
 }
