@@ -375,8 +375,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		}
 	}
 	if tunDevice != "" && runtime.GOOS == "linux" {
-		TuneKernelPerformance()
-		_ = EnableKernelForwarding()
+		if err := EnableKernelForwarding(); err != nil {
+			log.Printf("[EDGE] [ERROR] %v (CONNECT-IP egress requires IPv4 forwarding)", err)
+		}
 		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
 			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" || !cfg.AllowSelfSignedCertForTest {
 				quicServer.Close()

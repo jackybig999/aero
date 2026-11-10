@@ -23,6 +23,3 @@ func ApplyEdgeFirewall(devName string) error {
 
 // CleanupEdgeFirewall 非 Linux 平台占位
 func CleanupEdgeFirewall(devName string) {}
-
-// TuneKernelPerformance 非 Linux 平台占位
-func TuneKernelPerformance() {}

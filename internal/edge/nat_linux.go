@@ -83,32 +83,14 @@ func ConfigureGlobalTunnelDevice(devName string, ipv4CIDR, ipv6CIDR string, mtu 
 	return nil
 }
 
-// EnableKernelForwarding 检查并启用 Linux 内核 IPv4 与 IPv6 报文转发能力
+// EnableKernelForwarding 启用 IPv4 转发（CONNECT-IP NAT 必需，PROJECT_RULES 宿主状态清单）。
+// 不开启 IPv6 转发：net.ipv6.conf.all.forwarding=1 会使宿主忽略路由器通告，依赖
+// SLAAC 的主机可能在路由过期后失去整机 IPv6；内层 IPv6 默认关闭（ADR-0007）。
 func EnableKernelForwarding() error {
-	var errs []string
-	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0644); err != nil {
-		errs = append(errs, fmt.Sprintf("ipv4 forward: %v", err))
-	}
-	if err := os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1\n"), 0644); err != nil {
-		errs = append(errs, fmt.Sprintf("ipv6 forward: %v", err))
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("enable forwarding: %s", strings.Join(errs, "; "))
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o644); err != nil {
+		return fmt.Errorf("enable ipv4 forwarding: %w", err)
 	}
 	return nil
-}
-
-// TuneKernelPerformance 自主检查并启用 BBR 拥塞控制，并自适应优化内核 socket 缓冲区到 16MB
-func TuneKernelPerformance() {
-	if cc, err := os.ReadFile("/proc/sys/net/ipv4/tcp_congestion_control"); err == nil {
-		if !strings.Contains(string(cc), "bbr") {
-			_ = exec.Command("modprobe", "tcp_bbr").Run()
-			_ = os.WriteFile("/proc/sys/net/core/default_qdisc", []byte("fq\n"), 0644)
-			_ = os.WriteFile("/proc/sys/net/ipv4/tcp_congestion_control", []byte("bbr\n"), 0644)
-		}
-	}
-	_ = os.WriteFile("/proc/sys/net/core/rmem_max", []byte("16777216\n"), 0644)
-	_ = os.WriteFile("/proc/sys/net/core/wmem_max", []byte("16777216\n"), 0644)
 }
 
 // detectDefaultOutInterface 自动探测宿主机物理默认出站网卡
