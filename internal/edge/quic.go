@@ -456,6 +456,39 @@ func (ct *ConnTracker) CloseAll() {
 	}
 }
 
+// CloseUnauthorized 断开并移除 token 已不再有效的全部连接（删除、吊销、过期），
+// 返回断开的连接数。valid 在锁外调用，避免与 Validator 的锁嵌套。
+func (ct *ConnTracker) CloseUnauthorized(valid func(token string) bool) int {
+	if ct == nil || valid == nil {
+		return 0
+	}
+	ct.mu.RLock()
+	snapshot := make(map[*quic.Conn]string, len(ct.conns))
+	for c, tok := range ct.conns {
+		snapshot[c] = tok
+	}
+	ct.mu.RUnlock()
+
+	var toClose []*quic.Conn
+	for c, tok := range snapshot {
+		if !valid(tok) {
+			toClose = append(toClose, c)
+		}
+	}
+	if len(toClose) == 0 {
+		return 0
+	}
+	ct.mu.Lock()
+	for _, c := range toClose {
+		delete(ct.conns, c)
+	}
+	ct.mu.Unlock()
+	for _, c := range toClose {
+		_ = c.CloseWithError(0x100, "token no longer valid")
+	}
+	return len(toClose)
+}
+
 // StartReaper starts periodic dead connection scanning to prevent lingering pointers. (NEW-02)
 func (ct *ConnTracker) StartReaper(stopCh <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Minute)
@@ -561,8 +594,42 @@ type QUICServer struct {
 	stunIdleTimeout time.Duration
 	udpIdleTimeout  time.Duration
 
+	// token 有效性集中执行（PROJECT_RULES：吊销、过期等 10 秒内断开）
+	tokenEnforceInterval time.Duration
+	tokenEnforceOnce     sync.Once
+
 	stopCh    chan struct{}
 	closeOnce sync.Once
+}
+
+const defaultTokenEnforceInterval = 5 * time.Second
+
+// startTokenEnforcer 周期性断开 token 已失效的在线连接。只启动一次，随 Close 退出。
+// 在 Server.Start 中启动；测试可在启动前调整 tokenEnforceInterval。
+func (s *QUICServer) startTokenEnforcer() {
+	if s == nil || s.validator == nil || s.connTracker == nil {
+		return
+	}
+	s.tokenEnforceOnce.Do(func() {
+		interval := s.tokenEnforceInterval
+		if interval <= 0 {
+			interval = defaultTokenEnforceInterval
+		}
+		ticker := time.NewTicker(interval)
+		go func() {
+			defer ticker.Stop()
+			for {
+				select {
+				case <-s.stopCh:
+					return
+				case <-ticker.C:
+					if n := s.connTracker.CloseUnauthorized(s.validator.Validate); n > 0 {
+						log.Printf("[AUTH] closed %d connection(s) whose token is no longer valid", n)
+					}
+				}
+			}
+		}()
+	})
 }
 
 // MeteringReportRecord represents an edge traffic usage record to be synced with midplatform.
@@ -1221,6 +1288,8 @@ func newQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		offlineBurst:   make(map[string]int64),
 		udpSessions:    make(map[*udpSessionTracker]struct{}),
 		stopCh:         make(chan struct{}),
+
+		tokenEnforceInterval: defaultTokenEnforceInterval,
 	}
 	qs.connTracker.StartReaper(qs.stopCh)
 	qs.h3Server = &http3.Server{

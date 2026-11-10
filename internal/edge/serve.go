@@ -572,6 +572,7 @@ func (s *Server) Start() error {
 
 	// 2. QUIC Listener
 	s.quicServer.SetHandler(s)
+	s.quicServer.startTokenEnforcer()
 	quicLn, err := StartQUIC(s.cfg.Listen, tlsCfg, s.quicServer, s.ctx)
 	if err != nil {
 		_ = s.tcpListener.Close()
