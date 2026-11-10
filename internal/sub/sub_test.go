@@ -173,42 +173,12 @@ func TestZeroPortSubscription_StrictMandate(t *testing.T) {
 		}
 	})
 
-	// Subtest B: Superadmin Subscription Zero-Port Mandate
-	t.Run("Superadmin_ZeroPortURL", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil)
+	// Subtest B: 固定名称的管理员入口不存在
+	t.Run("NoFixedAdminEntry", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusOK {
-			t.Fatalf("expected 200 for /sub/superadmin, got %d (body: %s)", rec.Code, rec.Body.String())
-		}
-
-		var doc map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
-			t.Fatalf("unmarshal superadmin doc: %v", err)
-		}
-
-		subUrl, _ := doc["sub_url"].(string)
-		subUrlCamel, _ := doc["subUrl"].(string)
-		if subUrl == "" || subUrl != subUrlCamel {
-			t.Fatalf("superadmin sub_url mismatch: %q vs %q", subUrl, subUrlCamel)
-		}
-
-		u, err := url.Parse(subUrl)
-		if err != nil {
-			t.Fatalf("parse superadmin sub_url %q: %v", subUrl, err)
-		}
-		if u.Scheme != "https" {
-			t.Errorf("expected https scheme, got %s", u.Scheme)
-		}
-		if u.Port() != "" {
-			t.Errorf("VIOLATION: superadmin sub_url contains port: %s (port: %s)", subUrl, u.Port())
-		}
-		if !strings.HasSuffix(u.Path, "/sub/superadmin") {
-			t.Errorf("expected path suffix /sub/superadmin, got %s", u.Path)
-		}
-		if strings.Contains(subUrl, ":8443") || strings.Contains(subUrl, ":443") || strings.Contains(subUrl, ":18080") || strings.Contains(subUrl, "localhost") {
-			t.Errorf("VIOLATION: superadmin sub_url contains leaked port/localhost: %s", subUrl)
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for /sub/superadmin, got %d", rec.Code)
 		}
 	})
 
@@ -242,7 +212,7 @@ func TestZeroPortSubscription_StrictMandate(t *testing.T) {
 		}
 
 		// Non-standard port in X-Forwarded-Host header
-		reqFwd := httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil)
+		reqFwd := httptest.NewRequest(http.MethodGet, "/sub/"+userTom.SubSlug, nil)
 		reqFwd.Header.Set("X-Forwarded-Host", "fwd-gateway.aero-infra.com:2087")
 		recFwd := httptest.NewRecorder()
 		mux.ServeHTTP(recFwd, reqFwd)
@@ -260,15 +230,15 @@ func TestZeroPortSubscription_StrictMandate(t *testing.T) {
 			t.Fatalf("parse fwd url %q: %v", subUrlFwd, err)
 		}
 		if uFwd.Port() != "" {
-			t.Errorf("VIOLATION: X-Forwarded-Host bled port into superadmin sub_url: %s", subUrlFwd)
+			t.Errorf("VIOLATION: X-Forwarded-Host bled port into sub_url: %s", subUrlFwd)
 		}
-		expectedFwdURL := "https://fwd-gateway.aero-infra.com/sub/superadmin"
+		expectedFwdURL := "https://fwd-gateway.aero-infra.com/sub/" + userTom.SubSlug
 		if subUrlFwd != expectedFwdURL {
 			t.Errorf("expected sub_url=%s, got=%s", expectedFwdURL, subUrlFwd)
 		}
 
 		// Chained non-standard proxies in X-Forwarded-Host header
-		reqChained := httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil)
+		reqChained := httptest.NewRequest(http.MethodGet, "/sub/"+userTom.SubSlug, nil)
 		reqChained.Header.Set("X-Forwarded-Host", "first-proxy.aero-infra.com:8443, second-proxy.aero-infra.com:2083")
 		recChained := httptest.NewRecorder()
 		mux.ServeHTTP(recChained, reqChained)
@@ -291,7 +261,7 @@ func TestZeroPortSubscription_StrictMandate(t *testing.T) {
 		if strings.Contains(subUrlChained, ",") || strings.Contains(subUrlChained, ":8443") || strings.Contains(subUrlChained, ":2083") {
 			t.Errorf("VIOLATION: chained X-Forwarded-Host leaked comma or port: %s", subUrlChained)
 		}
-		expectedChainedURL := "https://first-proxy.aero-infra.com/sub/superadmin"
+		expectedChainedURL := "https://first-proxy.aero-infra.com/sub/" + userTom.SubSlug
 		if subUrlChained != expectedChainedURL {
 			t.Errorf("expected sub_url=%s, got=%s", expectedChainedURL, subUrlChained)
 		}

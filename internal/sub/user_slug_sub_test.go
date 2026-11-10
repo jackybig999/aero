@@ -154,25 +154,11 @@ func TestUserSlugSubscriptionAndMultiVPS(t *testing.T) {
 		t.Fatalf("CRITICAL SECURITY FLAW: Alice got Jacky's token!")
 	}
 
-	// 5. 测试系统管理员常用不限制全节点订阅: GET /sub/superadmin (无六位随机码)
-	reqAdmin := httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil)
+	// 5. 固定名称入口不存在（管理员见 TestSubAdminOnlyViaOwnSlug）
 	recAdmin := httptest.NewRecorder()
-	mux.ServeHTTP(recAdmin, reqAdmin)
-
-	if recAdmin.Code != http.StatusOK {
-		t.Fatalf("expected 200 for superadmin sub, got %d", recAdmin.Code)
-	}
-	var adminDoc struct {
-		Role         string           `json:"role"`
-		Unrestricted bool             `json:"unrestricted"`
-		Servers      []map[string]any `json:"servers"`
-	}
-	_ = json.Unmarshal(recAdmin.Body.Bytes(), &adminDoc)
-	if !adminDoc.Unrestricted || adminDoc.Role != "superadmin" {
-		t.Fatalf("expected unrestricted superadmin subscription document, got %+v", adminDoc)
-	}
-	if len(adminDoc.Servers) == 0 {
-		t.Fatalf("expected servers in superadmin subscription, got 0")
+	mux.ServeHTTP(recAdmin, httptest.NewRequest(http.MethodGet, "/sub/superadmin", nil))
+	if recAdmin.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for /sub/superadmin, got %d", recAdmin.Code)
 	}
 
 	// 6. 测试非法或不存在的 Slug

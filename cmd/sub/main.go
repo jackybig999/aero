@@ -340,7 +340,6 @@ func main() {
 	fmt.Printf("  AERO VPS Middle Platform v%s -> :%s\n", Version, port)
 	fmt.Printf("  Data directory: %s\n", dataDir)
 	fmt.Printf("  Health:         /health\n")
-	fmt.Printf("  Native Domain Sub:  https://<domain>/sub/superadmin\n")
 	fmt.Printf("  User Domain Sub:    https://<domain>/sub/<user_slug>\n")
 	fmt.Printf("=======================================================\n\n")
 

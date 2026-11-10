@@ -2444,15 +2444,7 @@ echo "REDIR_METHOD=$REDIR_METHOD"
       "line_type": "quic",
       "isp_affinity": "cmcc"
     }
-  ],
-  "user_subs": {
-    "superadmin": {
-      "username": "superadmin",
-      "slug": "superadmin",
-      "token": "usr_superadmin",
-      "expire_at": 0
-    }
-  }
+  ]
 }
 EOF
 `, subSec, cred.Name, host, host, dataPlanePort, tok, host)

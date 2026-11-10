@@ -1,7 +1,7 @@
 // Copyright 2026 AERO Protocol Contributors
 // AERO Native Subscription Builder, Edge Sync & SNI Matrix Subsystem
 // Enforces:
-// 1. Two official formats: /sub/superadmin & /sub/{slug}
+// 1. Subscription format: /sub/{slug} (random per subscription; no fixed names)
 // 2. 403 Forbidden if user is expired or switch_status is off
 // 3. ServerName equals physical node domain, zero non-standard ports in subscription URLs
 // 4. OpenAPI sync with Edge nodes via POST /admin/subs
@@ -97,38 +97,8 @@ func (sb *SubBuilder) ServeSub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. 系统管理员常用不限制全节点订阅: /sub/superadmin 或 /sub/{管理员名字} (无六位随机码)
-	var staffUser *User
-	if param == "superadmin" {
-		if sb.users != nil {
-			staffUser, _ = sb.users.GetUserBySlug("superadmin")
-			if staffUser == nil {
-				staffUser, _ = sb.users.GetUserByUsername("admin")
-			}
-		}
-	} else if sb.users != nil {
-		if u, err := sb.users.GetUserByUsername(param); err == nil && u != nil && u.IsStaff {
-			staffUser = u
-		}
-	}
-
-	if staffUser != nil || param == "superadmin" {
-		if staffUser == nil {
-			staffUser = &User{
-				Username: "admin",
-				SubSlug:  "superadmin",
-				SubToken: "usr_superadmin",
-				Status:   true,
-				IsStaff:  true,
-			}
-		}
-		isp := r.URL.Query().Get("isp")
-		purpose := r.URL.Query().Get("purpose")
-		sb.writeUserSubscription(w, r, staffUser, isp, purpose, true)
-		return
-	}
-
-	// 2. 普通用户专属 Slug 订阅 (格式: {username}{6位随机码})
+	// 管理员与普通用户一样只能通过自身的随机 slug 访问；不存在按用户名或固定名称的入口。
+	// 订阅 slug 格式：{username}{随机码}
 	if sb.users != nil {
 		// 优先从多订阅实体中检索
 		if sub, err := sb.users.GetSubscriptionBySlug(param); err == nil && sub != nil {
@@ -394,13 +364,6 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 	// 规则 P9 零非标端口铁律：严格使用标准 443 HTTPS 域名链接，严禁出现非标端口
 	subUrl := ""
 	slugToUse := user.SubSlug
-	if user.IsStaff {
-		if user.Username != "" && user.Username != "admin" {
-			slugToUse = user.Username
-		} else {
-			slugToUse = "superadmin"
-		}
-	}
 
 	if len(servers) > 0 {
 		for _, srv := range servers {
@@ -484,15 +447,7 @@ func (sb *SubBuilder) writeUserSubscription(w http.ResponseWriter, r *http.Reque
 			pubHost = h
 		}
 		if pubHost != "" && net.ParseIP(pubHost) == nil && pubHost != "localhost" && strings.Contains(pubHost, ".") && !strings.Contains(pubHost, ":") && !strings.Contains(pubHost, ",") {
-			slugToUse := user.SubSlug
-			if user.IsStaff {
-				if user.Username != "" && user.Username != "admin" {
-					slugToUse = user.Username
-				} else {
-					slugToUse = "superadmin"
-				}
-			}
-			newSubUrl := fmt.Sprintf("https://%s/sub/%s", pubHost, slugToUse)
+			newSubUrl := fmt.Sprintf("https://%s/sub/%s", pubHost, user.SubSlug)
 			doc["sub_url"] = newSubUrl
 			doc["subUrl"] = newSubUrl
 		}
@@ -534,13 +489,9 @@ func (s *VPSService) SyncUsersToEdge(vpsID uint64, users []*User) error {
 	}
 
 	var payloads []EdgeUserSubPayload
-	hasSuperadmin := false
 	for _, u := range users {
 		if u == nil || !u.Status || u.SubSlug == "" {
 			continue
-		}
-		if u.SubSlug == "superadmin" {
-			hasSuperadmin = true
 		}
 		exp := int64(0)
 		if !u.ExpireAt.IsZero() {
@@ -551,14 +502,6 @@ func (s *VPSService) SyncUsersToEdge(vpsID uint64, users []*User) error {
 			Slug:     u.SubSlug,
 			Token:    u.SubToken,
 			ExpireAt: exp,
-		})
-	}
-	if !hasSuperadmin {
-		payloads = append(payloads, EdgeUserSubPayload{
-			Username: "superadmin",
-			Slug:     "superadmin",
-			Token:    "usr_superadmin",
-			ExpireAt: 0,
 		})
 	}
 	if len(payloads) == 0 {

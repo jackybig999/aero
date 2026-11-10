@@ -68,37 +68,43 @@ func TestNodeLifecycleSyncOnUninstall(t *testing.T) {
 	}
 }
 
-func TestAdminUnrestrictedSubscription(t *testing.T) {
+// 回归：/sub/superadmin 与 /sub/{管理员用户名} 曾无鉴权返回全节点管理员订阅。
+// 管理员只能通过自身随机 slug 取订阅，且该订阅不限期、标记 unrestricted。
+func TestSubAdminOnlyViaOwnSlug(t *testing.T) {
 	uDB := NewMemoryUserStore()
-	subBuilder := NewSubBuilder(uDB, nil, nil, nil)
-
+	adminSlug := "admin" + GenerateUserToken()
+	if _, err := uDB.CreateUser(&User{ID: 1, Username: "admin", SubSlug: adminSlug, SubToken: "token-admin", Status: true, IsStaff: true}); err != nil {
+		t.Fatal(err)
+	}
 	mux := http.NewServeMux()
-	subBuilder.RegisterRoutes(mux)
+	NewSubBuilder(uDB, nil, nil, nil).RegisterRoutes(mux)
 
-	// 1. Test /sub/superadmin
-	reqSuper := httptest.NewRequest("GET", "/sub/superadmin", nil)
-	wSuper := httptest.NewRecorder()
-	mux.ServeHTTP(wSuper, reqSuper)
-	if wSuper.Code != http.StatusOK {
-		t.Fatalf("expected status 200 for /sub/superadmin, got %d", wSuper.Code)
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		return rec
 	}
-
-	// 2. Test /sub/admin for staff user
-	adminUser := &User{
-		ID:       1,
-		Username: "admin",
-		SubSlug:  "superadmin",
-		SubToken: "token-admin",
-		Status:   true,
-		IsStaff:  true,
+	for _, path := range []string{"/sub/superadmin", "/sub/admin"} {
+		if rec := get(path); rec.Code != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", path, rec.Code)
+		}
 	}
-	_, _ = uDB.CreateUser(adminUser)
-
-	reqAdmin := httptest.NewRequest("GET", "/sub/admin", nil)
-	wAdmin := httptest.NewRecorder()
-	mux.ServeHTTP(wAdmin, reqAdmin)
-	if wAdmin.Code != http.StatusOK {
-		t.Fatalf("expected status 200 for /sub/admin, got %d", wAdmin.Code)
+	rec := get("/sub/" + adminSlug)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET own admin slug = %d, want 200", rec.Code)
+	}
+	var doc struct {
+		Unrestricted bool   `json:"unrestricted"`
+		SubURL       string `json:"sub_url"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if !doc.Unrestricted {
+		t.Error("admin subscription is not marked unrestricted")
+	}
+	if doc.SubURL != "" && !strings.HasSuffix(doc.SubURL, "/sub/"+adminSlug) {
+		t.Errorf("sub_url %q does not use the admin's own slug", doc.SubURL)
 	}
 }
 
