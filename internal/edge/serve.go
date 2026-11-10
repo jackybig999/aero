@@ -79,6 +79,9 @@ type ServerConfig struct {
 	GlobalTUNDevice            string                        `json:"global_tun_device,omitempty" yaml:"global_tun_device"`
 	WarpProxy                  string                        `json:"warp_proxy,omitempty" yaml:"warp_proxy"`
 	WarpAll                    bool                          `json:"warp_all,omitempty" yaml:"warp_all"`
+	// ConfigPath 是 edge 持久化自身配置的文件路径，仅由 cmd/edge 显式设置。
+	// 为空时 NewServer 不读写任何宿主配置文件（测试与嵌入使用）。
+	ConfigPath string `json:"-"`
 }
 
 // Server is the unified edge server instance
@@ -253,7 +256,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	// 2c. AdminKey 自治生成与持久化保底
 	if cfg.AdminKey == "" {
-		if existingKey := loadExistingAdminKey(); existingKey != "" {
+		if existingKey := loadExistingAdminKey(cfg.ConfigPath); existingKey != "" {
 			cfg.AdminKey = existingKey
 		} else {
 			cfg.AdminKey = generateSecureAdminKey()
@@ -288,7 +291,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap subscription: %w", err)
 	}
-	persistServerConfig(cfg)
+	if err := persistServerConfig(cfg); err != nil {
+		log.Printf("[EDGE] [WARN] persist config: %v", err)
+	}
 
 	// 3b. Sync user tokens from subStore into tokenStore and validator
 	syncUserTokensFromSubs(subStore, tokenStore)
@@ -555,7 +560,9 @@ func (s *Server) Start() error {
 				log.Printf("[EDGE] [WARN] Listen address %s already in use (e.g. 443/8443 occupied), in-process auto-fallback switched to %s", s.cfg.Listen, newAddr)
 				ln = rotatedLn
 				s.cfg.Listen = newAddr
-				persistServerConfig(s.cfg)
+				if err := persistServerConfig(s.cfg); err != nil {
+					log.Printf("[EDGE] [WARN] persist config: %v", err)
+				}
 				if h, pStr, herr := net.SplitHostPort(newAddr); herr == nil {
 					if pNum, perr := strconv.Atoi(pStr); perr == nil && s.subStore != nil {
 						_ = s.subStore.UpdatePrimaryPort(pNum, h)
@@ -1331,51 +1338,91 @@ func tryPortFallbackTCP(initialListen string, tlsCfg *tls.Config) (net.Listener,
 	return nil, "", fmt.Errorf("all fallback candidate ports %v are in use", candidates)
 }
 
-// persistServerConfig 原子持久化同步当前生效配置至 /etc/aero/edge.json，实现全功能服务端完全自闭环
-func persistServerConfig(cfg ServerConfig) {
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
-		return
+// persistServerConfig 把当前生效配置合并写入 cfg.ConfigPath（键名与 ServerConfig 的
+// json tag 一致），保留文件中的其他键。ConfigPath 为空时不写任何文件。写盘按
+// L0 §8.8：同目录临时文件、Sync、Close、Rename，失败时保留原文件并返回错误。
+func persistServerConfig(cfg ServerConfig) error {
+	path := strings.TrimSpace(cfg.ConfigPath)
+	if path == "" {
+		return nil
 	}
-	const configDir = "/etc/aero"
-	const configFile = "/etc/aero/edge.json"
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		return
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
 	}
 	existing := make(map[string]any)
-	if data, err := os.ReadFile(configFile); err == nil {
-		_ = json.Unmarshal(data, &existing)
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &existing); err != nil {
+			return fmt.Errorf("parse existing %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", path, err)
 	}
-	if cfg.Listen != "" {
-		existing["listen"] = cfg.Listen
+	// 旧版本写入的键名与读取时的 json tag 不一致，重启后证书路径丢失；统一改为 tag 名。
+	delete(existing, "cert")
+	delete(existing, "key")
+	set := func(k, v string) {
+		if v != "" {
+			existing[k] = v
+		}
 	}
-	if cfg.Domain != "" {
-		existing["domain"] = cfg.Domain
-	}
-	if cfg.CertFile != "" {
-		existing["cert"] = cfg.CertFile
-	}
-	if cfg.KeyFile != "" {
-		existing["key"] = cfg.KeyFile
-	}
-	if cfg.DataDir != "" {
-		existing["data_dir"] = cfg.DataDir
-	}
-	if cfg.AdminKey != "" {
-		existing["admin_key"] = cfg.AdminKey
-	}
-	if cfg.Token != "" {
-		existing["token"] = cfg.Token
-	}
+	set("listen", cfg.Listen)
+	set("domain", cfg.Domain)
+	set("cert_file", cfg.CertFile)
+	set("key_file", cfg.KeyFile)
+	set("data_dir", cfg.DataDir)
+	set("admin_key", cfg.AdminKey)
+	set("token", cfg.Token)
 
 	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
-		return
+		return fmt.Errorf("marshal config: %w", err)
 	}
-	tmpFile := configFile + fmt.Sprintf(".tmp.%d", time.Now().UnixNano())
-	if err := os.WriteFile(tmpFile, data, 0o600); err != nil {
-		return
+	return replaceFileAtomic(path, data, 0o600)
+}
+
+// replaceFileAtomic 用同目录临时文件替换 target（L0 §8.8）。
+func replaceFileAtomic(target string, data []byte, perm os.FileMode) error {
+	if info, err := os.Stat(target); err == nil {
+		perm = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", target, err)
 	}
-	_ = os.Rename(tmpFile, configFile)
+	f, err := os.CreateTemp(filepath.Dir(target), ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmp := f.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync temp: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		return fmt.Errorf("replace %s: %w", target, err)
+	}
+	committed = true
+	if d, err := os.Open(filepath.Dir(target)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // checkPortAvailable 预检目标地址是否未被占用 (TCP与UDP双栈均空闲)
@@ -1406,9 +1453,12 @@ func generateSecureAdminKey() string {
 	return hex.EncodeToString(b)
 }
 
-// loadExistingAdminKey 从配置文件中尝试装载已存在的 admin_key
-func loadExistingAdminKey() string {
-	data, err := os.ReadFile("/etc/aero/edge.json")
+// loadExistingAdminKey 从显式配置文件中装载已存在的 admin_key；path 为空时不读取。
+func loadExistingAdminKey(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}

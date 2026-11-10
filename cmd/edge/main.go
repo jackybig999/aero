@@ -97,6 +97,15 @@ func main() {
 		log.Printf("[CONFIG] loaded configuration from %s", targetConfig)
 	}
 
+	// edge 持久化自身配置的路径：显式 --config 或已存在的 /etc/aero/edge.json；
+	// 首次以 root 在 Linux 运行时创建 /etc/aero/edge.json。其他情况不持久化。
+	switch {
+	case targetConfig != "":
+		cfg.ConfigPath = targetConfig
+	case runtime.GOOS == "linux" && os.Geteuid() == 0:
+		cfg.ConfigPath = "/etc/aero/edge.json"
+	}
+
 	// Apply profiles if not explicitly overridden
 	applyProfileDefaults(&cfg)
 
