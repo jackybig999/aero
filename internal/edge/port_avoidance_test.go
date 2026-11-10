@@ -79,3 +79,25 @@ func TestNewServer_PortAutoAvoidanceAndAdminKey(t *testing.T) {
 		t.Fatalf("expected non-empty AdminKey, got empty")
 	}
 }
+
+// 端口选择按契约列表 StandardCandidatePorts 的顺序进行（ADR-0005），不依赖固定端口。
+func TestSelectListenAddrFollowsContractOrder(t *testing.T) {
+	taken := map[string]bool{"0.0.0.0:443": true, "0.0.0.0:2083": true}
+	available := func(addr string) bool { return !taken[addr] }
+
+	got, moved := selectListenAddr("0.0.0.0:443", StandardCandidatePorts, available)
+	if !moved || got != "0.0.0.0:2087" {
+		t.Fatalf("selectListenAddr = (%q, %v), want (0.0.0.0:2087, true): first free port in contract order", got, moved)
+	}
+
+	got, moved = selectListenAddr("0.0.0.0:443", StandardCandidatePorts, func(string) bool { return true })
+	if moved || got != "0.0.0.0:443" {
+		t.Fatalf("free requested port must be kept, got (%q, %v)", got, moved)
+	}
+
+	none := func(string) bool { return false }
+	got, moved = selectListenAddr("0.0.0.0:443", StandardCandidatePorts, none)
+	if moved || got != "0.0.0.0:443" {
+		t.Fatalf("when every candidate is taken the requested address is returned unchanged, got (%q, %v)", got, moved)
+	}
+}

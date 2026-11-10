@@ -4856,7 +4856,7 @@ func TestEdge_InProcessPortFallbackWhen443And8443Occupied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
 	}
-	// Start 应该触发 tryPortFallbackTCP，在 8443 被占用的情况下自动跳过 8443，选定 2053 或后续端口
+	// NewServer 按契约列表避让已占用端口（ADR-0005）；8443 被占用时跳过 8443
 	if err := srv.Start(); err != nil {
 		t.Logf("Start returned: %v (verified fallback logic reached)", err)
 		return

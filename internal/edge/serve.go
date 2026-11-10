@@ -19,7 +19,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -253,19 +252,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	cert := certLoader.CurrentCert()
 
-	// 2b. Port pre-check and conflict auto-avoidance (服务端端口自主冲突检测与智能避让)
-	// 如果目标主端口 (如 :443) 已经被现有服务 (如 x-ui / nginx) 占用，服务端自动避让至空闲可用标准端口
-	if !checkPortAvailable(cfg.Listen) {
-		host, _, _ := net.SplitHostPort(cfg.Listen)
-		candidates := []int{8443, 2083, 2087, 2053, 2096, 10443, 24443, 34443, 44443}
-		for _, cand := range candidates {
-			candAddr := net.JoinHostPort(host, strconv.Itoa(cand))
-			if checkPortAvailable(candAddr) {
-				log.Printf("[EDGE] [PORT] Requested listen address %s is occupied (e.g. x-ui / nginx in use). Intelligently auto-avoiding to available port %s", cfg.Listen, candAddr)
-				cfg.Listen = candAddr
-				break
-			}
-		}
+	// 2b. 端口轮试（ADR-0005）：只在启动时选择一次，按契约列表 StandardCandidatePorts 顺序；
+	// 选定的地址随配置持久化，下次启动优先沿用。
+	if addr, moved := selectListenAddr(cfg.Listen, StandardCandidatePorts, checkPortAvailable); moved {
+		log.Printf("[EDGE] [PORT] %s is occupied by another program; using %s", cfg.Listen, addr)
+		cfg.Listen = addr
 	}
 
 	// 2c. AdminKey 自治生成与持久化保底
@@ -546,45 +537,11 @@ func (s *Server) Start() error {
 		log.Printf("[EDGE] ECH enabled for domain %s (keys count: %d)", s.cfg.Domain, len(s.cfg.EncryptedClientHelloKeys))
 	}
 
-	// 1. TCP/TLS & QUIC Dual-Stack Listener (支持 443/8443 等主端口被占用或 UDP 碰撞时双协议原子轮试自愈)
-	checkPortDualStackFree := func(addr string) bool {
-		uconn, uerr := net.ListenPacket("udp", addr)
-		if uerr != nil {
-			return false
-		}
-		_ = uconn.Close()
-		return true
-	}
-
-	var ln net.Listener
-	var err error
-	if checkPortDualStackFree(s.cfg.Listen) {
-		ln, err = tls.Listen("tcp", s.cfg.Listen, tlsCfg)
-	} else {
-		err = &net.OpError{Op: "listen", Net: "udp", Err: syscall.EADDRINUSE}
-	}
-
+	// 1. TCP/TLS 监听。端口已在 NewServer 中按契约列表选定；此处绑定失败直接报错，
+	// 不再做第二套回退（由服务管理器重启后重新选择）。
+	ln, err := tls.Listen("tcp", s.cfg.Listen, tlsCfg)
 	if err != nil {
-		if isAddrInUse(err) {
-			rotatedLn, newAddr, rerr := tryPortFallbackTCP(s.cfg.Listen, tlsCfg)
-			if rerr == nil {
-				log.Printf("[EDGE] [WARN] Listen address %s already in use (e.g. 443/8443 occupied), in-process auto-fallback switched to %s", s.cfg.Listen, newAddr)
-				ln = rotatedLn
-				s.cfg.Listen = newAddr
-				if err := persistServerConfig(s.cfg); err != nil {
-					log.Printf("[EDGE] [WARN] persist config: %v", err)
-				}
-				if h, pStr, herr := net.SplitHostPort(newAddr); herr == nil {
-					if pNum, perr := strconv.Atoi(pStr); perr == nil && s.subStore != nil {
-						_ = s.subStore.UpdatePrimaryPort(pNum, h)
-					}
-				}
-			} else {
-				return fmt.Errorf("dual-stack listen %s: %w", s.cfg.Listen, err)
-			}
-		} else {
-			return fmt.Errorf("tcp listen %s: %w", s.cfg.Listen, err)
-		}
+		return fmt.Errorf("tcp listen %s: %w", s.cfg.Listen, err)
 	}
 	s.tcpListener = ln
 
@@ -1304,57 +1261,6 @@ func isGo126OrLater(ver string) bool {
 	return minor >= 26
 }
 
-func isAddrInUse(err error) bool {
-	if err == nil {
-		return false
-	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		var sysErr *os.SyscallError
-		if errors.As(opErr.Err, &sysErr) {
-			if errors.Is(sysErr.Err, syscall.EADDRINUSE) {
-				return true
-			}
-		}
-	}
-	errStr := strings.ToLower(err.Error())
-	return strings.Contains(errStr, "address already in use") ||
-		strings.Contains(errStr, "only one usage of each socket address")
-}
-
-// tryPortFallbackTCP probes standard HTTPS candidate ports sequentially (8443, 2053, 2083, 2087, 2096, 10443)
-// and returns the first available listener whose TCP and UDP ports are both free.
-func tryPortFallbackTCP(initialListen string, tlsCfg *tls.Config) (net.Listener, string, error) {
-	host, portStr, err := net.SplitHostPort(initialListen)
-	if err != nil {
-		host = ""
-		portStr = strings.TrimPrefix(initialListen, ":")
-	}
-	initPort, _ := strconv.Atoi(portStr)
-
-	// 优先避让标准 HTTPS 备用端口 8443，然后按候选池顺序探测
-	candidates := []int{8443, 2083, 2087, 2053, 2096, 10443, 24443, 34443, 44443}
-	for _, cand := range candidates {
-		if cand == initPort {
-			continue
-		}
-		candAddr := net.JoinHostPort(host, strconv.Itoa(cand))
-
-		// Pre-flight check: ensure UDP port is also unbound for QUIC
-		uconn, uerr := net.ListenPacket("udp", candAddr)
-		if uerr != nil {
-			continue
-		}
-		_ = uconn.Close()
-
-		ln, terr := tls.Listen("tcp", candAddr, tlsCfg)
-		if terr == nil {
-			return ln, candAddr, nil
-		}
-	}
-	return nil, "", fmt.Errorf("all fallback candidate ports %v are in use", candidates)
-}
-
 // persistServerConfig 把当前生效配置合并写入 cfg.ConfigPath（键名与 ServerConfig 的
 // json tag 一致），保留文件中的其他键。ConfigPath 为空时不写任何文件。写盘按
 // L0 §8.8：同目录临时文件、Sync、Close、Rename，失败时保留原文件并返回错误。
@@ -1440,6 +1346,28 @@ func replaceFileAtomic(target string, data []byte, perm os.FileMode) error {
 		_ = d.Close()
 	}
 	return nil
+}
+
+// selectListenAddr 返回实际监听地址：requested 可用则保留；否则按 candidates 顺序取第一个
+// 可用端口（主机部分不变）。全部不可用时返回 requested 与 false，由后续绑定报错。
+func selectListenAddr(requested string, candidates []int, available func(string) bool) (string, bool) {
+	if available(requested) {
+		return requested, false
+	}
+	host, portStr, err := net.SplitHostPort(requested)
+	if err != nil {
+		return requested, false
+	}
+	for _, cand := range candidates {
+		if strconv.Itoa(cand) == portStr {
+			continue
+		}
+		addr := net.JoinHostPort(host, strconv.Itoa(cand))
+		if available(addr) {
+			return addr, true
+		}
+	}
+	return requested, false
 }
 
 // checkPortAvailable 预检目标地址是否未被占用 (TCP与UDP双栈均空闲)
