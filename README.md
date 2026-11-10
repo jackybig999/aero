@@ -1,31 +1,36 @@
-# AERO Protocol Migration Workspace
+# AERO
 
-本目录是 AERO 单 Go 模块迁移工作区，版本来源为根目录 `VERSION`。
+基于标准 HTTP/3 MASQUE（RFC 9298 / RFC 9484）的多用户加密隧道系统。版本来源为根目录 `VERSION`。
 
-## 组件边界
+## 目录（最多两级，ADR-0009）
 
-- `aeroprot/`：本阶段施工范围，包含客户端、边缘服务端和 guard。
-- `aeroos/`：桌面工作台结构，后续整合；本阶段不由 `aeroprot` 直接导入。
-- `aerosub/`：商业中台结构，后续整合；本阶段不由 `aeroprot` 直接导入。
-- `deploy/`：部署脚本和部署配置。
-- `tests/`：跨组件和端到端测试。
+| 路径 | 内容 |
+|---|---|
+| `cmd/edge`、`internal/edge` | 服务端：数据面、鉴权校验、计量、证书、geo 分发 |
+| `cmd/client`、`cmd/guard`、`internal/client` | 客户端与守护进程 |
+| `cmd/sub`、`internal/sub` | 订阅与计费中台（只读 edge 接口，不写服务端） |
+| `cmd/desk`、`internal/desk` | 桌面工作台：浏览器环境与指纹 |
+| `internal/egress`、`cmd/egress` | 出口模块（M5 新建，ADR-0006） |
+| `api/` | 组件之间唯一的契约：清单见 `api/README.md`，错误码 `api/errors.yaml` |
+| `docs/adr/` | 架构决策记录 |
+| `docs/contract/readiness.md` | 接口就绪矩阵 |
+| `deploy/` | 安装脚本（只放置二进制与 systemd unit） |
+| `tools/` | 仓库检查脚本 |
+| `tests/` | 跨组件测试 |
+
+组件之间 **不得** 互相 import，只通过 `api/` 契约通信；由 `tools/check-imports.sh` 在 CI 中强制。
 
 ## 工程规则
 
-施工必须先读取 `engineering-profile.yaml`、`PROJECT_RULES.md` 和
-`GLOBAL_ENGINEERING_RULES.md`。代理入口为 `AGENTS.md`；`CLAUDE.md` 只引用它。
-
-## 当前迁移阶段
-
-M1 已切换客户端生产启动路径到 CONNECT-IP 与 `IPDataPump`，初始 TUN MTU 为 1224。
-旧 gVisor 实现暂时保留，待客户端和 edge 的替代数据面分别完成并通过门禁后清理。
+先读 `engineering-profile.yaml`、`PROJECT_RULES.md`、`GLOBAL_ENGINEERING_RULES.md`。代理入口为 `AGENTS.md`；`CLAUDE.md` 只引用它。
 
 ## 验证
 
 ```bash
-go test -run '^$' ./aeroprot/...
-go vet ./aeroprot/...
-go test ./aeroprot/...
+tools/check-imports.sh
+go build ./...
+go vet ./...
+go test -shuffle=on ./...
 ```
 
-本地构建输出必须指向 `tmp/`，验证结束后清空 `tmp/`，不得把构建产物写入源码目录。
+本地构建输出必须指向 `tmp/`，不得把构建产物写入源码目录。

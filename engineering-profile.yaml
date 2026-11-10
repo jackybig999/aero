@@ -1,11 +1,11 @@
 language: go            # go | rust | go+rust
 kind: service           # cli | library | service
-persistence: file       # none | file | sqlite | server-db
+persistence: sqlite     # 变更：file -> sqlite（edge 计量、环境粘性出口、端口选择、吊销缓存；见 ADR-0008）
 network: inbound        # none | outbound | inbound
 concurrency: in-process # none | in-process
-frontend: embedded      # none | embedded | web | mobile（web：独立部署的浏览器前端）
-components: multi       # single | multi，独立单元是否多于一个
+frontend: embedded      # edge 控制台、客户端 UI 以 //go:embed 交付
+components: multi       # edge、aero-egress、client、sub、desk
 tenancy: multi          # single | multi
-replicas: 1             # 生产副本数
+replicas: 1             # 每个 edge 节点单副本；多节点是多个独立 edge，不是同一服务的副本
 ai: none                # none | llm
-pii: true               # 是否处理个人信息
+pii: true               # 用户账号、token、计量、环境绑定

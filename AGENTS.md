@@ -8,6 +8,11 @@
 1. 读 engineering-profile.yaml 与 PROJECT_RULES.md，按 L0 §0.6 确定启用的章节。
 2. 看 git status 与上一次验证命令的退出码。上次失败就先修它（§14.6-6）。
 
+## 组件与契约
+- 目录最多两级：`cmd/<组件>`、`internal/<组件>`；契约在 `api/`，ADR 在 `docs/adr/`。
+- 组件之间不互相 import，只通过 `api/` 契约通信；`tools/check-imports.sh` 必须通过。
+- 新增或修改接口：先改 `api/` 契约并更新 `docs/contract/readiness.md`，再写代码（§4.1）。新错误码先登记 `api/errors.yaml`（§4.5）。
+
 ## 每一步改动（§14.6）
 - 先在 tmp/step.md 写四行：目标、剖面、当前签名（从文件读）、验证命令。
 - 一步只做一件事；非生成文件默认不超过 3 个。

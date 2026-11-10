@@ -1,0 +1,19 @@
+# 错误码注册表（§4.5）初稿：新增错误码先登记再进契约
+EDGE_AUTH_INVALID_TOKEN:    {http: 401, desc: "token 签名或格式无效"}
+EDGE_AUTH_TOKEN_EXPIRED:    {http: 401, desc: "token 已过期"}
+EDGE_AUTH_TOKEN_REVOKED:    {http: 401, desc: "token 已吊销"}
+EDGE_QUOTA_EXCEEDED:        {http: 403, desc: "流量配额用尽"}
+EDGE_DEVICE_LIMIT:          {http: 403, desc: "超过同时在线设备数"}
+EDGE_CLASS_NOT_ALLOWED:     {http: 403, desc: "token 未授权该流量场景"}
+EDGE_DEST_PROHIBITED:       {http: 403, desc: "目的地址被 ACL 拒绝"}
+EDGE_POOL_EXHAUSTED:        {http: 503, desc: "地址池耗尽"}
+EDGE_RATE_LIMITED:          {http: 429, desc: "限流"}
+EDGE_NOT_READY:             {http: 503, desc: "排空中或未就绪"}
+EGRESS_UNAVAILABLE:         {http: 503, desc: "场景出口不可用（fail-closed）"}
+EGRESS_REBOUND:             {http: 200, desc: "环境出口已重新绑定"}
+CLIENT_UDP_BLOCKED:         {desc: "当前网络封锁 UDP，按设计不降级"}
+CLIENT_ECH_REJECTED:        {desc: "ECH 被拒或干扰，已切换混淆节点组"}
+CLIENT_ALL_PORTS_FAILED:    {desc: "全部候选端口不可达"}
+CLIENT_TUN_CONFLICT:        {desc: "检测到第三方 TUN"}
+SUB_TOKEN_ISSUE_FAILED:     {desc: "token 签发失败"}
+DESK_ENV_EGRESS_CHANGED:    {desc: "环境出口变更，需要同步指纹"}
