@@ -614,6 +614,9 @@ type QUICServer struct {
 	stunIdleTimeout time.Duration
 	udpIdleTimeout  time.Duration
 
+	// tcpIdleTimeout 是标准 CONNECT 中继的空闲上限（双向均无流量）；0 表示默认值。
+	tcpIdleTimeout time.Duration
+
 	// token 有效性集中执行（PROJECT_RULES：吊销、过期等 10 秒内断开）
 	tokenEnforceInterval time.Duration
 	tokenEnforceOnce     sync.Once
@@ -1843,10 +1846,21 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	str := streamer.HTTPStream()
 	defer str.Close()
 
+	idle := s.tcpIdleTimeout
+	if idle <= 0 {
+		idle = defaultTCPIdleTimeout
+	}
+	// lastActive 记录任一方向最近一次有数据的时间：空闲按“双向都无流量”判定，
+	// 只有单方向流量（如大文件上传、只下载）的连接不会被误判为空闲。
+	var lastActive atomic.Int64
+	touch := func() { lastActive.Store(time.Now().UnixNano()) }
+	stillActive := func() bool { return time.Since(time.Unix(0, lastActive.Load())) < idle }
+	touch()
+
 	relayCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// 联动退出协程：任一端结束立即通知另一端释放
+	// 任一方向出错或整体空闲时，关闭两端以唤醒阻塞的读写。
 	go func() {
 		<-relayCtx.Done()
 		_ = targetConn.Close()
@@ -1856,51 +1870,89 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// 客户端 → 目标。客户端关闭写端（EOF）时只关闭目标的写端（半关闭），继续回传响应。
 	go func() {
-		defer func() { cancel(); wg.Done() }()
+		defer wg.Done()
 		bufPtr := relayBufPool.Get().(*[]byte)
 		defer relayBufPool.Put(bufPtr)
 		buf := *bufPtr
 		for {
+			_ = str.SetReadDeadline(time.Now().Add(idle))
 			n, err := str.Read(buf)
 			if n > 0 {
+				touch()
 				if s.bandwidthLimiter != nil {
 					s.bandwidthLimiter.Take(token, n)
 				}
-				_ = targetConn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+				_ = targetConn.SetWriteDeadline(time.Now().Add(idle))
 				if _, werr := targetConn.Write(buf[:n]); werr != nil {
-					break
+					cancel()
+					return
 				}
 			}
 			if err != nil {
-				break
+				if isTimeoutErr(err) && stillActive() {
+					continue
+				}
+				if errors.Is(err, io.EOF) {
+					closeWriteSide(targetConn)
+					return
+				}
+				cancel()
+				return
 			}
 		}
 	}()
 
+	// 目标 → 客户端。目标关闭（EOF）时关闭流的发送方向，客户端读到 EOF。
 	go func() {
-		defer func() { cancel(); wg.Done() }()
+		defer wg.Done()
 		bufPtr := relayBufPool.Get().(*[]byte)
 		defer relayBufPool.Put(bufPtr)
 		buf := *bufPtr
 		for {
-			_ = targetConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			_ = targetConn.SetReadDeadline(time.Now().Add(idle))
 			n, err := targetConn.Read(buf)
 			if n > 0 {
+				touch()
 				if s.bandwidthLimiter != nil {
 					s.bandwidthLimiter.Take(token, n)
 				}
 				if _, werr := str.Write(buf[:n]); werr != nil {
-					break
+					cancel()
+					return
 				}
 			}
 			if err != nil {
-				break
+				if isTimeoutErr(err) && stillActive() {
+					continue
+				}
+				if errors.Is(err, io.EOF) {
+					_ = str.Close()
+					return
+				}
+				cancel()
+				return
 			}
 		}
 	}()
 
 	wg.Wait()
+}
+
+// defaultTCPIdleTimeout 是标准 CONNECT 中继双向均无流量时的关闭上限（估算，待实测）。
+const defaultTCPIdleTimeout = 10 * time.Minute
+
+func isTimeoutErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// closeWriteSide 关闭连接的写方向（TCP 半关闭）；不支持时保持连接，等待对端结束。
+func closeWriteSide(c net.Conn) {
+	if cw, ok := c.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
 }
 
 func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
