@@ -598,7 +598,7 @@ func TestAdversarial_AdminSubsAPI_DualFieldCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSubStore: %v", err)
 	}
-	validator := NewValidator(filepath.Join(dataDir, "nonce.wal"))
+	validator := NewValidator()
 	tokenStore, err := OpenTokenStore(dataDir, validator)
 	if err != nil {
 		t.Fatalf("OpenTokenStore: %v", err)

@@ -37,7 +37,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/connect-ip-go"
+	connectip "github.com/quic-go/connect-ip-go"
 	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -281,24 +281,6 @@ func TestValidatorAndTokenStore(t *testing.T) {
 
 	if !v.Validate(token) {
 		t.Fatal("token should be valid")
-	}
-
-	// Test Nonce validation and anti-replay
-	ts := uint64(time.Now().UnixMilli())
-	nonce1 := []byte("nonce_test_0001")
-
-	if !v.ValidateFull(token, ts, nonce1) {
-		t.Fatal("first ValidateFull should succeed")
-	}
-	// Replay with same nonce must fail!
-	if v.ValidateFull(token, ts, nonce1) {
-		t.Fatal("replay of nonce1 must fail")
-	}
-
-	// New nonce should succeed
-	nonce2 := []byte("nonce_test_0002")
-	if !v.ValidateFull(token, ts, nonce2) {
-		t.Fatal("ValidateFull with nonce2 should succeed")
 	}
 
 	// Test reload from disk
@@ -3001,45 +2983,6 @@ func TestAuthFailureJailRWMutexConcurrency(t *testing.T) {
 	}
 }
 
-func TestAuthRequestEnforcesValidateFull(t *testing.T) {
-	v := NewValidator()
-	tok := "auth_test_tok"
-	v.AddToken(tok, "user", 1*time.Hour)
-	qs := NewQUICServer(v, nil, nil, nil, nil)
-	defer qs.Close()
-
-	// 1. Missing timestamp & nonce -> 401
-	req1 := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req1.Header.Set("Authorization", "Bearer "+tok)
-	rec1 := httptest.NewRecorder()
-	tokRet1, ok1 := qs.authRequest(rec1, req1)
-	if ok1 || tokRet1 != "" || rec1.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 on missing timestamp/nonce, got code=%d ok=%v", rec1.Code, ok1)
-	}
-
-	// 2. Invalid timestamp/nonce -> 401
-	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req2.Header.Set("Authorization", "Bearer "+tok)
-	req2.Header.Set("Aero-Timestamp", "not-a-number")
-	req2.Header.Set("Aero-Nonce", "0102")
-	rec2 := httptest.NewRecorder()
-	tokRet2, ok2 := qs.authRequest(rec2, req2)
-	if ok2 || tokRet2 != "" || rec2.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 on invalid timestamp/nonce, got code=%d ok=%v", rec2.Code, ok2)
-	}
-
-	// 3. Valid timestamp & nonce -> 200 / success
-	req3 := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req3.Header.Set("Authorization", "Bearer "+tok)
-	req3.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
-	req3.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
-	rec3 := httptest.NewRecorder()
-	tokRet3, ok3 := qs.authRequest(rec3, req3)
-	if !ok3 || tokRet3 != tok {
-		t.Fatalf("expected auth success, got ok=%v tok=%s", ok3, tokRet3)
-	}
-}
-
 func TestPrecompiledTemplatesInitialized(t *testing.T) {
 	qs := NewQUICServer(nil, nil, nil, nil, nil)
 	defer qs.Close()
@@ -4711,45 +4654,6 @@ func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
 	}
 }
 
-// TestValidator_NonceWALPersistence 验证 Validator Nonce WAL 持久化与防重启重放
-func TestValidator_NonceWALPersistence(t *testing.T) {
-	tempDir := t.TempDir()
-	walPath := filepath.Join(tempDir, "nonce.wal")
-
-	token := "wal_test_token"
-	nonce := []byte("0123456789abcdef0123456789abcdef")
-	ts := uint64(time.Now().UnixMilli())
-
-	v1 := NewValidator(walPath)
-	v1.AddToken(token, "test", 24*time.Hour)
-
-	// 第一次校验成功
-	if !v1.ValidateFull(token, ts, nonce) {
-		t.Fatalf("expected first ValidateFull to succeed")
-	}
-	// 同一实例重放被拒绝
-	if v1.ValidateFull(token, ts, nonce) {
-		t.Fatalf("expected replay ValidateFull to fail")
-	}
-	v1.Close()
-
-	// 模拟进程重启：启动新的 Validator 实例，指定同一 walPath
-	v2 := NewValidator(walPath)
-	defer v2.Close()
-	v2.AddToken(token, "test", 24*time.Hour)
-
-	// 重启后使用相同 Nonce 依然被拒绝（防重启重放窗口）
-	if v2.ValidateFull(token, ts, nonce) {
-		t.Fatalf("expected ValidateFull after restart to reject previously consumed nonce from WAL")
-	}
-
-	// 新的 Nonce 允许通过
-	newNonce := []byte("fedcba9876543210fedcba9876543210")
-	if !v2.ValidateFull(token, ts, newNonce) {
-		t.Fatalf("expected new nonce to be accepted by v2")
-	}
-}
-
 // TestMultiPortHopping 验证边缘节点多端口监听与客户端跳频容灾
 func TestMultiPortHopping(t *testing.T) {
 	dataDir := t.TempDir()
@@ -5163,7 +5067,7 @@ func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSubStore: %v", err)
 	}
-	validator := NewValidator(filepath.Join(dataDir, "nonce.wal"))
+	validator := NewValidator()
 	tokenStore, err := OpenTokenStore(dataDir, validator)
 	if err != nil {
 		t.Fatalf("OpenTokenStore: %v", err)

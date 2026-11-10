@@ -194,8 +194,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}()
 
 	// 1. Validator & TokenStore (tokens.json)
-	walPath := filepath.Join(absDataDir, "nonce.wal")
-	validator := NewValidator(walPath)
+	validator := NewValidator()
 	tokenStore, err := OpenTokenStore(absDataDir, validator)
 	if err != nil {
 		return nil, fmt.Errorf("open token store: %w", err)
@@ -745,9 +744,6 @@ func (s *Server) Close() {
 		}
 	}
 	s.altQuicListeners = nil
-	if s.validator != nil {
-		s.validator.Close()
-	}
 	if s.dialGuard != nil {
 		s.dialGuard.Close()
 	}

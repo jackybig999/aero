@@ -25,7 +25,6 @@ func TestTokenStoreReloadKeepsTokensWhenFileIsCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	writeTokensFile(t, dir, tokensFileAB)
 	v := NewValidator()
-	defer v.Close()
 	ts, err := OpenTokenStore(dir, v)
 	if err != nil {
 		t.Fatalf("OpenTokenStore: %v", err)
@@ -45,7 +44,6 @@ func TestTokenStoreReloadIsAtomicReplacement(t *testing.T) {
 	dir := t.TempDir()
 	writeTokensFile(t, dir, tokensFileAB)
 	v := NewValidator()
-	defer v.Close()
 	ts, err := OpenTokenStore(dir, v)
 	if err != nil {
 		t.Fatalf("OpenTokenStore: %v", err)
@@ -96,7 +94,6 @@ func TestTokenStoreReloadPreservesCreatedAt(t *testing.T) {
 	dir := t.TempDir()
 	writeTokensFile(t, dir, tokensFileAB)
 	v := NewValidator()
-	defer v.Close()
 	ts, err := OpenTokenStore(dir, v)
 	if err != nil {
 		t.Fatalf("OpenTokenStore: %v", err)

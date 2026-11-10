@@ -13,7 +13,6 @@ func newSubExpiryAdmin(t *testing.T) (*AdminHandler, *Validator) {
 	t.Helper()
 	dir := t.TempDir()
 	v := NewValidator()
-	t.Cleanup(v.Close)
 	ts, err := OpenTokenStore(dir, v)
 	if err != nil {
 		t.Fatalf("OpenTokenStore: %v", err)
@@ -125,7 +124,6 @@ func TestSubExpiryConsoleRejectsPastExpiry(t *testing.T) {
 func TestSubExpiryStartupSyncRefreshesAndRemovesTokens(t *testing.T) {
 	dir := t.TempDir()
 	v := NewValidator()
-	defer v.Close()
 	ts, err := OpenTokenStore(dir, v)
 	if err != nil {
 		t.Fatalf("OpenTokenStore: %v", err)

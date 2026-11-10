@@ -11,8 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -29,156 +27,16 @@ type TokenInfo struct {
 	Label     string    `json:"label"`
 }
 
-type walItem struct {
-	nonceKey string
-	now      time.Time
-}
-
-// Validator validates access tokens, timestamps, and one-time nonces
+// Validator 保存有效 token 及其到期时间。防重放由 TLS 提供；不再维护 nonce 表
+// （C3 §5，审查 P0-8：全局 nonce 表可被单个用户耗尽）。
 type Validator struct {
 	mu     sync.RWMutex
 	tokens map[string]*TokenInfo
-
-	// nonceStore maps nonce hex string -> first used time
-	nonceStore map[string]time.Time
-
-	walPath string
-	stopCh  chan struct{}
-	walChan chan walItem
-	walDone chan struct{}
 }
 
-// NewValidator creates a new Validator with optional WAL persistence file path
-func NewValidator(walPath ...string) *Validator {
-	v := &Validator{
-		tokens:     make(map[string]*TokenInfo),
-		nonceStore: make(map[string]time.Time),
-		stopCh:     make(chan struct{}),
-		walChan:    make(chan walItem, 4096),
-		walDone:    make(chan struct{}),
-	}
-	if len(walPath) > 0 && walPath[0] != "" {
-		v.walPath = walPath[0]
-		v.loadWAL()
-	}
-	go v.cleanupLoop()
-	go v.walFlushWorker()
-	return v
-}
-
-func (v *Validator) loadWAL() {
-	if v.walPath == "" {
-		return
-	}
-	data, err := os.ReadFile(v.walPath)
-	if err != nil {
-		return
-	}
-	lines := strings.Split(string(data), "\n")
-	now := time.Now()
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	for _, line := range lines {
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			continue
-		}
-		tsMilli, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			continue
-		}
-		t := time.UnixMilli(tsMilli)
-		if now.Sub(t) <= 5*time.Minute {
-			v.nonceStore[parts[0]] = t
-		}
-	}
-}
-
-func (v *Validator) appendWAL(nonce string, t time.Time) error {
-	if v.walPath == "" {
-		return nil
-	}
-	f, err := os.OpenFile(v.walPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = fmt.Fprintf(f, "%s %d\n", nonce, t.UnixMilli())
-	return err
-}
-
-func (v *Validator) compactWAL() error {
-	if v.walPath == "" {
-		return nil
-	}
-	var buf strings.Builder
-	for k, t := range v.nonceStore {
-		fmt.Fprintf(&buf, "%s %d\n", k, t.UnixMilli())
-	}
-	tmpPath := v.walPath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(buf.String()), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, v.walPath)
-}
-
-func (v *Validator) walFlushWorker() {
-	defer close(v.walDone)
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-	var batch []walItem
-
-	flush := func() {
-		if len(batch) == 0 || v.walPath == "" {
-			return
-		}
-		for _, item := range batch {
-			_ = v.appendWAL(item.nonceKey, item.now)
-		}
-		batch = batch[:0]
-	}
-
-	for {
-		select {
-		case item, ok := <-v.walChan:
-			if !ok {
-				flush()
-				return
-			}
-			batch = append(batch, item)
-			if len(batch) >= 50 {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
-		}
-	}
-}
-
-func (v *Validator) enqueueWAL(nonceKey string, t time.Time) {
-	if v.walPath == "" || v.walChan == nil {
-		return
-	}
-	item := walItem{nonceKey: nonceKey, now: t}
-	select {
-	case v.walChan <- item:
-	default:
-		// 背压溢出回退：同步写，绝不丢弃 Nonce 造成重放漏洞
-		_ = v.appendWAL(nonceKey, t)
-	}
-}
-
-// Close gracefully stops the validator cleanup loop and flushes pending WAL items
-func (v *Validator) Close() {
-	select {
-	case <-v.stopCh:
-	default:
-		close(v.stopCh)
-	}
-	if v.walChan != nil {
-		close(v.walChan)
-		<-v.walDone
-	}
+// NewValidator 创建空的 Validator。
+func NewValidator() *Validator {
+	return &Validator{tokens: make(map[string]*TokenInfo)}
 }
 
 // AddToken registers a token in memory
@@ -208,86 +66,6 @@ func (v *Validator) Validate(token string) bool {
 	match := subtle.ConstantTimeCompare([]byte(token), []byte(info.Token)) == 1
 	valid := time.Now().Before(info.ExpiresAt)
 	return match && valid
-}
-
-// ValidateWithTimestamp validates token + timestamp (anti-replay, tolerance ±5 minutes)
-func (v *Validator) ValidateWithTimestamp(token string, timestamp uint64) bool {
-	if !v.Validate(token) {
-		return false
-	}
-
-	ts := time.UnixMilli(int64(timestamp))
-	diff := time.Since(ts)
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff > 5*time.Minute {
-		return false
-	}
-
-	return true
-}
-
-const maxNonces = 100_000
-
-// ValidateFull validates token + timestamp + nonce
-func (v *Validator) ValidateFull(token string, timestamp uint64, nonce []byte) bool {
-	if !v.ValidateWithTimestamp(token, timestamp) {
-		return false
-	}
-	if len(nonce) == 0 {
-		return false
-	}
-	nonceKey := fmt.Sprintf("%x", nonce)
-
-	v.mu.Lock()
-	defer v.mu.Unlock()
-
-	if _, used := v.nonceStore[nonceKey]; used {
-		return false
-	}
-
-	if len(v.nonceStore) >= maxNonces {
-		cutoff := time.Now().Add(-2 * time.Minute)
-		for k, t := range v.nonceStore {
-			if t.Before(cutoff) {
-				delete(v.nonceStore, k)
-			}
-		}
-		if len(v.nonceStore) >= maxNonces {
-			return false
-		}
-	}
-	v.nonceStore[nonceKey] = time.Now()
-	if v.walPath != "" {
-		v.enqueueWAL(nonceKey, time.Now())
-	}
-	return true
-}
-
-func (v *Validator) cleanupLoop() {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-v.stopCh:
-			return
-		case <-ticker.C:
-			v.mu.Lock()
-			cutoff := time.Now().Add(-5 * time.Minute)
-			changed := false
-			for k, t := range v.nonceStore {
-				if t.Before(cutoff) {
-					delete(v.nonceStore, k)
-					changed = true
-				}
-			}
-			if changed && v.walPath != "" {
-				_ = v.compactWAL()
-			}
-			v.mu.Unlock()
-		}
-	}
 }
 
 // RemoveToken removes token from in-memory validator

@@ -109,7 +109,6 @@ func TestConnectUDPResilienceOversizedUpstreamDatagramKeepsSession(t *testing.T)
 // DoH 请求体超过 4096 字节必须拒绝（413），不得整体读入内存。
 func TestDoHBodyLimitRejectsOversizedQuery(t *testing.T) {
 	v := NewValidator()
-	defer v.Close()
 	s := NewQUICServer(v, nil, nil, nil, nil)
 	defer s.Close()
 	s.SetAllowLoopbackForTest(true) // 无 QUIC 连接上下文时走回退校验路径

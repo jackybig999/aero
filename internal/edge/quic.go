@@ -10,7 +10,6 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +20,6 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1693,105 +1691,59 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 	}
 
 	if s.cfg != nil && s.cfg.Role == "egress" {
-		hopHdr := strings.TrimSpace(r.Header.Get("Aero-Hop-Token"))
-		bearerHdr := ""
-		if authHdr := r.Header.Get("Authorization"); strings.HasPrefix(authHdr, "Bearer ") {
-			bearerHdr = strings.TrimSpace(strings.TrimPrefix(authHdr, "Bearer "))
+		expected := []byte(s.cfg.HopCredential)
+		matches := func(v string) bool {
+			return v != "" && len(expected) > 0 && subtle.ConstantTimeCompare([]byte(v), expected) == 1
 		}
-		expectedCred := []byte(s.cfg.HopCredential)
-		matchHop := hopHdr != "" && len(expectedCred) > 0 && subtle.ConstantTimeCompare([]byte(hopHdr), expectedCred) == 1
-		matchBearer := bearerHdr != "" && len(expectedCred) > 0 && subtle.ConstantTimeCompare([]byte(bearerHdr), expectedCred) == 1
-		if matchHop || matchBearer {
+		bearer, _ := bearerToken(r)
+		if matches(strings.TrimSpace(r.Header.Get("Aero-Hop-Token"))) || matches(bearer) {
 			return s.cfg.HopCredential, true
 		}
-		if s.authJail != nil {
-			s.authJail.RecordFailure(remoteIP)
-		}
-		w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-		w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="invalid hop credential"`)
-		w.WriteHeader(http.StatusUnauthorized)
+		s.rejectAuth(w, remoteIP, "invalid hop credential")
 		return "", false
 	}
 
-	authHdr := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHdr, "Bearer ") {
-		if s.authJail != nil {
-			s.authJail.RecordFailure(remoteIP)
-		}
-		w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-		w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
-		w.WriteHeader(http.StatusUnauthorized)
+	// 只校验 token；Aero-Timestamp / Aero-Nonce 已废弃并被忽略（C3 §5）。
+	token, ok := bearerToken(r)
+	if !ok || s.validator == nil || !s.validator.Validate(token) {
+		s.rejectAuth(w, remoteIP, "")
 		return "", false
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(authHdr, "Bearer "))
-
-	qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn)
-	if qc != nil && s.connTracker != nil {
-		if bound, ok := s.connTracker.Get(qc); ok {
-			if token != bound || !s.validator.Validate(token) {
-				if s.authJail != nil {
-					s.authJail.RecordFailure(remoteIP)
-				}
-				w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-				w.Header().Set("Proxy-Status", "aero; error=proxy_authorization_required")
-				w.WriteHeader(http.StatusUnauthorized)
+	// 同一 QUIC 连接上的请求必须使用首次请求绑定的 token。
+	if qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn); qc != nil && s.connTracker != nil {
+		if bound, tracked := s.connTracker.Get(qc); tracked {
+			if subtle.ConstantTimeCompare([]byte(bound), []byte(token)) != 1 {
+				s.rejectAuth(w, remoteIP, "token differs from the one bound to this connection")
 				return "", false
 			}
-			return token, true
+		} else {
+			s.connTracker.Bind(qc, token)
 		}
-
-		tsStr := r.Header.Get("Aero-Timestamp")
-		nonceHex := r.Header.Get("Aero-Nonce")
-		if tsStr == "" || nonceHex == "" {
-			if s.authJail != nil {
-				s.authJail.RecordFailure(remoteIP)
-			}
-			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="missing timestamp or nonce on first request"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			return "", false
-		}
-		ts, err1 := strconv.ParseUint(tsStr, 10, 64)
-		nonceBytes, err2 := hex.DecodeString(nonceHex)
-		if err1 != nil || err2 != nil || len(nonceBytes) != 32 || !s.validator.ValidateFull(token, ts, nonceBytes) {
-			if s.authJail != nil {
-				s.authJail.RecordFailure(remoteIP)
-			}
-			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="invalid timestamp, nonce or signature"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			return "", false
-		}
-		s.connTracker.Bind(qc, token)
-		return token, true
-	}
-
-	if s.validator != nil {
-		tsStr := r.Header.Get("Aero-Timestamp")
-		nonceHex := r.Header.Get("Aero-Nonce")
-		if tsStr == "" || nonceHex == "" {
-			if s.authJail != nil {
-				s.authJail.RecordFailure(remoteIP)
-			}
-			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="missing timestamp or nonce on fallback"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			return "", false
-		}
-		ts, err1 := strconv.ParseUint(tsStr, 10, 64)
-		nonceBytes, err2 := hex.DecodeString(nonceHex)
-		if err1 != nil || err2 != nil || len(nonceBytes) != 32 || !s.validator.ValidateFull(token, ts, nonceBytes) {
-			if s.authJail != nil {
-				s.authJail.RecordFailure(remoteIP)
-			}
-			w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
-			w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="invalid timestamp, nonce or signature"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			return "", false
-		}
-		return token, true
 	}
 	return token, true
+}
+
+func bearerToken(r *http.Request) (string, bool) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return "", false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	return token, token != ""
+}
+
+// rejectAuth 记录失败并返回 401（RFC 9209 Proxy-Status）。
+func (s *QUICServer) rejectAuth(w http.ResponseWriter, remoteIP, details string) {
+	if s.authJail != nil {
+		s.authJail.RecordFailure(remoteIP)
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer realm="aero"`)
+	status := "aero; error=proxy_authorization_required"
+	if details != "" {
+		status += fmt.Sprintf("; details=%q", details)
+	}
+	w.Header().Set("Proxy-Status", status)
+	w.WriteHeader(http.StatusUnauthorized)
 }
 
 var relayBufPool = sync.Pool{

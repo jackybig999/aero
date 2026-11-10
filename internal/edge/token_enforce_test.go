@@ -88,7 +88,6 @@ func TestTokenEnforceClosesOnlyConnectionsWithInvalidTokens(t *testing.T) {
 // QUICServer 必须周期性执行：token 从 validator 中移除后，在线连接在时限内断开。
 func TestTokenEnforceServerSweepsRemovedTokens(t *testing.T) {
 	v := NewValidator()
-	defer v.Close()
 	v.AddToken("tok_live", "test", time.Hour)
 
 	s := NewQUICServer(v, nil, nil, nil, nil)
