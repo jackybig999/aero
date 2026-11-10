@@ -490,6 +490,25 @@ func (ct *ConnTracker) CloseUnauthorized(valid func(token string) bool) int {
 	return len(toClose)
 }
 
+// CloseAllForShutdown 以 H3_NO_ERROR 关闭全部已跟踪连接并说明原因“server shutting down”，
+// 客户端据此立即重连。返回关闭的连接数。
+func (ct *ConnTracker) CloseAllForShutdown() int {
+	if ct == nil {
+		return 0
+	}
+	ct.mu.Lock()
+	toClose := make([]*quic.Conn, 0, len(ct.conns))
+	for c := range ct.conns {
+		toClose = append(toClose, c)
+		delete(ct.conns, c)
+	}
+	ct.mu.Unlock()
+	for _, c := range toClose {
+		_ = c.CloseWithError(0x100, "server shutting down")
+	}
+	return len(toClose)
+}
+
 // StartReaper starts periodic dead connection scanning to prevent lingering pointers. (NEW-02)
 func (ct *ConnTracker) StartReaper(stopCh <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Minute)

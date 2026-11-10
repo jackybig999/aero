@@ -79,6 +79,8 @@ type ServerConfig struct {
 	GlobalTUNDevice            string                        `json:"global_tun_device,omitempty" yaml:"global_tun_device"`
 	WarpProxy                  string                        `json:"warp_proxy,omitempty" yaml:"warp_proxy"`
 	WarpAll                    bool                          `json:"warp_all,omitempty" yaml:"warp_all"`
+	// DrainTimeoutSec 是收到停止信号后的排空上限（秒，L0 §8.6）；0 表示默认 15 秒。
+	DrainTimeoutSec int `json:"drain_timeout,omitempty"`
 	// ConfigPath 是 edge 持久化自身配置的文件路径，仅由 cmd/edge 显式设置。
 	// 为空时 NewServer 不读写任何宿主配置文件（测试与嵌入使用）。
 	ConfigPath string `json:"-"`
@@ -834,8 +836,16 @@ func Run(cfg ServerConfig) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	sig := <-sigCh
-	log.Printf("[EDGE] Received signal %v, shutting down gracefully...", sig)
-	server.Close()
+	drain := time.Duration(cfg.DrainTimeoutSec) * time.Second
+	if drain <= 0 {
+		drain = 15 * time.Second
+	}
+	log.Printf("[EDGE] Received signal %v, draining (up to %v)...", sig, drain)
+	ctx, cancel := context.WithTimeout(context.Background(), drain)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("[EDGE] [WARN] shutdown: %v", err)
+	}
 	log.Printf("[EDGE] Server stopped.")
 
 	return nil
@@ -1444,3 +1454,28 @@ func loadExistingAdminKey(path string) string {
 	return ""
 }
 
+
+// Shutdown 优雅停机（L0 §8.6）：先清除 readiness（/readyz 503，/healthz 仍 200），
+// 再向已鉴权的在线连接发送 CONNECTION_CLOSE，使客户端立即重连而不是等待空闲超时，
+// 最后释放全部资源。ctx 为排空上限；超时则直接 Close 并返回 ctx 的错误。
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.ready.Store(false)
+	done := make(chan int, 1)
+	go func() {
+		n := 0
+		if s.quicServer != nil {
+			n = s.quicServer.connTracker.CloseAllForShutdown()
+		}
+		done <- n
+	}()
+	var err error
+	select {
+	case n := <-done:
+		log.Printf("[EDGE] drain: notified %d client connection(s)", n)
+	case <-ctx.Done():
+		err = ctx.Err()
+		log.Printf("[EDGE] [WARN] drain timed out: %v", err)
+	}
+	s.Close()
+	return err
+}
