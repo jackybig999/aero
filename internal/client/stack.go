@@ -8,9 +8,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"log"
 	"net"
-	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,26 +82,37 @@ func (e *StackEngine) SetOnDisconnect(cb func(error)) {
 	}
 }
 
-func (e *StackEngine) RestartWithConn(newConn IPPacketConn, prefixes []netip.Prefix) error {
+// RestartWithConn 用新的 CONNECT-IP 连接重启数据泵。旧泵关闭前先清除其断线回调，
+// 否则旧泵退出时会再次报告断线，引发重连死循环。
+func (e *StackEngine) RestartWithConn(newConn IPPacketConn) error {
+	if newConn == nil {
+		return errors.New("restart data pump: nil connection")
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
 	if e.pump != nil {
+		e.pump.SetOnDisconnect(nil)
 		_ = e.pump.Close()
 		e.pump = nil
 	}
-
 	e.conn = newConn
-	if newConn != nil && e.device != nil {
-		e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
-		e.pump.SetWebRTCActive(e.webrtcRelayEnabled.Load())
-		if e.onDisconnect != nil {
-			e.pump.SetOnDisconnect(e.onDisconnect)
-		}
-		e.pump.Start()
-		log.Printf("[STACK] RestartWithConn: IPDataPump restored on %s", e.device.Name())
+	if e.device == nil {
+		return errors.New("restart data pump: no TUN device")
 	}
+	e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+	e.pump.SetWebRTCActive(e.webrtcRelayEnabled.Load())
+	if e.onDisconnect != nil {
+		e.pump.SetOnDisconnect(e.onDisconnect)
+	}
+	e.pump.Start()
 	return nil
+}
+
+// currentConn 返回数据泵当前使用的 CONNECT-IP 连接（测试与诊断用）。
+func (e *StackEngine) currentConn() IPPacketConn {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.conn
 }
 
 func (e *StackEngine) Start() error {

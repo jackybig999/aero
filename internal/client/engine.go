@@ -1072,6 +1072,9 @@ func (e *Engine) startLocked(ticket uint64) error {
 		return failStart(fmt.Errorf("start stack: %w", err))
 	}
 
+	// 断线恢复：数据泵断开后自动重建 CONNECT-IP（M2-9）。prefixStr 已由 NewRouteConfig 校验。
+	e.startReconnector(e.rootCtx, e.stackEngine, dev, netip.MustParsePrefix(prefixStr))
+
 	// WebRTC 生产激活：探测成功且 stackEngine 启动后，显式激活 WebRTC
 	e.stackEngine.SetWebRTCActive(true)
 	SetGlobalMobileWebRTCActive(true)
