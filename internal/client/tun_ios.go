@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 )
@@ -171,3 +172,8 @@ func SetCmdExecutorForTest(f func(name string, args ...string) error) func() {
 
 // RotatePhysicalDNSRoute 移动端占位
 func RotatePhysicalDNSRoute() error { return nil }
+
+// setTunIPv4 移动端由原生壳管理 TUN 地址，此处不支持。
+func setTunIPv4(devName string, p netip.Prefix) error {
+	return fmt.Errorf("TUN not supported on this platform")
+}

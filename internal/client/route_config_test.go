@@ -28,3 +28,21 @@ func TestRouteConfig(t *testing.T) {
 		t.Fatal("expected ULA IPv6 prefix rejection")
 	}
 }
+
+// 客户端对隧道地址的判断与 edge 地址池 10.88.0.0/16 一致：edge 按 token 哈希分配，
+// 地址可在整个 /16 内，不能再假设 10.88.0.2 或 /24。
+func TestTunPoolMatchesEdgePool(t *testing.T) {
+	for _, ip := range []string{"10.88.0.2", "10.88.5.7", "10.88.255.254"} {
+		if !isAeroTunAddr(ip) {
+			t.Errorf("isAeroTunAddr(%s) = false, want true", ip)
+		}
+	}
+	for _, ip := range []string{"10.89.0.2", "192.168.1.2", "", "not-an-ip"} {
+		if isAeroTunAddr(ip) {
+			t.Errorf("isAeroTunAddr(%q) = true, want false", ip)
+		}
+	}
+	if got := tunPoolMask(); got != "255.255.0.0" {
+		t.Fatalf("tunPoolMask() = %s, want 255.255.0.0 (gateway 10.88.0.1 must be on-link for every pool address)", got)
+	}
+}

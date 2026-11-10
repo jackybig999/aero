@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -337,14 +338,7 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 		devName = "aero0"
 	}
 	gwIP := "10.88.0.1"
-	mask := "255.255.255.0"
-	tunIP := cfg.IPv4.Addr().String()
-	if bits := cfg.IPv4.Bits(); bits > 0 && bits < 31 {
-		mask = cidrToMask(fmt.Sprintf("%d", bits))
-	}
-
-	if err := runCmd("netsh", "interface", "ip", "set", "address",
-		"name="+devName, "source=static", "address="+tunIP, "mask="+mask, "gateway="+gwIP, "gwmetric=1"); err != nil {
+	if err := setTunIPv4(devName, cfg.IPv4); err != nil {
 		log.Printf("[TUN] Windows set IPv4 address on %s failed: %v", devName, err)
 	}
 	_ = runCmd("netsh", "interface", "set", "interface", "name="+devName, "admin=ENABLED")
@@ -445,7 +439,7 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	// 6. 物理 DNS /32 路由捕获：动态添加精准 /32 路由导流进 aero0，免改注册表彻底根治 Windows SMHNR 泄露
 	_ = RotatePhysicalDNSRoute()
 
-	log.Printf("[TUN] Routes and DNS configured on %s via tunIP=%s gwIP=%s if=%s (MTU=%d, IPv6=%t)", devName, tunIP, gwIP, idx, cfg.InitialMTU, cfg.EnableIPv6)
+	log.Printf("[TUN] Routes and DNS configured on %s via tunIP=%s gwIP=%s if=%s (MTU=%d, IPv6=%t)", devName, cfg.IPv4.Addr(), gwIP, idx, cfg.InitialMTU, cfg.EnableIPv6)
 	return nil
 }
 
@@ -1031,12 +1025,9 @@ func runCmd(name string, args ...string) error {
 	return nil
 }
 
-func cidrToMask(cidr string) string {
-	bits := 0
-	fmt.Sscanf(cidr, "%d", &bits)
-	mask := [4]byte{}
-	for i := 0; i < bits; i++ {
-		mask[i/8] |= 1 << (7 - i%8)
-	}
-	return fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3])
+// setTunIPv4 替换 TUN 的 IPv4 地址（netsh set address 为替换语义），不改动路由。
+// 掩码取地址池（/16）而不是 edge 下发的 /32，使网关 10.88.0.1 对池内任意地址都在同一网段。
+func setTunIPv4(devName string, p netip.Prefix) error {
+	return runCmd("netsh", "interface", "ip", "set", "address",
+		"name="+devName, "source=static", "address="+p.Addr().String(), "mask="+tunPoolMask(), "gateway=10.88.0.1", "gwmetric=1")
 }

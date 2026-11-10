@@ -166,7 +166,7 @@ func evaluateThirdPartyTUN(ifaces []ifaceSummary, routeTableText string) (bool, 
 		ifIP := fields[3]
 
 		if (dest == "0.0.0.0" && mask == "128.0.0.0") || (dest == "128.0.0.0" && mask == "128.0.0.0") {
-			if ifIP == "10.88.0.2" {
+			if isAeroTunAddr(ifIP) {
 				continue
 			}
 			if ifi, ok := ipToIface[ifIP]; ok {
@@ -189,7 +189,7 @@ func evaluateThirdPartyTUN(ifaces []ifaceSummary, routeTableText string) (bool, 
 		fields := strings.Fields(line)
 		if len(fields) >= 4 && fields[0] == "0.0.0.0" && fields[1] == "0.0.0.0" {
 			ifIP := fields[3]
-			if ifIP == "10.88.0.2" {
+			if isAeroTunAddr(ifIP) {
 				continue
 			}
 			ifi, ok := ipToIface[ifIP]

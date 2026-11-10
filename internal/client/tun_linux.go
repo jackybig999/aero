@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -187,7 +188,9 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	if err := runLinux("ip", "link", "set", devName, "up"); err != nil {
 		return err
 	}
-	_ = runLinux("ip", "addr", "add", cfg.IPv4.String(), "dev", devName)
+	if err := setTunIPv4(devName, cfg.IPv4); err != nil {
+		return err
+	}
 	if cfg.EnableIPv6 {
 		clientAddr, err := clientIPv6Addr(cfg.IPv6)
 		if err != nil {
@@ -538,4 +541,13 @@ func DetectThirdPartyTUN() (bool, string, error) {
 // RotatePhysicalDNSRoute 刷新 Linux 漫游 DNS 状态
 func RotatePhysicalDNSRoute() error {
 	return nil
+}
+
+// setTunIPv4 把 TUN 的 IPv4 地址替换为 p（先清空再添加，不残留旧地址），不改动路由：
+// 路由按设备绑定，重连更换地址时流量不会从物理网卡漏出。
+func setTunIPv4(devName string, p netip.Prefix) error {
+	if err := runLinux("ip", "-4", "addr", "flush", "dev", devName); err != nil {
+		return err
+	}
+	return runLinux("ip", "addr", "add", p.String(), "dev", devName)
 }

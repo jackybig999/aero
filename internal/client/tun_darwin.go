@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -225,8 +226,7 @@ func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
 	if devName == "" {
 		return fmt.Errorf("empty devName")
 	}
-	tunIP := cfg.IPv4.Addr().String()
-	_ = runMac("ifconfig", devName, "inet", tunIP, tunIP)
+	_ = setTunIPv4(devName, cfg.IPv4)
 	_ = runMac("ifconfig", devName, "up")
 
 	var clientIPv6, gatewayIPv6 string
@@ -555,7 +555,12 @@ func shouldCleanUtun(name, ifconfigText string, ifaceExists bool) bool {
 	if !ifaceExists {
 		return true
 	}
-	return strings.Contains(ifconfigText, "inet 10.88.0.2")
+	for _, f := range strings.Fields(ifconfigText) {
+		if isAeroTunAddr(f) {
+			return true
+		}
+	}
+	return false
 }
 
 func writeUtunRecord(name string) error {
@@ -605,7 +610,7 @@ func removeUtunRecord() {
 	_ = os.Remove(p)
 }
 
-// CleanAero0StaleRoutes 清理 macOS 残留路由（仅针对 AERO 打开且仍持有 10.88.0.2 的 utun 网卡）
+// CleanAero0StaleRoutes 清理 macOS 残留路由（仅针对 AERO 打开且仍持有隧道地址池地址的 utun 网卡）
 func CleanAero0StaleRoutes() {
 	name, err := readUtunRecord()
 	if err != nil || name == "" {
@@ -697,4 +702,10 @@ func DetectThirdPartyTUN() (bool, string, error) {
 // RotatePhysicalDNSRoute 刷新 macOS 漫游 DNS 状态
 func RotatePhysicalDNSRoute() error {
 	return nil
+}
+
+// setTunIPv4 替换 utun 的点对点 IPv4 地址（ifconfig inet 为替换语义），不改动路由。
+func setTunIPv4(devName string, p netip.Prefix) error {
+	ip := p.Addr().String()
+	return runMac("ifconfig", devName, "inet", ip, ip)
 }
