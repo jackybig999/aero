@@ -114,6 +114,8 @@ type Server struct {
 	altQuicListeners []*quic.Listener
 
 	startedAt time.Time
+
+	instanceLock *instanceLock
 }
 
 // MaskToken masks a token for safe logging (never print plaintext tokens)
@@ -164,6 +166,18 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err := os.MkdirAll(absDataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
+
+	// 同一数据目录只允许一个实例（ADR-0005）；构造失败的所有路径都释放锁。
+	lock, err := acquireInstanceLock(absDataDir)
+	if err != nil {
+		return nil, err
+	}
+	constructed := false
+	defer func() {
+		if !constructed {
+			_ = lock.release()
+		}
+	}()
 
 	// 1. Validator & TokenStore (tokens.json)
 	walPath := filepath.Join(absDataDir, "nonce.wal")
@@ -437,6 +451,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		RegisterFallbackPasswords(cfg.ObfsPassword, cfg.FallbackObfsPasswords)
 	}
 
+	srv.instanceLock = lock
+	constructed = true
 	return srv, nil
 }
 
@@ -756,6 +772,12 @@ func (s *Server) Close() {
 	}
 	if s.cfg.ObfsPassword != "" {
 		RegisterFallbackPasswords(s.cfg.ObfsPassword, nil)
+	}
+	if s.instanceLock != nil {
+		if err := s.instanceLock.release(); err != nil {
+			log.Printf("[EDGE] [WARN] release instance lock: %v", err)
+		}
+		s.instanceLock = nil
 	}
 }
 
