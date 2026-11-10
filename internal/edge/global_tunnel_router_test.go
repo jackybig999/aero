@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -322,4 +323,132 @@ func TestGlobalTunnelReaderReverseDispatchEnforcesDestinationACL(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("allowed public packet was not written")
 	}
+}
+
+// blockingTestConn 的 WritePacket 一直阻塞，模拟 SendDatagram 队列已满的拥塞客户端；
+// 与真实 CONNECT-IP 连接一样，Close 会让阻塞中的写入返回。
+type blockingTestConn struct {
+	release   chan struct{}
+	started   chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
+}
+
+func (c *blockingTestConn) ReadPacket([]byte) (int, error) { return 0, nil }
+func (c *blockingTestConn) WritePacket([]byte) ([]byte, error) {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return nil, net.ErrClosed
+}
+func (c *blockingTestConn) Close() error {
+	c.closeOnce.Do(func() { close(c.release) })
+	return nil
+}
+
+// 回归（审查 P0-6）：共享 TUN 读循环同步调用 WritePacket，一个拥塞客户端会卡住所有用户的下行。
+func TestGlobalTunnelReaderSlowClientDoesNotBlockOthers(t *testing.T) {
+	router := NewGlobalTunnelRouter()
+	slowIP := netip.MustParseAddr("10.88.0.20")
+	fastIP := netip.MustParseAddr("10.88.0.21")
+	slow := &blockingTestConn{release: make(chan struct{}), started: make(chan struct{})}
+	defer func() { _ = slow.Close() }()
+	fast := &readerTestConn{writes: make(chan []byte, 4)}
+	if _, err := router.Register(GlobalTunnelBinding{IPv4: slowIP, Conn: slow}); err != nil {
+		t.Fatalf("register slow: %v", err)
+	}
+	if _, err := router.Register(GlobalTunnelBinding{IPv4: fastIP, Conn: fast}); err != nil {
+		t.Fatalf("register fast: %v", err)
+	}
+	device := &readerTestDevice{packets: make(chan []byte, 512), closed: make(chan struct{})}
+	reader, err := NewGlobalTunnelReader(nil, device, router)
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+	reader.Start()
+	defer func() { _ = reader.Close() }()
+
+	internet := netip.MustParseAddr("1.1.1.1")
+	device.packets <- buildRouterTestIPv4(internet, slowIP)
+	select {
+	case <-slow.started:
+	case <-time.After(time.Second):
+		t.Fatal("slow client never received its first packet")
+	}
+	// 再塞满慢客户端的队列，读循环仍必须继续工作。
+	for i := 0; i < 300; i++ {
+		device.packets <- buildRouterTestIPv4(internet, slowIP)
+	}
+	device.packets <- buildRouterTestIPv4(internet, fastIP)
+	select {
+	case <-fast.writes:
+	case <-time.After(time.Second):
+		t.Fatal("fast client starved by a congested client on the shared TUN")
+	}
+}
+
+// 有拥塞客户端时，reader 仍必须能在限定时间内关闭（服务端优雅退出）。
+func TestGlobalTunnelReaderCloseWithCongestedClient(t *testing.T) {
+	router := NewGlobalTunnelRouter()
+	slowIP := netip.MustParseAddr("10.88.0.30")
+	slow := &blockingTestConn{release: make(chan struct{}), started: make(chan struct{})}
+	if _, err := router.Register(GlobalTunnelBinding{IPv4: slowIP, Conn: slow}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	device := &readerTestDevice{packets: make(chan []byte, 8), closed: make(chan struct{})}
+	reader, err := NewGlobalTunnelReader(nil, device, router)
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+	reader.Start()
+	device.packets <- buildRouterTestIPv4(netip.MustParseAddr("1.1.1.1"), slowIP)
+	select {
+	case <-slow.started:
+	case <-time.After(time.Second):
+		t.Fatal("slow client never received its packet")
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = reader.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader.Close hung behind a congested client")
+	}
+}
+
+// 会话从路由表注销后，其下行发送协程必须自行退出，不得遗留。
+// 使用 testing/synctest 的虚拟时钟，结果确定且不真实等待（L0 §13.1）。
+func TestGlobalTunnelReaderDownlinkExitsAfterUnregister(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		router := NewGlobalTunnelRouter()
+		ip := netip.MustParseAddr("10.88.0.40")
+		conn := &readerTestConn{writes: make(chan []byte, 4)}
+		generation, err := router.Register(GlobalTunnelBinding{IPv4: ip, Conn: conn})
+		if err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		device := &readerTestDevice{packets: make(chan []byte, 4), closed: make(chan struct{})}
+		reader, err := NewGlobalTunnelReader(nil, device, router)
+		if err != nil {
+			t.Fatalf("new reader: %v", err)
+		}
+		reader.Start()
+		defer func() { _ = reader.Close() }()
+
+		device.packets <- buildRouterTestIPv4(netip.MustParseAddr("1.1.1.1"), ip)
+		<-conn.writes
+		router.Unregister(ip, generation)
+
+		time.Sleep(2 * downlinkLivenessInterval) // 虚拟时间
+		synctest.Wait()
+
+		reader.downMu.Lock()
+		n := len(reader.downlinks)
+		reader.downMu.Unlock()
+		if n != 0 {
+			t.Fatalf("downlinks after unregister = %d, want 0", n)
+		}
+	})
 }

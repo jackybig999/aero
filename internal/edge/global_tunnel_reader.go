@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // GlobalTunnelDevice is the minimal server-side TUN contract. Opening and
@@ -68,6 +70,49 @@ type GlobalTunnelReader struct {
 	bindingMu     sync.Mutex
 	bindingCancel map[uint64]context.CancelFunc
 	bindingWG     sync.WaitGroup
+
+	// 每个会话一条有界下行队列与独立发送协程：读循环只入队、从不阻塞，
+	// 一个拥塞客户端（SendDatagram 阻塞）不会影响其他用户（审查 P0-6）。
+	downMu    sync.Mutex
+	downlinks map[uint64]*tunnelDownlink
+	downWG    sync.WaitGroup
+}
+
+// downlinkQueueLen 是单个会话的下行队列长度，用于吸收突发（1Gbps 约 9 万包/秒，
+// 1ms 调度延迟约 90 包）；满了即丢包（等同路由器尾部丢弃）。
+const downlinkQueueLen = 512
+
+// downlinkBudgetBytes 是全部会话排队中报文的总内存上限（L0 §9.2）；超出即丢包，
+// 大量客户端同时拥塞时内存仍有确定上界。
+const downlinkBudgetBytes = 64 << 20
+
+var downlinkQueuedBytes atomic.Int64
+
+type downlinkPacket struct {
+	buf *[]byte
+	n   int
+}
+
+type tunnelDownlink struct {
+	binding   GlobalTunnelBinding
+	conn      IPPacketConn
+	ch        chan downlinkPacket
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// downlinkBufPool 存放单个下行报文副本；TUN MTU 为 1360，2048 足够，更大的报文单独分配。
+var downlinkBufPool = sync.Pool{New: func() any {
+	b := make([]byte, 2048)
+	return &b
+}}
+
+func (d *tunnelDownlink) stop() {
+	d.closeOnce.Do(func() {
+		close(d.done)
+		// 关闭连接以解除阻塞中的 SendDatagram，保证发送协程有退出路径。
+		_ = d.conn.Close()
+	})
 }
 
 func NewGlobalTunnelReader(parent context.Context, device GlobalTunnelDevice, router *GlobalTunnelRouter) (*GlobalTunnelReader, error) {
@@ -81,7 +126,7 @@ func NewGlobalTunnelReader(parent context.Context, device GlobalTunnelDevice, ro
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &GlobalTunnelReader{device: device, router: router, ctx: ctx, cancel: cancel, bindingCancel: make(map[uint64]context.CancelFunc)}, nil
+	return &GlobalTunnelReader{device: device, router: router, ctx: ctx, cancel: cancel, bindingCancel: make(map[uint64]context.CancelFunc), downlinks: make(map[uint64]*tunnelDownlink)}, nil
 }
 
 // StartBinding starts the reverse direction for one registered CONNECT-IP
@@ -115,6 +160,7 @@ func (r *GlobalTunnelReader) StartBinding(parent context.Context, binding Global
 			r.bindingMu.Lock()
 			delete(r.bindingCancel, binding.Generation)
 			r.bindingMu.Unlock()
+			r.closeDownlink(binding.Generation)
 		}()
 		workerDone := make(chan struct{})
 		go func() {
@@ -184,15 +230,7 @@ func (r *GlobalTunnelReader) run() {
 			if routeErr != nil {
 				continue
 			}
-			icmpPkt, writeErr := binding.Conn.WritePacket(packet)
-			if len(icmpPkt) > 0 {
-				if writer, ok := r.device.(globalTunnelDeviceWriter); ok {
-					_, _ = writer.Write(icmpPkt)
-				}
-			}
-			if writeErr != nil && !errors.Is(writeErr, net.ErrClosed) {
-				log.Printf("[TUN] shared reader write packet failed: %v", writeErr)
-			}
+			r.enqueueDownlink(binding, packet)
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && r.ctx.Err() == nil {
@@ -215,9 +253,16 @@ func (r *GlobalTunnelReader) Close() error {
 		}
 		r.bindingMu.Unlock()
 		r.closeErr = r.device.Close()
+		r.downMu.Lock()
+		for gen, d := range r.downlinks {
+			d.stop()
+			delete(r.downlinks, gen)
+		}
+		r.downMu.Unlock()
 	})
 	r.wg.Wait()
 	r.bindingWG.Wait()
+	r.downWG.Wait()
 	return r.closeErr
 }
 
@@ -297,4 +342,129 @@ func clientPacketAllowed(packet []byte) bool {
 		return false
 	}
 	return true
+}
+
+// enqueueDownlink 把下行报文复制进会话队列；队列满或 reader 已关闭时丢弃。
+func (r *GlobalTunnelReader) enqueueDownlink(binding GlobalTunnelBinding, packet []byte) {
+	d := r.downlinkFor(binding)
+	if d == nil {
+		return
+	}
+	size := int64(len(packet))
+	if len(packet) <= 2048 {
+		size = 2048
+	}
+	if downlinkQueuedBytes.Add(size) > downlinkBudgetBytes {
+		downlinkQueuedBytes.Add(-size)
+		return // 全局预算耗尽：丢包
+	}
+	var buf *[]byte
+	if len(packet) <= 2048 {
+		buf = downlinkBufPool.Get().(*[]byte)
+	} else {
+		b := make([]byte, len(packet))
+		buf = &b
+	}
+	n := copy(*buf, packet)
+	select {
+	case d.ch <- downlinkPacket{buf: buf, n: n}:
+	default:
+		putDownlinkBuf(buf) // 队列满：丢包，不阻塞读循环
+	}
+}
+
+func putDownlinkBuf(buf *[]byte) {
+	size := int64(cap(*buf))
+	if size < 2048 {
+		size = 2048
+	}
+	downlinkQueuedBytes.Add(-size)
+	if cap(*buf) == 2048 {
+		downlinkBufPool.Put(buf)
+	}
+}
+
+// downlinkFor 返回会话的下行队列，不存在时创建并启动发送协程。
+func (r *GlobalTunnelReader) downlinkFor(binding GlobalTunnelBinding) *tunnelDownlink {
+	r.downMu.Lock()
+	defer r.downMu.Unlock()
+	if d, ok := r.downlinks[binding.Generation]; ok {
+		return d
+	}
+	if r.ctx.Err() != nil {
+		return nil
+	}
+	d := &tunnelDownlink{binding: binding, conn: binding.Conn, ch: make(chan downlinkPacket, downlinkQueueLen), done: make(chan struct{})}
+	r.downlinks[binding.Generation] = d
+	r.downWG.Add(1)
+	go r.runDownlink(d)
+	return d
+}
+
+// downlinkLivenessInterval：发送协程定期确认会话仍在路由表中，会话已注销即自行退出。
+// 这样无论“会话清理”与“注销路由”谁先发生，都不会为已结束的会话遗留协程。
+const downlinkLivenessInterval = time.Second
+
+func (r *GlobalTunnelReader) runDownlink(d *tunnelDownlink) {
+	defer r.downWG.Done()
+	writer, canWrite := r.device.(globalTunnelDeviceWriter)
+	liveness := time.NewTicker(downlinkLivenessInterval)
+	defer liveness.Stop()
+	for {
+		select {
+		case <-d.done:
+			r.drainDownlink(d)
+			return
+		case <-liveness.C:
+			if d.binding.Generation != 0 && !r.router.IsCurrent(d.binding) {
+				r.removeDownlink(d)
+				r.drainDownlink(d)
+				return
+			}
+		case p := <-d.ch:
+			icmpPkt, err := d.conn.WritePacket((*p.buf)[:p.n])
+			putDownlinkBuf(p.buf)
+			if len(icmpPkt) > 0 && canWrite {
+				_, _ = writer.Write(icmpPkt)
+			}
+			if err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Printf("[TUN] downlink write packet failed: %v", err)
+			}
+		}
+	}
+}
+
+// drainDownlink 归还队列中剩余报文的缓冲。
+func (r *GlobalTunnelReader) drainDownlink(d *tunnelDownlink) {
+	for {
+		select {
+		case p := <-d.ch:
+			putDownlinkBuf(p.buf)
+		default:
+			return
+		}
+	}
+}
+
+// removeDownlink 由发送协程自身调用：仅当表中仍是同一个队列时移除，并停止它。
+func (r *GlobalTunnelReader) removeDownlink(d *tunnelDownlink) {
+	r.downMu.Lock()
+	if cur, ok := r.downlinks[d.binding.Generation]; ok && cur == d {
+		delete(r.downlinks, d.binding.Generation)
+	}
+	r.downMu.Unlock()
+	d.stop()
+}
+
+// closeDownlink 停止并移除会话的下行队列（会话结束时调用）。
+func (r *GlobalTunnelReader) closeDownlink(generation uint64) {
+	r.downMu.Lock()
+	d, ok := r.downlinks[generation]
+	if ok {
+		delete(r.downlinks, generation)
+	}
+	r.downMu.Unlock()
+	if ok {
+		d.stop()
+	}
 }
