@@ -5,6 +5,7 @@ package client
 import (
 	"bufio"
 	"context"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -296,5 +297,55 @@ func TestConfigureLinkDNS(t *testing.T) {
 	want := [][]string{{"dns", "aero0", "10.88.0.1"}, {"domain", "aero0", "~."}}
 	if !slices.EqualFunc(calls, want, slices.Equal[[]string]) {
 		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+}
+
+// 回归：os.OpenFile 打开 /dev/net/tun 后 Read 立即返回 "not pollable"（edge 侧同样问题导致线上
+// CONNECT-IP 无下行）。必须能从网卡读到经 TUN 路由的报文，且 Close 能唤醒阻塞中的 Read。
+func TestTunHostLinuxDeviceReadsAndCloseUnblocks(t *testing.T) {
+	if !inNetns(t) {
+		return
+	}
+	h, err := openTunHost(tunHostConfig{Name: "aero0", MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), DNS: netip.MustParseAddr("10.88.0.1"), Plan: testPlan(t)})
+	if err != nil {
+		t.Fatalf("openTunHost: %v", err)
+	}
+	conn, err := net.Dial("udp4", "8.8.8.8:9") // 8.8.8.8 经规划路由进入 aero0
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("probe")); err != nil {
+		t.Fatal(err)
+	}
+	dev := h.Device()
+	buf := make([]byte, 2048)
+	found := false
+	for i := 0; i < 20 && !found; i++ { // 跳过系统在新网卡上发出的其他报文
+		n, err := dev.Read(buf)
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		found = n >= 20 && buf[0]>>4 == 4 && net.IP(buf[16:20]).Equal(net.IPv4(8, 8, 8, 8))
+	}
+	if !found {
+		t.Fatal("packet to 8.8.8.8 not read from aero0")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := dev.Read(buf)
+		done <- err
+	}()
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Read after Close returned nil error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not unblock a pending Read")
 	}
 }

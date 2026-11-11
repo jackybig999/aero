@@ -31,22 +31,26 @@ func newEdgeTunIfreq(name string) (*unix.Ifreq, error) {
 	return ifr, nil
 }
 
+// openGlobalTunnelDevice 打开共享 TUN。不能用 os.OpenFile：它在 TUNSETIFF 之前就把 fd 注册进
+// netpoll（此时设备未绑定，poll 返回错误），随后 file.Fd() 又把 fd 切回阻塞模式，Read 立即返回
+// "not pollable"，下行读取协程一启动就退出（v1.3.0 线上故障）。正确顺序：原始 open → TUNSETIFF →
+// 非阻塞 → os.NewFile，由 netpoll 管理读写，Close 可唤醒阻塞中的 Read。
 func openGlobalTunnelDevice(name string) (GlobalTunnelDevice, error) {
 	ifr, err := newEdgeTunIfreq(name)
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(edgeTunDevice, os.O_RDWR, 0)
+	fd, err := unix.Open(edgeTunDevice, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", edgeTunDevice, err)
 	}
-	if err := unix.IoctlIfreq(int(file.Fd()), unix.TUNSETIFF, ifr); err != nil {
-		if closeErr := file.Close(); closeErr != nil {
-			return nil, fmt.Errorf("TUNSETIFF: %v; close device: %w", err, closeErr)
-		}
-		return nil, fmt.Errorf("TUNSETIFF: %w", err)
+	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
+		return nil, errors.Join(fmt.Errorf("TUNSETIFF: %w", err), unix.Close(fd))
 	}
-	return &linuxGlobalTunnelDevice{name: ifr.Name(), file: file}, nil
+	if err := unix.SetNonblock(fd, true); err != nil {
+		return nil, errors.Join(fmt.Errorf("set %s non-blocking: %w", edgeTunDevice, err), unix.Close(fd))
+	}
+	return &linuxGlobalTunnelDevice{name: ifr.Name(), file: os.NewFile(uintptr(fd), edgeTunDevice)}, nil
 }
 
 func (d *linuxGlobalTunnelDevice) Read(packet []byte) (int, error)  { return d.file.Read(packet) }

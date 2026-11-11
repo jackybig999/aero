@@ -43,32 +43,28 @@ type linuxDevice struct {
 	mtu  int
 }
 
-// OpenTunDevice 创建 Linux TUN 设备
+// OpenTunDevice 创建 Linux TUN 设备。顺序必须是：原始 open → TUNSETIFF → 非阻塞 → os.NewFile。
+// 用 os.OpenFile 会在 TUNSETIFF 之前注册 netpoll、再被 file.Fd() 切回阻塞模式，Read 立即返回
+// "not pollable"（edge 侧同样的问题导致 v1.3.0 线上 CONNECT-IP 无下行）。
 func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 	if mtu <= 0 {
 		mtu = 1360
 	}
-	file, err := os.OpenFile(tunDevice, os.O_RDWR, 0)
+	ifr, err := newClientTunIfreq(name)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := unix.Open(tunDevice, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", tunDevice, err)
 	}
-
-	ifr, err := newClientTunIfreq(name)
-	if err != nil {
-		if closeErr := file.Close(); closeErr != nil {
-			return nil, fmt.Errorf("%v; close %s: %w", err, tunDevice, closeErr)
-		}
-		return nil, err
+	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
+		return nil, errors.Join(fmt.Errorf("TUNSETIFF: %w", err), unix.Close(fd))
 	}
-	if err := unix.IoctlIfreq(int(file.Fd()), unix.TUNSETIFF, ifr); err != nil {
-		if closeErr := file.Close(); closeErr != nil {
-			return nil, fmt.Errorf("TUNSETIFF: %v; close %s: %w", err, tunDevice, closeErr)
-		}
-		return nil, fmt.Errorf("TUNSETIFF: %w", err)
+	if err := unix.SetNonblock(fd, true); err != nil {
+		return nil, errors.Join(fmt.Errorf("set %s non-blocking: %w", tunDevice, err), unix.Close(fd))
 	}
-	devName := ifr.Name()
-
-	return &linuxDevice{name: devName, file: file, mtu: mtu}, nil
+	return &linuxDevice{name: ifr.Name(), file: os.NewFile(uintptr(fd), tunDevice), mtu: mtu}, nil
 }
 
 func (d *linuxDevice) Read(p []byte) (int, error)  { return d.file.Read(p) }

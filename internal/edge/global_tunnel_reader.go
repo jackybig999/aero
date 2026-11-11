@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -233,7 +234,7 @@ func (r *GlobalTunnelReader) run() {
 			r.enqueueDownlink(binding, packet)
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && r.ctx.Err() == nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, os.ErrClosed) && r.ctx.Err() == nil {
 				log.Printf("[TUN] shared reader read failed: %v", err)
 			}
 			return
