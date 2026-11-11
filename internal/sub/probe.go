@@ -2105,7 +2105,7 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		if verBytes, err := os.ReadFile("VERSION"); err == nil && len(strings.TrimSpace(string(verBytes))) > 0 {
 			targetVer = strings.TrimSpace(string(verBytes))
 		} else {
-			targetVer = "1.3.0"
+			targetVer = "1.3.1"
 		}
 	}
 	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
