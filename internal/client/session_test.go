@@ -8,11 +8,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"testing"
 )
 
@@ -28,17 +30,49 @@ func TestSessionManagerLifecycle(t *testing.T) {
 	}
 }
 
-func TestSessionAuthHeadersBearerOnly(t *testing.T) {
-	s := &Session{token: "tok_abc"}
-	for i := 0; i < 2; i++ {
-		hdr := http.Header{}
-		s.setAuthHeaders(hdr)
-		if got := hdr.Get("Authorization"); got != "Bearer tok_abc" {
-			t.Fatalf("request %d Authorization = %q, want Bearer tok_abc", i, got)
-		}
-		if hdr.Get("Aero-Timestamp") != "" || hdr.Get("Aero-Nonce") != "" {
-			t.Fatalf("request %d still sends deprecated Aero-Timestamp/Aero-Nonce (C3 §5)", i)
-		}
+func TestSessionAuthHeadersOneTimeNonce(t *testing.T) {
+	sess := &Session{
+		token: "test_secret_token_123",
+	}
+
+	// 1. First request on session: must include Bearer, Timestamp, Nonce
+	hdr1 := make(http.Header)
+	sess.setAuthHeaders(hdr1)
+
+	auth := hdr1.Get("Authorization")
+	if auth != "Bearer test_secret_token_123" {
+		t.Fatalf("unexpected Authorization header: %q", auth)
+	}
+
+	tsStr := hdr1.Get("Aero-Timestamp")
+	if tsStr == "" {
+		t.Fatal("expected Aero-Timestamp header on first request")
+	}
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil || ts <= 0 {
+		t.Fatalf("invalid Aero-Timestamp: %q", tsStr)
+	}
+
+	nonceHex := hdr1.Get("Aero-Nonce")
+	if len(nonceHex) != 64 {
+		t.Fatalf("expected 64 hex chars (32 bytes) Aero-Nonce, got %d chars: %q", len(nonceHex), nonceHex)
+	}
+	if _, err := hex.DecodeString(nonceHex); err != nil {
+		t.Fatalf("invalid hex Aero-Nonce: %v", err)
+	}
+
+	// 2. Second request on same session: must ONLY include Bearer, NO Timestamp or Nonce
+	hdr2 := make(http.Header)
+	sess.setAuthHeaders(hdr2)
+
+	if hdr2.Get("Authorization") != "Bearer test_secret_token_123" {
+		t.Fatalf("unexpected Authorization header on second request: %q", hdr2.Get("Authorization"))
+	}
+	if hdr2.Get("Aero-Timestamp") != "" {
+		t.Fatalf("expected NO Aero-Timestamp on subsequent request, got: %q", hdr2.Get("Aero-Timestamp"))
+	}
+	if hdr2.Get("Aero-Nonce") != "" {
+		t.Fatalf("expected NO Aero-Nonce on subsequent request, got: %q", hdr2.Get("Aero-Nonce"))
 	}
 }
 

@@ -7,6 +7,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -35,6 +37,7 @@ type Session struct {
 	token         string
 	addr          string
 	sni           string
+	nonceSent     atomic.Bool
 	draining      atomic.Bool
 	closed        atomic.Bool
 	closeOnce     sync.Once
@@ -87,9 +90,21 @@ func (s *Session) IsDraining() bool {
 	return s.draining.Load()
 }
 
-// setAuthHeaders 只附加 Authorization: Bearer（C3 §5：Aero-Timestamp/Aero-Nonce 已废弃）。
+// setAuthHeaders attaches authentication headers:
+// - Always: Authorization: Bearer <token>
+// - First request on connection: Aero-Timestamp (ms), Aero-Nonce (32 hex chars)
+//
+// C3 §5.2：新版 edge 已不要求、也不记录这两个头，但客户端行为保持不变——已部署的旧 edge 仍要求它们。
+// 全部 edge 升级到不要求 nonce 的版本后，再在客户端删除（不得早于此）。
 func (s *Session) setAuthHeaders(hdr http.Header) {
 	hdr.Set("Authorization", "Bearer "+s.token)
+	if s.nonceSent.CompareAndSwap(false, true) {
+		ts := time.Now().UnixMilli()
+		hdr.Set("Aero-Timestamp", strconv.FormatInt(ts, 10))
+		nonce := make([]byte, 32)
+		_, _ = rand.Read(nonce)
+		hdr.Set("Aero-Nonce", hex.EncodeToString(nonce))
+	}
 }
 
 // DialTCP dials an outbound TCP stream over HTTP/3 standard CONNECT (no :protocol).
