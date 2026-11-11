@@ -19,8 +19,14 @@ type reconnectHarness struct {
 	conns    []*mockIPPacketConn
 	prefixes []string // 第 i 次拨号返回的地址
 	dials    atomic.Int32
-	addrSets []netip.Prefix
+	hosts    *fakeTunHosts
 	eng      *Engine
+}
+
+// addrSets 返回重连期间对网卡地址的全部替换（tunHost.SetIPv4）。
+func (h *reconnectHarness) addrSets() []netip.Prefix {
+	_, addrs, _ := h.hosts.last().snapshot()
+	return addrs
 }
 
 func (h *reconnectHarness) conn(i int) *mockIPPacketConn {
@@ -42,25 +48,13 @@ func startReconnectHarness(t *testing.T, prefixes ...string) *reconnectHarness {
 		t.Fatalf("apply: %v", err)
 	}
 
-	origDetect, origOpen, origSetup, origTeardown, origClean, origDial, origSetAddr, origMin :=
-		detectThirdPartyTUN, openTunDeviceFn, setupRoutesFn, teardownRoutesFn, cleanAero0StaleRoutesFn, dialIPFn, setTunIPv4Fn, reconnectMinBackoff
+	h.hosts = useFakeTunHost(t, nil)
+	origDial, origMin := dialIPFn, reconnectMinBackoff
 	t.Cleanup(func() {
-		detectThirdPartyTUN, openTunDeviceFn, setupRoutesFn, teardownRoutesFn, cleanAero0StaleRoutesFn, dialIPFn, setTunIPv4Fn, reconnectMinBackoff =
-			origDetect, origOpen, origSetup, origTeardown, origClean, origDial, origSetAddr, origMin
+		dialIPFn, reconnectMinBackoff = origDial, origMin
 		SetQUICDialHook(nil)
 	})
-	detectThirdPartyTUN = func() (bool, string, error) { return false, "", nil }
-	cleanAero0StaleRoutesFn = func() {}
-	openTunDeviceFn = func(string, int) (TunDevice, error) { return newMockTunDevice(), nil }
-	setupRoutesFn = func(string, string) error { return nil }
-	teardownRoutesFn = func(string) {}
 	reconnectMinBackoff = 10 * time.Millisecond
-	setTunIPv4Fn = func(dev string, p netip.Prefix) error {
-		h.mu.Lock()
-		h.addrSets = append(h.addrSets, p)
-		h.mu.Unlock()
-		return nil
-	}
 	SetQUICDialHook(func(context.Context, net.PacketConn, net.Addr, *tls.Config, *quic.Config) (*quic.Conn, error) {
 		return nil, nil
 	})
@@ -118,10 +112,7 @@ func TestEngineReconnectAfterTunnelDrop(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	h.mu.Lock()
-	sets := len(h.addrSets)
-	h.mu.Unlock()
-	if sets != 0 {
+	if sets := len(h.addrSets()); sets != 0 {
 		t.Fatalf("TUN address changed %d times although the edge returned the same address", sets)
 	}
 
@@ -141,14 +132,12 @@ func TestEngineReconnectUpdatesTunAddressWhenItChanges(t *testing.T) {
 	waitDials(t, h, 2)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		h.mu.Lock()
-		sets := append([]netip.Prefix(nil), h.addrSets...)
-		h.mu.Unlock()
-		if len(sets) == 1 && sets[0] == netip.MustParsePrefix("10.88.7.9/32") {
+		sets := h.addrSets()
+		if len(sets) == 1 && sets[0] == netip.MustParsePrefix("10.88.7.9/16") {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("TUN address updates = %v, want [10.88.7.9/32]", sets)
+			t.Fatalf("TUN address updates = %v, want [10.88.7.9/16]", sets)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

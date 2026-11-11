@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"runtime"
 	"strings"
@@ -1370,6 +1371,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
 }
 
 func TestSysproxyModeNoHostRouteModificationOnSwitchAndNetworkChange(t *testing.T) {
+	forbidTunHost(t)
 	eng := NewEngine()
 	eng.SetMode("sysproxy")
 
@@ -1377,13 +1379,13 @@ func TestSysproxyModeNoHostRouteModificationOnSwitchAndNetworkChange(t *testing.
 	eng.state.Store(stateRunning)
 	eng.running.Store(true)
 
-	// 1. 切换节点：在 sysproxy 模式下，验证不会调用 ProtectHostRoute/UnprotectHostRoute
+	// 1. 切换节点：sysproxy 模式下不得触碰宿主网络（forbidTunHost 断言）
 	err := eng.switchActiveNodeLocked("198.51.100.1:443", "tok_test", "node1.example.com")
 	if err != nil {
 		t.Fatalf("switchActiveNodeLocked failed: %v", err)
 	}
 
-	// 2. 网络变动：在 sysproxy 模式下，验证 onNetworkChange 绝不调用 ProtectHostRoute
+	// 2. 网络变动：sysproxy 模式下 onNetworkChange 不得触碰宿主网络
 	eng.onNetworkChange("10.0.0.1", "eth0")
 
 	// 3. 正常退出
@@ -1397,9 +1399,9 @@ func TestStopSysproxyNoTunTeardown(t *testing.T) {
 	eng.SetMode("sysproxy")
 	eng.running.Store(true)
 	eng.state.Store(stateRunning)
-	eng.tunDevice = nil // 本地模式 tunDevice 为 nil
+	eng.tunHost = nil // 本地模式没有自有网卡
 
-	// 停止时不应 panic，且由于 tunDevice 为 nil，不执行 TeardownRoutes
+	// 停止时不应 panic；本地模式没有网卡可释放
 	if err := eng.Stop(); err != nil {
 		t.Fatalf("Stop failed: %v", err)
 	}
@@ -1446,19 +1448,16 @@ func TestEngineStartTUNConflictAborts(t *testing.T) {
 	if eng.IsRunning() {
 		t.Fatalf("expected running to be false after conflict")
 	}
-	if eng.tunDevice != nil {
-		t.Fatalf("expected tunDevice to be nil")
+	if eng.tunHost != nil {
+		t.Fatalf("expected no TUN after conflict")
 	}
 }
 
 func TestEngineStartSysproxyWithThirdPartyTUN(t *testing.T) {
 	origDetect := detectThirdPartyTUN
-	origCleanRoutes := cleanAero0StaleRoutesFn
 	defer func() {
 		detectThirdPartyTUN = origDetect
-		cleanAero0StaleRoutesFn = origCleanRoutes
 	}()
-	cleanAero0StaleRoutesFn = func() {}
 	detectThirdPartyTUN = func() (bool, string, error) {
 		return true, "Meta", nil
 	}
@@ -2223,31 +2222,16 @@ func TestStage1_StartEnablesWebRTCActive(t *testing.T) {
 	}
 
 	origDetect := detectThirdPartyTUN
-	origOpenTun := openTunDeviceFn
-	origSetupRoutes := setupRoutesFn
-	origTeardownRoutes := teardownRoutesFn
-	origCleanRoutes := cleanAero0StaleRoutesFn
 	defer func() {
 		detectThirdPartyTUN = origDetect
-		openTunDeviceFn = origOpenTun
-		setupRoutesFn = origSetupRoutes
-		teardownRoutesFn = origTeardownRoutes
-		cleanAero0StaleRoutesFn = origCleanRoutes
 	}()
-	cleanAero0StaleRoutesFn = func() {}
 
 	detectThirdPartyTUN = func() (bool, string, error) {
 		return false, "", nil
 	}
 
 	mockDev := newMockTunDevice()
-	openTunDeviceFn = func(name string, mtu int) (TunDevice, error) {
-		return mockDev, nil
-	}
-	setupRoutesFn = func(devName, ipv4 string) error {
-		return nil
-	}
-	teardownRoutesFn = func(devName string) {}
+	useFakeTunHost(t, mockDev)
 
 	// 模拟探测拨号成功与 CONNECT-IP 会话
 	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
@@ -2439,32 +2423,16 @@ func TestStage1_DesktopStartNoDialIPAndFixedPrefix(t *testing.T) {
 		t.Fatalf("apply failed: %v", err)
 	}
 
-	var capturedIPv4 string
 	origDetect := detectThirdPartyTUN
-	origOpenTun := openTunDeviceFn
-	origSetupRoutes := setupRoutesFn
-	origTeardownRoutes := teardownRoutesFn
-	origCleanRoutes := cleanAero0StaleRoutesFn
 	defer func() {
 		detectThirdPartyTUN = origDetect
-		openTunDeviceFn = origOpenTun
-		setupRoutesFn = origSetupRoutes
-		teardownRoutesFn = origTeardownRoutes
-		cleanAero0StaleRoutesFn = origCleanRoutes
 	}()
-	cleanAero0StaleRoutesFn = func() {}
 
 	detectThirdPartyTUN = func() (bool, string, error) {
 		return false, "", nil
 	}
 	mockDev := newMockTunDevice()
-	openTunDeviceFn = func(name string, mtu int) (TunDevice, error) {
-		return mockDev, nil
-	}
-	setupRoutesFn = func(devName, ipv4 string) error {
-		capturedIPv4 = ipv4
-		return nil
-	}
+	hosts := useFakeTunHost(t, mockDev)
 	// 模拟探测拨号成功与 CONNECT-IP 会话
 	SetQUICDialHook(func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
 		return nil, nil
@@ -2482,9 +2450,10 @@ func TestStage1_DesktopStartNoDialIPAndFixedPrefix(t *testing.T) {
 	}
 	defer eng.Stop()
 
-	// 核心断言：路由参数必须严格为 10.88.0.2/24，桌面启动严禁调用 DialIP 改变该参数
-	if capturedIPv4 != "10.88.0.2/24" {
-		t.Fatalf("expected SetupRoutes called with '10.88.0.2/24', got %q", capturedIPv4)
+	// 核心断言：网卡地址必须严格为 CONNECT-IP 分配的 10.88.0.2（按地址池 /16 配置），DNS 为池内虚拟网关
+	h := hosts.last()
+	if h == nil || h.cfg.IPv4 != netip.MustParsePrefix("10.88.0.2/16") || h.cfg.DNS != netip.MustParseAddr("10.88.0.1") {
+		t.Fatalf("TUN configured with %+v, want address 10.88.0.2 in pool /16 and DNS 10.88.0.1", h)
 	}
 }
 
@@ -3827,24 +3796,13 @@ func TestMultiPortHopping_And_PortAlignment(t *testing.T) {
 
 	// Mock TUN
 	origDetect := detectThirdPartyTUN
-	origOpenTun := openTunDeviceFn
-	origSetupRoutes := setupRoutesFn
-	origTeardownRoutes := teardownRoutesFn
-	origCleanRoutes := cleanAero0StaleRoutesFn
 	defer func() {
 		detectThirdPartyTUN = origDetect
-		openTunDeviceFn = origOpenTun
-		setupRoutesFn = origSetupRoutes
-		teardownRoutesFn = origTeardownRoutes
-		cleanAero0StaleRoutesFn = origCleanRoutes
 	}()
-	cleanAero0StaleRoutesFn = func() {}
 
 	detectThirdPartyTUN = func() (bool, string, error) { return false, "", nil }
 	mockDev := newMockTunDevice()
-	openTunDeviceFn = func(name string, mtu int) (TunDevice, error) { return mockDev, nil }
-	setupRoutesFn = func(devName, ipv4 string) error { return nil }
-	teardownRoutesFn = func(devName string) {}
+	useFakeTunHost(t, mockDev)
 
 	origDialIP := dialIPFn
 	defer func() { dialIPFn = origDialIP }()

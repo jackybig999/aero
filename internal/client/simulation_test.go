@@ -73,8 +73,8 @@ func TestMultiUserParallelModeSwitchAndConflict(t *testing.T) {
 		if u.IsRunning() {
 			t.Fatalf("user %d running should be false after conflict", i)
 		}
-		if u.tunDevice != nil {
-			t.Fatalf("user %d tunDevice should be nil", i)
+		if u.tunHost != nil {
+			t.Fatalf("user %d left a TUN behind", i)
 		}
 	}
 

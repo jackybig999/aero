@@ -50,20 +50,7 @@ var (
 	ErrStartAborted     = errors.New("start aborted by stop request")
 	subSingleFlight     singleflight.Group
 	detectThirdPartyTUN = DetectThirdPartyTUN
-	openTunDeviceFn     = OpenTunDevice
-	setupRoutesFn       = func(devName, ipv4 string) error {
-		cfg, err := NewRouteConfig(ipv4, nil, 1224)
-		if err != nil {
-			return err
-		}
-		if GlobalDefaultChinaMatcher != nil {
-			cfg.ExcludedCIDRs = GlobalDefaultChinaMatcher.ExportCIDRs()
-		}
-		return SetupRoutesWithConfig(devName, cfg)
-	}
-	teardownRoutesFn        = TeardownRoutes
-	cleanAero0StaleRoutesFn = CleanAero0StaleRoutes
-	dialIPFn                = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
+	dialIPFn            = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
 		if m != nil {
 			conn, prefixes, err := m.DialIP(ctx)
 			if err != nil {
@@ -123,7 +110,7 @@ type Engine struct {
 	tunnelClient *TunnelClient
 	sessionPool  ISessionPool
 	stackEngine  *StackEngine
-	tunDevice    TunDevice
+	tunHost      tunHost // 自有网卡及其上的全部宿主状态（ADR-0013）
 	sessionMgr   *SessionManager
 
 	appliedSub    *Applied
@@ -595,7 +582,7 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 		newIP = ip
 	}
 	if newIP != nil && e.mode == "tun" && e.running.Load() {
-		_ = ProtectHostRoute(newIP.String())
+		go e.refreshTunRoutes(newIP) // 不在 e.mu 内执行：refreshTunRoutes 自行加锁
 	}
 
 	var altPorts []int
@@ -689,7 +676,6 @@ func (e *Engine) StartWith(ticket uint64) error {
 }
 
 func (e *Engine) startLocked(ticket uint64) error {
-	var dev TunDevice
 	var nm NetworkMonitor
 	var ip net.IP
 
@@ -762,7 +748,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 
 	failStart := func(err error) error {
 		if errors.Is(err, context.Canceled) || e.state.Load() == stateStopping {
-			return e.abortStartLocked(startCancel, dev, nm, ip)
+			return e.abortStartLocked(startCancel, nm)
 		}
 		return rollbackLocked(ticket, startCancel, err)
 	}
@@ -774,14 +760,9 @@ func (e *Engine) startLocked(ticket uint64) error {
 	mode := e.mode
 	e.mu.RUnlock()
 
-	// 1. 本地模式 (sysproxy)：
-	// 绝对不调用 DetectThirdPartyTUN()，绝对不调完整 TeardownRoutes；
-	// 但清理上次崩溃可能残留在 aero0 上的 /1 路由（仅通过 interface aero0 指定删除，绝不碰 Clash）
-	if mode == "sysproxy" {
-		cleanAero0StaleRoutesFn()
-	} else {
-		// 2. 全局 TUN 模式：
-		// 第一行执行无死角第三方 TUN 冲突检测
+	// 本地模式（sysproxy）不碰宿主；TUN 模式先检测第三方 TUN 冲突（只读）。
+	// 自有网卡的全部状态随网卡销毁而消失，无需清理上次残留（ADR-0013）。
+	if mode != "sysproxy" {
 		conflict, vpnName, err := detectThirdPartyTUN()
 		if err != nil {
 			return failStart(fmt.Errorf("detect third-party tun: %w", err))
@@ -790,8 +771,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 			// 命中冲突：绝不创建 aero0，绝不调用 TeardownRoutes，绝不写 /32，绝不写两条 /1，running 保持 false
 			return failStart(&ErrConflictingTUN{VPNName: vpnName})
 		}
-
-		cleanAero0StaleRoutesFn()
 		invalidateGatewayCache()
 	}
 
@@ -839,10 +818,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 	}
 	ip = nodeIP
 
-	// 规则：仅在 tun 模式下保护节点路由；sysproxy 严格执行零主机篡改
-	if mode == "tun" {
-		_ = ProtectHostRoute(ip.String())
-	}
 	var ech []byte
 	if e.appliedSub != nil && e.appliedSub.ECHConfigs != nil {
 		if c, ok := e.appliedSub.ECHConfigs[activeAddr]; ok && len(c) > 0 {
@@ -879,9 +854,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 
 	select {
 	case <-startCtx.Done():
-		if mode == "tun" {
-			UnprotectHostRoute(ip.String())
-		}
 		return failStart(startCtx.Err())
 	default:
 	}
@@ -906,7 +878,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 	cl, err := Dial(probeCtx, cfg)
 	if err != nil {
 		if mode == "tun" {
-			UnprotectHostRoute(ip.String())
 			// 模式是 tun 而 UDP/443 (QUIC/HTTP/3) 拨号失败时：
 			// 不调用 OpenTunDevice，不装 /1 路由，55555 照常监听，向 UI 返回固定错误码 UDP_UNAVAILABLE。
 			// 严禁将整机流量降级走 TCP 再宣称全局隧道仍在。
@@ -971,9 +942,6 @@ func (e *Engine) startLocked(ticket uint64) error {
 
 	select {
 	case <-startCtx.Done():
-		if mode == "tun" {
-			UnprotectHostRoute(ip.String())
-		}
 		return failStart(startCtx.Err())
 	default:
 	}
@@ -1012,7 +980,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 		e.mu.Lock()
 		if e.startEpoch != ticket || !e.startPending.Load() || e.state.Load() != stateStarting {
 			e.mu.Unlock()
-			return e.abortStartLocked(startCancel, dev, nm, ip)
+			return e.abortStartLocked(startCancel, nm)
 		}
 		e.state.Store(stateRunning)
 		e.running.Store(true)
@@ -1023,75 +991,12 @@ func (e *Engine) startLocked(ticket uint64) error {
 		return nil
 	}
 
-	dev, err = openTunDeviceFn("aero0", 1224)
-	if err != nil {
-		UnprotectHostRoute(ip.String())
+	// 先建立 CONNECT-IP 取得地址，再创建自有网卡：网卡、地址、路由、DNS 防护一次就绪（ADR-0013）。
+	if err := e.bringUpTunLocked(nodeIP); err != nil {
 		if e.rootCancel != nil {
 			e.rootCancel()
 		}
-		return failStart(fmt.Errorf("open tun device: %w", err))
-	}
-	e.tunDevice = dev
-
-	dialIPCtx, dialIPCancel := context.WithTimeout(e.rootCtx, 8*time.Second)
-	ipConn, prefixStr, err := dialIPFn(dialIPCtx, e.sessionMgr)
-	dialIPCancel()
-	if err != nil {
-		_ = dev.Close()
-		e.tunDevice = nil
-		UnprotectHostRoute(ip.String())
-		if e.rootCancel != nil {
-			e.rootCancel()
-		}
-		return failStart(fmt.Errorf("dial CONNECT-IP: %w", err))
-	}
-	if _, err := NewRouteConfig(prefixStr, nil, 1224); err != nil {
-		closeErr := ipConn.Close()
-		_ = dev.Close()
-		e.tunDevice = nil
-		UnprotectHostRoute(ip.String())
-		if e.rootCancel != nil {
-			e.rootCancel()
-		}
-		if closeErr != nil {
-			return failStart(fmt.Errorf("invalid route configuration: %w; close CONNECT-IP: %v", err, closeErr))
-		}
-		return failStart(fmt.Errorf("invalid route configuration: %w", err))
-	}
-
-	e.stackEngine = NewStackEngineWithConn(dev, ipConn, e.dnsHandler)
-	e.stackEngine.SetKillSwitch(e.killSwitch.Load())
-	if err := e.stackEngine.Start(); err != nil {
-		_ = dev.Close()
-		e.tunDevice = nil
-		teardownRoutesFn(dev.Name())
-		UnprotectHostRoute(ip.String())
-		if e.rootCancel != nil {
-			e.rootCancel()
-		}
-		return failStart(fmt.Errorf("start stack: %w", err))
-	}
-
-	// 断线恢复：数据泵断开后自动重建 CONNECT-IP（M2-9）。prefixStr 已由 NewRouteConfig 校验。
-	e.startReconnector(e.rootCtx, e.stackEngine, dev, netip.MustParsePrefix(prefixStr))
-
-	// WebRTC 生产激活：探测成功且 stackEngine 启动后，显式激活 WebRTC
-	e.stackEngine.SetWebRTCActive(true)
-	SetGlobalMobileWebRTCActive(true)
-
-	if err := setupRoutesFn(dev.Name(), prefixStr); err != nil {
-		if e.stackEngine != nil {
-			e.stackEngine.Stop()
-			e.stackEngine = nil
-		}
-		_ = dev.Close()
-		e.tunDevice = nil
-		teardownRoutesFn(dev.Name())
-		UnprotectHostRoute(ip.String())
-		if e.rootCancel != nil {
-			e.rootCancel()
-		}
-		return failStart(fmt.Errorf("setup routes: %w", err))
+		return failStart(err)
 	}
 
 	go func() {
@@ -1112,7 +1017,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	e.mu.Lock()
 	if e.startEpoch != ticket || !e.startPending.Load() || e.state.Load() != stateStarting {
 		e.mu.Unlock()
-		return e.abortStartLocked(startCancel, dev, nm, ip)
+		return e.abortStartLocked(startCancel, nm)
 	}
 	e.state.Store(stateRunning)
 	e.running.Store(true)
@@ -1124,7 +1029,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 }
 
 // abortStartLocked 清理本次启动申请的临时资源，不置空全局基础设施，不修改状态
-func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice, nm NetworkMonitor, ip net.IP) error {
+func (e *Engine) abortStartLocked(startCancel context.CancelFunc, nm NetworkMonitor) error {
 	if startCancel != nil {
 		startCancel()
 	}
@@ -1135,22 +1040,7 @@ func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice,
 	e.startCancel = nil
 	e.mu.Unlock()
 
-	if e.stackEngine != nil {
-		e.stackEngine.SetWebRTCActive(false)
-		SetGlobalMobileWebRTCActive(false)
-		e.stackEngine.Stop()
-		e.stackEngine = nil
-	}
-	if dev != nil {
-		if name := dev.Name(); name != "" {
-			teardownRoutesFn(name)
-		}
-		_ = dev.Close()
-		e.tunDevice = nil
-	}
-	if ip != nil {
-		UnprotectHostRoute(ip.String())
-	}
+	e.releaseTunLocked()
 	if e.rootCancel != nil {
 		e.rootCancel()
 		e.rootCancel = nil
@@ -1158,12 +1048,11 @@ func (e *Engine) abortStartLocked(startCancel context.CancelFunc, dev TunDevice,
 	if nm != nil {
 		nm.Stop()
 	}
-
 	return ErrStartAborted
 }
 
 // onNetworkChange 响应底层物理网络切换事件
-// 规则：原子级刷新 ProtectHostRoute、清理存量悬挂连接、重置会话池、更新物理解析、异步预热 QUIC
+// 规则：按新网络的系统 DNS 重新规划 TUN 路由、清理存量悬挂连接、重置会话池、更新物理解析、异步预热 QUIC
 func (e *Engine) onNetworkChange(newGW, ifName string) {
 	invalidateGatewayCache()
 	log.Printf("[ENGINE] onNetworkChange triggered: newGW=%s, ifName=%s", newGW, ifName)
@@ -1187,13 +1076,9 @@ func (e *Engine) onNetworkChange(newGW, ifName string) {
 
 	_, _, _, ip := getActiveEdge()
 
-	// 1. 刷新活跃节点保护路由（仅限全局 TUN 模式，sysproxy 模式绝对不篡改主机路由表）
+	// 1. 新网络的 DNS 服务器不同：重新规划 TUN 路由（仅 TUN 模式；sysproxy 不碰宿主）
 	if mode == "tun" && e.running.Load() {
-		if ip != nil {
-			_ = ProtectHostRoute(ip.String())
-		}
-		// 2. 刷新物理 DNS 捕获路由（自动撤销旧 Wi-Fi DNS /32，绑定新 Wi-Fi DNS /32，免改注册表防泄露）
-		_ = RotatePhysicalDNSRoute()
+		e.refreshTunRoutes(ip)
 	}
 
 	// 2. 斩断前一网络留存的悬挂连接
@@ -1326,30 +1211,10 @@ func (e *Engine) stopLocked() error {
 
 	e.closeActiveConns()
 
-	if e.stackEngine != nil {
-		e.stackEngine.SetWebRTCActive(false)
-		SetGlobalMobileWebRTCActive(false)
-		e.stackEngine.Stop()
-		e.stackEngine = nil
-	}
+	e.releaseTunLocked()
 
 	if e.tunnelClient != nil {
 		e.tunnelClient.Close()
-	}
-
-	if e.tunDevice != nil {
-		devName := e.tunDevice.Name()
-		if devName != "" {
-			teardownRoutesFn(devName)
-		}
-		_ = os.Remove(utunRecordPath())
-		_ = e.tunDevice.Close()
-		e.tunDevice = nil
-	}
-
-	_, _, _, ip := getActiveEdge()
-	if ip != nil {
-		UnprotectHostRoute(ip.String())
 	}
 
 	e.sessionPool.Reset()
