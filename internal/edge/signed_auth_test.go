@@ -22,6 +22,14 @@ type signedAuthFixture struct {
 	now  time.Time
 }
 
+// liveConns 让测试用的零值 quic.Conn 视为存活，dead 中的除外。
+func liveConns(t *testing.T, dead map[*quic.Conn]bool) {
+	t.Helper()
+	prev := connAlive
+	connAlive = func(c *quic.Conn) bool { return !dead[c] }
+	t.Cleanup(func() { connAlive = prev })
+}
+
 func newSignedAuthFixture(t *testing.T) *signedAuthFixture {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -106,6 +114,8 @@ func TestSignedTokenExpiredIsNotJailed(t *testing.T) {
 // 已绑定连接的后续请求不受影响；同一连接换 token 拒绝。
 func TestSignedTokenDeviceLimit(t *testing.T) {
 	f := newSignedAuthFixture(t)
+	dead := map[*quic.Conn]bool{}
+	liveConns(t, dead)
 	tok := f.token(t, "user_carol01", 2, time.Hour)
 	c1, c2, c3 := new(quic.Conn), new(quic.Conn), new(quic.Conn)
 	for i, c := range []*quic.Conn{c1, c2} {
@@ -130,7 +140,13 @@ func TestSignedTokenDeviceLimit(t *testing.T) {
 	f.qs.connTracker.Remove(c3)
 	f.qs.connTracker.Remove(c2)
 	if ok, _ := f.auth(tok, c3, "203.0.113.30"); !ok {
-		t.Fatal("device slot not freed after a connection closed")
+		t.Fatal("device slot not freed after a connection was removed")
+	}
+	// 已关闭但尚未被定期清理删除的连接不得占用名额
+	dead[c1] = true
+	c4 := new(quic.Conn)
+	if ok, rec := f.auth(tok, c4, "203.0.113.30"); !ok {
+		t.Fatalf("closed connection still counted as a device: %d", rec.Code)
 	}
 }
 

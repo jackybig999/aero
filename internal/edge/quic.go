@@ -419,6 +419,16 @@ type ConnTracker struct {
 	conns map[*quic.Conn]connBinding
 }
 
+// connAlive 报告连接是否仍存活；可在测试中替换（零值 quic.Conn 没有上下文）。
+var connAlive = func(c *quic.Conn) bool {
+	select {
+	case <-c.Context().Done():
+		return false
+	default:
+		return true
+	}
+}
+
 // connBinding 是连接绑定的 token 与（签名 token 的）uid；uid 用于本节点设备数计数（C3 §3 第 7 步）。
 type connBinding struct {
 	token, uid string
@@ -461,9 +471,14 @@ func (ct *ConnTracker) BindLimited(c *quic.Conn, token, uid string, max int) boo
 	if uid != "" && max > 0 {
 		n := 0
 		for other, b := range ct.conns {
-			if other != c && b.uid == uid {
-				n++
+			if other == c || b.uid != uid {
+				continue
 			}
+			if !connAlive(other) { // 已关闭的连接不计数（定期清理每 5 分钟才删除记录）
+				delete(ct.conns, other)
+				continue
+			}
+			n++
 		}
 		if n >= max {
 			return false
