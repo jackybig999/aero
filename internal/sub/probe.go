@@ -2318,6 +2318,8 @@ WorkingDirectory=/var/lib/aero
 EnvironmentFile=-/etc/aero/edge.conf
 ExecStart=/usr/local/bin/aero-edge -listen :%d -data-dir /var/lib/aero -advertise-host %s -domain %s -token %s -admin-key %s %s
 ExecReload=/bin/kill -HUP $MAINPID
+# 服务退出（含崩溃）后还原宿主：删除带标记的转发规则、还原 ip_forward（ADR-0012）
+ExecStopPost=/usr/local/bin/aero-edge cleanup-host
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
@@ -2541,6 +2543,8 @@ func RunUninstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
 	globalTaskManager.SetStep(taskID, "clean_files", "running", "深度清理核心文件、配置与网络规则...", 80, "清理文件与网络规则")
 	globalTaskManager.AppendLog(taskID, "[清理] 正在清理 /usr/local/bin/aero-edge、systemd 单元、运行配置及 NAT 重定向规则...")
 	cleanCmd := `set +e
+# 先还原宿主（转发规则、ip_forward），再删除程序（ADR-0012）
+[ -x /usr/local/bin/aero-edge ] && /usr/local/bin/aero-edge cleanup-host
 rm -rf /usr/local/bin/aero-edge /usr/local/bin/aero /etc/systemd/system/aero-edge.service /etc/systemd/system/aero.service /etc/aero /var/lib/aero/tls /var/lib/aero/certs /var/lib/aero/edge.conf
 systemctl daemon-reload 2>/dev/null || true
 

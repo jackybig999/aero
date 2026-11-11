@@ -55,6 +55,8 @@ After=network.target
 
 [Service]
 ExecStart=/usr/local/bin/aero-edge
+# 服务退出（含崩溃）后还原宿主：删除带标记的转发规则、还原 ip_forward（ADR-0012）
+ExecStopPost=/usr/local/bin/aero-edge cleanup-host
 Restart=always
 
 [Install]

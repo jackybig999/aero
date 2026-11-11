@@ -39,21 +39,7 @@ func TestEdgeTunIfreqRejectsInvalidNames(t *testing.T) {
 // 共享 TUN 下行读取协程一启动即退出，CONNECT-IP 无回包。本测试真正从设备读包，
 // 并验证 Close 能唤醒阻塞中的 Read。在独立用户 + 网络命名空间中运行，不触碰宿主网络。
 func TestGlobalTunnelDeviceReadsPacketsAndCloseUnblocks(t *testing.T) {
-	if os.Getenv("AERO_NETNS") != "1" {
-		if _, err := exec.LookPath("unshare"); err != nil {
-			t.Skip("unshare not available")
-		}
-		out, err := exec.Command("unshare", "-rn", "env", "AERO_NETNS=1", os.Args[0],
-			"-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v").CombinedOutput()
-		if err != nil {
-			if strings.Contains(string(out), "Operation not permitted") || strings.Contains(string(out), "unshare failed") {
-				t.Skipf("user/net namespaces not permitted: %s", out)
-			}
-			t.Fatalf("netns run failed: %v\n%s", err, out)
-		}
-		if !strings.Contains(string(out), "--- PASS: "+t.Name()) {
-			t.Fatalf("netns run did not pass:\n%s", out)
-		}
+	if !inNetns(t) {
 		return
 	}
 

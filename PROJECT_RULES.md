@@ -132,8 +132,8 @@ AERO：基于标准 HTTP/3 MASQUE（RFC 9298 / RFC 9484）的多用户加密隧�
 | 所有者 | 修改内容 | 标记 | 自动消失 | 退出 / 崩溃 / 启动 | 手动清理命令 |
 |---|---|---|---|---|---|
 | edge | TUN 设备 `aero-tun0` | 设备名 | 进程退出即消失 | — | — |
-| edge | iptables 规则（转发放行、NAT、MSS 钳制，仅限 TUN） | 注释标签 | 否 | 删除 / `ExecStopPost` / 启动先删 | `aero-edge cleanup-host` |
-| edge | `ip_forward` | 变更日志记录原值 | 否 | 还原原值 / `ExecStopPost` / 启动先还原 | 同上 |
+| edge | iptables 规则（转发放行、NAT、MSS 钳制，仅限 TUN；原 `ip_forward` 为 0 时追加“非本 TUN 转发一律丢弃”，保持宿主原语义） | 注释标签 `aero_edge_default` | 否 | 删除 / `ExecStopPost` / 启动先删 | `aero-edge cleanup-host` |
+| edge | `ip_forward` | 数据目录 `host-state.json` 记录修改前原值（崩溃后重启不覆盖） | 否 | 还原原值 / `ExecStopPost` / 启动先还原 | 同上 |
 | client | TUN 网卡 `aero0` 及其地址、路由、MTU、该网卡自身 DNS | 设备（Windows 固定 GUID） | 网卡销毁即消失 | — | — |
 | client（Windows） | WFP 动态会话过滤规则（放行本进程与本网卡，屏蔽其余 53 端口） | 动态会话 | 进程退出即由内核删除 | — | — |
 | client（macOS） | SCDynamicStore 会话键（本服务 DNS） | 会话 | 进程退出即删除 | — | — |

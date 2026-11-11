@@ -11,15 +11,8 @@ func ConfigureGlobalTunnelDevice(devName string, ipv4CIDR, ipv6CIDR string, mtu 
 	return nil
 }
 
-// EnableKernelForwarding 非 Linux 平台占位
-func EnableKernelForwarding() error {
-	return nil
-}
+// PrepareHostForTunnel 非 Linux 平台占位（共享 TUN 与 NAT 仅支持 Linux）。
+func PrepareHostForTunnel(dataDir, devName string) error { return nil }
 
-// ApplyEdgeFirewall 非 Linux 平台占位
-func ApplyEdgeFirewall(devName string) error {
-	return nil
-}
-
-// CleanupEdgeFirewall 非 Linux 平台占位
-func CleanupEdgeFirewall(devName string) {}
+// RestoreHost 非 Linux 平台占位。
+func RestoreHost(dataDir string) error { return nil }

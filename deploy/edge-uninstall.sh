@@ -58,6 +58,11 @@ if [[ -f "/etc/systemd/system/aero-edge.service" ]]; then
     echo "[systemd] 已移除 aero-edge.service"
 fi
 
+# 1b. 还原宿主（删除带 aero_edge_default 标记的转发规则、还原 ip_forward，ADR-0012），须在删除程序前执行
+if [[ -x /usr/local/bin/aero-edge ]]; then
+    /usr/local/bin/aero-edge cleanup-host || echo "[warn] cleanup-host failed; run it manually before removing the binary"
+fi
+
 # 2. 清理 nftables 规则
 if command -v nft >/dev/null 2>&1; then
     for table_name in "aero_edge_${INSTANCE_ID}" "aero_edge_default" "aero_nat"; do

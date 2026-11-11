@@ -117,6 +117,7 @@ type Server struct {
 	startedAt time.Time
 
 	instanceLock *instanceLock
+	hostStateDir string // 非空：已修改宿主（规则、ip_forward），Close 时按该目录的状态日志还原
 
 	// ready 为真表示可以接流量：Start 完成后置位，排空开始时清除（/readyz）。
 	ready atomic.Bool
@@ -375,10 +376,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			tunDevice = "aero-tun0"
 		}
 	}
+	hostStateDir := "" // 非空表示已修改宿主，Close 时据此还原
 	if tunDevice != "" && runtime.GOOS == "linux" {
-		if err := EnableKernelForwarding(); err != nil {
-			log.Printf("[EDGE] [ERROR] %v (CONNECT-IP egress requires IPv4 forwarding)", err)
-		}
 		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
 			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" || !cfg.AllowSelfSignedCertForTest {
 				quicServer.Close()
@@ -388,8 +387,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		} else {
 			log.Printf("[EDGE] Global TUN device %s attached and active for CONNECT-IP data plane", tunDevice)
 			_ = ConfigureGlobalTunnelDevice(tunDevice, "10.88.0.1/16", "fd88:ae80::1/64", 1360)
-			if err := ApplyEdgeFirewall(tunDevice); err != nil {
-				log.Printf("[EDGE] [ERROR] CONNECT-IP NAT/forwarding rules incomplete, tunnel egress may fail: %v", err)
+			// 只有 TUN 就绪后才修改宿主（ADR-0012）；失败时已做的修改由 PrepareHostForTunnel 自行还原。
+			if err := PrepareHostForTunnel(absDataDir, tunDevice); err != nil {
+				log.Printf("[EDGE] [ERROR] CONNECT-IP forwarding not prepared, tunnel egress will fail: %v", err)
+			} else {
+				hostStateDir = absDataDir
 			}
 		}
 	} else if tunDevice != "" {
@@ -457,6 +459,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	srv.instanceLock = lock
+	srv.hostStateDir = hostStateDir
 	constructed = true
 	return srv, nil
 }
@@ -726,7 +729,12 @@ func (s *Server) Close() {
 	if s.quicServer != nil {
 		s.quicServer.Close()
 	}
-	CleanupEdgeFirewall(s.cfg.GlobalTUNDevice)
+	if s.hostStateDir != "" {
+		if err := RestoreHost(s.hostStateDir); err != nil {
+			log.Printf("[EDGE] [ERROR] restore host state (run `aero-edge cleanup-host`): %v", err)
+		}
+		s.hostStateDir = ""
+	}
 	if s.httpServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = s.httpServer.Shutdown(ctx)

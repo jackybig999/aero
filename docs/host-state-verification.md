@@ -25,4 +25,5 @@
   - 端口轮试：UDP 8443 被同机 xray 占用，edge 自动跳过，其余 8 个端口正常。
   - 闭环（tmp/e2e，进程内，不建网卡）：QUIC 握手 746ms；TCP 中继出口 207.57.187.35；DoH 解析 www.google.com 正常；CONNECT-IP 分配 10.88.36.254/32，ICMP 1.1.1.1 往返 227ms，UDP DNS 8.8.8.8 往返 226ms。
   - `/sub/admin` 返回 404（匿名泄露已关闭）。
-- 未完成：`ip_forward` 退出时仍不还原；cleanup-host 与 ExecStopPost 待实现。
+- 2026-11-11 回滚机制（隔离网络命名空间，真实 iptables 与 ip_forward）：`TestHostStateLifecycleForwardingOff/On`、`TestHostStateRemovesLegacyRules`、`TestCleanupHostRefusesWhileRunning` 通过；`aero-edge cleanup-host` 命令行在模拟崩溃现场（ip_forward=1、3 条标记规则、日志原值 0）执行后：ip_forward=0、标记规则 0、外来规则保留、日志删除，二次执行幂等。宿主 ip_forward 全程未变。
+- 线上待部署：需发布新版本并在服务单元加入 `ExecStopPost=/usr/local/bin/aero-edge cleanup-host`。

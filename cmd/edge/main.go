@@ -16,17 +16,16 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "cleanup-host" {
+		os.Exit(cleanupHostCmd(os.Args[2:]))
+	}
 	showVer := flag.Bool("version", false, "print version and exit")
 	listen := flag.String("listen", ":443", "listen address (e.g. :443)")
 	domain := flag.String("domain", "", "public domain or SNI")
 	token := flag.String("token", "", "initial bootstrap token (auto-generated if empty)")
 	certFile := flag.String("cert", "", "path to TLS cert PEM")
 	keyFile := flag.String("key", "", "path to TLS key PEM")
-	defaultDataDir := "./data"
-	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
-		defaultDataDir = "/var/lib/aero"
-	}
-	dataDir := flag.String("data-dir", defaultDataDir, "data directory for tokens.json and client-sub.json")
+	dataDir := flag.String("data-dir", defaultDataDir(), "data directory for tokens.json and client-sub.json")
 	adminKey := flag.String("admin-key", "", "remote Admin API key (X-Aero-Admin-Key)")
 	profile := flag.String("profile", "small", "performance profile: tiny|small|medium")
 	maxConn := flag.Int("max-conn", 0, "max active tunnels global (0=default)")
@@ -148,4 +147,54 @@ func applyProfileDefaults(cfg *edge.ServerConfig) {
 			cfg.RateIP = 200
 		}
 	}
+}
+
+func defaultDataDir() string {
+	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+		return "/var/lib/aero"
+	}
+	return "./data"
+}
+
+// cleanupHostCmd 实现 `aero-edge cleanup-host [-data-dir DIR] [-config FILE]`：edge 停止后还原宿主状态
+// （带标记的规则、ip_forward）。供 systemd ExecStopPost 调用（含崩溃），也可手动执行；edge 运行中时拒绝。
+// 数据目录与服务一致：-data-dir 优先，其次配置文件的 data_dir（-config 或已存在的 /etc/aero/edge.json），最后默认值。
+func cleanupHostCmd(args []string) int {
+	fs := flag.NewFlagSet("cleanup-host", flag.ContinueOnError)
+	dataDir := fs.String("data-dir", "", "edge data directory (default: config data_dir, else "+defaultDataDir()+")")
+	configPath := fs.String("config", "", "edge config file (default: /etc/aero/edge.json if present)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	dir := *dataDir
+	if dir == "" {
+		path := *configPath
+		if path == "" {
+			if _, err := os.Stat("/etc/aero/edge.json"); err == nil {
+				path = "/etc/aero/edge.json"
+			}
+		}
+		if path != "" {
+			var c struct {
+				DataDir string `json:"data_dir"`
+			}
+			b, err := os.ReadFile(path)
+			if err == nil {
+				err = json.Unmarshal(b, &c)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "cleanup-host: read %s: %v\n", path, err)
+				return 1
+			}
+			dir = c.DataDir
+		}
+	}
+	if dir == "" {
+		dir = defaultDataDir()
+	}
+	if err := edge.CleanupHost(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "cleanup-host: %v\n", err)
+		return 1
+	}
+	return 0
 }
