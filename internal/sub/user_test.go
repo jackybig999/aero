@@ -1,5 +1,5 @@
 // Copyright 2026 AERO Protocol Contributors
-// Unit tests for SeedAdmin persistence, password hashing with crypto/rand, admin key, and ECH/alt_ports injection.
+// Unit tests for password hashing with crypto/rand, admin key, and ECH/alt_ports injection.
 package sub
 
 import (
@@ -15,48 +15,6 @@ import (
 	"strings"
 	"testing"
 )
-
-// 1. 验证 SeedAdmin 运行后，修改密码，再次调用 SeedAdmin，密码哈希未被重置回初始密码
-func TestSeedAdminPasswordRetention(t *testing.T) {
-	uDB := NewMemoryUserStore()
-	svc := NewUserService(uDB, "test-hmac-secret-seed-admin")
-
-	// First SeedAdmin creates admin with initial password
-	SeedAdmin(svc, uDB)
-
-	admin, err := uDB.GetUserByUsername("admin")
-	if err != nil || admin == nil {
-		t.Fatalf("expected admin user to be created, err: %v", err)
-	}
-
-	initPwd := "admin123456"
-	if !CheckPassword(initPwd, admin.PasswordHash) {
-		t.Fatalf("expected initial password to match admin123456")
-	}
-
-	// Admin manually updates password
-	newCustomPwd := "CustomAdminPass2026#"
-	newHash := HashPassword(newCustomPwd)
-	if err := uDB.SetPassword(admin.ID, newHash); err != nil {
-		t.Fatalf("failed to update admin password: %v", err)
-	}
-
-	// Service restarts, calling SeedAdmin again
-	SeedAdmin(svc, uDB)
-
-	// Verify admin's updated password was NOT overwritten
-	adminAfter, err := uDB.GetUserByUsername("admin")
-	if err != nil || adminAfter == nil {
-		t.Fatalf("failed to get admin user after re-seed: %v", err)
-	}
-
-	if !CheckPassword(newCustomPwd, adminAfter.PasswordHash) {
-		t.Fatalf("FATAL: admin password was reset by SeedAdmin! Custom password verification failed")
-	}
-	if CheckPassword(initPwd, adminAfter.PasswordHash) {
-		t.Fatalf("FATAL: admin password was reverted to initial password")
-	}
-}
 
 // 2. 验证 HashPassword 使用 crypto/rand 随机盐且能被 CheckPassword 成功校验
 func TestHashPasswordCryptoRandSalt(t *testing.T) {
@@ -261,40 +219,29 @@ func TestSQLiteSingleWriterPool(t *testing.T) {
 	}
 }
 
-// 6. 验证内置超级管理员 superadmin 与 ID=1 禁止删除保护
-func TestSuperadminProtection(t *testing.T) {
+// 6. 内置管理员（用户名 admin，无论 ID）禁止删除；普通用户可删除。
+func TestAdminDeleteProtection(t *testing.T) {
 	uDB := NewMemoryUserStore()
-	svc := NewUserService(uDB, "test-hmac-secret-superadmin")
+	svc := NewUserService(uDB, "test-hmac-secret-admin")
 
-	// 创建 superadmin
-	superAdmin, err := svc.Register(CreateUserParams{
-		Username:   "superadmin",
-		Password:   "InitialPassword123!",
-		Email:      "superadmin@example.com",
-		PlanMonths: 1,
-		IsStaff:    true,
-	})
+	if _, err := svc.Register(CreateUserParams{Username: "firstuser", Password: "FirstPassword123", Email: "first@example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := svc.Register(CreateUserParams{Username: "admin", Password: "InitialPassword123", IsStaff: true})
 	if err != nil {
-		t.Fatalf("Register superadmin failed: %v", err)
+		t.Fatal(err)
 	}
-
-	// 尝试删除 superadmin
-	if err := svc.DeleteUser(superAdmin.ID); err == nil {
-		t.Fatalf("expected error when deleting superadmin, got nil")
+	if admin.ID == 1 {
+		t.Fatal("test setup: admin must not have ID 1")
 	}
-
-	// 创建普通用户并验证可以正常删除
-	normalUser, err := svc.Register(CreateUserParams{
-		Username:   "normaluser",
-		Password:   "NormalPassword123!",
-		Email:      "normal@example.com",
-		PlanMonths: 1,
-	})
+	if err := svc.DeleteUser(admin.ID); err == nil {
+		t.Fatal("admin (ID != 1) was deleted")
+	}
+	normal, err := svc.Register(CreateUserParams{Username: "normaluser", Password: "NormalPassword123", Email: "normal@example.com"})
 	if err != nil {
-		t.Fatalf("Register normal user failed: %v", err)
+		t.Fatal(err)
 	}
-
-	if err := svc.DeleteUser(normalUser.ID); err != nil {
+	if err := svc.DeleteUser(normal.ID); err != nil {
 		t.Fatalf("failed to delete normal user: %v", err)
 	}
 }

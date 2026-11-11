@@ -136,7 +136,9 @@ func main() {
 
 	userDB := aeroDB
 	userSvc := sub.NewUserService(userDB, hmacSecret)
-	sub.SeedAdmin(userSvc, userDB)
+	if err := sub.EnsureAdmin(userSvc, userDB, dataDir); err != nil {
+		log.Fatalf("ensure admin account: %v", err)
+	}
 
 	// 3. Billing & Node Registry
 	billingSvc := sub.NewBillingService(aeroDB)

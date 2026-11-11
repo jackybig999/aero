@@ -437,28 +437,6 @@ func (a *AeroDB) CreateUser(u *User) (uint64, error) {
 	id, _ := res.LastInsertId()
 	u.ID = uint64(id)
 
-	// Create initial subscription only when user explicitly has an assigned plan and expiration
-	if u.SubSlug != "" && u.PlanName != "" && !u.ExpireAt.IsZero() {
-		subID := fmt.Sprintf("sub_%s", u.SubSlug)
-		_ = a.CreateSubscription(&Subscription{
-			SubID:         subID,
-			UserID:        u.ID,
-			UserUUID:      u.UUID,
-			SubSlug:       u.SubSlug,
-			SubToken:      u.SubToken,
-			SubTicketSeed: u.SubTicketSeed,
-			PlanName:      u.PlanName,
-			AssignedNodes: u.AssignedNodes,
-			LimitBytes:    107374182400,
-			UsedBytes:     0,
-			ExpireAt:      u.ExpireAt,
-			SwitchStatus:  "on",
-			Status:        u.Status,
-			CreatedAt:     now,
-			UpdatedAt:     now,
-		})
-	}
-
 	return u.ID, nil
 }
 
@@ -984,6 +962,23 @@ func (a *AeroDB) UpdateSubscription(subID string, status bool, assignedNodes []s
 	_, err := a.db.Exec(`UPDATE subscription SET status = ?, assigned_nodes_json = ?, updated_at = ? WHERE sub_id = ?`,
 		statusInt, string(nodesJSON), nowStr, subID)
 	return err
+}
+
+// UpdateSubscriptionSlug 更换订阅 slug；订阅不存在时返回错误，slug 冲突由唯一约束拒绝。
+func (a *AeroDB) UpdateSubscriptionSlug(subID, slug string) error {
+	res, err := a.db.Exec(`UPDATE subscription SET sub_slug = ?, updated_at = ? WHERE sub_id = ?`,
+		slug, time.Now().Format(time.RFC3339), subID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errors.New("subscription not found")
+	}
+	return nil
 }
 
 // ----------------------------------------------------------------------

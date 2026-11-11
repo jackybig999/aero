@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -282,6 +281,7 @@ type UserStore interface {
 	RenewSubscription(subID string, months int32, priceCents int64, planName string) (*Subscription, error)
 	UpdateSubscription(subID string, status bool, assignedNodes []string) error
 	UpdateSubscriptionSwitch(subID string, switchStatus string) error
+	UpdateSubscriptionSlug(subID, slug string) error
 	DeleteSubscription(subID string) error
 }
 
@@ -660,6 +660,23 @@ func (m *MemoryUserStore) UpdateSubscription(subID string, status bool, assigned
 	return nil
 }
 
+func (m *MemoryUserStore) UpdateSubscriptionSlug(subID, slug string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sub, ok := m.subscriptions[subID]
+	if !ok {
+		return errors.New("subscription not found")
+	}
+	for id, other := range m.subscriptions {
+		if id != subID && other.SubSlug == slug {
+			return errors.New("subscription slug already in use")
+		}
+	}
+	sub.SubSlug = slug
+	sub.UpdatedAt = time.Now()
+	return nil
+}
+
 func (m *MemoryUserStore) UpdateSubscriptionSwitch(subID string, switchStatus string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -759,8 +776,33 @@ func (s *UserService) Register(params CreateUserParams) (*User, error) {
 		return nil, err
 	}
 	u.ID = createdID
+	// 带套餐的普通用户同时开通首个订阅；staff 不建订阅（管理员订阅由 EnsureAdmin 管理）。
+	if !u.IsStaff && u.PlanName != "" && !u.ExpireAt.IsZero() {
+		now := time.Now()
+		if err := s.store.CreateSubscription(&Subscription{
+			SubID:         "sub_" + u.SubSlug,
+			UserID:        u.ID,
+			UserUUID:      u.UUID,
+			SubSlug:       u.SubSlug,
+			SubToken:      u.SubToken,
+			SubTicketSeed: u.SubTicketSeed,
+			PlanName:      u.PlanName,
+			AssignedNodes: u.AssignedNodes,
+			LimitBytes:    defaultPlanLimitBytes,
+			ExpireAt:      u.ExpireAt,
+			SwitchStatus:  "on",
+			Status:        u.Status,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}); err != nil {
+			return nil, fmt.Errorf("create initial subscription: %w", err)
+		}
+	}
 	return u, nil
 }
+
+// defaultPlanLimitBytes 是注册时首个订阅的流量额度（100 GiB），与旧实现一致。
+const defaultPlanLimitBytes = 100 << 30
 
 func (s *UserService) Login(username, password string) (string, *User, error) {
 	u, err := s.store.GetUserByUsername(username)
@@ -845,7 +887,7 @@ func (s *UserService) ListSubscriptions(userID uint64) ([]*Subscription, error) 
 func (s *UserService) DeleteUser(id uint64) error {
 	u, err := s.store.GetUser(id)
 	if err == nil && u != nil {
-		if u.Username == "superadmin" || id == 1 {
+		if u.Username == adminUsername || id == 1 {
 			return fmt.Errorf("内置超级管理员禁止删除")
 		}
 	}
@@ -1277,61 +1319,4 @@ func (h *UserHandler) RenewSubscription(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": sub})
-}
-
-// SeedAdmin ensures admin user and admin subscription exist.
-func SeedAdmin(svc *UserService, db UserStore) {
-	initPwd := os.Getenv("ADMIN_INIT_PASSWORD")
-	if initPwd == "" {
-		initPwd = "admin123456"
-	}
-
-	var adminUser *User
-	existing, err := db.GetUserByUsername("admin")
-	if err == nil && existing != nil {
-		adminUser = existing
-		if !existing.IsStaff {
-			_ = db.SetStaff(existing.ID, true)
-		}
-		if existing.PasswordHash == "" {
-			_ = db.SetPassword(existing.ID, HashPassword(initPwd))
-		}
-		if existing.SubSlug != "superadmin" {
-			_ = db.UpdateSubSlug(existing.ID, "superadmin")
-		}
-	} else {
-		u, err := svc.Register(CreateUserParams{
-			Username: "admin", Password: initPwd, Email: "admin@vpn.local", IsStaff: true,
-		})
-		if err == nil && u != nil {
-			adminUser = u
-			_ = db.SetStaff(u.ID, true)
-			_ = db.UpdateSubSlug(u.ID, "superadmin")
-		}
-	}
-
-	if adminUser != nil {
-		subs, _ := db.ListSubscriptions(adminUser.ID)
-		if len(subs) == 0 {
-			now := time.Now()
-			exp := now.Add(10 * 365 * 24 * time.Hour)
-			_ = db.CreateSubscription(&Subscription{
-				SubID:         "sub_admin_" + GenerateShortUUID(),
-				UserID:        adminUser.ID,
-				UserUUID:      adminUser.UUID,
-				SubSlug:       "superadmin",
-				SubToken:      GenerateUserToken(),
-				SubTicketSeed: GenerateTicketSeed(),
-				PlanName:      "管理员专享订阅",
-				AssignedNodes: []string{},
-				LimitBytes:    10 * 1024 * 1024 * 1024 * 1024, // 10TB
-				UsedBytes:     0,
-				ExpireAt:      exp,
-				SwitchStatus:  "on",
-				Status:        true,
-				CreatedAt:     now,
-				UpdatedAt:     now,
-			})
-		}
-	}
 }

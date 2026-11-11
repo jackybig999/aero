@@ -1527,11 +1527,10 @@ func (s *VPSService) UpdateDomain(id uint64, domain string) error {
 		if s.eps != nil && cleanDomain != "" {
 			if ep, ok := s.eps.Get(id); ok {
 				ep.Host = cleanDomain
-				sec := ep.SubSecret
-				if sec == "" {
-					sec = "superadmin"
+				ep.SubURL = ""
+				if ep.SubSecret != "" {
+					ep.SubURL = fmt.Sprintf("https://%s/sub/%s", cleanDomain, ep.SubSecret)
 				}
-				ep.SubURL = fmt.Sprintf("https://%s/sub/%s", cleanDomain, sec)
 				_ = s.eps.Upsert(ep)
 			}
 		}
