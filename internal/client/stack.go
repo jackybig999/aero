@@ -100,6 +100,7 @@ func (e *StackEngine) RestartWithConn(newConn IPPacketConn) error {
 		return errors.New("restart data pump: no TUN device")
 	}
 	e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+	e.pump.SetIPv6Blackhole(true) // 客户端 TUN 不配内层 IPv6：IPv6 一律本地回 ICMPv6 不可达，应用快速回落 IPv4
 	e.pump.SetWebRTCActive(e.webrtcRelayEnabled.Load())
 	if e.onDisconnect != nil {
 		e.pump.SetOnDisconnect(e.onDisconnect)
@@ -121,6 +122,7 @@ func (e *StackEngine) Start() error {
 
 	if e.conn != nil && e.device != nil {
 		e.pump = NewIPDataPump(e.ctx, e.device, e.conn, &e.killSwitch, e.dns)
+		e.pump.SetIPv6Blackhole(true) // 同上；重连新建的泵也必须开启
 		e.pump.SetWebRTCActive(e.webrtcRelayEnabled.Load())
 		if e.onDisconnect != nil {
 			e.pump.SetOnDisconnect(e.onDisconnect)
