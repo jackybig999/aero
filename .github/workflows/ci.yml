@@ -89,10 +89,10 @@ jobs:
           path: dist/server/*
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Job 2: Windows — Client GUI + Watchdog Guard + Desk
+  # Job 2: Windows — Client GUI + Desk
   # ──────────────────────────────────────────────────────────────────────────
   build-client-windows:
-    name: Windows Build & Test (Client GUI + Guard + Desk)
+    name: Windows Build & Test (Client GUI + Desk)
     runs-on: windows-latest
     steps:
       - name: Checkout Code
@@ -106,7 +106,7 @@ jobs:
 
       - name: Vet & Test Client & Desk
         run: |
-          go vet ./internal/client ./cmd/client ./cmd/guard ./internal/desk ./cmd/desk
+          go vet ./internal/client ./cmd/client ./internal/desk ./cmd/desk
           go test -v -short -shuffle=on ./internal/client ./internal/desk
 
       - name: Build Windows Client & Desk
@@ -114,7 +114,6 @@ jobs:
           mkdir -p dist/client-windows
           mkdir -p dist/aeroprot-win-bundle
           go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/aeroprot.exe ./cmd/client
-          go build -v -ldflags="-H windowsgui -s -w" -o dist/aeroprot-win-bundle/guard.exe ./cmd/guard
           curl.exe -fsSL "https://www.wintun.net/builds/wintun-0.14.1.zip" -o wintun.zip
           tar.exe -xf wintun.zip
           Copy-Item wintun/bin/amd64/wintun.dll dist/aeroprot-win-bundle/wintun.dll

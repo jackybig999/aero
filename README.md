@@ -7,7 +7,7 @@
 | 路径 | 内容 |
 |---|---|
 | `cmd/edge`、`internal/edge` | 服务端：数据面、鉴权校验、计量、证书、geo 分发 |
-| `cmd/client`、`cmd/guard`、`internal/client` | 客户端与守护进程 |
+| `cmd/client`、`internal/client` | 客户端 |
 | `cmd/sub`、`internal/sub` | 订阅与计费中台（只读 edge 接口，不写服务端） |
 | `cmd/desk`、`internal/desk` | 桌面工作台：浏览器环境与指纹 |
 | `internal/egress`、`cmd/egress` | 出口模块（M5 新建，ADR-0006） |

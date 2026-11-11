@@ -17,7 +17,7 @@ AERO：基于标准 HTTP/3 MASQUE（RFC 9298 / RFC 9484）的多用户加密隧�
 |---|---|---|---|
 | edge | `internal/edge`、`cmd/edge` | 数据面、token 校验、计量、端口选择、证书、geo 分发、自身配置 | 调用 sub；执行 shell；安装或卸载系统软件 |
 | egress | `internal/egress`、`cmd/egress`（M5 新建） | 出口（direct / warp / relay）、出口健康分 | 鉴权用户；读写 edge 存储 |
-| client | `internal/client`、`cmd/client`、`cmd/guard` | 本地分类、本地 DNS、隧道、防泄漏 | 持有业务事实（配额、档位判定以 edge 为准） |
+| client | `internal/client`、`cmd/client` | 本地分类、本地 DNS、隧道、防泄漏 | 持有业务事实（配额、档位判定以 edge 为准） |
 | sub | `internal/sub`、`cmd/sub` | 用户、计费、token 签发、吊销列表签发 | 写 edge；运行时调用 edge 的写接口 |
 | desk | `internal/desk`、`cmd/desk` | 浏览器环境与指纹，每个环境的状态持久保留 | 直接操作隧道或路由 |
 | 安装脚本 | `deploy/` | 放置二进制与 systemd unit、启动服务 | 读写任何组件配置文件；修改防火墙、路由；生成密钥 |

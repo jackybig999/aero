@@ -11,10 +11,7 @@ mod=$(go list -m)
 
 # cmd 名 -> 允许 import 的组件
 component_of_cmd() {
-  case "$1" in
-    guard) echo client ;;
-    *) echo "$1" ;;
-  esac
+  echo "$1"
 }
 
 fail=0
