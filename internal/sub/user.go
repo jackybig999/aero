@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -180,33 +181,6 @@ func ValidatePassword(p string) error {
 		return errors.New("密码必须包含字母和数字的组合")
 	}
 	return nil
-}
-
-func HashPassword(password string) string {
-	saltBytes := make([]byte, 16)
-	if _, err := rand.Read(saltBytes); err != nil {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
-		copy(saltBytes, h[:16])
-	}
-	salt := hex.EncodeToString(saltBytes)
-	h := sha256.Sum256([]byte(salt + password))
-	return fmt.Sprintf("sha256:%s:%x", salt, h)
-}
-
-func CheckPassword(password, stored string) bool {
-	if len(stored) < 83 || stored[:7] != "sha256:" {
-		return false
-	}
-	rest := stored[7:]
-	idx := strings.IndexByte(rest, ':')
-	if idx < 0 {
-		return false
-	}
-	salt := rest[:idx]
-	hash := rest[idx+1:]
-	h := sha256.Sum256([]byte(salt + password))
-	expected := fmt.Sprintf("%x", h)
-	return subtle.ConstantTimeCompare([]byte(hash), []byte(expected)) == 1
 }
 
 func GenerateUserSlug(username string) string {
@@ -806,8 +780,18 @@ const defaultPlanLimitBytes = 100 << 30
 
 func (s *UserService) Login(username, password string) (string, *User, error) {
 	u, err := s.store.GetUserByUsername(username)
-	if err != nil || !u.Status || !CheckPassword(password, u.PasswordHash) {
+	if err != nil || u == nil {
+		CheckPassword(password, dummyPasswordHash) // 与密码错误时开销一致，不泄露用户名是否存在
 		return "", nil, ErrInvalidCredentials
+	}
+	if !CheckPassword(password, u.PasswordHash) || !u.Status {
+		return "", nil, ErrInvalidCredentials
+	}
+	// 旧格式或旧参数：用已验证的明文重新哈希（迁移失败不影响本次登录）
+	if passwordNeedsRehash(u.PasswordHash) {
+		if err := s.store.SetPassword(u.ID, HashPassword(password)); err != nil {
+			log.Printf("[USER] rehash password for user %d: %v", u.ID, err)
+		}
 	}
 	token := s.GenerateSessionToken(u)
 	return token, u.Sanitize(), nil
