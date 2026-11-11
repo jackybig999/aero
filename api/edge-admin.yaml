@@ -65,7 +65,7 @@ paths:
             schema:
               type: object
               properties:
-                key: { type: string, minLength: 32, maxLength: 128, description: 指定密钥；省略则由 edge 生成 128 位随机密钥。 }
+                key: { type: string, minLength: 32, maxLength: 128, description: "指定密钥；省略则由 edge 生成 128 位随机密钥。" }
       responses:
         "200":
           content:
@@ -115,7 +115,7 @@ paths:
       parameters:
         - { name: slug, in: path, required: true, schema: { type: string } }
       responses:
-        "204": { description: 已删除 }
+        "204": { description: "已删除" }
         "404": { $ref: "#/components/responses/Problem" }
   /v1/subscription/admin:
     get:
@@ -144,7 +144,7 @@ paths:
                 properties:
                   rules_count: { type: integer }
                   etag: { type: string }
-                  updated_at: { type: integer, description: Unix 秒 }
+                  updated_at: { type: integer, description: "Unix 秒" }
         "502": { $ref: "#/components/responses/Problem" }
 components:
   responses:
@@ -174,7 +174,7 @@ components:
           type: object
           required: [not_after, days_left]
           properties:
-            not_after: { type: integer, description: Unix 秒 }
+            not_after: { type: integer, description: "Unix 秒" }
             days_left: { type: integer }
         tun:
           type: object
@@ -183,7 +183,7 @@ components:
             device: { type: string }
             up: { type: boolean }
             forwarding: { type: boolean }
-            firewall_rules: { type: integer, description: 本进程添加且仍存在的规则数 }
+            firewall_rules: { type: integer, description: "本进程添加且仍存在的规则数" }
         warp:
           type: object
           required: [configured]
@@ -217,14 +217,14 @@ components:
       required: [username, slug, created_at, status]
       description: 本地用户（iss=edge），字段语义与中台 subscription 对齐（ADR-0010）。
       properties:
-        uid: { type: string, description: 本地生成的不透明 ID；对应中台 user_uuid（1.1.0 追加） }
-        tier: { type: string, description: 档位名，仅展示；对应中台 plan_name（1.1.0 追加） }
-        classes: { type: array, items: { type: string, enum: [default, ai, browser, game] }, description: 1.1.0 追加 }
-        max_devices: { type: integer, minimum: 1, maximum: 64, description: 1.1.0 追加 }
-        bw_bps: { type: integer, minimum: 0, description: 每秒字节；0 不限（1.1.0 追加） }
+        uid: { type: string, description: "本地生成的不透明 ID；对应中台 user_uuid（1.1.0 追加）" }
+        tier: { type: string, description: "档位名，仅展示；对应中台 plan_name（1.1.0 追加）" }
+        classes: { type: array, items: { type: string, enum: [default, ai, browser, game] }, description: "1.1.0 追加" }
+        max_devices: { type: integer, minimum: 1, maximum: 64, description: "1.1.0 追加" }
+        bw_bps: { type: integer, minimum: 0, description: "每秒字节；0 不限（1.1.0 追加）" }
         username: { type: string }
         slug: { type: string }
-        expire_at: { type: integer, description: Unix 秒；0 表示不限期 }
+        expire_at: { type: integer, description: "Unix 秒；0 表示不限期" }
         traffic_limit_bytes: { type: integer }
         traffic_used_bytes: { type: integer }
         created_at: { type: integer }
@@ -237,10 +237,10 @@ components:
         username: { type: string, pattern: "^[A-Za-z0-9_@.-]{2,64}$" }
         expire_days: { type: integer, minimum: 1 }
         traffic_limit_gb: { type: integer, minimum: 0 }
-        tier: { type: string, pattern: "^[a-z0-9_-]{1,32}$", description: 1.1.0 追加；默认 local }
-        classes: { type: array, items: { type: string, enum: [default, ai, browser, game] }, description: 1.1.0 追加；默认 [default] }
-        max_devices: { type: integer, minimum: 1, maximum: 64, description: 1.1.0 追加；默认 3 }
-        bw_bps: { type: integer, minimum: 0, description: 1.1.0 追加；默认 0（不限） }
+        tier: { type: string, pattern: "^[a-z0-9_-]{1,32}$", description: "1.1.0 追加；默认 local" }
+        classes: { type: array, items: { type: string, enum: [default, ai, browser, game] }, description: "1.1.0 追加；默认 [default]" }
+        max_devices: { type: integer, minimum: 1, maximum: 64, description: "1.1.0 追加；默认 3" }
+        bw_bps: { type: integer, minimum: 0, description: "1.1.0 追加；默认 0（不限）" }
 x-aero-decisions:
   - 控制台 /console/api/* 与本接口共用同一实现（两个入口，一套逻辑）。
   - C3 上线后，本地用户的 token 由 edge 本地签发（iss=edge）。
