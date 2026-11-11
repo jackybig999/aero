@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,16 +86,20 @@ func TestTunHostWindowsLifecycle(t *testing.T) {
 	if h.guard == nil {
 		t.Fatal("WFP DNS guard not active")
 	}
-	for p, want := range map[string]bool{"10.88.0.0/16": true, "192.168.77.1/32": true, "8.0.0.0/7": true} {
-		if got := hasRoute(h.luid, p); got != want {
-			t.Errorf("route %s present = %v, want %v", p, got, want)
+	// 规划中的每一条路由与地址池网段都必须已下发；被 bypass 的地址不得被任何路由覆盖
+	for _, p := range h.filterFamily(tunRoutes(cfg.IPv4, cfg.Plan)) {
+		if !hasRoute(h.luid, p.String()) {
+			t.Errorf("route %s missing", p)
 		}
+	}
+	if prefixesContain(cfg.Plan.IPv4, netip.MustParseAddr("9.9.9.9")) {
+		t.Error("bypass address 9.9.9.9 covered by the plan")
 	}
 
 	if err := h.ApplyRoutes(RoutePlan{IPv4: mustPrefixes("8.8.8.0/24")}); err != nil {
 		t.Fatalf("ApplyRoutes: %v", err)
 	}
-	if !hasRoute(h.luid, "8.8.8.0/24") || hasRoute(h.luid, "8.0.0.0/7") {
+	if !hasRoute(h.luid, "8.8.8.0/24") || hasRoute(h.luid, "8.0.0.0/8") || !hasRoute(h.luid, "10.88.0.0/16") {
 		t.Fatal("incremental route update not applied")
 	}
 	if err := h.SetIPv4(netip.MustParsePrefix("10.88.5.9/16")); err != nil {
@@ -155,5 +160,40 @@ func TestTunHostWindowsNoResidueAfterKill(t *testing.T) {
 	}
 	if adapterExists(winTestTun) {
 		t.Fatal("adapter still exists 10s after the owning process was killed")
+	}
+}
+
+// 真实直连名单（约一万条路由）的下发与拆除耗时。需在 internal\client 目录下运行以读取 china_ip.txt。
+func TestTunHostWindowsChinaListTiming(t *testing.T) {
+	requireHostTunTest(t)
+	b, err := os.ReadFile("china_ip.txt")
+	if err != nil {
+		t.Skipf("china_ip.txt not found (run from internal\\client): %v", err)
+	}
+	var direct []netip.Prefix
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		direct = append(direct, netip.MustParsePrefix(line))
+	}
+	plan, err := PlanTUNRoutes(RoutePlanInput{Direct: direct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	h, err := openTunHost(tunHostConfig{Name: winTestTun, MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), DNS: netip.MustParseAddr("10.88.0.1"), Plan: plan})
+	if err != nil {
+		t.Fatalf("openTunHost: %v", err)
+	}
+	up := time.Since(start)
+	start = time.Now()
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	t.Logf("%d routes: up %v, down %v", len(plan.IPv4)+len(plan.IPv6), up, time.Since(start))
+	if adapterExists(winTestTun) {
+		t.Fatal("adapter still exists after Close")
 	}
 }
