@@ -46,9 +46,6 @@
     // WARP
     warpStatusBadge: document.getElementById('warpStatusBadge'),
     warpToggle: document.getElementById('warpToggle'),
-    btnInstallWarp: document.getElementById('btnInstallWarp'),
-    btnUninstallWarp: document.getElementById('btnUninstallWarp'),
-    btnViewLogs: document.getElementById('btnViewLogs'),
 
     // GeoData
     geodataRulesCount: document.getElementById('geodataRulesCount'),
@@ -74,13 +71,6 @@
     usersTableBody: document.getElementById('usersTableBody'),
 
     // Modal
-    logsModal: document.getElementById('logsModal'),
-    btnCloseLogs: document.getElementById('btnCloseLogs'),
-    btnCloseLogs2: document.getElementById('btnCloseLogs2'),
-    logStepBadge: document.getElementById('logStepBadge'),
-    logStepDesc: document.getElementById('logStepDesc'),
-    logProgressBar: document.getElementById('logProgressBar'),
-    terminalLogs: document.getElementById('terminalLogs'),
 
     toast: document.getElementById('toast'),
   };
@@ -133,8 +123,6 @@
   }
 
   // 3. API Fetchers
-  let isPollingLogs = false;
-  let logPollTimer = null;
 
   async function fetchStatus() {
     try {
@@ -227,32 +215,11 @@
     if (data.warp) {
       const running = !!(data.warp.running || data.warp.active);
       const installed = !!(data.warp.installed || running);
-      const updateAvailable = !!data.warp.update_available;
-      el.warpStatusBadge.textContent = running ? '已接管出站 (SOCKS5 40000)' : (installed ? '未开启接管 (已安装)' : '未安装');
+      el.warpStatusBadge.textContent = running ? '已接管出站 (SOCKS5 40000)' : (installed ? '可用，未开启' : '未检测到本机 WARP 代理');
       el.warpStatusBadge.className = 'badge ' + (running ? 'badge-success' : (installed ? 'badge-warning' : 'badge-danger'));
 
       if (!document.activeElement || document.activeElement !== el.warpToggle) {
         el.warpToggle.checked = !!running;
-      }
-
-      if (el.btnUninstallWarp) {
-        el.btnUninstallWarp.style.display = installed ? 'inline-block' : 'none';
-      }
-
-      if (el.btnInstallWarp) {
-        if (installed && !updateAvailable) {
-          el.btnInstallWarp.disabled = true;
-          el.btnInstallWarp.className = 'btn btn-secondary';
-          el.btnInstallWarp.textContent = 'WARP 官方组件已就绪';
-        } else if (updateAvailable) {
-          el.btnInstallWarp.disabled = false;
-          el.btnInstallWarp.className = 'btn btn-primary';
-          el.btnInstallWarp.textContent = '检测到新版本 (点击静默升级)';
-        } else {
-          el.btnInstallWarp.disabled = false;
-          el.btnInstallWarp.className = 'btn btn-primary';
-          el.btnInstallWarp.textContent = '一键官方静默安装 WARP';
-        }
       }
     }
 
@@ -500,92 +467,6 @@
   }
 
   if (el.warpToggle) el.warpToggle.addEventListener('change', updateWarpToggle);
-
-  // WARP Installer, Uninstaller & Logs
-  if (el.btnInstallWarp) {
-    el.btnInstallWarp.addEventListener('click', async () => {
-      if (!confirm('确定启动官方 Cloudflare WARP 静默安装流水线？\n系统将自动检测旁路保护，绝不破坏现有配置。')) return;
-      openLogsModal();
-      try {
-        const res = await fetch(getApiUrl('/console/api/warp/install'), { method: 'POST' });
-        const data = await res.json();
-        if (data.bypassed) {
-          showToast('旁路保护生效：WARP 已在运行');
-        } else if (data.ok) {
-          showToast('安装流水线已启动');
-        } else {
-          alert(data.error || '启动安装失败');
-        }
-      } catch (e) {
-        alert(`触发安装异常: ${e.message}`);
-      }
-    });
-  }
-
-  if (el.btnUninstallWarp) {
-    el.btnUninstallWarp.addEventListener('click', async () => {
-      if (!confirm('确定要卸载官方 Cloudflare WARP 组件吗？\n卸载后出站将恢复原生直连。')) return;
-      openLogsModal();
-      try {
-        const res = await fetch(getApiUrl('/console/api/warp/uninstall'), { method: 'POST' });
-        const data = await res.json();
-        if (data.ok) {
-          showToast('卸载清理流水线已启动');
-        } else {
-          alert(data.error || '启动卸载失败');
-        }
-      } catch (e) {
-        alert(`触发卸载异常: ${e.message}`);
-      }
-    });
-  }
-
-  function openLogsModal() {
-    el.logsModal.classList.add('active');
-    isPollingLogs = true;
-    pollLogs();
-  }
-
-  function closeLogsModal() {
-    el.logsModal.classList.remove('active');
-    isPollingLogs = false;
-    if (logPollTimer) clearTimeout(logPollTimer);
-  }
-
-  if (el.btnViewLogs) el.btnViewLogs.addEventListener('click', openLogsModal);
-  if (el.btnCloseLogs) el.btnCloseLogs.addEventListener('click', closeLogsModal);
-  if (el.btnCloseLogs2) el.btnCloseLogs2.addEventListener('click', closeLogsModal);
-
-  async function pollLogs() {
-    if (!isPollingLogs) return;
-    try {
-      const res = await fetch(getApiUrl('/console/api/warp/logs'));
-      if (res.ok) {
-        const data = await res.json();
-        el.logStepBadge.textContent = data.step || '执行中';
-        el.logStepDesc.textContent = data.step_desc || '';
-        el.logProgressBar.style.width = `${data.progress || 0}%`;
-
-        if (data.logs && data.logs.length > 0) {
-          el.terminalLogs.textContent = data.logs.map(l => {
-            if (typeof l === 'string') return l;
-            return `[${l.time}] [${l.level.toUpperCase()}] ${l.msg}`;
-          }).join('\n');
-          el.terminalLogs.scrollTop = el.terminalLogs.scrollHeight;
-        }
-
-        if (data.status === 'success' || data.status === 'already_active') {
-          fetchStatus();
-          fetchPurity();
-        }
-      }
-    } catch (e) {
-      console.warn('Logs poll error:', e);
-    }
-    if (isPollingLogs) {
-      logPollTimer = setTimeout(pollLogs, 1500);
-    }
-  }
 
   // GeoData Sync Handler
   if (el.btnUpdateGeoData) {

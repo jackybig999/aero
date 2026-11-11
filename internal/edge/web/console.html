@@ -138,11 +138,7 @@
             </div>
           </div>
 
-          <div class="warp-actions">
-            <button class="btn btn-primary" id="btnInstallWarp">一键官方静默安装 WARP</button>
-            <button class="btn btn-danger" id="btnUninstallWarp" style="display:none;">一键卸载 WARP</button>
-            <button class="btn btn-secondary" id="btnViewLogs">查看安装日志</button>
-          </div>
+          <p class="desc-text">WARP 是插件：请按 Cloudflare 官方文档在本机安装官方客户端并使用 proxy 模式（127.0.0.1:40000）。edge 只读取其状态，并按上方开关决定是否使用；edge 不安装、不配置 WARP。</p>
         </div>
       </section>
 
@@ -273,26 +269,6 @@
       </section>
     </main>
 
-    <!-- Modal: WARP Real-time Installation Logs -->
-    <div class="modal" id="logsModal">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3>Cloudflare WARP 静默安装实时日志</h3>
-          <button class="btn-close" id="btnCloseLogs">&times;</button>
-        </div>
-        <div class="modal-body">
-          <div class="step-progress">
-            <span class="step-badge" id="logStepBadge">检测中</span>
-            <span class="step-desc" id="logStepDesc">准备启动流水线...</span>
-            <div class="progress-bar"><div class="progress-fill" id="logProgressBar" style="width: 0%"></div></div>
-          </div>
-          <pre class="terminal-log" id="terminalLogs">正在连接日志流...</pre>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" id="btnCloseLogs2">关闭</button>
-        </div>
-      </div>
-    </div>
 
     <!-- Toast Notification -->
     <div class="toast" id="toast">复制成功</div>

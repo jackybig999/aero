@@ -102,7 +102,6 @@ type Server struct {
 	consoleHandler   *ConsoleHandler
 	metricsCollector *MetricsCollector
 	purityEngine     *PurityEngine
-	warpInstaller    *WarpInstaller
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -117,7 +116,8 @@ type Server struct {
 	startedAt time.Time
 
 	instanceLock *instanceLock
-	hostStateDir string // 非空：已修改宿主（规则、ip_forward），Close 时按该目录的状态日志还原
+	hostStateDir string     // 非空：已修改宿主（规则、ip_forward），Close 时按该目录的状态日志还原
+	warpMu       sync.Mutex // 串行化 WARP 开关的修改与持久化
 
 	// ready 为真表示可以接流量：Start 完成后置位，排空开始时清除（/readyz）。
 	ready atomic.Bool
@@ -414,7 +414,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// 8. Console, Sysinfo, Purity & WARP Installer (Milestone 3)
 	metricsCollector := NewMetricsCollector(2 * time.Second)
 	purityEngine := NewPurityEngine(warpProxy)
-	warpInstaller := NewWarpInstaller(dialGuard)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -433,7 +432,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		geoHandler:       geoHandler,
 		metricsCollector: metricsCollector,
 		purityEngine:     purityEngine,
-		warpInstaller:    warpInstaller,
 		ctx:              ctx,
 		cancel:           cancel,
 		certLoader:       certLoader,
@@ -449,7 +447,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		subStore,
 		metricsCollector,
 		purityEngine,
-		warpInstaller,
 		srv.serveCover,
 	)
 	srv.consoleHandler = consoleHandler
@@ -500,9 +497,6 @@ func (s *Server) MetricsCollector() *MetricsCollector { return s.metricsCollecto
 
 // PurityEngine returns the IP cleanliness engine
 func (s *Server) PurityEngine() *PurityEngine { return s.purityEngine }
-
-// WarpInstaller returns the Cloudflare WARP installer
-func (s *Server) WarpInstaller() *WarpInstaller { return s.warpInstaller }
 
 // CertLoader returns the server's dynamic cert loader
 func (s *Server) CertLoader() *DynamicCertLoader {
@@ -1274,6 +1268,9 @@ func persistServerConfig(cfg ServerConfig) error {
 	set("data_dir", cfg.DataDir)
 	set("admin_key", cfg.AdminKey)
 	set("token", cfg.Token)
+	// WARP 开关显式写入（关闭时为空串），否则“关闭”无法持久化
+	existing["warp_proxy"] = cfg.WarpProxy
+	existing["warp_all"] = cfg.WarpAll
 
 	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
@@ -1419,4 +1416,26 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.Close()
 	return err
+}
+
+// SetWarpEgress 打开或关闭 WARP 出口插件（经本机官方客户端 SOCKS5 代理），立即生效并持久化到配置文件。
+// edge 只使用、不安装 WARP（ADR-0012 第 6 条）。
+func (s *Server) SetWarpEgress(enabled, all bool) error {
+	s.warpMu.Lock()
+	defer s.warpMu.Unlock()
+	cfg := s.cfg
+	if enabled {
+		cfg.WarpProxy, cfg.WarpAll = warpLocalProxy, all
+	} else {
+		cfg.WarpProxy, cfg.WarpAll = "", false
+	}
+	if err := persistServerConfig(cfg); err != nil {
+		return fmt.Errorf("persist WARP setting: %w", err)
+	}
+	s.cfg.WarpProxy, s.cfg.WarpAll = cfg.WarpProxy, cfg.WarpAll
+	if s.dialGuard != nil {
+		s.dialGuard.SetWarpProxy(cfg.WarpProxy, cfg.WarpAll)
+	}
+	log.Printf("[WARP] egress plugin %s (all=%v)", map[bool]string{true: "enabled", false: "disabled"}[enabled], cfg.WarpAll)
+	return nil
 }

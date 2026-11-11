@@ -14,7 +14,6 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -47,7 +46,6 @@ type ConsoleHandler struct {
 	subStore         *SubStore
 	metricsCollector *MetricsCollector
 	purityEngine     *PurityEngine
-	warpInstaller    *WarpInstaller
 	coverRenderer    func(http.ResponseWriter, *http.Request)
 }
 
@@ -60,7 +58,6 @@ func NewConsoleHandler(
 	subStore *SubStore,
 	metricsCollector *MetricsCollector,
 	purityEngine *PurityEngine,
-	warpInstaller *WarpInstaller,
 	coverRenderer func(http.ResponseWriter, *http.Request),
 ) *ConsoleHandler {
 	return &ConsoleHandler{
@@ -71,7 +68,6 @@ func NewConsoleHandler(
 		subStore:         subStore,
 		metricsCollector: metricsCollector,
 		purityEngine:     purityEngine,
-		warpInstaller:    warpInstaller,
 		coverRenderer:    coverRenderer,
 	}
 }
@@ -218,16 +214,11 @@ func (h *ConsoleHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		h.handleAPIPurity(w, r)
 		return true
 
-	case p == "/console/api/warp/install" && r.Method == http.MethodPost:
-		h.handleAPIWarpInstall(w, r)
-		return true
-
-	case p == "/console/api/warp/uninstall" && r.Method == http.MethodPost:
-		h.handleAPIWarpUninstall(w, r)
-		return true
-
-	case p == "/console/api/warp/logs" && r.Method == http.MethodGet:
-		h.handleAPIWarpLogs(w, r)
+	case p == "/console/api/warp/install" || p == "/console/api/warp/uninstall" || p == "/console/api/warp/logs":
+		// WARP 是插件（ADR-0012 第 6 条）：edge 不安装、不卸载，只读取状态并按开关使用。
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusGone)
+		_, _ = w.Write([]byte(`{"ok":false,"error":"edge 不再安装或卸载 WARP：请按 Cloudflare 官方文档安装官方客户端（proxy 模式，端口 40000），此处只读取状态并用开关控制。"}`))
 		return true
 
 	case p == "/console/api/warp/toggle" && r.Method == http.MethodPost:
@@ -409,7 +400,7 @@ func (h *ConsoleHandler) handleAPIStatus(w http.ResponseWriter, r *http.Request)
 			"traffic_limit_bytes": int64(0),
 		},
 		"warp": map[string]any{
-			"installed":        warpEnabled || (h.warpInstaller != nil && (h.warpInstaller.GetStatus().Bypassed || h.warpInstaller.IsInstalled())),
+			"installed":        warpEnabled || warpLocalProxyAvailable(), // 只读状态：本机官方客户端 proxy 模式端口是否在线
 			"running":          warpEnabled,
 			"active":           warpEnabled,
 			"proxy_addr":       warpProxy,
@@ -505,84 +496,6 @@ func (h *ConsoleHandler) handleAPIPurity(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, resp)
 }
 
-func (h *ConsoleHandler) handleAPIWarpInstall(w http.ResponseWriter, r *http.Request) {
-	if h.warpInstaller == nil {
-		h.warpInstaller = NewWarpInstaller(h.dialGuard)
-	}
-	status, bypassed, err := h.warpInstaller.StartInstall(r.Context())
-	if errors.Is(err, ErrInstallInProgress) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"ok":false,"status":"running","error":"installation already in progress"}`))
-		return
-	}
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error())))
-		return
-	}
-
-	if bypassed {
-		writeJSON(w, map[string]any{
-			"ok":       true,
-			"status":   "already_active",
-			"bypassed": true,
-			"message":  "Cloudflare WARP proxy 127.0.0.1:40000 is already active; installation bypassed to preserve configuration.",
-		})
-		return
-	}
-
-	writeJSON(w, map[string]any{
-		"ok":       true,
-		"status":   status,
-		"bypassed": false,
-		"message":  "Cloudflare WARP silent installation pipeline started.",
-	})
-}
-
-func (h *ConsoleHandler) handleAPIWarpUninstall(w http.ResponseWriter, r *http.Request) {
-	if h.warpInstaller == nil {
-		h.warpInstaller = NewWarpInstaller(h.dialGuard)
-	}
-	status, err := h.warpInstaller.StartUninstall(r.Context())
-	if err != nil {
-		if errors.Is(err, ErrInstallInProgress) {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusConflict)
-			_, _ = w.Write([]byte(`{"ok":false,"error":"installation or uninstallation already in progress"}`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":false,"error":"%s"}`, err.Error())))
-		return
-	}
-
-	writeJSON(w, map[string]any{
-		"ok":      true,
-		"status":  status,
-		"message": "Cloudflare WARP uninstallation pipeline started.",
-	})
-}
-
-func (h *ConsoleHandler) handleAPIWarpLogs(w http.ResponseWriter, r *http.Request) {
-	if h.warpInstaller == nil {
-		h.warpInstaller = NewWarpInstaller(h.dialGuard)
-	}
-	st := h.warpInstaller.GetStatus()
-	writeJSON(w, map[string]any{
-		"ok":        true,
-		"status":    st.Status,
-		"progress":  st.Progress,
-		"step":      st.Step,
-		"step_desc": st.StepDesc,
-		"bypassed":  st.Bypassed,
-		"error":     st.Error,
-		"logs":      st.Logs,
-	})
-}
-
 type warpToggleRequest struct {
 	Enabled  *bool `json:"enabled"`
 	WarpAll  *bool `json:"warp_all"`
@@ -600,29 +513,31 @@ func (h *ConsoleHandler) handleAPIWarpToggle(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if req.Enabled != nil && *req.Enabled {
-		// Verify port 40000 is open
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:40000", 350*time.Millisecond)
-		if err != nil {
+	if req.Enabled != nil {
+		if *req.Enabled && !warpLocalProxyAvailable() {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"ok":false,"error":"WARP local port 40000 is not active. Please install and start WARP first."}`))
+			_, _ = w.Write([]byte(`{"ok":false,"error":"WARP local proxy 127.0.0.1:40000 is not active; install and start the official client in proxy mode first."}`))
 			return
 		}
-		_ = conn.Close()
-
 		warpAll := true
 		if req.WarpAll != nil {
 			warpAll = *req.WarpAll
 		} else if req.CamelAll != nil {
 			warpAll = *req.CamelAll
 		}
-		if h.dialGuard != nil {
-			h.dialGuard.SetWarpProxy("127.0.0.1:40000", warpAll)
+		if h.server == nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"server not available"}`))
+			return
 		}
-	} else if req.Enabled != nil && !*req.Enabled {
-		if h.dialGuard != nil {
-			h.dialGuard.SetWarpProxy("", false)
+		// 开关持久化到配置文件，重启后保持（ADR-0012 第 6 条）。
+		if err := h.server.SetWarpEgress(*req.Enabled, warpAll); err != nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error())))
+			return
 		}
 	}
 
@@ -926,4 +841,17 @@ func randomHexCode(n int) (string, error) {
 		sb.WriteByte(chars[num.Int64()])
 	}
 	return sb.String(), nil
+}
+
+// warpLocalProxy 是 Cloudflare 官方客户端 proxy 模式的默认本地 SOCKS5 地址。
+const warpLocalProxy = "127.0.0.1:40000"
+
+// warpLocalProxyAvailable 只读检测本机 WARP 代理端口是否在线（不执行 warp-cli，不修改任何状态）。
+func warpLocalProxyAvailable() bool {
+	conn, err := net.DialTimeout("tcp", warpLocalProxy, 350*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }

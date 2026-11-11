@@ -5,230 +5,18 @@
 package edge
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-func TestWarpInstaller_BypassProtection(t *testing.T) {
-	dg := NewDialGuard(64)
-	defer dg.Close()
-	installer := NewWarpInstaller(dg)
-
-	var execCalls atomic.Int32
-	installer.SetHooks(
-		func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			execCalls.Add(1)
-			return []byte("ok"), nil
-		},
-		func(addr string) bool {
-			// Mock port 40000 is open
-			return addr == "127.0.0.1:40000"
-		},
-		func(addr string) bool {
-			// Mock trace has warp=on
-			return true
-		},
-		func() bool {
-			return true
-		},
-		func() bool {
-			return true
-		},
-	)
-
-	status, bypassed, err := installer.StartInstall(context.Background())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if status != "already_active" {
-		t.Errorf("expected status 'already_active', got %q", status)
-	}
-	if !bypassed {
-		t.Errorf("expected bypassed true, got false")
-	}
-
-	// Crucial rule: Apt / systemctl must NOT be executed if bypassed
-	if calls := execCalls.Load(); calls != 0 {
-		t.Errorf("expected 0 command executions on bypass, got %d", calls)
-	}
-
-	st := installer.GetStatus()
-	if !st.Bypassed {
-		t.Errorf("expected status.Bypassed true")
-	}
-	if st.Progress != 100 {
-		t.Errorf("expected Progress 100 on bypass, got %d", st.Progress)
-	}
-	if len(st.Logs) == 0 {
-		t.Errorf("expected bypass log entry, got empty logs")
-	}
-}
-
-func TestWarpInstaller_FullPipeline(t *testing.T) {
-	dg := NewDialGuard(64)
-	defer dg.Close()
-	installer := NewWarpInstaller(dg)
-
-	var executedCommands []string
-	var mu sync.Mutex
-
-	portActive := false
-	installer.SetHooks(
-		func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			mu.Lock()
-			cmdStr := name + " " + strings.Join(args, " ")
-			executedCommands = append(executedCommands, cmdStr)
-			mu.Unlock()
-
-			if strings.Contains(cmdStr, "warp-cli") || strings.Contains(cmdStr, "systemctl") {
-				portActive = true
-			}
-			return []byte("success"), nil
-		},
-		func(addr string) bool {
-			return portActive
-		},
-		func(addr string) bool {
-			return false // initially not bypassed
-		},
-		func() bool {
-			return true
-		},
-		func() bool {
-			return true // root
-		},
-	)
-
-	status, bypassed, err := installer.StartInstall(context.Background())
-	if err != nil {
-		t.Fatalf("StartInstall: %v", err)
-	}
-	if status != "running" {
-		t.Errorf("expected status 'running', got %q", status)
-	}
-	if bypassed {
-		t.Errorf("expected bypassed false")
-	}
-
-	// Wait for pipeline completion
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		st := installer.GetStatus()
-		if st.Status == "success" || st.Status == "failed" {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	st := installer.GetStatus()
-	if st.Status != "success" {
-		t.Fatalf("expected pipeline status 'success', got %q (error: %s)", st.Status, st.Error)
-	}
-	if st.Progress != 100 {
-		t.Errorf("expected Progress 100, got %d", st.Progress)
-	}
-
-	mu.Lock()
-	cmds := executedCommands
-	mu.Unlock()
-
-	if len(cmds) < 4 {
-		t.Errorf("expected at least 4 commands executed, got %d: %v", len(cmds), cmds)
-	}
-}
-
-func TestWarpInstaller_ConcurrentInstallConflict(t *testing.T) {
-	dg := NewDialGuard(64)
-	defer dg.Close()
-	installer := NewWarpInstaller(dg)
-
-	blockCh := make(chan struct{})
-	installer.SetHooks(
-		func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			<-blockCh
-			return []byte("ok"), nil
-		},
-		func(addr string) bool { return false },
-		func(addr string) bool { return false },
-		func() bool { return true },
-		func() bool { return true },
-	)
-
-	// First call starts pipeline
-	_, _, err := installer.StartInstall(context.Background())
-	if err != nil {
-		t.Fatalf("StartInstall #1: %v", err)
-	}
-
-	// Second concurrent call should immediately return conflict
-	_, _, err2 := installer.StartInstall(context.Background())
-	if err2 == nil || err2 != ErrInstallInProgress {
-		t.Errorf("expected ErrInstallInProgress on concurrent start, got: %v", err2)
-	}
-
-	close(blockCh)
-}
-
-func TestWarpInstaller_UninstallPipeline(t *testing.T) {
-	dg := NewDialGuard(64)
-	defer dg.Close()
-	installer := NewWarpInstaller(dg)
-
-	// Pre-set proxy
-	dg.SetWarpProxy("127.0.0.1:40000", true)
-
-	var executedCmds []string
-	var mu sync.Mutex
-
-	installer.SetHooks(
-		func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			mu.Lock()
-			executedCmds = append(executedCmds, fmt.Sprintf("%s %s", name, strings.Join(args, " ")))
-			mu.Unlock()
-			return []byte("ok"), nil
-		},
-		func(addr string) bool { return false },
-		func(addr string) bool { return false },
-		func() bool { return false },
-		func() bool { return true },
-	)
-
-	status, err := installer.StartUninstall(context.Background())
-	if err != nil {
-		t.Fatalf("StartUninstall: %v", err)
-	}
-	if status != "running" {
-		t.Errorf("expected status 'running', got %s", status)
-	}
-
-	// Wait for pipeline to finish
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		st := installer.GetStatus()
-		if st.Status == "idle" || st.Status == "failed" {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	st := installer.GetStatus()
-	if st.Status != "idle" {
-		t.Fatalf("expected uninstall status 'idle', got: %+v", st)
-	}
-
-	// Verify WARP proxy was cleared in dialGuard
-	proxy, all, enabled, _ := dg.GetWarpStatus()
-	if enabled || all || proxy != "" {
-		t.Errorf("expected dialGuard warp proxy disabled, got proxy=%s, enabled=%v", proxy, enabled)
-	}
-}
 
 func TestDialGuard_WarpToggle_RaceSafety(t *testing.T) {
 	dg := NewDialGuard(128)
@@ -399,4 +187,59 @@ func TestDialGuard_ConcurrentSetWarpProxy_RaceFree(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// WARP 开关持久化（ADR-0012 第 6 条）：开启写入 warp_proxy/warp_all，关闭显式写空，重启后保持。
+func TestSetWarpEgressPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edge.json")
+	if err := os.WriteFile(path, []byte(`{"domain":"n.example","listen":":2083"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{cfg: ServerConfig{ConfigPath: path, Domain: "n.example", Listen: ":2083"}, dialGuard: NewDialGuard(4)}
+	defer s.dialGuard.Close()
+	read := func() map[string]any {
+		var m map[string]any
+		b, err := os.ReadFile(path)
+		if err == nil {
+			err = json.Unmarshal(b, &m)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	if err := s.SetWarpEgress(true, false); err != nil {
+		t.Fatal(err)
+	}
+	if m := read(); m["warp_proxy"] != warpLocalProxy || m["warp_all"] != false || m["listen"] != ":2083" {
+		t.Fatalf("after enable: %v", m)
+	}
+	if proxy, all, enabled, _ := s.dialGuard.GetWarpStatus(); !enabled || proxy != warpLocalProxy || all {
+		t.Fatalf("dial guard not updated: proxy=%q all=%v enabled=%v", proxy, all, enabled)
+	}
+	if err := s.SetWarpEgress(false, true); err != nil {
+		t.Fatal(err)
+	}
+	if m := read(); m["warp_proxy"] != "" || m["warp_all"] != false {
+		t.Fatalf("after disable: %v", m)
+	}
+	if _, _, enabled, _ := s.dialGuard.GetWarpStatus(); enabled {
+		t.Fatal("dial guard still routes via WARP after disable")
+	}
+}
+
+// edge 不再安装或卸载 WARP：旧接口返回 410 与操作说明。
+func TestConsoleWarpInstallEndpointsGone(t *testing.T) {
+	h := NewConsoleHandler("console_key_0123456789", nil, nil, nil, nil, nil, nil, nil)
+	for _, path := range []string{"/console/api/warp/install", "/console/api/warp/uninstall", "/console/api/warp/logs"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Header.Set("X-Aero-Admin-Key", "console_key_0123456789")
+		rec := httptest.NewRecorder()
+		if !h.TryServe(rec, req) {
+			t.Fatalf("%s not handled", path)
+		}
+		if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "官方") {
+			t.Errorf("%s = %d %s, want 410 with guidance", path, rec.Code, rec.Body.String())
+		}
+	}
 }
