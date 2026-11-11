@@ -198,32 +198,26 @@ jobs:
           ls -lh release-dist/
 
       - name: Resolve Release Tag and Version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER=$(cat VERSION 2>/dev/null || echo "1.0.0")
           VER=$(echo "$VER" | tr -d '[:space:]' | sed 's/^v//')
           echo "RELEASE_VER=$VER" >> $GITHUB_ENV
           echo "RELEASE_TAG=v$VER" >> $GITHUB_ENV
-
-      - name: Prune Stale Release Assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "=== Auditing GitHub Release $RELEASE_TAG Assets ==="
-          EXISTING_ASSETS=$(gh api repos/${{ github.repository }}/releases/tags/$RELEASE_TAG --jq '.assets[] | "\(.id) \(.name)"' 2>/dev/null || true)
-          if [ -n "$EXISTING_ASSETS" ]; then
-            while read -r asset_id asset_name; do
-              if [ -n "$asset_id" ] && [ -n "$asset_name" ]; then
-                if [ ! -f "release-dist/$asset_name" ]; then
-                  echo "[PRUNE] Removing obsolete release asset: $asset_name (id: $asset_id)"
-                  gh api --method DELETE "repos/${{ github.repository }}/releases/assets/$asset_id" || true
-                else
-                  echo "[KEEP] Current valid release asset: $asset_name"
-                fi
-              fi
-            done <<< "$EXISTING_ASSETS"
+          # 已发布的版本不可改写：资产一旦发布即被部署与校验，重新构建会改变哈希。要发布新产物必须先升 VERSION。
+          if gh api "repos/${{ github.repository }}/releases/tags/v$VER" >/dev/null 2>&1; then
+            echo "RELEASE_EXISTS=1" >> $GITHUB_ENV
+            echo "Release v$VER already exists; not republishing. Bump VERSION to publish." >> $GITHUB_STEP_SUMMARY
           fi
 
+      - name: Generate SHA256SUMS
+        if: env.RELEASE_EXISTS != '1'
+        run: |
+          cd release-dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+
       - name: Publish All Multi-Platform Assets to GitHub Release
+        if: env.RELEASE_EXISTS != '1'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
