@@ -1453,62 +1453,7 @@ func (s *VPSService) RestartEdge(ctx context.Context, id uint64) (map[string]any
 // Harvest & VPS Edge Installation (from vps_install.go)
 // ============================================================================
 
-// parseHarvest parses deployment output from target VPS into an EndpointInfo.
-func parseHarvest(out string, cred *Credentials) EndpointInfo {
-	kv := make(map[string]string)
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if i := strings.Index(line, "="); i > 0 {
-			kv[line[:i]] = line[i+1:]
-		}
-	}
-	host := strings.TrimSpace(kv["ADVERTISE"])
-	if host == "" {
-		if cred != nil && cred.Domain != "" {
-			host = cred.Domain
-		} else if cred != nil {
-			host = cred.IP
-		}
-	}
-	host = strings.TrimPrefix(host, "https://")
-	host = strings.TrimPrefix(host, "http://")
-	host = strings.Split(host, "/")[0]
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	port := 443
-	if p, err := strconv.Atoi(strings.TrimSpace(kv["PORT"])); err == nil && p > 0 {
-		port = p
-	}
-	sec := strings.TrimSpace(kv["SUB_SECRET"])
-	admin := strings.TrimSpace(kv["ADMIN_KEY"])
-	subURL := ""
-	if host != "" && sec != "" {
-		subURL = "https://" + host + "/sub/" + sec
-	}
-
-	var vpsID uint64
-	var name string
-	if cred != nil {
-		vpsID = cred.VPSID
-		name = cred.Name
-	}
-	return EndpointInfo{
-		VPSID:     vpsID,
-		Name:      name,
-		Host:      host,
-		Port:      port,
-		SubSecret: sec,
-		AdminKey:  admin,
-		HasAdmin:  admin != "",
-		SubURL:    subURL,
-		Installed: sec != "" && host != "",
-		UpdatedAt: time.Now(),
-	}
-}
-
-// InstallAeroOnVPS installs or refreshes the AERO edge on the remote host via SSH.
+// InstallAeroOnVPS 刷新节点信息：只读读取已安装 edge 的端口与管理密钥（不安装、不修改节点）。
 func (s *VPSService) InstallAeroOnVPS(vpsID uint64) (*EndpointInfo, error) {
 	cred, err := s.store.GetCredentials(vpsID)
 	if err != nil {
@@ -1526,13 +1471,30 @@ func (s *VPSService) InstallAeroOnVPS(vpsID uint64) (*EndpointInfo, error) {
 	}
 	defer client.Close()
 
-	// 远程获取已安装服务状态
-	harvestCmd := "if [ -f /etc/aero/env ]; then cat /etc/aero/env; fi"
-	out, _ := runSSH(client, harvestCmd, 5*time.Second)
-
-	ep := parseHarvest(out, cred)
+	// 只读回读 edge 持久化的端口与管理密钥（与安装流程相同来源 /etc/aero/edge.json）
+	st, err := readEdgeServiceState(client)
+	if err != nil {
+		return nil, err
+	}
+	host := cred.Domain
+	if host == "" {
+		host = cred.IP
+	}
+	ep := EndpointInfo{
+		VPSID:     vpsID,
+		Name:      cred.Name,
+		Host:      host,
+		IP:        cred.IP,
+		Port:      st.Port,
+		AdminKey:  st.AdminKey,
+		HasAdmin:  st.AdminKey != "",
+		Installed: true,
+		UpdatedAt: time.Now(),
+	}
 	if s.eps != nil {
-		_ = s.eps.Upsert(ep)
+		if err := s.eps.Upsert(ep); err != nil {
+			return nil, err
+		}
 	}
 	return &ep, nil
 }
@@ -2041,16 +2003,6 @@ func DefaultUninstallSteps() []DeployStep {
 	}
 }
 
-func DefaultWarpInstallSteps() []DeployStep {
-	return []DeployStep{
-		{Key: "warp_detect", Title: "环境检测与已安装旁路", Status: "pending"},
-		{Key: "warp_install", Title: "Debian 官方源配置与安装", Status: "pending"},
-		{Key: "warp_config", Title: "WARP 模式与 40000 端口配置", Status: "pending"},
-		{Key: "firewall_ufw", Title: "UFW 防火墙增量放行", Status: "pending"},
-		{Key: "verify_unblock", Title: "Edge 联动与 AI 解锁验收", Status: "pending"},
-	}
-}
-
 func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService) {
 	globalTaskManager.AppendLog(taskID, "===> 开始 AERO Edge 安装/部署流水线 <===")
 
@@ -2097,380 +2049,87 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 	globalTaskManager.AppendLog(taskID, "[SSH 连通] 安全终端连接建立成功，目标系统环境正常。")
 	globalTaskManager.SetStep(taskID, "ssh_connect", "success", "已连通", 40, "拉取官方源")
 
-	// 步骤 3：版本前置检测与按需拉取部署
+	// 步骤 3 起（ADR-0011 运维面、ADR-0012 宿主状态）：安装只做三件事——放置经校验的二进制、
+	// 全新安装时写入最小配置、注册服务单元。不安装系统软件，不改防火墙、sysctl、nftables/iptables
+	// 持久配置，不写 edge 的业务数据（sub_meta.json 等），密钥不出现在命令行。端口轮试、令牌、证书
+	// 发现均由 edge 自己完成并持久化到 /etc/aero/edge.json。
 	globalTaskManager.SetStep(taskID, "binary_deploy", "running", "检测远端版本并部署...", 45, "版本检测")
-
-	targetVer := strings.TrimSpace(src.ReleaseTag)
-	if targetVer == "" || targetVer == "main" {
-		if verBytes, err := os.ReadFile("VERSION"); err == nil && len(strings.TrimSpace(string(verBytes))) > 0 {
-			targetVer = strings.TrimSpace(string(verBytes))
-		} else {
-			targetVer = "1.3.1"
-		}
+	if src.SourceType != "github" || strings.TrimSpace(src.ReleaseTag) == "" || src.ReleaseTag == "main" {
+		errMsg := "未找到可用的 GitHub Release（安装只使用经校验的发布产物，不在节点上编译源码）"
+		globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "官方源不可用")
+		globalTaskManager.Finish(taskID, "failed", errMsg)
+		return
 	}
-	cleanTargetVer := strings.TrimPrefix(targetVer, "v")
-
-	verCheckScript := `set +e
-if [ -x /usr/local/bin/aero-edge ]; then
-  echo "INSTALLED=yes"
-  VER=$(/usr/local/bin/aero-edge -version 2>/dev/null | awk '{print $2}')
-  echo "REMOTE_VER=$VER"
-else
-  echo "INSTALLED=no"
-  echo "REMOTE_VER="
-fi
-`
-	verOut, _ := runSSH(client, verCheckScript, 8*time.Second)
-	verKV := parseKV(verOut)
-	remoteInstalled := verKV["INSTALLED"] == "yes"
-	remoteVer := strings.TrimPrefix(strings.TrimSpace(verKV["REMOTE_VER"]), "v")
-
-	if remoteInstalled && remoteVer != "" && remoteVer == cleanTargetVer {
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[版本检测 提示] 目标 VPS 当前已安装最新版本 (aero-edge v%s)，无需重复拉取构建！", remoteVer))
-		globalTaskManager.SetStep(taskID, "binary_deploy", "success", fmt.Sprintf("已是最新版 (v%s)", remoteVer), 65, "配置服务")
-	} else {
-		if remoteInstalled {
-			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[版本升级 清理] 远端版本 (v%s) 与最新目标版本 (v%s) 不一致，正在清理旧版组件...", remoteVer, cleanTargetVer))
-			cleanOldCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; pkill -9 -f aero-edge 2>/dev/null || true; rm -f /usr/local/bin/aero-edge; rm -rf /tmp/aero-git /tmp/aero-*"
-			_, _ = runSSH(client, cleanOldCmd, 15*time.Second)
-		} else {
-			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[全新部署] 目标 VPS 尚未安装核心组件，开始拉取官方最新版本 (v%s)...", cleanTargetVer))
-		}
-
-		_, _ = runSSH(client, "mkdir -p /usr/local/bin /var/lib/aero /var/lib/aero/tls /etc/aero /var/log /tmp", 10*time.Second)
-
-		token := os.Getenv("AERO_GITHUB_TOKEN")
-		if token == "" {
-			token = os.Getenv("GITHUB_TOKEN")
-		}
-		var downloadCmd string
-		if src.SourceType == "github" && src.DownloadURL != "" {
-			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方 Release 拉取] 目标 VPS 正在从 GitHub 官方发布包拉取: %s...", src.DownloadURL))
-			if token != "" {
-				downloadCmd = fmt.Sprintf("curl -fsSL -H %q -H %q -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge",
-					"Authorization: Bearer "+token, "Accept: application/octet-stream", src.DownloadURL)
-			} else {
-				downloadCmd = fmt.Sprintf("curl -fsSL -o /usr/local/bin/aero-edge %q && chmod 755 /usr/local/bin/aero-edge", src.DownloadURL)
-			}
-		} else {
-			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[官方公开源同步] 目标 VPS 正在从 GitHub 官方公开源（%s:main）拉取源码并构建核心组件...", src.Repo))
-			downloadCmd = fmt.Sprintf("rm -rf /tmp/aero-git && git clone --depth 1 https://github.com/%s.git /tmp/aero-git && (command -v go >/dev/null || (apt-get update -y && apt-get install -y golang-go 2>/dev/null || yum install -y golang 2>/dev/null)) && cd /tmp/aero-git && go build -v -ldflags=\"-s -w\" -o /usr/local/bin/aero-edge ./cmd/edge && chmod 755 /usr/local/bin/aero-edge && rm -rf /tmp/aero-git", src.Repo)
-		}
-
-		out, err := runSSH(client, downloadCmd, 180*time.Second)
-		if err != nil {
-			errMsg := fmt.Sprintf("从官方源拉取并安装失败: %v (输出: %s)", err, strings.TrimSpace(out))
-			globalTaskManager.AppendLog(taskID, "[拉取 错误] "+errMsg)
-			globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "官方源拉取失败")
-			globalTaskManager.Finish(taskID, "failed", errMsg)
-			return
-		}
-
-		globalTaskManager.AppendLog(taskID, "[部署 成功] 已成功从官方源置入最新 /usr/local/bin/aero-edge (0755)。")
-		globalTaskManager.SetStep(taskID, "binary_deploy", "success", "拉取部署完成", 65, "配置服务")
+	tag := strings.TrimSpace(src.ReleaseTag)
+	if err := deployEdgeBinary(client, taskID, src.Repo, tag); err != nil {
+		globalTaskManager.AppendLog(taskID, "[部署 错误] "+err.Error())
+		globalTaskManager.SetStep(taskID, "binary_deploy", "failed", err.Error(), 40, "部署失败")
+		globalTaskManager.Finish(taskID, "failed", err.Error())
+		return
 	}
+	globalTaskManager.SetStep(taskID, "binary_deploy", "success", "已部署 "+tag, 65, "配置服务")
 
-	// 步骤 4：配置 systemd 服务与运行环境
+	// 步骤 4：配置与服务单元
 	globalTaskManager.SetStep(taskID, "service_config", "running", "写入服务配置...", 70, "配置服务")
 	host := cred.Domain
 	if host == "" {
 		host = cred.IP
 	}
-	adminKey := "ak_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	subSec := "sub_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	tok := "tok_" + cred.Name
-
-	// 端口选择与智能轮试：支持管理员显式指定端口；未指定或默认 443 则探测 443，遇第三方占用自动轮试候选标准 HTTPS 端口
-	targetPort := 443
-	if customPort > 0 && customPort != 443 {
-		targetPort = customPort
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口指定] 管理员显式指定部署监听端口: %d", targetPort))
-	} else {
-		portDetectScript := `set +e
-OCCUPIED_BY=""
-SELECTED_PORT=443
-LINE_443=""
-if command -v ss >/dev/null 2>&1; then
-  LINE_443=$(ss -lnutp 2>/dev/null | grep -E ':(443)\b' | head -1)
-elif command -v netstat >/dev/null 2>&1; then
-  LINE_443=$(netstat -lnutp 2>/dev/null | grep -E ':(443)\b' | head -1)
-fi
-if [ -n "$LINE_443" ]; then
-  PNAME=$(echo "$LINE_443" | grep -o 'users:(("[^"]*"' | tr -d 'users:(("' | head -1)
-  [ -z "$PNAME" ] && PNAME=$(echo "$LINE_443" | awk '{print $NF}')
-  PID=$(echo "$LINE_443" | grep -o 'pid=[0-9]*' | tr -d 'pid=' | head -1)
-  if [ "$PNAME" != "aero-edge" ] && [ "$PNAME" != "aero" ] && [ "$PNAME" != "ao-dg" ]; then
-    echo "OCCUPIED_BY=${PNAME:-unknown}(${PID:-0})"
-    # 443 端口被第三方占用，轮试标准 HTTPS 候选备用端口与高位自治端口
-    for CANDIDATE in 2083 2087 8443 2053 2096 10443 24443 34443 44443; do
-      IN_USE=0
-      LINE_CAND=$(ss -lnutp 2>/dev/null | grep -E ":$CANDIDATE\b" | head -1)
-      if [ -n "$LINE_CAND" ]; then
-        if echo "$LINE_CAND" | grep -qE "aero-edge|ao-dg|aero"; then
-          echo "SELECTED_PORT=$CANDIDATE"
-          echo "REUSING_AERO_PORT=yes"
-          break
-        else
-          IN_USE=1
-          echo "CANDIDATE_${CANDIDATE}_OCCUPIED=yes"
-        fi
-      fi
-      if [ "$IN_USE" -eq 0 ]; then
-        echo "SELECTED_PORT=$CANDIDATE"
-        break
-      fi
-    done
-  fi
-fi
-`
-		detOut, _ := runSSH(client, portDetectScript, 6*time.Second)
-		detKV := parseKV(detOut)
-		if occ, ok := detKV["OCCUPIED_BY"]; ok && occ != "" {
-			if selP, ok2 := detKV["SELECTED_PORT"]; ok2 && selP != "" {
-				if pNum, err := strconv.Atoi(selP); err == nil && pNum > 0 {
-					targetPort = pNum
-					if detKV["REUSING_AERO_PORT"] == "yes" {
-						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口复用] 443 端口已被第三方进程 [%s] 占用，检测到 AERO Edge 已在备用端口 %d 运行，自动对齐复用！", occ, targetPort))
-					} else if detKV["CANDIDATE_8443_OCCUPIED"] == "yes" {
-						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口冲突自愈] 443 与 8443 备用端口均已被第三方进程 [%s] 占用！自动跳过已占用端口，选定空闲标准 HTTPS 端口: %d", occ, targetPort))
-					} else {
-						globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口冲突自愈] 443 端口已被第三方进程 [%s] 占用！自动轮试选定备用标准 HTTPS 端口: %d", occ, targetPort))
-					}
-				}
-			} else {
-				globalTaskManager.AppendLog(taskID, fmt.Sprintf("[端口提示] 443 端口占用者: [%s]，尝试共用或接管", occ))
-			}
-		} else {
-			globalTaskManager.AppendLog(taskID, "[端口检测] 443 端口空闲，使用标准 443 端口部署。")
-		}
-	}
-
-	// 证书自适应搜寻与双轨闭环策略：老机多源扫描复用，新机原生 autocert 自动申领，绝不硬写死路径
-	certScanScript := fmt.Sprintf(`set +e
-CERT_MODE="autocert"
-mkdir -p /var/lib/aero/tls /var/lib/aero/certs
-DOMAIN_LOWER=$(echo "%s" | tr '[:upper:]' '[:lower:]')
-
-# 1. 严格层级扫描老机器存量证书：顶级优先 /root/.acme.sh/ 域名目录 (ECC/RSA)，次优 certbot，兜底常规目录
-FOUND_CERT=""
-FOUND_KEY=""
-for D in "/root/.acme.sh/${DOMAIN_LOWER}_ecc" "/root/.acme.sh/${DOMAIN_LOWER}" "/etc/letsencrypt/live/${DOMAIN_LOWER}" "/root/cert/${DOMAIN_LOWER}" "/root/certs/${DOMAIN_LOWER}" "/root/cert" "/root/certs" "/usr/local/s-ui/bin/cert" "/etc/ssl"; do
-  if [ -d "$D" ]; then
-    FC=$(find "$D" -maxdepth 2 -type f \( -name "fullchain.cer" -o -name "fullchain.pem" -o -name "*${DOMAIN_LOWER}*.cer" -o -name "*${DOMAIN_LOWER}*fullchain*.pem" -o -name "${DOMAIN_LOWER}.crt" \) 2>/dev/null | head -1)
-    if [ -n "$FC" ]; then
-      KY=$(find "$(dirname "$FC")" -maxdepth 1 -type f \( -name "${DOMAIN_LOWER}.key" -o -name "*${DOMAIN_LOWER}*.key" -o -name "privkey.pem" -o -name "*.key" \) 2>/dev/null | head -1)
-      if [ -n "$KY" ]; then
-        FOUND_CERT="$FC"
-        FOUND_KEY="$KY"
-        break
-      fi
-    fi
-  fi
-done
-
-if [ -n "$FOUND_CERT" ] && [ -n "$FOUND_KEY" ]; then
-  cp -f "$FOUND_CERT" /var/lib/aero/tls/fullchain.pem
-  cp -f "$FOUND_KEY" /var/lib/aero/tls/privkey.pem
-  chmod 600 /var/lib/aero/tls/privkey.pem
-  echo "FOUND_EXISTING_CERT=yes"
-  echo "CERT_SOURCE=$FOUND_CERT"
-  CERT_MODE="manual"
-fi
-
-if [ "$CERT_MODE" != "manual" ]; then
-  if [ -f /var/lib/aero/tls/fullchain.pem ] && [ -f /var/lib/aero/tls/privkey.pem ]; then
-    echo "FOUND_EXISTING_CERT=yes"
-    echo "CERT_SOURCE=/var/lib/aero/tls"
-    CERT_MODE="manual"
-  else
-    echo "FOUND_EXISTING_CERT=no"
-    CERT_MODE="autocert"
-  fi
-fi
-echo "CERT_MODE=$CERT_MODE"
-`, host)
-
-	certScanOut, _ := runSSH(client, certScanScript, 8*time.Second)
-	certKV := parseKV(certScanOut)
-	certMode := certKV["CERT_MODE"]
-	var certFlags string
-	if certMode == "manual" {
-		certSource := certKV["CERT_SOURCE"]
-		if certSource == "" {
-			certSource = "/var/lib/aero/tls"
-		}
-		certFlags = "-cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem"
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[证书检测 通过] 成功发现并复用老主机存量证书: %s", certSource))
-	} else {
-		certFlags = "-cert /var/lib/aero/tls/fullchain.pem -key /var/lib/aero/tls/privkey.pem"
-		globalTaskManager.AppendLog(taskID, "[证书检测 通过] 使用节点原生 TLS 证书: /var/lib/aero/tls/fullchain.pem")
-	}
-
-	serviceUnit := fmt.Sprintf(`[Unit]
-Description=AERO Edge Server
-After=network.target
-
-[Service]
-Type=simple
-Restart=always
-RestartSec=5
-WorkingDirectory=/var/lib/aero
-EnvironmentFile=-/etc/aero/edge.conf
-ExecStart=/usr/local/bin/aero-edge -listen :%d -data-dir /var/lib/aero -advertise-host %s -domain %s -token %s -admin-key %s %s
-ExecReload=/bin/kill -HUP $MAINPID
-# 服务退出（含崩溃）后还原宿主：删除带标记的转发规则、还原 ip_forward（ADR-0012）
-ExecStopPost=/usr/local/bin/aero-edge cleanup-host
-LimitNOFILE=65535
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-`, targetPort, host, host, tok, adminKey, certFlags)
-
-	confContent := fmt.Sprintf("ADVERTISE=%s\nPORT=%d\nSUB_SECRET=%s\nADMIN_KEY=%s\nTOKEN=%s\n", host, targetPort, subSec, adminKey, tok)
-
-	writeCmd := fmt.Sprintf("cat << 'EOF' > /etc/aero/edge.conf\n%sEOF\ncat << 'EOF' > /etc/systemd/system/aero-edge.service\n%sEOF\nsystemctl daemon-reload && systemctl enable aero-edge\n", confContent, serviceUnit)
-	_, err = runSSH(client, writeCmd, 15*time.Second)
+	adminKey, err := randomHex(32)
 	if err != nil {
-		errMsg := fmt.Sprintf("配置 systemd 失败: %v", err)
+		globalTaskManager.Finish(taskID, "failed", err.Error())
+		return
+	}
+	created, err := configureEdgeService(client, host, adminKey, customPort)
+	if err != nil {
+		errMsg := fmt.Sprintf("配置服务失败: %v", err)
 		globalTaskManager.AppendLog(taskID, "[配置 错误] "+errMsg)
 		globalTaskManager.SetStep(taskID, "service_config", "failed", errMsg, 65, "配置失败")
 		globalTaskManager.Finish(taskID, "failed", errMsg)
 		return
 	}
-
-	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[配置 成功] /etc/systemd/system/aero-edge.service 及运行环境写入完毕 (端口: %d)。", targetPort))
-
-	// === 全陌生环境自适应网络与 UDP/TCP 透明重定向保障 ===
-	redirScript := fmt.Sprintf(`set +e
-TARGET_PORT=%d
-REDIR_ACTIVE="no"
-REDIR_METHOD="none"
-
-# 1. 检查候选重定向端口占用状况 (杜绝破坏第三方业务)
-# 若 TARGET_PORT 为标准 443，尝试开启 2083/2087 -> 443 透明重定向规避运营商 UDP 443 封锁；
-# 若 TARGET_PORT 不为 443 (443 已被第三方占用)，则坚决禁止向 443 重定向，避免将流量转发给非 AERO 进程！
-if [ "$TARGET_PORT" -eq 443 ]; then
-  OCC_2083=$(ss -lnutp 2>/dev/null | grep -E ':(2083)\b' | head -1)
-  if [ -n "$OCC_2083" ] && ! echo "$OCC_2083" | grep -qE "aero|nft|iptables"; then
-    echo "OCCUPIED_2083=yes"
-  else
-    # 2. 首选 nftables
-    if command -v nft >/dev/null 2>&1 || (apt-get update -y >/dev/null 2>&1 && apt-get install -y nftables >/dev/null 2>&1) || (yum install -y nftables >/dev/null 2>&1); then
-      if nft add table inet aero_nat 2>/dev/null; then
-        nft 'add chain inet aero_nat prerouting { type nat hook prerouting priority dstnat; }' 2>/dev/null || true
-        nft add rule inet aero_nat prerouting udp dport 2083 redirect to :443 2>/dev/null || true
-        nft add rule inet aero_nat prerouting tcp dport 2083 redirect to :443 2>/dev/null || true
-        nft add rule inet aero_nat prerouting udp dport 2087 redirect to :443 2>/dev/null || true
-        nft add rule inet aero_nat prerouting tcp dport 2087 redirect to :443 2>/dev/null || true
-        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
-        systemctl enable nftables 2>/dev/null || true
-        systemctl restart nftables 2>/dev/null || true
-        REDIR_ACTIVE="yes"
-        REDIR_METHOD="nftables"
-      fi
-    fi
-
-    # 3. 若 nftables 不可用，回退至 iptables
-    if [ "$REDIR_ACTIVE" != "yes" ]; then
-      if iptables -t nat -L -n >/dev/null 2>&1; then
-        iptables -t nat -C PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
-        iptables -t nat -C PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
-        iptables -t nat -C PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
-        iptables -t nat -C PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || iptables -t nat -A PREROUTING -p tcp --dport 2087 -j REDIRECT --to-ports 443 2>/dev/null || true
-        which iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
-        REDIR_ACTIVE="yes"
-        REDIR_METHOD="iptables"
-      fi
-    fi
-  fi
-fi
-
-# 4. 全环境防火墙放行 (UFW / Firewalld) - 必须放行实际业务端口 TARGET_PORT 以及备用端口
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  ufw allow ${TARGET_PORT}/tcp 2>/dev/null || true
-  ufw allow ${TARGET_PORT}/udp 2>/dev/null || true
-  ufw allow 2083/tcp 2>/dev/null || true
-  ufw allow 2083/udp 2>/dev/null || true
-  ufw allow 2087/tcp 2>/dev/null || true
-  ufw allow 2087/udp 2>/dev/null || true
-fi
-if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-  firewall-cmd --add-port=${TARGET_PORT}/tcp --add-port=${TARGET_PORT}/udp --add-port=2083/tcp --add-port=2083/udp --add-port=2087/tcp --add-port=2087/udp --permanent 2>/dev/null || true
-  firewall-cmd --reload 2>/dev/null || true
-fi
-
-echo "REDIR_ACTIVE=$REDIR_ACTIVE"
-echo "REDIR_METHOD=$REDIR_METHOD"
-`, targetPort)
-	redirOut, _ := runSSH(client, redirScript, 15*time.Second)
-	redirKV := parseKV(redirOut)
-	redirActive := redirKV["REDIR_ACTIVE"] == "yes"
-	redirMethod := redirKV["REDIR_METHOD"]
-
-	dataPlanePort := targetPort
-	if targetPort == 443 && redirActive {
-		dataPlanePort = 2083
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[网络防护 自适应] 通过 %s 成功配置 UDP/TCP 2083->443 透明重定向（成功规避移动等运营商 UDP 443 封锁）！", redirMethod))
-	} else if !redirActive {
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[网络探测 提示] 宿主机环境保持原生 %d 端口监听（未启用 2083 重定向）。", targetPort))
+	if created {
+		globalTaskManager.AppendLog(taskID, "[配置] 已写入最小配置 /etc/aero/edge.json（0600）；端口、令牌、证书由 edge 自行选择并持久化。")
+	} else {
+		globalTaskManager.AppendLog(taskID, "[配置] 保留节点现有 /etc/aero/edge.json（配置归 edge 管理，不覆盖）。")
 	}
-
 	globalTaskManager.SetStep(taskID, "service_config", "success", "配置就绪", 85, "验收服务")
 
-	// 步骤 5：启动服务与健康验收
+	// 步骤 5：启动与验收（只读回读 edge 选定的端口与管理密钥）
 	globalTaskManager.SetStep(taskID, "verify_health", "running", "启动服务...", 90, "服务验收")
-	globalTaskManager.AppendLog(taskID, "[验收] 重启 aero-edge.service 并检验服务活性...")
+	st, err := readEdgeServiceState(client)
+	if err != nil {
+		errMsg := fmt.Sprintf("服务未就绪: %v", err)
+		globalTaskManager.AppendLog(taskID, "[验收 错误] "+errMsg)
+		globalTaskManager.SetStep(taskID, "verify_health", "failed", errMsg, 90, "服务未就绪")
+		globalTaskManager.Finish(taskID, "failed", errMsg)
+		return
+	}
+	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[验收] aero-edge 运行中，监听端口 %d。", st.Port))
+	if len(st.Firewalls) > 0 {
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[防火墙 提示] 检测到 %s 处于启用状态。安装程序不修改宿主防火墙，请运维放行 UDP/TCP %d 及备用端口 2083 2087 8443 2053 2096 10443 24443 34443 44443。",
+			strings.Join(st.Firewalls, "、"), st.Port))
+	}
 
-	_, _ = runSSH(client, "systemctl restart aero-edge", 15*time.Second)
-	time.Sleep(2 * time.Second)
-
-	checkCmd := fmt.Sprintf("systemctl is-active aero-edge; ss -lntp | grep ':%d'", targetPort)
-	checkOut, _ := runSSH(client, checkCmd, 10*time.Second)
-	isActive := strings.Contains(checkOut, "active")
-	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[验收 结果] 运行状态: %s (端口 %d 检测: %v)", strings.TrimSpace(strings.Split(checkOut, "\n")[0]), targetPort, strings.Contains(checkOut, fmt.Sprint(targetPort))))
-
-	// 同步生成目标 VPS 的 sub_meta.json 与 client-sub.json，数据面指定 dataPlanePort
-	edgeSubSetupScript := fmt.Sprintf(`cat << 'EOF' > /var/lib/aero/sub_meta.json
-{
-  "secret": "%s",
-  "servers": [
-    {
-      "name": "%s",
-      "host": "%s",
-      "address": "%s:%d",
-      "token": "%s",
-      "sni": "%s",
-      "protocol": "connect-ip",
-      "line_type": "quic",
-      "isp_affinity": "cmcc"
-    }
-  ]
-}
-EOF
-`, subSec, cred.Name, host, host, dataPlanePort, tok, host)
-	_, _ = runSSH(client, edgeSubSetupScript, 10*time.Second)
-
-	// 更新中台 Endpoint 资产状态：强制统一标准 443 HTTPS 零端口订阅链接
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	subUrl := fmt.Sprintf("https://%s/sub/%s", host, subSec)
 	ep := EndpointInfo{
 		VPSID:     vpsID,
 		Name:      cred.Name,
 		Host:      host,
-		Port:      dataPlanePort,
-		SubSecret: subSec,
-		AdminKey:  adminKey,
-		HasAdmin:  true,
-		SubURL:    subUrl,
+		IP:        cred.IP,
+		Port:      st.Port,
+		AdminKey:  st.AdminKey,
+		HasAdmin:  st.AdminKey != "",
 		Installed: true,
+		Version:   strings.TrimPrefix(tag, "v"),
 		UpdatedAt: time.Now(),
 	}
 	if svc.eps != nil {
-		_ = svc.eps.Upsert(ep)
+		if err := svc.eps.Upsert(ep); err != nil {
+			globalTaskManager.AppendLog(taskID, "[资产 警告] 记录节点信息失败: "+err.Error())
+		}
 	}
 
 	// 联动上线节点
@@ -2482,7 +2141,7 @@ EOF
 			if n.VPSID == vpsID || (cred.IP != "" && n.IP == cred.IP) {
 				n.Status = true
 				n.Region = geo
-				n.Port = int32(dataPlanePort)
+				n.Port = int32(st.Port)
 				n.UpdatedAt = time.Now()
 				found = true
 				break
@@ -2490,25 +2149,169 @@ EOF
 		}
 		svc.nodeSvc.mu.Unlock()
 		if !found {
-			_, _ = svc.nodeSvc.CreateNode(cred.Name, geo, host, "aero-quic", int32(dataPlanePort), 500, false, 100, vpsID)
+			_, _ = svc.nodeSvc.CreateNode(cred.Name, geo, host, "aero-quic", int32(st.Port), 500, false, 100, vpsID)
 		}
 	}
 
-	// 联动同步中台全部活跃用户凭证至新就绪的 Edge 节点 (闭环杜绝远端 404)
+	// 过渡期：用户凭证仍经 /admin/subs 同步；C3 签名 token 上线后删除（ADR-0010/0011）。
 	if svc.userStore != nil {
 		if err := svc.SyncAllUsersToVPS(vpsID, svc.userStore); err == nil {
-			globalTaskManager.AppendLog(taskID, "[凭证同步] 已自动同步活跃用户专属订阅至新部署的 Edge 节点。")
+			globalTaskManager.AppendLog(taskID, "[凭证同步] 已同步活跃用户凭证至节点。")
+		} else {
+			globalTaskManager.AppendLog(taskID, "[凭证同步 警告] "+err.Error())
 		}
 	}
 
-	detail := "服务运行正常"
-	if !isActive {
-		detail = "已部署但待启动"
-	}
 	InvalidateDiagCache(vpsID)
-	globalTaskManager.AppendLog(taskID, "===> AERO Edge 部署全部完成，状态正常已可运维！ <===")
-	globalTaskManager.SetStep(taskID, "verify_health", "success", detail, 100, "安装完成")
+	globalTaskManager.AppendLog(taskID, "===> AERO Edge 部署完成 <===")
+	globalTaskManager.SetStep(taskID, "verify_health", "success", "服务运行正常", 100, "安装完成")
 	globalTaskManager.Finish(taskID, "success", "")
+}
+
+// deployEdgeBinary 在节点上按架构下载 Release 产物，对照同一 Release 的 SHA256SUMS 校验后原子替换。
+// 旧 Release 没有 SHA256SUMS 时记录“未校验”并继续；有 SHA256SUMS 但缺条目或不匹配时拒绝安装。
+func deployEdgeBinary(client *ssh.Client, taskID uint64, repo, tag string) error {
+	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", repo, tag)
+	script := fmt.Sprintf(`set -e
+case "$(uname -m)" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) echo "RESULT=unsupported-arch-$(uname -m)"; exit 0 ;;
+esac
+ASSET="edge_linux_$ARCH"
+TMP="/usr/local/bin/.aero-edge.new.$$"
+SUMS="/tmp/.aero-edge-sums.$$"
+trap 'rm -f "$TMP" "$SUMS"' EXIT
+mkdir -p /usr/local/bin
+curl -fsSL --retry 3 -o "$TMP" "%s/$ASSET" || { echo "RESULT=download-failed"; exit 0; }
+if curl -fsSL --retry 2 -o "$SUMS" "%s/SHA256SUMS"; then
+  EXP=$(awk -v n="$ASSET" '$2==n || $2=="*"n {print $1}' "$SUMS")
+  [ -n "$EXP" ] || { echo "RESULT=checksum-entry-missing"; exit 0; }
+  echo "$EXP  $TMP" | sha256sum -c - >/dev/null 2>&1 || { echo "RESULT=checksum-mismatch"; exit 0; }
+  echo "CHECKSUM=verified"
+else
+  echo "CHECKSUM=unavailable"
+fi
+chmod 0755 "$TMP"
+VER=$("$TMP" -version 2>/dev/null | awk '{print $2}')
+[ -n "$VER" ] || { echo "RESULT=binary-not-runnable"; exit 0; }
+mv -f "$TMP" /usr/local/bin/aero-edge
+echo "VERSION=$VER"
+echo "RESULT=ok"
+`, base, base)
+	out, err := runSSH(client, script, 180*time.Second)
+	kv := parseKV(out)
+	if err != nil || kv["RESULT"] != "ok" {
+		return fmt.Errorf("部署 aero-edge %s 失败: result=%q err=%v", tag, kv["RESULT"], err)
+	}
+	if kv["CHECKSUM"] == "verified" {
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[部署] aero-edge %s 已安装，SHA256 校验通过。", kv["VERSION"]))
+	} else {
+		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[部署 警告] aero-edge %s 已安装，但该 Release 无 SHA256SUMS，未做哈希校验。", kv["VERSION"]))
+	}
+	return nil
+}
+
+// edgeServiceUnit 是 aero-edge 的 systemd 单元：命令行不含任何密钥（配置在 0600 的 /etc/aero/edge.json），
+// 退出（含崩溃）后由 ExecStopPost 还原宿主状态（ADR-0012）。
+const edgeServiceUnit = `[Unit]
+Description=AERO Edge Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aero-edge -config /etc/aero/edge.json
+ExecStopPost=/usr/local/bin/aero-edge cleanup-host -config /etc/aero/edge.json
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// configureEdgeService 全新安装时写入最小配置（已有配置不覆盖，返回 created=false），写入服务单元并重启服务。
+func configureEdgeService(client *ssh.Client, host, adminKey string, customPort int) (created bool, err error) {
+	cfg := map[string]any{"domain": host, "data_dir": "/var/lib/aero", "admin_key": adminKey}
+	if customPort > 0 {
+		cfg["listen"] = fmt.Sprintf(":%d", customPort)
+	}
+	cfgJSON, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	script := fmt.Sprintf(`set -e
+mkdir -p /etc/aero /var/lib/aero
+chmod 700 /etc/aero
+if [ -f /etc/aero/edge.json ]; then
+  echo "CONFIG=existing"
+else
+  ( umask 077; cat > /etc/aero/edge.json.new <<'AERO_CFG_EOF'
+%s
+AERO_CFG_EOF
+  )
+  mv -f /etc/aero/edge.json.new /etc/aero/edge.json
+  echo "CONFIG=created"
+fi
+cat > /etc/systemd/system/aero-edge.service <<'AERO_UNIT_EOF'
+%sAERO_UNIT_EOF
+systemctl daemon-reload
+systemctl enable aero-edge >/dev/null 2>&1
+systemctl restart aero-edge
+echo "RESULT=ok"
+`, cfgJSON, edgeServiceUnit)
+	out, err := runSSH(client, script, 30*time.Second)
+	kv := parseKV(out)
+	if err != nil || kv["RESULT"] != "ok" {
+		return false, fmt.Errorf("result=%q err=%v", kv["RESULT"], err)
+	}
+	return kv["CONFIG"] == "created", nil
+}
+
+type edgeServiceState struct {
+	Port      int
+	AdminKey  string
+	Firewalls []string // 处于启用状态的宿主防火墙（只检测，不修改）
+}
+
+// readEdgeServiceState 等待服务就绪后只读回读 edge 持久化的监听端口与管理密钥，并检测宿主防火墙。
+func readEdgeServiceState(client *ssh.Client) (edgeServiceState, error) {
+	script := `set +e
+for i in $(seq 1 30); do
+  if systemctl is-active --quiet aero-edge && grep -q '"listen"' /etc/aero/edge.json 2>/dev/null; then break; fi
+  sleep 0.5
+done
+echo "ACTIVE=$(systemctl is-active aero-edge)"
+echo "LISTEN=$(grep -o '"listen"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
+echo "ADMIN_KEY=$(grep -o '"admin_key"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then echo "FW_UFW=yes"; fi
+if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then echo "FW_FIREWALLD=yes"; fi
+`
+	out, err := runSSH(client, script, 30*time.Second)
+	if err != nil {
+		return edgeServiceState{}, err
+	}
+	kv := parseKV(out)
+	if kv["ACTIVE"] != "active" {
+		return edgeServiceState{}, fmt.Errorf("aero-edge 状态为 %q（请查看 journalctl -u aero-edge）", kv["ACTIVE"])
+	}
+	_, portStr, err := net.SplitHostPort(kv["LISTEN"])
+	if err != nil {
+		return edgeServiceState{}, fmt.Errorf("无法从 edge.json 读取监听地址 %q: %w", kv["LISTEN"], err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 {
+		return edgeServiceState{}, fmt.Errorf("监听端口无效 %q", portStr)
+	}
+	st := edgeServiceState{Port: port, AdminKey: kv["ADMIN_KEY"]}
+	if kv["FW_UFW"] == "yes" {
+		st.Firewalls = append(st.Firewalls, "UFW")
+	}
+	if kv["FW_FIREWALLD"] == "yes" {
+		st.Firewalls = append(st.Firewalls, "firewalld")
+	}
+	return st, nil
 }
 
 func RunUninstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
@@ -2535,7 +2338,8 @@ func RunUninstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
 	// 步骤 2：停止服务与进程深度清理
 	globalTaskManager.SetStep(taskID, "stop_service", "running", "停止并杀死系统服务...", 50, "停止服务")
 	globalTaskManager.AppendLog(taskID, "[停止] 正在执行 systemctl stop & disable aero-edge 并终结进程...")
-	stopCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; pkill -9 -f aero-edge 2>/dev/null || true; pkill -9 -f '/usr/local/bin/aero' 2>/dev/null || true"
+	// 正常停止，让 ExecStopPost（cleanup-host）还原宿主状态；不强杀，不按路径前缀误杀其他进程。
+	stopCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; true"
 	_, _ = runSSH(client, stopCmd, 15*time.Second)
 	globalTaskManager.SetStep(taskID, "stop_service", "success", "服务已停止并终结", 65, "清理文件与网络规则")
 
@@ -2548,13 +2352,12 @@ func RunUninstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
 rm -rf /usr/local/bin/aero-edge /usr/local/bin/aero /etc/systemd/system/aero-edge.service /etc/systemd/system/aero.service /etc/aero /var/lib/aero/tls /var/lib/aero/certs /var/lib/aero/edge.conf
 systemctl daemon-reload 2>/dev/null || true
 
-# 清理 nftables 重定向规则
+# 清理旧版本（≤1.2.x）安装流程添加的重定向规则（本程序的残留）；不改写系统防火墙持久配置文件
 if command -v nft >/dev/null 2>&1; then
   nft delete table inet aero_nat 2>/dev/null || true
-  nft list ruleset > /etc/nftables.conf 2>/dev/null || true
 fi
 
-# 清理 iptables 重定向规则
+# 同上：旧版本 iptables 重定向规则
 if command -v iptables >/dev/null 2>&1; then
   iptables -t nat -D PREROUTING -p udp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
   iptables -t nat -D PREROUTING -p tcp --dport 2083 -j REDIRECT --to-ports 443 2>/dev/null || true
@@ -2580,249 +2383,5 @@ fi
 	InvalidateDiagCache(vpsID)
 	globalTaskManager.AppendLog(taskID, "===> AERO Edge 深度卸载完成，中台已同步切换为未安装状态！ <===")
 	globalTaskManager.SetStep(taskID, "verify_clean", "success", "卸载完成", 100, "卸载完成")
-	globalTaskManager.Finish(taskID, "success", "")
-}
-
-func RunWarpInstallTask(taskID uint64, vpsID uint64, svc *VPSService) {
-	globalTaskManager.AppendLog(taskID, "===> 开始 Cloudflare 官方 WARP 出口保护与送中解除流水线 <===")
-
-	// 步骤 1：SSH 连接与环境检测
-	globalTaskManager.SetStep(taskID, "warp_detect", "running", "建立安全连接与环境检测...", 10, "环境检测")
-	cred, err := svc.store.GetCredentials(vpsID)
-	if err != nil {
-		errMsg := fmt.Sprintf("获取 VPS 凭证失败: %v", err)
-		globalTaskManager.AppendLog(taskID, "[SSH 错误] "+errMsg)
-		globalTaskManager.SetStep(taskID, "warp_detect", "failed", errMsg, 10, "凭据异常")
-		globalTaskManager.Finish(taskID, "failed", errMsg)
-		return
-	}
-
-	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[SSH] 正在连通目标主机 %s (%s:%d)...", cred.Name, cred.IP, cred.SSHPort))
-	client, err := dialSSH(SSHCredentials{
-		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 15*time.Second)
-	if err != nil {
-		errMsg := fmt.Sprintf("SSH 握手失败: %v", err)
-		globalTaskManager.AppendLog(taskID, "[SSH 错误] "+errMsg)
-		globalTaskManager.SetStep(taskID, "warp_detect", "failed", errMsg, 10, "SSH 连接失败")
-		globalTaskManager.Finish(taskID, "failed", errMsg)
-		return
-	}
-	defer client.Close()
-
-	globalTaskManager.AppendLog(taskID, "[SSH 连通] 安全终端连接成功，正在检测远端系统环境与 WARP 安装状态...")
-
-	detScript := `set +e
-OS_NAME=""
-OS_CODENAME=""
-if [ -f /etc/os-release ]; then
-  . /etc/os-release
-  OS_NAME=$ID
-  OS_CODENAME=$VERSION_CODENAME
-fi
-[ -z "$OS_CODENAME" ] && OS_CODENAME="bookworm"
-
-HAS_WARP_CLI="no"
-if command -v warp-cli >/dev/null 2>&1; then
-  HAS_WARP_CLI="yes"
-fi
-
-PORT_40000="no"
-if ss -tlnp 2>/dev/null | grep -q ":40000 "; then
-  PORT_40000="yes"
-elif netstat -tlnp 2>/dev/null | grep -q ":40000 "; then
-  PORT_40000="yes"
-fi
-
-WARP_TRACE="no"
-if curl -s4 -m 3 --socks5 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
-  WARP_TRACE="yes"
-fi
-
-echo "OS_NAME=$OS_NAME"
-echo "OS_CODENAME=$OS_CODENAME"
-echo "HAS_WARP_CLI=$HAS_WARP_CLI"
-echo "PORT_40000=$PORT_40000"
-echo "WARP_TRACE=$WARP_TRACE"
-`
-	detOut, _ := runSSH(client, detScript, 10*time.Second)
-	detKV := parseKV(detOut)
-	osName := detKV["OS_NAME"]
-	osCodename := detKV["OS_CODENAME"]
-	hasWarpCli := detKV["HAS_WARP_CLI"] == "yes"
-	port40000 := detKV["PORT_40000"] == "yes"
-	warpTrace := detKV["WARP_TRACE"] == "yes"
-
-	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[环境检测] 操作系统: %s (%s) · warp-cli 已存在: %v · 40000 端口活跃: %v · WARP Trace: %v", osName, osCodename, hasWarpCli, port40000, warpTrace))
-
-	skipInstall := false
-	skipConfig := false
-
-	// 核心防重复安装与现有配置保护逻辑：
-	// 场景 A：已经安装且 40000 正常运行 -> 严格旁路，跳过安装与配置，直接进入防火墙与 Edge 验收
-	if hasWarpCli && port40000 && warpTrace {
-		globalTaskManager.AppendLog(taskID, "[已安装旁路 保护命中] 检测到宿主机当前已安装官方 Cloudflare WARP 且 127.0.0.1:40000 代理正在正常运行！")
-		globalTaskManager.AppendLog(taskID, "[防重复保护] 严格遵循防重复安装铁律，直接跳过 APT 安装与重新注册步骤，保护现有配置不被覆盖！")
-		globalTaskManager.SetStep(taskID, "warp_detect", "success", "已存在且运行中 (触发旁路保护)", 25, "环境检测")
-		globalTaskManager.SetStep(taskID, "warp_install", "skipped", "跳过安装 (已存在组件)", 0, "")
-		globalTaskManager.SetStep(taskID, "warp_config", "skipped", "跳过配置 (40000 运行中)", 0, "")
-		skipInstall = true
-		skipConfig = true
-	} else if hasWarpCli {
-		// 场景 B：已安装 warp-cli 但 40000 端口未就绪 -> 跳过 APT 安装，直接进入配置步骤
-		globalTaskManager.AppendLog(taskID, "[已安装检测 提示] 宿主机已安装 warp-cli 二进制，但 40000 代理未处于活跃状态。跳过 APT 重复安装，直接配置并启动服务！")
-		globalTaskManager.SetStep(taskID, "warp_detect", "success", "已存在 warp-cli", 25, "环境检测")
-		globalTaskManager.SetStep(taskID, "warp_install", "skipped", "跳过安装 (已存在二进制)", 0, "")
-		skipInstall = true
-	} else {
-		// 场景 C：全新安装 -> 校验 Debian/Ubuntu 环境并配置官方源
-		if osName != "debian" && osName != "ubuntu" {
-			globalTaskManager.AppendLog(taskID, fmt.Sprintf("[系统提示] 当前系统为 %s，官方 WARP 主要支持 Debian/Ubuntu，将以 Debian (%s) 官方源尝试安装...", osName, osCodename))
-		}
-		globalTaskManager.SetStep(taskID, "warp_detect", "success", fmt.Sprintf("系统 %s (%s) 就绪", osName, osCodename), 20, "环境检测")
-	}
-
-	// 步骤 2：配置 Debian 官方源并安装 cloudflare-warp
-	if !skipInstall {
-		globalTaskManager.SetStep(taskID, "warp_install", "running", "配置 Cloudflare 官方 APT 源并安装...", 25, "官方源安装")
-		globalTaskManager.AppendLog(taskID, "[官方源安装] 正在向 APT 添加 pkg.cloudflareclient.com 官方密钥与软件源...")
-
-		installScript := fmt.Sprintf(`set -e
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y curl gpg lsb-release ca-certificates >/dev/null 2>&1 || true
-mkdir -p /usr/share/keyrings
-curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main" > /etc/apt/sources.list.d/cloudflare-client.list
-apt-get update -y
-apt-get install -y cloudflare-warp
-`, osCodename)
-
-		instOut, err := runSSH(client, installScript, 180*time.Second)
-		if err != nil {
-			errMsg := fmt.Sprintf("安装官方 cloudflare-warp 失败: %v (输出: %s)", err, strings.TrimSpace(instOut))
-			globalTaskManager.AppendLog(taskID, "[安装错误] "+errMsg)
-			globalTaskManager.SetStep(taskID, "warp_install", "failed", errMsg, 25, "安装失败")
-			globalTaskManager.Finish(taskID, "failed", errMsg)
-			return
-		}
-		globalTaskManager.AppendLog(taskID, "[安装完成] 成功安装 Cloudflare 官方 cloudflare-warp 软件包！")
-		globalTaskManager.SetStep(taskID, "warp_install", "success", "官方包安装成功", 45, "配置服务")
-	}
-
-	// 步骤 3：注册与配置 WARP 本地 SOCKS5 代理模式 (40000 端口)
-	if !skipConfig {
-		globalTaskManager.SetStep(taskID, "warp_config", "running", "配置 SOCKS5 代理模式 (40000 端口)...", 50, "模式配置")
-		globalTaskManager.AppendLog(taskID, "[模式配置] 正在启动 warp-svc 并配置本地代理模式（严格隔离，绝不篡改全局默认路由）...")
-
-		configScript := `set +e
-systemctl enable warp-svc 2>/dev/null || true
-systemctl restart warp-svc 2>/dev/null || true
-sleep 2
-
-# 执行用户注册 (若未注册)
-warp-cli --accept-tos registration new 2>/dev/null || warp-cli --accept-tos register 2>/dev/null || warp-cli register 2>/dev/null || true
-
-# 设置为代理模式 (proxy mode)
-warp-cli --accept-tos mode proxy 2>/dev/null || warp-cli mode proxy 2>/dev/null || true
-
-# 绑定本地 40000 端口
-warp-cli --accept-tos proxy port 40000 2>/dev/null || warp-cli proxy port 40000 2>/dev/null || warp-cli --accept-tos set-proxy-port 40000 2>/dev/null || true
-
-# 建立连接
-warp-cli --accept-tos connect 2>/dev/null || warp-cli connect 2>/dev/null || true
-sleep 3
-
-# 检查 40000 端口
-CFG_PORT=no
-if ss -tlnp 2>/dev/null | grep -q ":40000 "; then
-  CFG_PORT=yes
-elif netstat -tlnp 2>/dev/null | grep -q ":40000 "; then
-  CFG_PORT=yes
-fi
-echo "CFG_PORT=$CFG_PORT"
-`
-		cfgOut, _ := runSSH(client, configScript, 30*time.Second)
-		cfgKV := parseKV(cfgOut)
-		if cfgKV["CFG_PORT"] == "yes" {
-			globalTaskManager.AppendLog(taskID, "[配置成功] Cloudflare WARP 本地 SOCKS5 代理已成功在 127.0.0.1:40000 启动监听！")
-			globalTaskManager.SetStep(taskID, "warp_config", "success", "40000 端口已就绪", 70, "防火墙放行")
-		} else {
-			globalTaskManager.AppendLog(taskID, "[配置提示] 40000 端口初次探测未完成，尝试二次拉起 warp-cli connect...")
-			_, _ = runSSH(client, "warp-cli --accept-tos connect 2>/dev/null || true; sleep 2", 10*time.Second)
-			globalTaskManager.SetStep(taskID, "warp_config", "success", "配置指令下发完成", 70, "防火墙放行")
-		}
-	}
-	// 步骤 4：UFW 防火墙规则增量放行 (严禁破坏/改动任何其他端口，严格保留 22 端口)
-	globalTaskManager.SetStep(taskID, "firewall_ufw", "running", "UFW 增量安全放行...", 75, "防火墙配置")
-	globalTaskManager.AppendLog(taskID, "[防火墙规则 增量放行] 正在检测 UFW 状态，并增量放行 127.0.0.1:40000 及确认 22/tcp...")
-
-	ufwScript := `set +e
-UFW_STATUS="inactive"
-if command -v ufw >/dev/null 2>&1; then
-  if ufw status 2>/dev/null | grep -q "Status: active"; then
-    UFW_STATUS="active"
-    # 铁律：绝对优先放行 22/tcp，杜绝误操作阻断 SSH 连接
-    ufw allow 22/tcp 2>/dev/null || true
-    # 增量放行本地回环接口 (lo) 访问 40000 端口
-    ufw allow in on lo to 127.0.0.1 port 40000 proto tcp comment 'AERO_WARP_SOCKS5' 2>/dev/null || true
-    ufw allow 40000/tcp comment 'AERO_WARP_SOCKS5' 2>/dev/null || true
-  else
-    UFW_STATUS="inactive"
-  fi
-else
-  UFW_STATUS="not_installed"
-fi
-echo "UFW_STATUS=$UFW_STATUS"
-`
-	ufwOut, _ := runSSH(client, ufwScript, 10*time.Second)
-	ufwKV := parseKV(ufwOut)
-	st := ufwKV["UFW_STATUS"]
-	if st == "active" {
-		globalTaskManager.AppendLog(taskID, "[防火墙 UFW] 宿主 UFW 处于活跃状态：已增量放行 22/tcp 及 127.0.0.1:40000 (lo/tcp)，未触动或重置任何其他现有端口规则。")
-	} else {
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[防火墙 UFW] 宿主 UFW 状态: %s (未阻断本地回环流量)。", st))
-	}
-	globalTaskManager.SetStep(taskID, "firewall_ufw", "success", "增量规则配置完毕", 85, "验收与联动")
-
-	// 步骤 5：Edge 服务联动与 AI 出口解锁验收
-	globalTaskManager.SetStep(taskID, "verify_unblock", "running", "重启 AERO Edge 联动并验收 AI 出口...", 90, "验收与联动")
-	globalTaskManager.AppendLog(taskID, "[联动与验收] 重启 aero-edge 服务以接入 127.0.0.1:40000 出口隧道...")
-
-	_, _ = runSSH(client, "systemctl restart aero-edge 2>/dev/null || true", 10*time.Second)
-	time.Sleep(2 * time.Second)
-
-	verifyScript := `set +e
-WARP_TRACE="no"
-if curl -s4 -m 4 --socks5 127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
-  WARP_TRACE="yes"
-fi
-
-GEMINI_CODE=$(curl -s4 -m 4 --socks5 127.0.0.1:40000 -o /dev/null -w "%{http_code}" -L https://gemini.google.com 2>/dev/null || echo "000")
-EDGE_ACTIVE=$(systemctl is-active aero-edge 2>/dev/null || echo "unknown")
-
-echo "WARP_TRACE=$WARP_TRACE"
-echo "GEMINI_CODE=$GEMINI_CODE"
-echo "EDGE_ACTIVE=$EDGE_ACTIVE"
-`
-	verOut, _ := runSSH(client, verifyScript, 12*time.Second)
-	verKV := parseKV(verOut)
-	finalWarpTrace := verKV["WARP_TRACE"] == "yes"
-	geminiCode := verKV["GEMINI_CODE"]
-	edgeActive := verKV["EDGE_ACTIVE"]
-
-	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[验收结果] AERO Edge 服务: %s · WARP 40000 Trace: %v · Gemini 经 WARP HTTP Code: %s", edgeActive, finalWarpTrace, geminiCode))
-
-	// 重新执行纯净度探针持久化最新状态
-	purityRes, probeErr := svc.ProbePurity(context.Background(), vpsID)
-	if probeErr == nil && purityRes != nil {
-		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[纯净度探针] 最新纯净度评分: %d分 · YouTube 归属: %s · Gemini 状态: %v · WARP 保护: %v",
-			purityRes.PurityScore, purityRes.YouTubeLoc, purityRes.GeminiOK, purityRes.IsWARPEgress))
-	}
-
-	InvalidateDiagCache(vpsID)
-
-	globalTaskManager.AppendLog(taskID, "===> Cloudflare 官方 WARP 出口保护配置全部完成，AERO Edge 已接管，源 IP 保护生效，AI 解锁成功！ <===")
-	globalTaskManager.SetStep(taskID, "verify_unblock", "success", "WARP 出口保护生效 · AI 解锁成功", 100, "执行完成")
 	globalTaskManager.Finish(taskID, "success", "")
 }

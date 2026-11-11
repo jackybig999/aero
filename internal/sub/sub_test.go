@@ -267,29 +267,8 @@ func TestZeroPortSubscription_StrictMandate(t *testing.T) {
 		}
 	})
 
-	// Subtest D: Probe Harvest and EndpointInfo Zero-Port Mandate
+	// Subtest D: EndpointInfo Zero-Port Mandate（旧 /etc/aero/env 采集已删除）
 	t.Run("ProbeHarvest_And_VPSService_ZeroPortMandate", func(t *testing.T) {
-		harvestRaw := `ADVERTISE=harvest-node.aero-edge.com:8443
-PORT=8443
-SUB_SECRET=probe_harvest_token_abc
-ADMIN_KEY=probe_admin_key_xyz
-`
-		ep := parseHarvest(harvestRaw, nil)
-		if ep.Port != 8443 {
-			t.Errorf("data plane Port was lost! expected 8443, got %d", ep.Port)
-		}
-		if strings.Contains(ep.SubURL, ":8443") || strings.Contains(ep.SubURL, ":443") {
-			t.Errorf("VIOLATION: parseHarvest SubURL contains port: %s", ep.SubURL)
-		}
-		expectedSub := "https://harvest-node.aero-edge.com/sub/probe_harvest_token_abc"
-		if ep.SubURL != expectedSub {
-			t.Errorf("expected SubURL=%s, got=%s", expectedSub, ep.SubURL)
-		}
-		uHarvest, err := url.Parse(ep.SubURL)
-		if err != nil || uHarvest.Port() != "" {
-			t.Errorf("parseHarvest SubURL must have empty port, got %s (port: %s)", ep.SubURL, uHarvest.Port())
-		}
-
 		// VPSService.UpdateDomain zero-port test
 		memVPS := NewMemoryVPSStore()
 		box, err := NewSecretBox()

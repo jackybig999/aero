@@ -805,25 +805,11 @@ func (h *AeroHandler) BroadcastSubs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"code": 0, "message": "broadcasted successfully"})
 }
 
+// InstallWARP 已停用（HTTP 410）：中台与 edge 都不安装 WARP（ADR-0012 第 6 条）。WARP 是插件，
+// 由运维按 Cloudflare 官方文档安装；edge 只读取其状态并以开关决定是否使用。旧实现以 apt 安装软件包，
+// 并以 `ufw allow 40000/tcp` 把 SOCKS5 代理端口对公网开放。
 func (h *AeroHandler) InstallWARP(w http.ResponseWriter, r *http.Request) {
-	id, err := parseVPSID(r)
-	if err != nil {
-		writeJSON(w, 422, errResp(1002, "invalid vps id"))
-		return
-	}
-	host, err := h.svc.Get(id)
-	if err != nil || host == nil {
-		writeJSON(w, 404, errResp(1004, "vps not found"))
-		return
-	}
-
-	task := globalTaskManager.CreateTask("warp_install", id, host.Name, DefaultWarpInstallSteps())
-	go RunWarpInstallTask(task.ID, id, h.svc)
-
-	writeJSON(w, 200, map[string]any{
-		"code": 0,
-		"data": task,
-	})
+	writeJSON(w, http.StatusGone, errResp(1010, "中台不再安装 WARP：请按 Cloudflare 官方文档在节点上安装官方客户端（proxy 模式），edge 只读取其状态并按开关使用"))
 }
 
 func (h *AeroHandler) CheckPurity(w http.ResponseWriter, r *http.Request) {

@@ -525,9 +525,8 @@ EOF
 }
 
 cmd_bbr() {
-    check_root
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${BOLD}           内核 BBR 拥塞控制与参数调优              ${PLAIN}"
+    echo -e "${BOLD}           内核拥塞控制状态（只读）              ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
     CC=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo "unknown")
     echo -e " 当前拥塞算法:   ${GREEN}${CC}${PLAIN}"
@@ -535,18 +534,11 @@ cmd_bbr() {
     echo -e " 队列调度器:     ${GREEN}${QDISC}${PLAIN}"
     echo -e "${CYAN}----------------------------------------------------${PLAIN}"
     
+    # 只读（ADR-0012：服务端不修改 VPS 系统配置）。如需调整内核参数，由运维自行决定并执行。
     if [[ "$CC" != "bbr" ]]; then
-        read -r -p "是否立即开启 BBR 拥塞控制与 16MB 缓冲区优化? [Y/n]: " do_tune
-        if [[ ! "$do_tune" =~ ^[nN]$ ]]; then
-            modprobe tcp_bbr 2>/dev/null || true
-            sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
-            sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
-            sysctl -w net.core.rmem_max=16777216 2>/dev/null || true
-            sysctl -w net.core.wmem_max=16777216 2>/dev/null || true
-            echo -e "${GREEN}BBR 拥塞控制与内核缓冲区优化已完成！${PLAIN}"
-        fi
+        echo -e "${YELLOW}未启用 BBR。AERO 不修改内核参数；如需开启请由运维自行配置。${PLAIN}"
     else
-        echo -e "${GREEN}BBR 已经处于激活运行状态，无需重复配置。${PLAIN}"
+        echo -e "${GREEN}BBR 已启用。${PLAIN}"
     fi
     echo -e "${CYAN}====================================================${PLAIN}"
 }
@@ -669,7 +661,7 @@ show_menu() {
         echo -e " ${BOLD}10.${PLAIN} 修改 Web 控制台访问密钥 (Admin Key)"
         echo -e " ${BOLD}11.${PLAIN} 修改服务端主监听端口 (Listen Port)"
         echo -e " ${BOLD}12.${PLAIN} TLS 公网证书与自动续期检测 (ACME Cert)"
-        echo -e " ${BOLD}13.${PLAIN} 内核 BBR 状态与一键调优 (BBR Tuning)"
+        echo -e " ${BOLD}13.${PLAIN} 内核 BBR 状态 (只读)"
         echo -e " ${BOLD}14.${PLAIN} 虚拟网卡 (TUN) 与防火墙 NAT 状态 (TUN & NAT)"
         echo -e " ${BOLD}15.${PLAIN} GeoData 直连规则库管理 (GeoData Sync)"
         echo -e " ${BOLD}16.${PLAIN} Cloudflare WARP 出口分流状态 (WARP Proxy)"
@@ -744,7 +736,7 @@ case "$action" in
         echo "  key          修改 Web 控制台管理密钥"
         echo "  port         修改服务端主监听端口"
         echo "  cert         查看 TLS 证书与自动续期健康状态"
-        echo "  bbr          查看并开启 BBR 拥塞控制"
+        echo "  bbr          查看 BBR 拥塞控制状态（只读）"
         echo "  net          查看 TUN 网卡与防火墙 NAT 状态"
         echo "  geodata      查看并同步 GeoData 规则库"
         echo "  warp         查看 WARP 出口代理状态"

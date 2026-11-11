@@ -277,19 +277,6 @@ func TestEvaluatePurity_DeepInspection_VPS8_Clean(t *testing.T) {
 	}
 }
 
-func TestDefaultWarpInstallSteps(t *testing.T) {
-	steps := DefaultWarpInstallSteps()
-	if len(steps) != 5 {
-		t.Fatalf("expected 5 steps, got %d", len(steps))
-	}
-	expectedKeys := []string{"warp_detect", "warp_install", "warp_config", "firewall_ufw", "verify_unblock"}
-	for i, key := range expectedKeys {
-		if steps[i].Key != key {
-			t.Errorf("step %d expected key %s, got %s", i, key, steps[i].Key)
-		}
-	}
-}
-
 func TestDiagCache_Concurrency(t *testing.T) {
 	vpsID := uint64(9999)
 	InvalidateDiagCache(vpsID)
