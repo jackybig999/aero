@@ -149,3 +149,26 @@ func SignToken(priv ed25519.PrivateKey, c TokenClaims) (string, error) {
 	}
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, []byte(signingInput))), nil
 }
+
+// parseTokenIssuers 解析配置 token_issuers（kid → base64 的 32 字节 Ed25519 公钥，签发方 sub）。
+// 开关开启时必须至少有一把合法公钥，否则拒绝启动，不带着无法校验的配置运行。
+func parseTokenIssuers(m map[string]string) (map[string]IssuerKey, error) {
+	if len(m) == 0 {
+		return nil, errors.New("token_issuers is empty")
+	}
+	keys := make(map[string]IssuerKey, len(m))
+	for kid, b64 := range m {
+		if !kidPattern.MatchString(kid) {
+			return nil, fmt.Errorf("invalid kid %q", kid)
+		}
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+		if err != nil {
+			raw, err = base64.RawURLEncoding.DecodeString(strings.TrimSpace(b64))
+		}
+		if err != nil || len(raw) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("token_issuers[%s]: want base64 of a %d-byte Ed25519 public key", kid, ed25519.PublicKeySize)
+		}
+		keys[kid] = IssuerKey{Issuer: "sub", PublicKey: ed25519.PublicKey(raw)}
+	}
+	return keys, nil
+}

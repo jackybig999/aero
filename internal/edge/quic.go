@@ -416,12 +416,17 @@ type quicConnKey struct{}
 // ConnTracker associates each active quic.Conn with its authenticated token.
 type ConnTracker struct {
 	mu    sync.RWMutex
-	conns map[*quic.Conn]string
+	conns map[*quic.Conn]connBinding
+}
+
+// connBinding 是连接绑定的 token 与（签名 token 的）uid；uid 用于本节点设备数计数（C3 §3 第 7 步）。
+type connBinding struct {
+	token, uid string
 }
 
 // NewConnTracker creates a new ConnTracker.
 func NewConnTracker() *ConnTracker {
-	return &ConnTracker{conns: make(map[*quic.Conn]string)}
+	return &ConnTracker{conns: make(map[*quic.Conn]connBinding)}
 }
 
 // Get returns the token bound to c.
@@ -431,8 +436,8 @@ func (ct *ConnTracker) Get(c *quic.Conn) (string, bool) {
 	}
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
-	token, ok := ct.conns[c]
-	return token, ok
+	b, ok := ct.conns[c]
+	return b.token, ok
 }
 
 // Bind associates token with c.
@@ -441,8 +446,31 @@ func (ct *ConnTracker) Bind(c *quic.Conn, token string) {
 		return
 	}
 	ct.mu.Lock()
-	ct.conns[c] = token
+	ct.conns[c] = connBinding{token: token}
 	ct.mu.Unlock()
+}
+
+// BindLimited 在同一把锁内检查并绑定（L0 §7.5 原子）：uid 非空且 max > 0 时，该 uid 在本节点已绑定的
+// 连接数达到 max 则拒绝，返回 false。
+func (ct *ConnTracker) BindLimited(c *quic.Conn, token, uid string, max int) bool {
+	if c == nil {
+		return true
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if uid != "" && max > 0 {
+		n := 0
+		for other, b := range ct.conns {
+			if other != c && b.uid == uid {
+				n++
+			}
+		}
+		if n >= max {
+			return false
+		}
+	}
+	ct.conns[c] = connBinding{token: token, uid: uid}
+	return true
 }
 
 // Remove dissociates c.
@@ -462,8 +490,8 @@ func (ct *ConnTracker) CloseByToken(token string) {
 	}
 	ct.mu.Lock()
 	var toClose []*quic.Conn
-	for c, tok := range ct.conns {
-		if tok == token {
+	for c, b := range ct.conns {
+		if b.token == token {
 			toClose = append(toClose, c)
 			delete(ct.conns, c)
 		}
@@ -505,8 +533,8 @@ func (ct *ConnTracker) CloseUnauthorized(valid func(token string) bool) int {
 	}
 	ct.mu.RLock()
 	snapshot := make(map[*quic.Conn]string, len(ct.conns))
-	for c, tok := range ct.conns {
-		snapshot[c] = tok
+	for c, b := range ct.conns {
+		snapshot[c] = b.token
 	}
 	ct.mu.RUnlock()
 
@@ -607,6 +635,7 @@ type udpSessionTracker struct {
 type QUICServer struct {
 	cfg              *ServerConfig
 	validator        *Validator
+	tokenVerifier    *TokenVerifier // 非 nil 即启用 C3 签名 token（auth_signed_token）
 	connLimiter      *ConnLimiter
 	bandwidthLimiter *BandwidthLimiter
 	dialGuard        *DialGuard
@@ -686,7 +715,7 @@ func (s *QUICServer) startTokenEnforcer() {
 				case <-s.stopCh:
 					return
 				case <-ticker.C:
-					if n := s.connTracker.CloseUnauthorized(s.validator.Validate); n > 0 {
+					if n := s.connTracker.CloseUnauthorized(s.tokenStillValid); n > 0 {
 						log.Printf("[AUTH] closed %d connection(s) whose token is no longer valid", n)
 					}
 				}
@@ -1705,11 +1734,23 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 
 	// 只校验 token；Aero-Timestamp / Aero-Nonce 已废弃并被忽略（C3 §5）。
 	token, ok := bearerToken(r)
-	if !ok || s.validator == nil || !s.validator.Validate(token) {
+	if !ok {
 		s.rejectAuth(w, remoteIP, "")
 		return "", false
 	}
-	// 同一 QUIC 连接上的请求必须使用首次请求绑定的 token。
+	claims, err := s.checkToken(token)
+	if errors.Is(err, ErrTokenExpired) {
+		// 过期是正常用户的常态（休眠后），客户端会刷新 token；不计入防爆破封禁
+		w.Header().Set("WWW-Authenticate", `Bearer realm="aero", error="invalid_token"`)
+		w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="EDGE_AUTH_TOKEN_EXPIRED"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		return "", false
+	}
+	if err != nil {
+		s.rejectAuth(w, remoteIP, err.Error())
+		return "", false
+	}
+	// 同一 QUIC 连接上的请求必须使用首次请求绑定的 token；首次绑定时执行本节点设备数限制（C3 §3 第 7 步）。
 	if qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn); qc != nil && s.connTracker != nil {
 		if bound, tracked := s.connTracker.Get(qc); tracked {
 			if subtle.ConstantTimeCompare([]byte(bound), []byte(token)) != 1 {
@@ -1717,10 +1758,46 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 				return "", false
 			}
 		} else {
-			s.connTracker.Bind(qc, token)
+			uid, maxDevices := "", 0
+			if claims != nil {
+				uid, maxDevices = claims.UID, claims.MaxDevices
+			}
+			if !s.connTracker.BindLimited(qc, token, uid, maxDevices) {
+				// 正常用户多开设备，不计入防爆破封禁
+				w.Header().Set("Proxy-Status", `aero; error=connection_refused; details="EDGE_DEVICE_LIMIT"`)
+				w.WriteHeader(http.StatusForbidden)
+				log.Printf("[AUTH] device limit %d reached for uid %s", maxDevices, uid)
+				return "", false
+			}
 		}
 	}
 	return token, true
+}
+
+// checkToken 校验 token（C3 §3 第 1–4 步）。aero1 签名 token 只在 auth_signed_token 开启时接受；
+// 其他视为旧的不透明 token（过渡期 30 天，C3 §8）。返回签名 token 的载荷，不透明 token 返回 nil。
+func (s *QUICServer) checkToken(token string) (*TokenClaims, error) {
+	if strings.HasPrefix(token, tokenPrefix) {
+		if s.tokenVerifier == nil {
+			return nil, ErrTokenInvalid
+		}
+		return s.tokenVerifier.Verify(token)
+	}
+	if s.validator == nil || !s.validator.Validate(token) {
+		return nil, ErrTokenInvalid
+	}
+	return nil, nil
+}
+
+// tokenStillValid 供执行器周期检查已绑定连接（过期、删除、吊销后断开）。
+func (s *QUICServer) tokenStillValid(token string) bool {
+	_, err := s.checkToken(token)
+	return err == nil
+}
+
+// SetTokenVerifier 启用 C3 签名 token 校验（nil 关闭）。
+func (s *QUICServer) SetTokenVerifier(v *TokenVerifier) {
+	s.tokenVerifier = v
 }
 
 func bearerToken(r *http.Request) (string, bool) {

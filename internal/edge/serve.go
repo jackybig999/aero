@@ -78,6 +78,9 @@ type ServerConfig struct {
 	GlobalTUNDevice            string                        `json:"global_tun_device,omitempty" yaml:"global_tun_device"`
 	WarpProxy                  string                        `json:"warp_proxy,omitempty" yaml:"warp_proxy"`
 	WarpAll                    bool                          `json:"warp_all,omitempty" yaml:"warp_all"`
+	// C3 签名 token（api/token.md）：开关与 sub 的签发公钥（kid → 32 字节 Ed25519 公钥 base64）。
+	AuthSignedToken bool              `json:"auth_signed_token,omitempty" yaml:"auth_signed_token"`
+	TokenIssuers    map[string]string `json:"token_issuers,omitempty" yaml:"token_issuers"`
 	// DrainTimeoutSec 是收到停止信号后的排空上限（秒，L0 §8.6）；0 表示默认 15 秒。
 	DrainTimeoutSec int `json:"drain_timeout,omitempty"`
 	// ConfigPath 是 edge 持久化自身配置的文件路径，仅由 cmd/edge 显式设置。
@@ -365,6 +368,15 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	quicServer := NewQUICServerWithIPv6Prefix(validator, connLimit, bwLimit, dialGuard, rateLimit, ipv6Prefix)
 	quicServer.SetServerConfig(&cfg)
+	if cfg.AuthSignedToken {
+		keys, err := parseTokenIssuers(cfg.TokenIssuers)
+		if err != nil {
+			quicServer.Close()
+			return nil, fmt.Errorf("auth_signed_token: %w", err)
+		}
+		quicServer.SetTokenVerifier(NewTokenVerifier(keys))
+		log.Printf("[AUTH] signed tokens (C3) enabled with %d sub key(s)", len(keys))
+	}
 	if cfg.AllowSelfSignedCertForTest {
 		quicServer.SetAllowLoopbackForTest(true)
 	}
