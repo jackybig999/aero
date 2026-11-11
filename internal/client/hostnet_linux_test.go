@@ -20,6 +20,7 @@ import (
 func inNetns(t *testing.T) bool {
 	t.Helper()
 	if os.Getenv("AERO_NETNS") == "1" {
+		noRealResolved(t)
 		return true
 	}
 	if _, err := exec.LookPath("unshare"); err != nil {
@@ -41,6 +42,14 @@ func inNetns(t *testing.T) bool {
 		t.Fatalf("test in netns did not pass:\n%s", out)
 	}
 	return false
+}
+
+// noRealResolved 禁止测试调用真实 resolvectl：它会改到宿主上序号相同的网卡（见 configureLinkDNS 注释）。
+func noRealResolved(t *testing.T) {
+	origStub, origCtl := resolvedStubInUse, resolvectl
+	resolvedStubInUse = func() bool { return false }
+	resolvectl = func(context.Context, ...string) error { panic("real resolvectl must not run in tests") }
+	t.Cleanup(func() { resolvedStubInUse, resolvectl = origStub, origCtl })
 }
 
 func ipOut(t *testing.T, args ...string) string {
@@ -98,7 +107,7 @@ func TestTunHostLinuxLifecycle(t *testing.T) {
 	if !inNetns(t) {
 		return
 	}
-	cfg := tunHostConfig{Name: "aero0", MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), Plan: testPlan(t, "9.9.9.9")}
+	cfg := tunHostConfig{Name: "aero0", MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), DNS: netip.MustParseAddr("10.88.0.1"), Plan: testPlan(t, "9.9.9.9")}
 	h, err := openTunHost(cfg)
 	if err != nil {
 		t.Fatalf("openTunHost: %v", err)
@@ -191,7 +200,7 @@ func TestTunHostLinuxRollbackOnFailure(t *testing.T) {
 	ipBatch = func(ctx context.Context, lines []string) error {
 		return orig(ctx, append(lines, "route replace not-a-prefix dev aero0"))
 	}
-	if _, err := openTunHost(tunHostConfig{Name: "aero0", MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), Plan: testPlan(t)}); err == nil {
+	if _, err := openTunHost(tunHostConfig{Name: "aero0", MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), DNS: netip.MustParseAddr("10.88.0.1"), Plan: testPlan(t)}); err == nil {
 		t.Fatal("openTunHost succeeded with a failing batch")
 	}
 	if linkExists("aero0") {
@@ -202,7 +211,8 @@ func TestTunHostLinuxRollbackOnFailure(t *testing.T) {
 // 进程被强杀（kill -9）后，网卡与其上的全部路由必须消失。
 func TestTunHostLinuxNoResidueAfterKill(t *testing.T) {
 	if os.Getenv("AERO_TUNHOST_CHILD") == "1" {
-		h, err := openTunHost(tunHostConfig{Name: "aero0", MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), Plan: testPlan(t)})
+		noRealResolved(t)
+		h, err := openTunHost(tunHostConfig{Name: "aero0", MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), DNS: netip.MustParseAddr("10.88.0.1"), Plan: testPlan(t)})
 		if err != nil {
 			t.Fatalf("child openTunHost: %v", err)
 		}
@@ -261,5 +271,30 @@ func TestParseResolvConf(t *testing.T) {
 		if got[i].String() != want[i] {
 			t.Errorf("got[%d] = %v, want %s", i, got[i], want[i])
 		}
+	}
+}
+
+// resolved 本地桩在用时只对本网卡设置链路 DNS 与 "~." 路由域；未使用时不调用 resolvectl。
+func TestConfigureLinkDNS(t *testing.T) {
+	origStub, origCtl := resolvedStubInUse, resolvectl
+	defer func() { resolvedStubInUse, resolvectl = origStub, origCtl }()
+	var calls [][]string
+	resolvectl = func(_ context.Context, args ...string) error {
+		calls = append(calls, args)
+		return nil
+	}
+
+	resolvedStubInUse = func() bool { return false }
+	if err := configureLinkDNS("aero0", netip.MustParseAddr("10.88.0.1")); err != nil || len(calls) != 0 {
+		t.Fatalf("without resolved: err=%v calls=%v", err, calls)
+	}
+
+	resolvedStubInUse = func() bool { return true }
+	if err := configureLinkDNS("aero0", netip.MustParseAddr("10.88.0.1")); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"dns", "aero0", "10.88.0.1"}, {"domain", "aero0", "~."}}
+	if !slices.EqualFunc(calls, want, slices.Equal[[]string]) {
+		t.Fatalf("calls = %v, want %v", calls, want)
 	}
 }

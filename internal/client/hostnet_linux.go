@@ -77,7 +77,50 @@ func openTunHost(cfg tunHostConfig) (tunHost, error) {
 		return nil, errors.Join(fmt.Errorf("configure %s: %w", h.name, err), h.dev.Close())
 	}
 	h.ipv4, h.plan, h.routes = cfg.IPv4, cfg.Plan, routes
+	if err := configureLinkDNS(h.name, cfg.DNS); err != nil {
+		return nil, errors.Join(fmt.Errorf("DNS on %s: %w", h.name, err), h.dev.Close())
+	}
 	return h, nil
+}
+
+// DNS（ADR-0014）：使用 systemd-resolved 的本地桩时，resolved 会把查询 socket 绑定到各链路发出，
+// 路由捕获无效；此时只对本网卡设置链路 DNS 与 "~." 路由域，网卡消失时 resolved 自动丢弃该配置。
+// 其他情况下 glibc 直接按路由发出查询，系统 DNS 服务器已由 Capture 路由进 TUN。
+//
+// 两个入口可替换：命名空间测试与宿主共享 /etc/resolv.conf 和 resolved 的 D-Bus，按网卡名换算出的
+// 序号属于测试命名空间，真实调用会改到宿主上序号相同的另一张网卡，因此测试必须替换。
+var (
+	resolvedStubInUse = func() bool {
+		servers, err := readResolvConf("/etc/resolv.conf")
+		if err != nil {
+			return false
+		}
+		for _, a := range servers {
+			if a == netip.MustParseAddr("127.0.0.53") || a == netip.MustParseAddr("127.0.0.54") {
+				return true
+			}
+		}
+		return false
+	}
+	resolvectl = func(ctx context.Context, args ...string) error {
+		out, err := exec.CommandContext(ctx, "resolvectl", args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("resolvectl %s: %w: %s", strings.Join(args, " "), err, bytes.TrimSpace(out))
+		}
+		return nil
+	}
+)
+
+func configureLinkDNS(dev string, dns netip.Addr) error {
+	if !resolvedStubInUse() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ipBatchTimeout)
+	defer cancel()
+	if err := resolvectl(ctx, "dns", dev, dns.String()); err != nil {
+		return err
+	}
+	return resolvectl(ctx, "domain", dev, "~.")
 }
 
 func (h *linuxTunHost) Device() TunDevice { return h.dev }

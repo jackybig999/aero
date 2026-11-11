@@ -14,8 +14,9 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
-// Windows 实现（ADR-0013）：wintun 网卡 + IP Helper API（winipcfg），不调用 netsh、route、PowerShell，
-// 不写 NRPT，不设置任何网卡的 DNS。地址与路由都挂在自有网卡的 LUID 上，网卡删除时随之消失。
+// Windows 实现（ADR-0013、ADR-0014）：wintun 网卡 + IP Helper API（winipcfg），不调用 netsh、route、
+// PowerShell，不写 NRPT，不改其他网卡的 DNS。地址、路由、DNS 都挂在自有网卡的 LUID 上；
+// DNS 防泄漏用 WFP 动态会话（wfp_windows.go）。网卡删除或进程终止时由系统一并清除。
 //
 // 网卡使用固定 GUID：Windows 按 GUID 保存接口参数，随机 GUID 每次运行都会留下一份孤儿配置。
 
@@ -31,6 +32,7 @@ const (
 type windowsTunHost struct {
 	mu     sync.Mutex
 	dev    *windowsDevice
+	guard  *dnsGuard
 	luid   winipcfg.LUID
 	ipv4   netip.Prefix
 	plan   RoutePlan
@@ -53,7 +55,7 @@ func openTunHost(cfg tunHostConfig) (tunHost, error) {
 	}
 	h := &windowsTunHost{dev: dev, luid: winipcfg.LUID(dev.adapter.LUID())}
 	if err := h.configure(cfg); err != nil {
-		return nil, errors.Join(fmt.Errorf("configure %s: %w", cfg.Name, err), dev.Close())
+		return nil, errors.Join(fmt.Errorf("configure %s: %w", cfg.Name, err), h.teardown())
 	}
 	return h, nil
 }
@@ -102,6 +104,16 @@ func (h *windowsTunHost) configure(cfg tunHostConfig) error {
 		return err
 	}
 	h.ipv4, h.plan, h.routes = cfg.IPv4, cfg.Plan, routes
+
+	// DNS（ADR-0014）：只设置本网卡自己的 DNS；其余网卡的 53 端口由 WFP 动态会话屏蔽。
+	if err := h.luid.SetDNS(windows.AF_INET, []netip.Addr{cfg.DNS}, nil); err != nil {
+		return fmt.Errorf("set DNS on %s: %w", cfg.Name, err)
+	}
+	guard, err := startDNSGuard(uint64(h.luid))
+	if err != nil {
+		return fmt.Errorf("DNS leak guard: %w", err)
+	}
+	h.guard = guard
 	return nil
 }
 
@@ -197,7 +209,24 @@ func (h *windowsTunHost) Close() error {
 		return nil
 	}
 	h.closed = true
-	return h.dev.Close() // 删除网卡；其上的地址与路由由系统一并清除
+	return h.teardown()
+}
+
+// teardown 按依赖逆序拆除：WFP 规则 → 本网卡 DNS → 网卡（其上地址与路由由系统一并清除）。
+// 清空 DNS 使正常退出不在本网卡 GUID 名下留下配置；崩溃时 WFP 规则与网卡由系统删除。
+func (h *windowsTunHost) teardown() error {
+	return errors.Join(
+		h.guard.Close(),
+		ignoreNotFound(h.luid.FlushDNS(windows.AF_INET)),
+		h.dev.Close(),
+	)
+}
+
+func ignoreNotFound(err error) error {
+	if errors.Is(err, windows.ERROR_NOT_FOUND) {
+		return nil
+	}
+	return err
 }
 
 func (h *windowsTunHost) usable() error {

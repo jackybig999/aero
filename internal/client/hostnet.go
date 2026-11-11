@@ -20,6 +20,9 @@ type tunHostConfig struct {
 	// 并以路由 MTU（或按地址族的接口 MTU）把 IPv4 限制在本值。
 	MTU  int
 	IPv4 netip.Prefix // 本机隧道地址，如 10.88.0.2/16
+	// DNS 是本网卡的 DNS 服务器（隧道虚拟网关，须在 IPv4 地址池内，查询在 TUN 内被端口 53 拦截）。
+	// 实现须让系统只经本网卡解析，且只用随进程或网卡自动消失的机制（ADR-0014）。
+	DNS  netip.Addr
 	Plan RoutePlan
 }
 
@@ -31,6 +34,8 @@ func (c tunHostConfig) validate() error {
 		return fmt.Errorf("tun MTU %d out of range 576..9000", c.MTU)
 	case !c.IPv4.IsValid() || !c.IPv4.Addr().Is4():
 		return fmt.Errorf("tun IPv4 %v is not an IPv4 prefix", c.IPv4)
+	case !c.DNS.Is4() || !c.IPv4.Masked().Contains(c.DNS) || c.DNS == c.IPv4.Addr():
+		return fmt.Errorf("tun DNS %v must be another address inside %v", c.DNS, c.IPv4.Masked())
 	}
 	return nil
 }

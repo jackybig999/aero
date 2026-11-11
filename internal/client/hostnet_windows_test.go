@@ -55,7 +55,7 @@ func hasRoute(luid winipcfg.LUID, p string) bool {
 
 func TestTunHostWindowsLifecycle(t *testing.T) {
 	requireHostTunTest(t)
-	cfg := tunHostConfig{Name: winTestTun, MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), Plan: winTestPlan(t)}
+	cfg := tunHostConfig{Name: winTestTun, MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), DNS: netip.MustParseAddr("10.88.0.1"), Plan: winTestPlan(t)}
 	start := time.Now()
 	th, err := openTunHost(cfg)
 	if err != nil {
@@ -78,6 +78,12 @@ func TestTunHostWindowsLifecycle(t *testing.T) {
 		if !hasRoute(h.luid, "2000::/3") {
 			t.Error("IPv6 route 2000::/3 missing")
 		}
+	}
+	if dns, err := h.luid.DNS(); err != nil || len(dns) != 1 || dns[0] != netip.MustParseAddr("10.88.0.1") {
+		t.Fatalf("adapter DNS = %v, err %v; want [10.88.0.1]", dns, err)
+	}
+	if h.guard == nil {
+		t.Fatal("WFP DNS guard not active")
 	}
 	for p, want := range map[string]bool{"10.88.0.0/16": true, "192.168.77.1/32": true, "8.0.0.0/7": true} {
 		if got := hasRoute(h.luid, p); got != want {
@@ -112,7 +118,7 @@ func TestTunHostWindowsLifecycle(t *testing.T) {
 // 进程被强杀后网卡及其路由必须消失（wintun 网卡生命周期绑定创建它的进程）。
 func TestTunHostWindowsNoResidueAfterKill(t *testing.T) {
 	if os.Getenv("AERO_TUNHOST_CHILD") == "1" {
-		if _, err := openTunHost(tunHostConfig{Name: winTestTun, MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), Plan: winTestPlan(t)}); err != nil {
+		if _, err := openTunHost(tunHostConfig{Name: winTestTun, MTU: 1224, IPv4: netip.MustParsePrefix("10.88.0.2/16"), DNS: netip.MustParseAddr("10.88.0.1"), Plan: winTestPlan(t)}); err != nil {
 			t.Fatalf("child openTunHost: %v", err)
 		}
 		os.Stdout.WriteString("READY\n")
