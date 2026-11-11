@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"os"
 	"strings"
 )
@@ -80,29 +79,6 @@ func OpenTunDevice(name string, mtu int) (TunDevice, error) {
 	return nil, fmt.Errorf("TUN not supported on this platform")
 }
 
-// SetInterfaceMTU 移动端占位
-func SetInterfaceMTU(devName string, mtu int) error {
-	return fmt.Errorf("TUN not supported on this platform")
-}
-
-// SetupRoutes 明确返回不支持错误，阻断桌面版 TUN 流程
-func SetupRoutes(devName, ipv4 string) error {
-	return fmt.Errorf("TUN not supported on this platform")
-}
-
-func SetupRoutesWithConfig(devName string, cfg RouteConfig) error {
-	return fmt.Errorf("TUN not supported on this platform")
-}
-
-// TeardownRoutes 移动端占位
-func TeardownRoutes(devName string) {}
-
-// ProtectHostRoute 移动端占位
-func ProtectHostRoute(hostIP string) error { return nil }
-
-// UnprotectHostRoute 移动端占位
-func UnprotectHostRoute(hostIP string) {}
-
 // PhysicalDefaultGateway 移动端占位
 func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	return "", "", fmt.Errorf("TUN not supported on this platform")
@@ -124,9 +100,6 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 }
 
 func invalidateGatewayCache() {}
-
-// CleanAero0StaleRoutes 移动端占位
-func CleanAero0StaleRoutes() {}
 
 // DetectThirdPartyTUN 移动端第三方 TUN 检测 (扫描 iOS NetworkExtension utun 与 Fake-IP)
 func DetectThirdPartyTUN() (bool, string, error) {
@@ -168,12 +141,4 @@ func DetectThirdPartyTUN() (bool, string, error) {
 // SetCmdExecutorForTest 移动端占位
 func SetCmdExecutorForTest(f func(name string, args ...string) error) func() {
 	return func() {}
-}
-
-// RotatePhysicalDNSRoute 移动端占位
-func RotatePhysicalDNSRoute() error { return nil }
-
-// setTunIPv4 移动端由原生壳管理 TUN 地址，此处不支持。
-func setTunIPv4(devName string, p netip.Prefix) error {
-	return fmt.Errorf("TUN not supported on this platform")
 }

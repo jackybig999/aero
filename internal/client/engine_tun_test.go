@@ -144,7 +144,7 @@ func TestTunGateway(t *testing.T) {
 	}
 }
 
-// 订阅中的全部节点地址与额外地址都进入 Bypass；系统 DNS 进入 Capture。
+// 订阅中的全部节点地址与额外地址都进入 Bypass（无效地址忽略）；系统 DNS 进入 Capture。
 func TestTunPlanInputBypassesAllNodes(t *testing.T) {
 	useFakeTunHost(t, nil)
 	eng := NewEngine()
@@ -153,12 +153,13 @@ func TestTunPlanInputBypassesAllNodes(t *testing.T) {
 	want := map[netip.Addr]bool{
 		netip.MustParseAddr("198.51.100.1"): true, netip.MustParseAddr("198.51.100.2"): true, netip.MustParseAddr("203.0.113.9"): true,
 	}
-	if len(in.Bypass) != len(want) {
-		t.Fatalf("bypass = %v", in.Bypass)
-	}
+	got := map[netip.Addr]bool{}
 	for _, a := range in.Bypass {
-		if !want[a] {
-			t.Errorf("unexpected bypass %v", a)
+		got[a] = true
+	}
+	for a := range want { // 另含当前活跃节点（全局状态），故只断言包含
+		if !got[a] {
+			t.Errorf("bypass %v missing from %v", a, in.Bypass)
 		}
 	}
 	if len(in.Capture) != 1 || in.Capture[0] != netip.MustParseAddr("192.168.1.1") {

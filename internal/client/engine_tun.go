@@ -43,7 +43,7 @@ func tunGateway(p netip.Prefix) netip.Addr {
 }
 
 // tunPlanInputLocked 由当前订阅、直连名单与系统 DNS 生成路由规划输入。调用方持 e.mu（读）。
-// 订阅中全部节点地址都放入 Bypass，切换节点无需改路由。
+// 订阅中全部节点地址与当前活跃节点都放入 Bypass，切换到订阅内节点无需改路由。
 func (e *Engine) tunPlanInputLocked(extra ...net.IP) RoutePlanInput {
 	var in RoutePlanInput
 	if GlobalDefaultChinaMatcher != nil {
@@ -62,6 +62,9 @@ func (e *Engine) tunPlanInputLocked(extra ...net.IP) RoutePlanInput {
 		for _, s := range e.appliedSub.IPs {
 			addBypass(net.ParseIP(s))
 		}
+	}
+	if _, _, _, active := getActiveEdge(); active != nil { // 当前节点可能是运行时解析出的地址
+		addBypass(active)
 	}
 	for _, ip := range extra {
 		addBypass(ip)

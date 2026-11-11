@@ -484,8 +484,8 @@ func (p *IPDataPump) applyNextHopMTU(newMTU int) {
 			break // 仅单调向下收缩，已小于等于当前 MTU 则忽略
 		}
 		if p.currentMTU.CompareAndSwap(cur, int32(newMTU)) {
-			log.Printf("[PUMP] Path MTU clamped down to %d, updating virtual NIC", newMTU)
-			_ = SetInterfaceMTU(p.dev.Name(), newMTU)
+			// 只更新数据泵自身的 MTU；网卡 MTU 由 tunHost 设定（ADR-0013），不再调用 netsh/ip 改网卡。
+			log.Printf("[PUMP] Path MTU clamped down to %d", newMTU)
 			break
 		}
 	}

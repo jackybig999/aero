@@ -582,7 +582,9 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 		newIP = ip
 	}
 	if newIP != nil && e.mode == "tun" && e.running.Load() {
-		go e.refreshTunRoutes(newIP) // 不在 e.mu 内执行：refreshTunRoutes 自行加锁
+		// 新旧节点都走物理网卡：旧会话在 20 秒排空期内仍在使用旧节点（见下方 Drain）。
+		// 不在 e.mu 内执行：refreshTunRoutes 自行加锁。
+		go e.refreshTunRoutes(newIP, oldIP)
 	}
 
 	var altPorts []int
@@ -638,7 +640,7 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	}
 
 	// 平滑软切线（Graceful Draining）：
-	// 旧 Session 标记为 draining，不立即 Close()，保留其宿主机保护路由，开启 20 秒排空定时器（锁绝不盖住这 20 秒！）；
+	// 旧 Session 标记为 draining，不立即 Close()，排空期内旧节点保持 bypass，开启 20 秒排空定时器（锁绝不盖住这 20 秒！）；
 	// 新请求立刻走向新 Session。
 	if e.sessionMgr != nil {
 		e.sessionMgr.Drain(20 * time.Second)
@@ -652,10 +654,8 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	}
 
 	if e.mode == "tun" && e.running.Load() && oldIP != nil && (newIP == nil || !oldIP.Equal(newIP)) {
-		oldIPStr := oldIP.String()
-		time.AfterFunc(20*time.Second, func() {
-			UnprotectHostRoute(oldIPStr)
-		})
+		// 排空结束后重新规划：旧节点不在订阅中时其 bypass 随之移除
+		time.AfterFunc(20*time.Second, func() { e.refreshTunRoutes() })
 	}
 
 	log.Printf("[ENGINE] active node switched to %s (sni=%s)", addr, sni)
