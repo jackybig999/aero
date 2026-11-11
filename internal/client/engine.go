@@ -144,6 +144,8 @@ type Engine struct {
 	packetConnFactory PacketConnFactory
 	daemonCtx         context.Context
 	daemonCancel      context.CancelFunc
+	tokenRefreshKick  chan struct{} // 订阅应用后通知 token 刷新协程（token_refresh.go）
+	tokenRefreshOnce  sync.Once     // 首次应用订阅时才启动刷新协程
 
 	chainProxyMu  sync.RWMutex
 	chainProxyCfg ChainProxyConfig
@@ -188,6 +190,7 @@ func NewEngine() *Engine {
 		packetConnFactory: ListenPhysicalPacket,
 	}
 	eng.daemonCtx, eng.daemonCancel = context.WithCancel(context.Background())
+	eng.tokenRefreshKick = make(chan struct{}, 1)
 	eng.sentinel = newNodeSentinel(eng)
 	SetPacketConnFactory(ListenPhysicalPacket)
 	eng.loadChainProxyConfig()
@@ -382,7 +385,10 @@ func (e *Engine) Apply(applied *Applied) error {
 
 	primary := applied.Servers[0]
 	SetActiveEdgePinSPKI(primary.PinSPKI)
+	defer e.kickTokenRefresh()
 	if e.activeAddr == primary.Address {
+		// 同一节点：只更新凭证（含刷新后的签名 token），下次启动与重连使用新值
+		e.activeToken, e.activeSNI = primary.Token, primary.SNI
 		// host:port 严格一致，短路返回，绝对不调用 Reset()！
 		var ech []byte
 		if applied.ECHConfigs != nil {

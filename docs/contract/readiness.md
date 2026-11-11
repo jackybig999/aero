@@ -7,7 +7,7 @@
 | C1 `class=game` | draft | 未开始 | 未执行 | `class_game` | OFF | |
 | C1 `class=browser` | draft | 未开始 | 未执行 | `class_browser` | OFF | 依赖 C9、C10 |
 | C2 DoH | draft | 已实现（需按 M2 修复） | 未执行 | `doh` | OFF | |
-| C3 签名 token | final | edge 校验已接入（§3 第 1–4、7 步；过期断连）；第 5 步依赖 C4，第 6 步依赖 C1 场景；sub 签发已实现（`-signed-tokens` 默认关，密钥 0600，安装时写公钥）；client 按到期刷新未实现 | 黄金向量 api/testdata/c3-golden.json（sub 签、edge 验） | `auth_signed_token` | OFF | 档位由中台定义，token 携带执行参数。设备数超限时新连接优先、断开最早连接（2026-11-11 修订）。已核实 client 的鉴权流量只走主会话一条连接（连接池仅预热握手、不鉴权，不计数） |
+| C3 签名 token | final | edge 校验已接入（§3 第 1–4、7 步；过期断连）；第 5 步依赖 C4，第 6 步依赖 C1 场景；sub 签发已实现（`-signed-tokens` 默认关，密钥 0600，安装时写公钥）；client 剩余 25% 时刷新订阅并轮换会话；edge 按 uid 租约保持隧道地址 | 黄金向量 api/testdata/c3-golden.json（sub 签、edge 验） | `auth_signed_token` | OFF | 档位由中台定义，token 携带执行参数。设备数超限时新连接优先、断开最早连接（2026-11-11 修订）。已核实 client 的鉴权流量只走主会话一条连接（连接池仅预热握手、不鉴权，不计数） |
 | C5 订阅 | draft | 已实现（需重写） | 未执行 | `subscription_v2` | OFF | |
 | C5 ECH | draft | 未开始 | 未执行 | `ech_enabled` | OFF | 先验证 quic-go 路径与国内网络 |
 | C5 内层 IPv6 | draft | 部分实现（需重写） | 未执行 | `ipv6_inner` | OFF | 启动自检门禁 |
