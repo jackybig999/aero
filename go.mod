@@ -14,6 +14,7 @@ require (
 	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.7.0
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
+	golang.zx2c4.com/wireguard/windows v1.1.1
 	modernc.org/sqlite v1.59.0
 )
 

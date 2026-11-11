@@ -95,3 +95,16 @@ func hostAddr(p netip.Prefix) netip.Prefix {
 func tunRoutes(ipv4 netip.Prefix, plan RoutePlan) []netip.Prefix {
 	return append([]netip.Prefix{ipv4.Masked()}, planPrefixes(plan)...)
 }
+
+// uniqueAddrs 原地去重并保持顺序。
+func uniqueAddrs(in []netip.Addr) []netip.Addr {
+	seen := make(map[netip.Addr]bool, len(in))
+	out := in[:0]
+	for _, a := range in {
+		if !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	return out
+}

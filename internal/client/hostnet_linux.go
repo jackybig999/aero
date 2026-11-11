@@ -28,9 +28,9 @@ type linuxTunHost struct {
 	ipv4   netip.Prefix
 	plan   RoutePlan
 	routes []netip.Prefix // 实际下发的路由（含地址池网段）
-	ipv6   bool // 网卡是否启用 IPv6（宿主禁用 IPv6 时不下发 v6 路由，宿主本身也不会发出 IPv6）
-	v4MTU  int  // 隧道承载的 IPv4 内层 MTU
-	devMTU int  // 网卡 MTU：启用 IPv6 时至少 1280
+	ipv6   bool           // 网卡是否启用 IPv6（宿主禁用 IPv6 时不下发 v6 路由，宿主本身也不会发出 IPv6）
+	v4MTU  int            // 隧道承载的 IPv4 内层 MTU
+	devMTU int            // 网卡 MTU：启用 IPv6 时至少 1280
 	broken bool
 	closed bool
 }
@@ -229,18 +229,6 @@ func parseResolvConf(b []byte) []netip.Addr {
 			if a, err := netip.ParseAddr(f[1]); err == nil {
 				out = append(out, a.Unmap())
 			}
-		}
-	}
-	return out
-}
-
-func uniqueAddrs(in []netip.Addr) []netip.Addr {
-	seen := make(map[netip.Addr]bool, len(in))
-	out := in[:0]
-	for _, a := range in {
-		if !seen[a] {
-			seen[a] = true
-			out = append(out, a)
 		}
 	}
 	return out
