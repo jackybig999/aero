@@ -23,7 +23,7 @@ fi
 
 # 1. 部署二进制产物 (采用 POSIX 原子临时文件替换，杜绝任何进程占用导致 curl 23 错误)
 REPO="jackybig999/aero"
-VERSION="1.2.40"
+VERSION="1.3.0"
 
 echo "[1/3] 下载并安装 AERO Edge 核心程序..."
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/edge_linux_${ARCH}"

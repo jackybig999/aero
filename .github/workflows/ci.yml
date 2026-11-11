@@ -32,10 +32,10 @@ jobs:
       - name: Component Isolation Gate (ADR-0009)
         run: bash tools/check-imports.sh
 
-      - name: Vet & Test Edge & Mid
+      - name: Vet & Test Edge, Sub & Client
         run: |
-          go vet ./internal/edge ./cmd/edge ./internal/sub ./cmd/sub
-          go test -race -shuffle=on -v ./internal/edge ./internal/sub
+          go vet ./internal/edge ./cmd/edge ./internal/sub ./cmd/sub ./internal/client ./cmd/client
+          go test -race -shuffle=on -v ./internal/edge ./internal/sub ./internal/client
 
       - name: Build Edge Server (linux/amd64 & linux/arm64)
         run: |
@@ -228,11 +228,7 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_VER }}
-          body: |
-            ### 核心技术更新 (Release Highlights)
-            - **权威线缆契约与零空值零遗漏防线**：跨系统全面落地 Wire-Contract 测试与归一化流水线，强输入校验与未知字段拦截，彻底消除空值漂移与字段丢弃。
-            - **生产级单写者架构与资源回收无锁化**：单机 Pure-Go SQLite 数据库固化单写者连接池（SetMaxOpenConns(1)），无锁回收空闲上下文，彻底消除并发死锁与锁库崩溃。
-            - **零本地宿主订阅与标准 443 协议发布死线**：中台严格定位为管理控制台，全系统绝对严禁输出任何本地宿主带端口订阅，统一经由公网合法 SSL 证书的标准 443 HTTPS 域名发布；双向探活对齐与 Windows NRPT 自动自愈。
+          body_path: RELEASE_NOTES.md
           draft: false
           prerelease: false
           make_latest: true
