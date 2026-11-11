@@ -453,6 +453,16 @@ func (ct *ConnTracker) Get(c *quic.Conn) (string, bool) {
 	return b.token, ok
 }
 
+// UID 返回 c 绑定的签名 token 的 uid（不透明 token 或未绑定时为空）。
+func (ct *ConnTracker) UID(c *quic.Conn) string {
+	if c == nil {
+		return ""
+	}
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+	return ct.conns[c].uid
+}
+
 // Bind associates token with c.
 func (ct *ConnTracker) Bind(c *quic.Conn, token string) {
 	if c == nil {
@@ -2306,13 +2316,21 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assignedPrefix, err := s.ipPool.AllocateFor(token)
+	// 地址租约键：签名 token 按 uid（token 每 24 小时轮换，地址保持不变，隧道内 TCP 不中断）；
+	// 旧的不透明 token 按 token 本身。
+	leaseKey := token
+	if qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn); qc != nil && s.connTracker != nil {
+		if uid := s.connTracker.UID(qc); uid != "" {
+			leaseKey = "uid:" + uid
+		}
+	}
+	assignedPrefix, err := s.ipPool.AllocateFor(leaseKey)
 	if err != nil {
 		w.Header().Set("Proxy-Status", "aero; error=address_pool_exhausted; details=\"IP pool exhausted\"")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	defer s.ipPool.ReleaseFor(token, assignedPrefix)
+	defer s.ipPool.ReleaseFor(leaseKey, assignedPrefix)
 
 	var assignedIPv6 netip.Prefix
 	if s.ipv6Pool != nil {

@@ -188,3 +188,34 @@ func TestParseTokenIssuers(t *testing.T) {
 		}
 	}
 }
+
+// 地址租约按 uid：签名 token 轮换（同一 uid 的新 token）后仍拿回原地址，隧道内 TCP 不中断。
+func TestSignedTokenLeaseFollowsUID(t *testing.T) {
+	f := newSignedAuthFixture(t)
+	liveConns(t, map[*quic.Conn]bool{})
+	f.qs.validator.AddToken("tok_opaque", "legacy", time.Hour)
+	c1, c2 := new(quic.Conn), new(quic.Conn)
+	if ok, _ := f.auth(f.token(t, "user_grace01", 3, time.Hour), c1, "203.0.113.40"); !ok {
+		t.Fatal("signed token rejected")
+	}
+	if got := f.qs.connTracker.UID(c1); got != "user_grace01" {
+		t.Fatalf("UID = %q", got)
+	}
+	if ok, _ := f.auth("tok_opaque", c2, "203.0.113.41"); !ok || f.qs.connTracker.UID(c2) != "" {
+		t.Fatal("opaque token connection must have no uid")
+	}
+
+	pool, err := NewIPPool("10.88.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := pool.AllocateFor("uid:user_grace01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.ReleaseFor("uid:user_grace01", first) // 旧连接关闭
+	again, err := pool.AllocateFor("uid:user_grace01")
+	if err != nil || again != first {
+		t.Fatalf("after token rotation got %v (err %v), want the same address %v", again, err, first)
+	}
+}
