@@ -110,43 +110,46 @@ func TestSignedTokenExpiredIsNotJailed(t *testing.T) {
 	}
 }
 
-// 本节点设备数：同一 uid 的连接达到 max_devices 后拒绝新连接（403），断开一条后可再连；
-// 已绑定连接的后续请求不受影响；同一连接换 token 拒绝。
-func TestSignedTokenDeviceLimit(t *testing.T) {
+// 本节点设备数（C3 §3 第 7 步，2026-11-11 修订）：达到 max_devices 时接受新连接、断开该 uid 最早的连接；
+// 已关闭的连接不占名额；同一连接上的后续请求不受影响；同一连接换 token 拒绝；其他用户互不影响。
+func TestSignedTokenDeviceLimitEvictsOldest(t *testing.T) {
 	f := newSignedAuthFixture(t)
 	dead := map[*quic.Conn]bool{}
 	liveConns(t, dead)
+	var evicted []*quic.Conn
+	prevClose := closeEvictedConn
+	closeEvictedConn = func(c *quic.Conn) { evicted = append(evicted, c) }
+	t.Cleanup(func() { closeEvictedConn = prevClose })
+
 	tok := f.token(t, "user_carol01", 2, time.Hour)
 	c1, c2, c3 := new(quic.Conn), new(quic.Conn), new(quic.Conn)
-	for i, c := range []*quic.Conn{c1, c2} {
+	for i, c := range []*quic.Conn{c1, c2, c3} {
 		if ok, rec := f.auth(tok, c, "203.0.113.30"); !ok {
-			t.Fatalf("device %d rejected: %d", i+1, rec.Code)
+			t.Fatalf("connection %d rejected: %d", i+1, rec.Code)
 		}
 	}
-	ok, rec := f.auth(tok, c3, "203.0.113.30")
-	if ok || rec.Code != http.StatusForbidden || !strings.Contains(rec.Header().Get("Proxy-Status"), "EDGE_DEVICE_LIMIT") {
-		t.Fatalf("third device: ok=%v code=%d status=%q", ok, rec.Code, rec.Header().Get("Proxy-Status"))
+	if len(evicted) != 1 || evicted[0] != c1 {
+		t.Fatalf("evicted = %v, want only the oldest connection c1", evicted)
 	}
-	if ok, _ := f.auth(tok, c1, "203.0.113.30"); !ok {
-		t.Fatal("follow-up request on an already bound connection rejected")
+	if _, tracked := f.qs.connTracker.Get(c1); tracked {
+		t.Fatal("evicted connection still tracked")
 	}
-	if ok, _ := f.auth(f.token(t, "user_dave001", 2, time.Hour), c1, "203.0.113.30"); ok {
+	if ok, _ := f.auth(tok, c2, "203.0.113.30"); !ok {
+		t.Fatal("follow-up request on a bound connection rejected")
+	}
+	if len(evicted) != 1 {
+		t.Fatal("a follow-up request on an existing connection evicted another one")
+	}
+	if ok, _ := f.auth(f.token(t, "user_dave001", 2, time.Hour), c2, "203.0.113.30"); ok {
 		t.Fatal("a different token accepted on a connection bound to another token")
 	}
-	other := f.token(t, "user_erin001", 1, time.Hour) // 其他用户不受 carol 的计数影响
-	if ok, _ := f.auth(other, c3, "203.0.113.31"); !ok {
-		t.Fatal("another uid blocked by carol's device count")
+	if ok, _ := f.auth(f.token(t, "user_erin001", 1, time.Hour), new(quic.Conn), "203.0.113.31"); !ok || len(evicted) != 1 {
+		t.Fatal("another user's connection affected carol's devices")
 	}
-	f.qs.connTracker.Remove(c3)
-	f.qs.connTracker.Remove(c2)
-	if ok, _ := f.auth(tok, c3, "203.0.113.30"); !ok {
-		t.Fatal("device slot not freed after a connection was removed")
-	}
-	// 已关闭但尚未被定期清理删除的连接不得占用名额
-	dead[c1] = true
-	c4 := new(quic.Conn)
-	if ok, rec := f.auth(tok, c4, "203.0.113.30"); !ok {
-		t.Fatalf("closed connection still counted as a device: %d", rec.Code)
+	// 已关闭的连接不占名额：c2 关闭后再来一条，不应再踢掉 c3
+	dead[c2] = true
+	if ok, _ := f.auth(tok, new(quic.Conn), "203.0.113.30"); !ok || len(evicted) != 1 {
+		t.Fatalf("closed connection still counted (evicted=%d)", len(evicted))
 	}
 }
 

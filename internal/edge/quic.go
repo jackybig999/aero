@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -417,6 +418,7 @@ type quicConnKey struct{}
 type ConnTracker struct {
 	mu    sync.RWMutex
 	conns map[*quic.Conn]connBinding
+	seq   uint64 // 绑定顺序，用于找出最早的连接
 }
 
 // connAlive 报告连接是否仍存活；可在测试中替换（零值 quic.Conn 没有上下文）。
@@ -432,6 +434,7 @@ var connAlive = func(c *quic.Conn) bool {
 // connBinding 是连接绑定的 token 与（签名 token 的）uid；uid 用于本节点设备数计数（C3 §3 第 7 步）。
 type connBinding struct {
 	token, uid string
+	seq        uint64
 }
 
 // NewConnTracker creates a new ConnTracker.
@@ -460,16 +463,18 @@ func (ct *ConnTracker) Bind(c *quic.Conn, token string) {
 	ct.mu.Unlock()
 }
 
-// BindLimited 在同一把锁内检查并绑定（L0 §7.5 原子）：uid 非空且 max > 0 时，该 uid 在本节点已绑定的
-// 连接数达到 max 则拒绝，返回 false。
-func (ct *ConnTracker) BindLimited(c *quic.Conn, token, uid string, max int) bool {
+// BindEvictOldest 在同一把锁内计数并绑定（L0 §7.5 原子，C3 §3 第 7 步）：uid 非空且 max > 0 时，
+// 若该 uid 在本节点的存活连接加上本连接超过 max，则摘除最早的连接并返回它们，由调用方在锁外断开。
+// 新连接总是被接受：服务端无法及时区分“同一设备换网重连”与“另一设备上线”（最长 90 秒空闲超时）。
+func (ct *ConnTracker) BindEvictOldest(c *quic.Conn, token, uid string, max int) []*quic.Conn {
 	if c == nil {
-		return true
+		return nil
 	}
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
+	var evict []*quic.Conn
 	if uid != "" && max > 0 {
-		n := 0
+		var same []*quic.Conn
 		for other, b := range ct.conns {
 			if other == c || b.uid != uid {
 				continue
@@ -478,14 +483,24 @@ func (ct *ConnTracker) BindLimited(c *quic.Conn, token, uid string, max int) boo
 				delete(ct.conns, other)
 				continue
 			}
-			n++
+			same = append(same, other)
 		}
-		if n >= max {
-			return false
+		if extra := len(same) + 1 - max; extra > 0 {
+			sort.Slice(same, func(i, j int) bool { return ct.conns[same[i]].seq < ct.conns[same[j]].seq })
+			evict = same[:extra]
+			for _, e := range evict {
+				delete(ct.conns, e)
+			}
 		}
 	}
-	ct.conns[c] = connBinding{token: token, uid: uid}
-	return true
+	ct.seq++
+	ct.conns[c] = connBinding{token: token, uid: uid, seq: ct.seq}
+	return evict
+}
+
+// closeEvictedConn 断开因设备数上限被替换的连接；可在测试中替换。
+var closeEvictedConn = func(c *quic.Conn) {
+	_ = c.CloseWithError(0x103, "EDGE_DEVICE_LIMIT: replaced by a newer connection of the same user")
 }
 
 // Remove dissociates c.
@@ -1777,12 +1792,11 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 			if claims != nil {
 				uid, maxDevices = claims.UID, claims.MaxDevices
 			}
-			if !s.connTracker.BindLimited(qc, token, uid, maxDevices) {
-				// 正常用户多开设备，不计入防爆破封禁
-				w.Header().Set("Proxy-Status", `aero; error=connection_refused; details="EDGE_DEVICE_LIMIT"`)
-				w.WriteHeader(http.StatusForbidden)
-				log.Printf("[AUTH] device limit %d reached for uid %s", maxDevices, uid)
-				return "", false
+			if evicted := s.connTracker.BindEvictOldest(qc, token, uid, maxDevices); len(evicted) > 0 {
+				for _, old := range evicted {
+					closeEvictedConn(old)
+				}
+				log.Printf("[AUTH] uid %s at device limit %d: closed %d oldest connection(s)", uid, maxDevices, len(evicted))
 			}
 		}
 	}

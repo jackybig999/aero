@@ -37,9 +37,10 @@ aero1.<payload>.<signature>
 | 4 | `iat` ≤ 当前时间 + 300 秒；当前时间 < `exp` + 0（不放宽过期） | `EDGE_AUTH_TOKEN_EXPIRED` |
 | 5 | `jti` 不在吊销列表（C4） | `EDGE_AUTH_TOKEN_REVOKED` |
 | 6 | 请求的场景在 `classes` 内 | `EDGE_CLASS_NOT_ALLOWED` |
-| 7 | 该 `uid` 在本节点的 QUIC 连接数 < `max_devices`（服务端原子计数，L0 §7.5） | `EDGE_DEVICE_LIMIT` |
+| 7 | 该 `uid` 在本节点的存活 QUIC 连接数达到 `max_devices` 时，**接受新连接并断开该 uid 最早的连接**（服务端原子计数，L0 §7.5；修订 2026-11-11，用户决定） | 被断开的连接以 `EDGE_DEVICE_LIMIT` 为关闭原因 |
 
 - 校验通过的 token 绑定到该 QUIC 连接；连接存续期间 token 过期或被吊销时，edge 在 10 秒内断开该连接（已由 M1-4a 的执行器实现）。
+- 第 7 步修订理由：客户端换网络后立即重连，而服务端最长 90 秒（QUIC 空闲超时）才能发现旧连接已断，期间无法区分“同一设备重连”与“另一设备上线”；拒绝新连接会让 `max_devices=1` 的用户换网后长时间无法使用。修订对客户端是兼容变更（L0 §4.6）。
 - 时钟容差只用于 `iat`（容忍签发方时钟略快），不用于 `exp`。
 - 日志只记录 `jti` 的前 8 个字符与 `uid`，不记录完整 token。
 
@@ -68,7 +69,7 @@ aero1.<payload>.<signature>
 
 | 限制 | 单节点（立即，硬限制） | 跨节点（延迟一个拉取周期，软限制） |
 |---|---|---|
-| 设备数 `max_devices` | 本节点同一 `uid` 并发 QUIC 连接原子计数 | sub 汇总各节点 `/v1/status` 的每用户在线会话数，超限则吊销最早签发的 `jti` |
+| 设备数 `max_devices` | 本节点同一 `uid` 并发 QUIC 连接原子计数，超限时新连接优先、断开最早连接 | sub 汇总各节点 `/v1/status` 的每用户在线会话数，超限则吊销最早签发的 `jti` |
 | 流量 `quota_bytes` | 本节点累计计量达到即断开 | sub 汇总 `/v1/usage`，跨节点合计超限即吊销 |
 | 带宽 `bw_bps` | 本节点按 `uid` 令牌桶 | 不做跨节点合计 |
 
