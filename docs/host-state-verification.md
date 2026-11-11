@@ -20,4 +20,9 @@
 - 待实现（C4）。
 
 ## 服务端 edge
-- 待实现（ip_forward 还原、cleanup-host、ExecStopPost）。
+- 2026-11-11 线上节点（Debian，x86_64，edge 1.3.1，sha256 7bf93be6…05ad）：
+  - 升级时旧进程退出日志 “Firewall rules added by this process were removed”，新进程规则全部带 `aero_edge_default` 标签且限定 `aero-tun0`/地址池（FORWARD MSS 2 条、filter 2 条、nat MASQUERADE 1 条），无重复叠加。
+  - 端口轮试：UDP 8443 被同机 xray 占用，edge 自动跳过，其余 8 个端口正常。
+  - 闭环（tmp/e2e，进程内，不建网卡）：QUIC 握手 746ms；TCP 中继出口 207.57.187.35；DoH 解析 www.google.com 正常；CONNECT-IP 分配 10.88.36.254/32，ICMP 1.1.1.1 往返 227ms，UDP DNS 8.8.8.8 往返 226ms。
+  - `/sub/admin` 返回 404（匿名泄露已关闭）。
+- 未完成：`ip_forward` 退出时仍不还原；cleanup-host 与 ExecStopPost 待实现。
