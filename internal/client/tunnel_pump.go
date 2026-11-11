@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -229,6 +230,10 @@ func (p *IPDataPump) pumpTunToRemote() {
 				continue
 			}
 
+			if !forwardable(raw) { // 组播、广播、TTL ≤ 1
+				continue
+			}
+
 			// 3c. 宿主局域网源 IP 串流拦截：若源 IP 为物理局域网私有网段 (192.168.0.0/16, 172.16.0.0/12)，严禁送入远端 CONNECT-IP 隧道
 			srcIP := net.IP(raw[12:16])
 			if (srcIP[0] == 192 && srcIP[1] == 168) || (srcIP[0] == 172 && srcIP[1] >= 16 && srcIP[1] <= 31) {
@@ -252,6 +257,10 @@ func (p *IPDataPump) pumpTunToRemote() {
 				if isSTUNPacket(raw[48:]) && !p.webrtcActive.Load() {
 					continue
 				}
+			}
+
+			if !forwardable(raw) { // 组播、链路本地、Hop Limit ≤ 1：不进隧道，也不回 ICMP
+				continue
 			}
 
 			// 第 3 重防泄漏 (方案 §3.2)：若开启 IPv6 黑洞模式，拒绝非 DNS 的 IPv6 报文，原生回写 ICMPv6 Type 1 Code 3
@@ -544,4 +553,19 @@ func buildICMPv6AddressUnreachable(origPkt []byte) []byte {
 	}
 	binary.BigEndian.PutUint16(icmp[2:4], csum)
 	return resp
+}
+
+// forwardable 判断报文能否经 CONNECT-IP 转发。网卡启用后系统会在本网卡上发送链路本地组播
+// （LLMNR、mDNS、MLD、SSDP 等，TTL/Hop Limit 常为 1）；RFC 9484 代理会因 TTL 递减拒绝这类报文，
+// 它们也不应离开本机，故在本地丢弃。调用方已保证 IPv4 首部完整、IPv6 至少 40 字节。
+func forwardable(raw []byte) bool {
+	switch raw[0] >> 4 {
+	case 4:
+		dst := netip.AddrFrom4([4]byte(raw[16:20]))
+		return raw[8] > 1 && !dst.IsMulticast() && dst != netip.AddrFrom4([4]byte{255, 255, 255, 255})
+	case 6:
+		dst := netip.AddrFrom16([16]byte(raw[24:40]))
+		return raw[7] > 1 && !dst.IsMulticast() && !dst.IsLinkLocalUnicast()
+	}
+	return false
 }

@@ -395,6 +395,7 @@ func TestICMPFragNeededOnDFOverflow(t *testing.T) {
 	// 1. 带 DF 标志且超限包：构造 ICMP
 	bigPacketDF := make([]byte, 1300)
 	bigPacketDF[0] = 0x45                          // IPv4, IHL=5 (20 bytes)
+	bigPacketDF[8] = 64                            // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	bigPacketDF[6] = 0x40                          // DF = 1
 	copy(bigPacketDF[12:16], []byte{10, 88, 0, 2}) // Src IP
 	copy(bigPacketDF[16:20], []byte{8, 8, 8, 8})   // Dst IP
@@ -428,6 +429,7 @@ func TestICMPFragNeededOnDFOverflow(t *testing.T) {
 	// 2. 不带 DF 标志超限包：静默丢弃 (DF = 0)
 	bigPacketNoDF := make([]byte, 1300)
 	bigPacketNoDF[0] = 0x45
+	bigPacketNoDF[8] = 64   // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	bigPacketNoDF[6] = 0x00 // DF = 0
 	df := (bigPacketNoDF[6] & 0x40) != 0
 	if df {
@@ -4234,6 +4236,7 @@ func TestIPDataPump_DomesticIPBypass(t *testing.T) {
 	// 1. 发送国内 IP 报文 (223.5.5.5:80 HTTP) - 必须被阻断，绝不送入远端隧道
 	chinaPkt := make([]byte, 40)
 	chinaPkt[0] = 0x45
+	chinaPkt[8] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	binary.BigEndian.PutUint16(chinaPkt[2:4], 40)
 	chinaPkt[9] = 6 // TCP
 	copy(chinaPkt[12:16], net.ParseIP("10.88.0.2").To4())
@@ -4248,6 +4251,7 @@ func TestIPDataPump_DomesticIPBypass(t *testing.T) {
 	// 2. 发送私网 IP 报文 (192.168.1.1:80) - 必须被阻断
 	privatePkt := make([]byte, 40)
 	privatePkt[0] = 0x45
+	privatePkt[8] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	binary.BigEndian.PutUint16(privatePkt[2:4], 40)
 	privatePkt[9] = 6
 	copy(privatePkt[12:16], net.ParseIP("10.88.0.2").To4())
@@ -4262,6 +4266,7 @@ func TestIPDataPump_DomesticIPBypass(t *testing.T) {
 	// 3. 发送海外公网 IP 报文 (8.8.8.8:80) - 必须正常送入远端隧道
 	overseasPkt := make([]byte, 40)
 	overseasPkt[0] = 0x45
+	overseasPkt[8] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	binary.BigEndian.PutUint16(overseasPkt[2:4], 40)
 	overseasPkt[9] = 6
 	copy(overseasPkt[12:16], net.ParseIP("10.88.0.2").To4())

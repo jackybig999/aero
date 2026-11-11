@@ -49,6 +49,7 @@ func TestAdversarial_TunnelPump_InputValidation(t *testing.T) {
 	for length := 20; length < 40; length++ {
 		pkt := make([]byte, length)
 		pkt[0] = 0x60 // IPv6
+		pkt[7] = 64   // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 		pkt[6] = 17   // UDP
 		tun.inCh <- pkt
 	}
@@ -112,6 +113,7 @@ func TestAdversarial_TunnelPump_InputValidation(t *testing.T) {
 	for l := 40; l < 48; l++ {
 		shortUDP := make([]byte, l)
 		shortUDP[0] = 0x60
+		shortUDP[7] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 		shortUDP[6] = 17 // UDP
 		tun.inCh <- shortUDP
 
@@ -129,6 +131,7 @@ func TestAdversarial_TunnelPump_InputValidation(t *testing.T) {
 	// 6a. Length 48 (UDP payload length = 0)
 	emptyDNSPkt := make([]byte, 48)
 	emptyDNSPkt[0] = 0x60
+	emptyDNSPkt[7] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	emptyDNSPkt[6] = 17
 	copy(emptyDNSPkt[8:24], net.ParseIP("fd88::2").To16())
 	copy(emptyDNSPkt[24:40], net.ParseIP("fd88::1").To16())
@@ -140,6 +143,7 @@ func TestAdversarial_TunnelPump_InputValidation(t *testing.T) {
 	for payloadLen := 1; payloadLen < 12; payloadLen++ {
 		truncDNS := make([]byte, 48+payloadLen)
 		truncDNS[0] = 0x60
+		truncDNS[7] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 		truncDNS[6] = 17
 		copy(truncDNS[8:24], net.ParseIP("fd88::2").To16())
 		copy(truncDNS[24:40], net.ParseIP("fd88::1").To16())
@@ -151,6 +155,7 @@ func TestAdversarial_TunnelPump_InputValidation(t *testing.T) {
 	// 6c. Corrupted DNS question label pointer (points beyond buffer)
 	corruptLabel := make([]byte, 70)
 	corruptLabel[0] = 0x60
+	corruptLabel[7] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	corruptLabel[6] = 17
 	copy(corruptLabel[8:24], net.ParseIP("fd88::2").To16())
 	copy(corruptLabel[24:40], net.ParseIP("fd88::1").To16())
@@ -207,7 +212,8 @@ func TestAdversarial_TunnelPump_InputValidation(t *testing.T) {
 	// Ensure pump is alive and healthy after fuzzing
 	probePkt := make([]byte, 50)
 	probePkt[0] = 0x60
-	probePkt[6] = 6 // TCP
+	probePkt[7] = 64 // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
+	probePkt[6] = 6  // TCP
 	tun.inCh <- probePkt
 
 	select {
@@ -312,6 +318,7 @@ func TestAdversarial_TunnelPump_DualStackConcurrency(t *testing.T) {
 				// IPv4 packet: 20-byte IP header + 40-byte payload
 				pkt := make([]byte, 60)
 				pkt[0] = 0x45 // IPv4, IHL 5
+				pkt[8] = 64   // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 				binary.BigEndian.PutUint16(pkt[2:4], 60)
 				pkt[9] = 6 // TCP
 				copy(pkt[12:16], net.ParseIP("10.88.0.2").To4())
@@ -338,6 +345,7 @@ func TestAdversarial_TunnelPump_DualStackConcurrency(t *testing.T) {
 				// IPv6 packet: 40-byte IPv6 header + 40-byte payload
 				pkt := make([]byte, 80)
 				pkt[0] = 0x60 // IPv6
+				pkt[7] = 64   // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 				binary.BigEndian.PutUint16(pkt[4:6], 40)
 				pkt[6] = 6 // TCP
 				copy(pkt[8:24], net.ParseIP("fd88::2").To16())

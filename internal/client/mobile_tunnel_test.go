@@ -295,6 +295,7 @@ func TestFinalGate_MobileBufPool(t *testing.T) {
 
 	packet1500 := make([]byte, 1500)
 	packet1500[0] = 0x45 // IPv4
+	packet1500[8] = 64   // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	packet1500[1499] = 0xFF
 
 	var wg sync.WaitGroup

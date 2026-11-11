@@ -7,6 +7,8 @@ package client
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
+	"log"
 	"net"
 	"strings"
 	"sync"
@@ -442,7 +444,13 @@ func (h *DNSHandler) queryDoH(ctx context.Context, pkt []byte, qname, qnameLower
 		return nil
 	}
 	resp, err := h.dohResolver(ctx, pkt)
-	if err == nil && len(resp) >= 12 {
+	if err == nil && len(resp) < 12 {
+		err = fmt.Errorf("short DoH response (%d bytes)", len(resp))
+	}
+	if err != nil {
+		logDoHFailure(err)
+	}
+	if err == nil {
 		if len(pkt) >= 2 && len(resp) >= 2 {
 			resp[0], resp[1] = pkt[0], pkt[1]
 		}
@@ -458,6 +466,24 @@ func (h *DNSHandler) queryDoH(ctx context.Context, pkt []byte, qname, qnameLower
 		return resp
 	}
 	return nil
+}
+
+// DoH 失败日志限速：首次立即记录，之后每 30 秒最多一条，并带上期间被抑制的次数。
+var dohFailLog struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+func logDoHFailure(err error) { // 不记录域名（访问记录属于隐私）
+	dohFailLog.mu.Lock()
+	defer dohFailLog.mu.Unlock()
+	if !dohFailLog.last.IsZero() && time.Since(dohFailLog.last) < 30*time.Second {
+		dohFailLog.suppressed++
+		return
+	}
+	log.Printf("[DNS] DoH query failed: %v (%d similar failures suppressed)", err, dohFailLog.suppressed)
+	dohFailLog.last, dohFailLog.suppressed = time.Now(), 0
 }
 
 // parseFirstIPv4FromDNSResponse 按 RFC 1035 标准解析 DNS 应答中的首个 A 记录

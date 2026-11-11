@@ -378,6 +378,7 @@ func TestSimulatedGameAccelerationDatagramGuard(t *testing.T) {
 	// 2. 验证生产代码 buildICMPFragNeeded: 栈入口超限 IPv4 且 DF=1 生成 ICMP Type 3 Code 4
 	bigPacketDF := make([]byte, 1400)
 	bigPacketDF[0] = 0x45
+	bigPacketDF[8] = 64   // TTL/Hop Limit：真实报文不为 0，≤1 的报文不可转发
 	bigPacketDF[6] = 0x40 // DF=1
 	binary.BigEndian.PutUint16(bigPacketDF[2:4], 1400)
 	copy(bigPacketDF[12:16], net.ParseIP("10.88.0.2").To4()) // 原源 IP
