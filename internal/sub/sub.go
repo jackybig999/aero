@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,6 +31,14 @@ type SubBuilder struct {
 	eps    *EndpointStore
 	vps    VPSStore
 	sniMgr *SNIMatrixManager
+
+	issuer       *TokenIssuer // C3 签发方
+	signedTokens bool         // 订阅下发签名 token（-signed-tokens，默认关闭）
+}
+
+// SetTokenIssuer 设置 C3 签发方；enabled 为真时订阅下发签名 token（替代旧的不透明 token）。
+func (sb *SubBuilder) SetTokenIssuer(ti *TokenIssuer, enabled bool) {
+	sb.issuer, sb.signedTokens = ti, enabled && ti != nil
 }
 
 func NewSubBuilder(users UserStore, eps *EndpointStore, vps VPSStore, sniMgr *SNIMatrixManager) *SubBuilder {
@@ -167,6 +176,18 @@ func (sb *SubBuilder) ServeSub(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allowDegrade bool) (map[string]any, int, error) {
+	// C3：同一订阅在所有节点使用同一个签名 token（edge 以 uid 计设备数）
+	signedToken := ""
+	if sb.signedTokens {
+		tok, _, err := sb.issuer.IssueForUser(user)
+		if errors.Is(err, errSubscriptionExpired) {
+			return nil, http.StatusForbidden, err
+		}
+		if err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("issue token: %w", err)
+		}
+		signedToken = tok
+	}
 	vpsMap := make(map[uint64]*VPSHost)
 	if sb.vps != nil {
 		if hosts, err := sb.vps.List(); err == nil {
@@ -220,13 +241,14 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 				port = 443
 			}
 
-			token := ""
-			if user.SubToken != "" {
+			token := signedToken
+			if token == "" && user.SubToken != "" {
 				token = user.SubToken
-			} else if user.SubTicketSeed != "" {
+			} else if token == "" && user.SubTicketSeed != "" {
 				token = DeriveNodeToken(user.SubTicketSeed, host)
-			} else {
-				token = "usr_" + user.Username
+			}
+			if token == "" {
+				continue // 没有凭证的用户不下发节点（旧实现回退为可猜的 "usr_"+用户名）
 			}
 
 			loadScore := 50.0

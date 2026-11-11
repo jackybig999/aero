@@ -1,0 +1,25 @@
+{
+  "claims": {
+    "v": 1,
+    "iss": "sub",
+    "kid": "sub-golden",
+    "uid": "u_a1b2c3-42",
+    "jti": "jti_golden_000000000001",
+    "tier": "standard",
+    "classes": [
+      "default",
+      "ai",
+      "browser",
+      "game"
+    ],
+    "max_devices": 3,
+    "quota_bytes": 107374182400,
+    "iat": 1800000000,
+    "exp": 1800086400
+  },
+  "description": "C3 cross-component golden vector: sub must produce exactly this token for these claims and seed; edge must verify it. Do not edit by hand.",
+  "kid": "sub-golden",
+  "public_key": "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=",
+  "seed_base64": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+  "token": "aero1.eyJ2IjoxLCJpc3MiOiJzdWIiLCJraWQiOiJzdWItZ29sZGVuIiwidWlkIjoidV9hMWIyYzMtNDIiLCJqdGkiOiJqdGlfZ29sZGVuXzAwMDAwMDAwMDAwMSIsInRpZXIiOiJzdGFuZGFyZCIsImNsYXNzZXMiOlsiZGVmYXVsdCIsImFpIiwiYnJvd3NlciIsImdhbWUiXSwibWF4X2RldmljZXMiOjMsInF1b3RhX2J5dGVzIjoxMDczNzQxODI0MDAsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDg2NDAwfQ.K4W3eXDX_GH3Bg2OAHCLeR33izUuGCnEDjkv6bl754h2YAXi_4vb2ftESXW4OTm0fS9_igwSX_mZSpzUcjmyAw"
+}

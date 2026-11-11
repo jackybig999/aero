@@ -1399,6 +1399,12 @@ type VPSService struct {
 	eps       *EndpointStore
 	nodeSvc   *NodeService
 	userStore UserStore
+	issuer    *TokenIssuer // 全新安装时把公钥写入节点 token_issuers（auth_signed_token 仍默认关闭）
+}
+
+// SetTokenIssuer 设置 C3 签发方，供安装流程写入节点配置的公钥。
+func (s *VPSService) SetTokenIssuer(ti *TokenIssuer) {
+	s.issuer = ti
 }
 
 func NewVPSService(s VPSStore, box *SecretBox, eps *EndpointStore) *VPSService {

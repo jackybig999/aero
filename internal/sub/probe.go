@@ -2080,7 +2080,7 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		globalTaskManager.Finish(taskID, "failed", err.Error())
 		return
 	}
-	created, err := configureEdgeService(client, host, adminKey, customPort)
+	created, err := configureEdgeService(client, host, adminKey, customPort, svc.issuer)
 	if err != nil {
 		errMsg := fmt.Sprintf("配置服务失败: %v", err)
 		globalTaskManager.AppendLog(taskID, "[配置 错误] "+errMsg)
@@ -2232,10 +2232,14 @@ WantedBy=multi-user.target
 `
 
 // configureEdgeService 全新安装时写入最小配置（已有配置不覆盖，返回 created=false），写入服务单元并重启服务。
-func configureEdgeService(client *ssh.Client, host, adminKey string, customPort int) (created bool, err error) {
+func configureEdgeService(client *ssh.Client, host, adminKey string, customPort int, issuer *TokenIssuer) (created bool, err error) {
 	cfg := map[string]any{"domain": host, "data_dir": "/var/lib/aero", "admin_key": adminKey}
 	if customPort > 0 {
 		cfg["listen"] = fmt.Sprintf(":%d", customPort)
+	}
+	if issuer != nil {
+		// 只写公钥（运维面配置）；auth_signed_token 默认关闭，由运维确认后开启（C3）
+		cfg["token_issuers"] = map[string]string{issuer.Kid(): issuer.PublicKeyBase64()}
 	}
 	cfgJSON, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {

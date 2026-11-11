@@ -464,6 +464,7 @@ func RegisterMeteringRoutes(mux *http.ServeMux, db *AeroDB, adminKey string) {
 func (h *AeroHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/aero/vps-options/", h.VPSOptions)
 	mux.HandleFunc("GET /api/v1/aero/source-status/", h.SourceStatus)
+	mux.HandleFunc("GET /api/v1/aero/token-issuer/", h.TokenIssuer)
 	mux.HandleFunc("GET /api/v1/aero/tasks/", h.ListTasks)
 	mux.HandleFunc("GET /api/v1/aero/tasks/{id}/", h.GetTask)
 	mux.HandleFunc("DELETE /api/v1/aero/tasks/{id}/", h.DeleteTask)
@@ -862,4 +863,18 @@ func (h *AeroHandler) GetPurity(w http.ResponseWriter, r *http.Request) {
 		"code": 0,
 		"data": data,
 	})
+}
+
+// TokenIssuer 返回 C3 签发公钥（管理员接口）：运维据此配置节点 edge.json 的 token_issuers。不返回私钥。
+func (h *AeroHandler) TokenIssuer(w http.ResponseWriter, r *http.Request) {
+	ti := h.svc.issuer
+	if ti == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errResp(1011, "token issuer not configured"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{
+		"kid":           ti.Kid(),
+		"public_key":    ti.PublicKeyBase64(),
+		"token_issuers": map[string]string{ti.Kid(): ti.PublicKeyBase64()},
+	}})
 }

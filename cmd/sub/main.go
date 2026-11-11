@@ -43,6 +43,7 @@ func main() {
 	hostFlag := flag.String("host", "0.0.0.0", "middle platform listen host")
 	portFlag := flag.String("port", "18080", "middle platform listen port")
 	dataDirFlag := flag.String("data", "", "data directory path")
+	signedTokens := flag.Bool("signed-tokens", false, "issue C3 signed tokens in subscriptions (nodes need auth_signed_token and this platform's token_issuers key)")
 	flag.Parse()
 
 	if *showVer {
@@ -180,11 +181,18 @@ func main() {
 	vpsSvc := sub.NewVPSService(vpsDB, box, epStore)
 	vpsSvc.SetNodeService(nodeSvc)
 	vpsSvc.SetUserStore(userDB)
+	tokenIssuer, err := sub.LoadOrCreateTokenIssuer(dataDir)
+	if err != nil {
+		log.Fatalf("token signing key: %v", err)
+	}
+	vpsSvc.SetTokenIssuer(tokenIssuer)
+	log.Printf("[AUTH] C3 token issuer kid=%s (signed tokens in subscriptions: %v)", tokenIssuer.Kid(), *signedTokens)
 	vpsSvc.StartPurityTicker(context.Background(), 4*time.Hour)
 
 	sniPath := filepath.Join(dataDir, "sni_matrix.json")
 	sniMgr := sub.NewSNIMatrixManager(sniPath)
 	subBuilder := sub.NewSubBuilder(userDB, epStore, vpsDB, sniMgr)
+	subBuilder.SetTokenIssuer(tokenIssuer, *signedTokens)
 
 	// 7. Auto-sync All VPS Assets & AERO Endpoints into Node Registry
 	existingHosts, _ := vpsDB.List()
