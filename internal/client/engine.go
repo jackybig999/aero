@@ -760,6 +760,10 @@ func (e *Engine) startLocked(ticket uint64) error {
 	mode := e.mode
 	e.mu.RUnlock()
 
+	// 只有明确的 "tun" 才会修改宿主网络；其他未知值拒绝启动（fail-closed）。
+	if mode != "tun" && mode != "sysproxy" {
+		return failStart(fmt.Errorf("unsupported mode %q (use tun or sysproxy)", mode))
+	}
 	// 本地模式（sysproxy）不碰宿主；TUN 模式先检测第三方 TUN 冲突（只读）。
 	// 自有网卡的全部状态随网卡销毁而消失，无需清理上次残留（ADR-0013）。
 	if mode != "sysproxy" {
@@ -1528,6 +1532,18 @@ func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
 }
 
 // SetMode 设置工作模式
+// NormalizeMode 把用户输入的模式规范为 "tun" 或 "sysproxy"（"socks"、"proxy" 为 sysproxy 的别名）。
+// 未知模式报错：不得因拼写错误默认进入会修改宿主网络的 TUN 模式。
+func NormalizeMode(m string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(m)) {
+	case "tun":
+		return "tun", nil
+	case "sysproxy", "socks", "proxy":
+		return "sysproxy", nil
+	}
+	return "", fmt.Errorf("unsupported mode %q (use tun or sysproxy)", m)
+}
+
 func (e *Engine) SetMode(m string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

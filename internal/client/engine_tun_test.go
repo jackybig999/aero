@@ -178,3 +178,45 @@ func TestRefreshTunRoutesIgnoresClosedHost(t *testing.T) {
 		t.Fatalf("closed host produced error %q", st.LastError)
 	}
 }
+
+// 节点切换、网络变化触发的路由刷新与停止并发时不得有数据竞争（需 -race）。
+func TestRefreshTunRoutesConcurrentWithRelease(t *testing.T) {
+	useFakeTunHost(t, nil)
+	eng := NewEngine()
+	for i := 0; i < 50; i++ {
+		eng.mu.Lock()
+		eng.tunHost = &fakeTunHost{dev: newMockTunDevice()}
+		eng.mu.Unlock()
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); eng.refreshTunRoutes() }()
+		go func() { defer wg.Done(); eng.releaseTunLocked() }()
+		wg.Wait()
+	}
+}
+
+func TestNormalizeMode(t *testing.T) {
+	for in, want := range map[string]string{"tun": "tun", "TUN": "tun", "sysproxy": "sysproxy", "socks": "sysproxy", " proxy ": "sysproxy"} {
+		if got, err := NormalizeMode(in); err != nil || got != want {
+			t.Errorf("NormalizeMode(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "tunn", "global"} {
+		if _, err := NormalizeMode(bad); err == nil {
+			t.Errorf("NormalizeMode(%q) accepted", bad)
+		}
+	}
+}
+
+// 回归：-mode socks 曾落入 TUN 分支并修改宿主网络。未知模式必须拒绝启动且不创建网卡。
+func TestEngineStartRejectsUnknownMode(t *testing.T) {
+	forbidTunHost(t)
+	eng := NewEngine()
+	eng.SetMode("socks") // 未经 NormalizeMode
+	if err := eng.Start(); err == nil {
+		t.Fatal("Start accepted an unknown mode")
+	}
+	if eng.IsRunning() {
+		t.Fatal("engine running after unknown mode")
+	}
+}

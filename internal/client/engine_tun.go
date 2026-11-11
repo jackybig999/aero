@@ -129,7 +129,9 @@ func (e *Engine) bringUpTunLocked(nodeIP net.IP) error {
 	if err != nil {
 		return errors.Join(fmt.Errorf("open TUN: %w", err), ipConn.Close())
 	}
+	e.mu.Lock() // refreshTunRoutes 在 e.mu 下读取 tunHost
 	e.tunHost = host
+	e.mu.Unlock()
 
 	e.stackEngine = NewStackEngineWithConn(host.Device(), ipConn, e.dnsHandler)
 	e.stackEngine.SetKillSwitch(e.killSwitch.Load())
@@ -146,6 +148,7 @@ func (e *Engine) bringUpTunLocked(nodeIP net.IP) error {
 }
 
 // releaseTunLocked 停止数据面并销毁自有网卡（其上的地址、路由、DNS 及防护规则随之清除）；幂等。
+// 调用方不得持有 e.mu（本函数在 e.mu 下摘下 tunHost，再在锁外关闭）。
 func (e *Engine) releaseTunLocked() {
 	if e.stackEngine != nil {
 		e.stackEngine.SetWebRTCActive(false)
@@ -153,10 +156,13 @@ func (e *Engine) releaseTunLocked() {
 		e.stackEngine.Stop()
 		e.stackEngine = nil
 	}
-	if e.tunHost != nil {
-		if err := e.tunHost.Close(); err != nil {
+	e.mu.Lock()
+	host := e.tunHost
+	e.tunHost = nil
+	e.mu.Unlock()
+	if host != nil {
+		if err := host.Close(); err != nil {
 			log.Printf("[ENGINE] close TUN: %v", err)
 		}
-		e.tunHost = nil
 	}
 }

@@ -196,11 +196,6 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 	return lc.ListenPacket(ctx, network, ":0")
 }
 
-var (
-	linuxCmdExecutorMu sync.RWMutex
-	linuxCmdExecutor   func(name string, args ...string) error
-)
-
 // DetectThirdPartyTUN 检测 Linux 第三方 TUN
 func DetectThirdPartyTUN() (bool, string, error) {
 	// 条件 1: 扫描所有 UP 网卡是否分配了 198.18.0.0/15 地址 (Clash / 透明代理 Fake-IP)

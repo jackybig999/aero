@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -19,17 +18,6 @@ import (
 
 	"golang.org/x/sys/unix"
 )
-
-type darwinDevice struct {
-	name string
-	file *os.File
-	mtu  int
-}
-
-type darwinDNSBackup struct {
-	Service string   `json:"service"`
-	Servers []string `json:"servers"`
-}
 
 type cachedGateway struct {
 	gw      string

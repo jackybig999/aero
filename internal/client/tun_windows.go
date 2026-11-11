@@ -52,7 +52,6 @@ const errorNoMoreItems = syscall.Errno(259)
 
 type windowsDevice struct {
 	name      string
-	mtu       int
 	adapter   *wintun.Adapter
 	session   wintun.Session
 	sessionMu sync.RWMutex
@@ -180,63 +179,6 @@ func (d *windowsDevice) Close() error {
 }
 
 func (d *windowsDevice) Name() string { return d.name }
-
-var (
-	physDNSRoutesMu         sync.Mutex
-	physDNSRoutes           []string
-	getPhysicalDNSServersFn = getPhysicalAdapterDNSServers
-)
-
-// getPhysicalAdapterDNSServers 通过原生 IP Helper API 探测活动物理网卡的 DNS 服务器 IP
-func getPhysicalAdapterDNSServers() ([]string, error) {
-	_, idxStr, err := PhysicalDefaultGateway()
-	if err != nil || idxStr == "" {
-		return nil, err
-	}
-	targetIdx, err := strconv.Atoi(idxStr)
-	if err != nil {
-		return nil, err
-	}
-
-	var size uint32 = 15000
-	for i := 0; i < 3; i++ {
-		buf := make([]byte, size)
-		p := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
-		flags := uint32(windows.GAA_FLAG_INCLUDE_ALL_INTERFACES | windows.GAA_FLAG_SKIP_MULTICAST)
-		err := windows.GetAdaptersAddresses(windows.AF_INET, flags, 0, p, &size)
-		if err == nil {
-			var dnsIPs []string
-			for curr := p; curr != nil; curr = curr.Next {
-				if int(curr.IfIndex) != targetIdx && int(curr.Ipv6IfIndex) != targetIdx {
-					continue
-				}
-				for d := curr.FirstDnsServerAddress; d != nil; d = d.Next {
-					ip := d.Address.IP()
-					if ip == nil {
-						continue
-					}
-					ip4 := ip.To4()
-					if ip4 == nil {
-						continue
-					}
-					if ip4.IsLoopback() || ip4.IsUnspecified() {
-						continue
-					}
-					// 过滤虚拟网卡自身保留网段 (10.88.0.x)
-					if ip4[0] == 10 && ip4[1] == 88 && ip4[2] == 0 {
-						continue
-					}
-					dnsIPs = append(dnsIPs, ip4.String())
-				}
-			}
-			return dnsIPs, nil
-		}
-		if err != windows.ERROR_BUFFER_OVERFLOW {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("GetAdaptersAddresses buffer overflow")
-}
 
 // getWindowsAdaptersSummary 通过原生 IP Helper API 采集完整的网卡描述与 IfType
 func getWindowsAdaptersSummary() ([]ifaceSummary, error) {
