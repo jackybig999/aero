@@ -55,7 +55,7 @@ AERO：基于标准 HTTP/3 MASQUE（RFC 9298 / RFC 9484）的多用户加密隧�
 - TCP（订阅、伪装站）与 UDP（数据面）**MUST** 分开选择端口。
 - edge 只在启动时按列表顺序选端口，选定后持久化，下次优先沿用；被自身旧进程占用时先等待重试；**MUST** 用独占锁文件，**MUST NOT** 启用 `SO_REUSEPORT`。
 - client 依次尝试候选端口（TCP 与 HTTP/3），成功端口 **MUST** 落盘缓存。
-- 会话中途端口跳变：edge 以 nftables DNAT 将候选端口段汇聚到同一 QUIC 监听（宿主状态见下）。
+- 会话中途端口跳变：edge 在进程内同时监听多个候选 UDP 端口（不使用 DNAT，ADR-0012）。
 
 ### 鉴权（ADR-0002）
 - 用户 token：sub 以 Ed25519 签发，字段 `{uid, tier, classes, max_devices, exp, kid}`；edge 以配置中的公钥离线验签。
@@ -77,7 +77,7 @@ AERO：基于标准 HTTP/3 MASQUE（RFC 9298 / RFC 9484）的多用户加密隧�
 - 测试代码与测试开关 **MUST NOT** 改变生产代码分支；测试使用测试 CA（§7.4）。
 - CONNECT-IP 写入 TUN 之前 **MUST** 做目的地址 ACL；默认拒绝：私网、链路本地、回环、组播、CGNAT、元数据地址、本机地址、其他用户地址池、出站 25 端口。
 - 任何破坏性删除或清理 **MUST** 先归档并提供清单和回滚脚本（沿用旧规则）。
-- Windows 客户端不新增宿主防火墙修改（沿用旧规则）。
+- 客户端不修改宿主防火墙、注册表与系统 DNS（ADR-0012）。
 
 ## 剖面参数（§0.7）
 
@@ -125,13 +125,15 @@ AERO：基于标准 HTTP/3 MASQUE（RFC 9298 / RFC 9484）的多用户加密隧�
 | 测试运行数据 | 不超过 7 天 |
 | 删除请求时限 | 30 天内完成主存储删除，审计留痕 |
 
-## 宿主全局状态（§8.10）
+## 宿主全局状态（§8.10，ADR-0012）
 
-| 所有者 | 修改内容 | 标记 | 退出时 | 手动清理命令 |
-|---|---|---|---|---|
-| edge | nftables 表 `inet aero_edge`（目的地址 ACL、NAT、MSS 钳制仅限 TUN 接口、端口 DNAT） | 表名 | 删除整表 | `aero-edge cleanup-host` |
-| edge | TUN 设备 `aero-tun0`、`ip_forward` | 设备名 | 删除设备；不回写 `ip_forward` | 同上 |
-| egress | 策略路由表 `1100–1199`、`ip rule` 优先级 `11000–11999`、出口网卡 `aero-eg*` | 表号 / 优先级 / 设备名 | 删除 | `aero-egress cleanup-host`（M5） |
-| client | 路由 `0.0.0.0/1`、`128.0.0.0/1`、`::/1`、`8000::/1`、直连排除路由、DNS 设置 | 设备 `aero0` | 删除并恢复 DNS | `aero cleanup` |
+铁律：服务端不改 VPS 系统与配置，客户端不改宿主（注册表、系统 DNS、配置文件、防火墙、物理网卡路由均禁止）；**MUST NOT** 使用 gVisor 或任何用户态协议栈。唯一允许的修改如下，无法随网卡自动消失的项 **MUST** 同时具备退出回滚、崩溃应急回滚、启动自检回滚。
+
+| 所有者 | 修改内容 | 标记 | 自动消失 | 退出 / 崩溃 / 启动 | 手动清理命令 |
+|---|---|---|---|---|---|
+| edge | TUN 设备 `aero-tun0` | 设备名 | 进程退出即消失 | — | — |
+| edge | iptables 规则（转发放行、NAT、MSS 钳制，仅限 TUN） | 注释标签 | 否 | 删除 / `ExecStopPost` / 启动先删 | `aero-edge cleanup-host` |
+| edge | `ip_forward` | 变更日志记录原值 | 否 | 还原原值 / `ExecStopPost` / 启动先还原 | 同上 |
+| client | TUN 网卡 `aero0` 及挂在其上的路由、该网卡自身 DNS | 设备 | 网卡销毁即消失 | 守护进程兜底删除网卡 | `aero cleanup` |
 
 每项 **MUST** 附一次“强杀后残留”记录（M4 补）。
