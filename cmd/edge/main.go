@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strings"
+	"time"
 
 	"github.com/aero-protocol/aero/internal/edge"
 )
@@ -18,6 +20,9 @@ import (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "cleanup-host" {
 		os.Exit(cleanupHostCmd(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "check-cert" {
+		os.Exit(checkCertCmd(os.Args[2:]))
 	}
 	showVer := flag.Bool("version", false, "print version and exit")
 	listen := flag.String("listen", ":443", "listen address (e.g. :443)")
@@ -154,6 +159,24 @@ func defaultDataDir() string {
 		return "/var/lib/aero"
 	}
 	return "./data"
+}
+
+// checkCertCmd 实现 `aero-edge check-cert -domain D`：只读检查系统 acme.sh/certbot 默认位置是否有覆盖 D 的
+// 有效证书（与启动时规则相同），以 KEY=VALUE 行输出，供安装前预检。始终退出 0，结果看 CERT_FOUND。
+func checkCertCmd(args []string) int {
+	fs := flag.NewFlagSet("check-cert", flag.ContinueOnError)
+	domain := fs.String("domain", "", "node domain")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	r := edge.CheckSystemCert(*domain)
+	yes := map[bool]string{true: "yes", false: "no"}
+	fmt.Printf("CERT_DOMAIN=%s\nCERT_FOUND=%s\nACME_SH=%s\nCERTBOT=%s\n", r.Domain, yes[r.Found], yes[r.ACMESh], yes[r.Certbot])
+	if r.Found {
+		fmt.Printf("CERT_FILE=%s\nCERT_NOT_AFTER=%s\n", r.CertFile, r.NotAfter.UTC().Format(time.RFC3339))
+	}
+	fmt.Printf("CERT_SEARCHED=%s\n", strings.Join(r.Searched, ","))
+	return 0
 }
 
 // cleanupHostCmd 实现 `aero-edge cleanup-host [-data-dir DIR] [-config FILE]`：edge 停止后还原宿主状态

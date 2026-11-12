@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -139,4 +140,36 @@ func errNoSystemCert(domain string, dirs []string) error {
 	return fmt.Errorf("production edge server strictly requires valid TLS certificate: none for %s in %s; "+
 		"issue one with the system acme.sh or certbot (default locations) or set cert_file/key_file "+
 		"(self-signed cert is prohibited)", domain, strings.Join(dirs, ", "))
+}
+
+// CertCheck 是 `aero-edge check-cert` 的结果（安装前预检，只读）。
+type CertCheck struct {
+	Domain   string
+	Found    bool
+	CertFile string
+	NotAfter time.Time
+	ACMESh   bool // 宿主上有 acme.sh
+	Certbot  bool // 宿主上有 certbot
+	Searched []string
+}
+
+// CheckSystemCert 按与启动时相同的规则查找 domain 的证书，并检测系统 ACME 客户端是否存在。
+func CheckSystemCert(domain string) CertCheck {
+	dirs := systemCertDirs()
+	r := CertCheck{Domain: normalizeCertDomain(domain), Searched: dirs}
+	if r.Domain != "" {
+		if c, ok := findSystemCert(dirs, r.Domain, time.Now()); ok {
+			r.Found, r.CertFile, r.NotAfter = true, c.CertFile, c.NotAfter
+		}
+	}
+	_, err := exec.LookPath("acme.sh")
+	r.ACMESh = err == nil
+	for _, d := range dirs {
+		if firstNonEmptyFile(d, "acme.sh") != "" {
+			r.ACMESh = true
+		}
+	}
+	_, err = exec.LookPath("certbot")
+	r.Certbot = err == nil
+	return r
 }

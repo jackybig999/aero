@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1982,7 +1983,14 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		return
 	}
 	tag := strings.TrimSpace(src.ReleaseTag)
-	if err := deployEdgeBinary(client, taskID, src.Repo, tag); err != nil {
+	domain := strings.TrimSpace(cred.Domain)
+	if !nodeDomainPattern.MatchString(domain) {
+		errMsg := "节点未配置域名：证书与中台管理都按域名进行（只有 IP 的节点无法校验身份）。请先为该 VPS 填写域名并解析到节点（Cloudflare 灰云）。"
+		globalTaskManager.SetStep(taskID, "binary_deploy", "failed", errMsg, 40, "缺少域名")
+		globalTaskManager.Finish(taskID, "failed", errMsg)
+		return
+	}
+	if err := deployEdgeBinary(client, taskID, src.Repo, tag, domain); err != nil {
 		globalTaskManager.AppendLog(taskID, "[部署 错误] "+err.Error())
 		globalTaskManager.SetStep(taskID, "binary_deploy", "failed", err.Error(), 40, "部署失败")
 		globalTaskManager.Finish(taskID, "failed", err.Error())
@@ -2092,7 +2100,12 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 
 // deployEdgeBinary 在节点上按架构下载 Release 产物，对照同一 Release 的 SHA256SUMS 校验后原子替换。
 // 旧 Release 没有 SHA256SUMS 时记录“未校验”并继续；有 SHA256SUMS 但缺条目或不匹配时拒绝安装。
-func deployEdgeBinary(client *ssh.Client, taskID uint64, repo, tag string) error {
+// deployEdgeBinary 下载并校验发布物，先用新二进制执行只读证书预检（check-cert，与 edge 启动规则相同），
+// 通过后才替换 /usr/local/bin/aero-edge；预检不通过时节点保持原样。
+func deployEdgeBinary(client *ssh.Client, taskID uint64, repo, tag, domain string) error {
+	if !nodeDomainPattern.MatchString(domain) {
+		return fmt.Errorf("节点域名无效: %q", domain)
+	}
 	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", repo, tag)
 	script := fmt.Sprintf(`set -e
 case "$(uname -m)" in
@@ -2117,21 +2130,46 @@ fi
 chmod 0755 "$TMP"
 VER=$("$TMP" -version 2>/dev/null | awk '{print $2}')
 [ -n "$VER" ] || { echo "RESULT=binary-not-runnable"; exit 0; }
-mv -f "$TMP" /usr/local/bin/aero-edge
 echo "VERSION=$VER"
+CHECK=$("$TMP" check-cert -domain '%s' 2>/dev/null || true)
+echo "$CHECK"
+echo "$CHECK" | grep -qx 'CERT_FOUND=yes' || { echo "RESULT=cert-missing"; exit 0; }
+mv -f "$TMP" /usr/local/bin/aero-edge
 echo "RESULT=ok"
-`, base, base)
+`, base, base, domain)
 	out, err := runSSH(client, script, 180*time.Second)
 	kv := parseKV(out)
+	if err == nil && kv["RESULT"] == "cert-missing" {
+		return certMissingError(domain, kv)
+	}
 	if err != nil || kv["RESULT"] != "ok" {
 		return fmt.Errorf("部署 aero-edge %s 失败: result=%q err=%v", tag, kv["RESULT"], err)
 	}
+	globalTaskManager.AppendLog(taskID, fmt.Sprintf("[证书] 已有覆盖 %s 的有效证书 %s（到期 %s），跳过证书步骤。", domain, kv["CERT_FILE"], kv["CERT_NOT_AFTER"]))
 	if kv["CHECKSUM"] == "verified" {
 		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[部署] aero-edge %s 已安装，SHA256 校验通过。", kv["VERSION"]))
 	} else {
 		globalTaskManager.AppendLog(taskID, fmt.Sprintf("[部署 警告] aero-edge %s 已安装，但该 Release 无 SHA256SUMS，未做哈希校验。", kv["VERSION"]))
 	}
 	return nil
+}
+
+// nodeDomainPattern 限定节点域名（证书与中台管理都按域名；也用于安全地拼入远程命令）。
+var nodeDomainPattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$`)
+
+// certMissingError 生成证书预检失败的提示：中台不在节点上安装或签发任何东西，由运维用系统 ACME 客户端完成。
+func certMissingError(domain string, kv map[string]string) error {
+	where := strings.ReplaceAll(kv["CERT_SEARCHED"], ",", "、")
+	if kv["ACME_SH"] != "yes" && kv["CERTBOT"] != "yes" {
+		return fmt.Errorf("证书预检未通过：节点上未检测到 acme.sh 或 certbot。请先安装其一，并为 %s 签发证书（使用默认位置），"+
+			"完成后重新执行安装。节点未做任何改动。查找位置：%s", domain, where)
+	}
+	client := "acme.sh"
+	if kv["ACME_SH"] != "yes" {
+		client = "certbot"
+	}
+	return fmt.Errorf("证书预检未通过：已检测到 %s，但没有覆盖 %s 的有效证书。请先用 %s 签发（默认位置），完成后重新执行安装。"+
+		"节点未做任何改动。查找位置：%s", client, domain, client, where)
 }
 
 // edgeServiceUnit 是 aero-edge 的 systemd 单元：命令行不含任何密钥（配置在 0600 的 /etc/aero/edge.json），
