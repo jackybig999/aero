@@ -403,10 +403,10 @@ func TestAdminHandlerAndTokenSync(t *testing.T) {
 	ts, _ := OpenTokenStore(tmpDir, v)
 	ss, _ := NewSubStore(tmpDir)
 
-	admin := NewAdminHandler("my-secret-key", v, ts, ss, nil, nil, nil)
+	admin := NewAdminHandler("my-secret-key", v, ts, ss)
 
 	// Unauthorized request (external IP, no key)
-	req := httptest.NewRequest(http.MethodGet, "/admin/version", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/subs", nil)
 	req.RemoteAddr = "203.0.113.195:12345"
 	rec := httptest.NewRecorder()
 	admin.TryServe(rec, req)
@@ -441,116 +441,6 @@ func TestAdminHandlerAndTokenSync(t *testing.T) {
 	// Verify token was automatically mounted into TokenStore and Validator!
 	if !v.Validate("aero_provisioned_token_999") {
 		t.Fatal("provisioned token should be active in Validator immediately")
-	}
-}
-
-func TestAdminECH_GetAndSet(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "aero-admin-ech-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	v := NewValidator()
-	ts, _ := OpenTokenStore(tmpDir, v)
-	ss, _ := NewSubStore(tmpDir)
-
-	admin := NewAdminHandler("my-secret-key", v, ts, ss, nil, nil, nil)
-
-	// 1. Unauthorized GET /admin/ech
-	req := httptest.NewRequest(http.MethodGet, "/admin/ech", nil)
-	req.RemoteAddr = "203.0.113.195:12345"
-	rec := httptest.NewRecorder()
-	admin.TryServe(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 forbidden without key, got %d", rec.Code)
-	}
-
-	// 2. Authorized GET /admin/ech (initially empty)
-	req = httptest.NewRequest(http.MethodGet, "/admin/ech", nil)
-	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
-	rec = httptest.NewRecorder()
-	admin.TryServe(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", rec.Code)
-	}
-	var getResp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &getResp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if getResp["ok"] != true || getResp["enabled"] != false || getResp["ech"] != "" {
-		t.Fatalf("unexpected initial response: %+v", getResp)
-	}
-
-	// 3. Authorized POST /admin/ech with snake_case ech_config
-	postPayload := `{"ech_config": "QUFBQUJCQkNDQ0REREVFRUZGR0dI"}`
-	req = httptest.NewRequest(http.MethodPost, "/admin/ech", strings.NewReader(postPayload))
-	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
-	rec = httptest.NewRecorder()
-	admin.TryServe(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var postResp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &postResp); err != nil {
-		t.Fatalf("decode post response: %v", err)
-	}
-	if postResp["ok"] != true || postResp["enabled"] != true || postResp["ech_config"] != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" {
-		t.Fatalf("unexpected post response: %+v", postResp)
-	}
-
-	// 4. GET /admin/ech returns updated config
-	req = httptest.NewRequest(http.MethodGet, "/admin/ech", nil)
-	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
-	rec = httptest.NewRecorder()
-	admin.TryServe(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", rec.Code)
-	}
-	var getResp2 map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &getResp2); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if getResp2["ech"] != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" || getResp2["enabled"] != true {
-		t.Fatalf("unexpected get response: %+v", getResp2)
-	}
-	if ss.GetECH() != "QUFBQUJCQkNDQ0REREVFRUZGR0dI" {
-		t.Fatalf("subStore.GetECH() = %q, expected QUFBQUJCQkNDQ0REREVFRUZGR0dI", ss.GetECH())
-	}
-
-	// 5. PUT /admin/ech with legacy ech
-	putPayload := `{"ech": "TkVXX0VDSA=="}`
-	req = httptest.NewRequest(http.MethodPut, "/admin/ech", strings.NewReader(putPayload))
-	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
-	rec = httptest.NewRecorder()
-	admin.TryServe(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on PUT, got %d", rec.Code)
-	}
-	if ss.GetECH() != "TkVXX0VDSA==" {
-		t.Fatalf("subStore.GetECH() after PUT = %q, expected TkVXX0VDSA==", ss.GetECH())
-	}
-
-	// 6. POST /admin/ech with camelCase echConfig
-	camelPayload := `{"echConfig": "Q0FNRUxfRUNI"}`
-	req = httptest.NewRequest(http.MethodPost, "/admin/ech", strings.NewReader(camelPayload))
-	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
-	rec = httptest.NewRecorder()
-	admin.TryServe(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on camelCase POST, got %d", rec.Code)
-	}
-	if ss.GetECH() != "Q0FNRUxfRUNI" {
-		t.Fatalf("subStore.GetECH() after camelCase POST = %q, expected Q0FNRUxfRUNI", ss.GetECH())
-	}
-
-	// 7. POST /admin/ech with malformed JSON returns 400 Bad Request
-	req = httptest.NewRequest(http.MethodPost, "/admin/ech", strings.NewReader("{invalid-json"))
-	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
-	rec = httptest.NewRecorder()
-	admin.TryServe(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 Bad Request for malformed JSON, got %d", rec.Code)
 	}
 }
 
@@ -4718,7 +4608,7 @@ func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
 	}
 
 	adminKey := "super_secret_admin_key_123"
-	adminHandler := NewAdminHandler(adminKey, validator, tokenStore, subStore, nil, nil, nil)
+	adminHandler := NewAdminHandler(adminKey, validator, tokenStore, subStore)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
 		if !adminHandler.TryServe(w, r) {

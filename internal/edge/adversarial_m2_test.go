@@ -492,7 +492,7 @@ func TestAdversarial_AdminSubsAPI_DualFieldCompatibility(t *testing.T) {
 	}
 
 	adminKey := "secretKey123"
-	adminHandler := NewAdminHandler(adminKey, validator, tokenStore, subStore, nil, nil, nil)
+	adminHandler := NewAdminHandler(adminKey, validator, tokenStore, subStore)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
 		if !adminHandler.TryServe(w, r) {

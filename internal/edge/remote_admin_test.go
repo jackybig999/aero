@@ -91,14 +91,17 @@ func TestRemoteAdminHiddenUnlessAuthenticated(t *testing.T) {
 		"key in query": f.do(http.MethodGet, "/admin/v1/status?key="+testAdminKey, "", nil),
 		"unknown path": f.do(http.MethodGet, "/admin/v1/exec", testAdminKey, nil),
 		"wrong method": f.do(http.MethodDelete, "/admin/v1/status", testAdminKey, nil),
-		"legacy":       f.do(http.MethodGet, "/admin/status", "wrong", nil),
+		"legacy":       f.do(http.MethodGet, "/admin/subs", "wrong", nil),
 	} {
 		if !isCover(rec) {
 			t.Errorf("%s: %d %s", name, rec.Code, rec.Header().Get("Content-Type"))
 		}
 	}
-	if rec := f.do(http.MethodGet, "/admin/status", testAdminKey, nil); rec.Code != http.StatusOK || isCover(rec) {
-		t.Fatalf("legacy status with key: %d", rec.Code)
+	if rec := f.do(http.MethodGet, "/admin/subs", testAdminKey, nil); rec.Code != http.StatusOK || isCover(rec) {
+		t.Fatalf("legacy subs with key: %d", rec.Code)
+	}
+	if rec := f.do(http.MethodGet, "/admin/status", testAdminKey, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("removed legacy /admin/status still served: %d", rec.Code)
 	}
 }
 

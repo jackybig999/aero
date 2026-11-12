@@ -452,7 +452,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	// 6. Admin & Sub HTTP Handlers
-	adminHandler := NewAdminHandler(cfg.AdminKey, validator, tokenStore, subStore, connLimit, bwLimit, dialGuard)
+	adminHandler := NewAdminHandler(cfg.AdminKey, validator, tokenStore, subStore)
 	subHandler := &SubHandler{Store: subStore}
 
 	// 7. GeoData Handler

@@ -21,7 +21,7 @@ func newSubExpiryAdmin(t *testing.T) (*AdminHandler, *Validator) {
 	if err != nil {
 		t.Fatalf("NewSubStore: %v", err)
 	}
-	return NewAdminHandler("admin_key_expiry", v, ts, ss, nil, nil, nil), v
+	return NewAdminHandler("admin_key_expiry", v, ts, ss), v
 }
 
 func postSubs(t *testing.T, h *AdminHandler, body map[string]any) int {

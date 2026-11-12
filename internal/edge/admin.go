@@ -7,11 +7,9 @@ package edge
 import (
 	"crypto/subtle"
 	"encoding/json"
-	"io"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -23,36 +21,15 @@ var (
 
 // AdminHandler handles /admin/* management endpoints
 type AdminHandler struct {
-	mu         sync.RWMutex
-	echConfig  string
 	adminKey   string
 	validator  *Validator
 	tokenStore *TokenStore
 	subStore   *SubStore
-	connLimit  *ConnLimiter
-	bwLimit    *BandwidthLimiter
-	dialGuard  *DialGuard
-	quicServer *QUICServer
-	startedAt  time.Time
 }
 
-// NewAdminHandler creates an AdminHandler
-func NewAdminHandler(key string, v *Validator, ts *TokenStore, ss *SubStore, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard) *AdminHandler {
-	return &AdminHandler{
-		adminKey:   key,
-		validator:  v,
-		tokenStore: ts,
-		subStore:   ss,
-		connLimit:  cl,
-		bwLimit:    bl,
-		dialGuard:  dg,
-		startedAt:  time.Now(),
-	}
-}
-
-// SetQUICServer links the QUICServer instance for disaster-recovery policy inspection.
-func (h *AdminHandler) SetQUICServer(qs *QUICServer) {
-	h.quicServer = qs
+// NewAdminHandler 创建旧管理接口处理器（只剩 /admin/subs）。
+func NewAdminHandler(key string, v *Validator, ts *TokenStore, ss *SubStore) *AdminHandler {
+	return &AdminHandler{adminKey: key, validator: v, tokenStore: ts, subStore: ss}
 }
 
 func (h *AdminHandler) isLoopback(r *http.Request) bool {
@@ -98,147 +75,18 @@ func (h *AdminHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
+	// 旧管理接口只保留订阅注入（签名 token 过渡期结束后删除）；其余由 C13 /admin/v1/* 取代。
 	switch {
-	case r.URL.Path == "/admin/version" && r.Method == http.MethodGet:
-		writeJSON(w, map[string]any{
-			"version":   Version,
-			"protocol":  Protocol,
-			"api_level": APILevel,
-		})
-	case r.URL.Path == "/admin/status" && r.Method == http.MethodGet:
-		h.handleStatus(w)
-	case r.URL.Path == "/admin/tokens" && r.Method == http.MethodGet:
-		h.handleListTokens(w)
-	case r.URL.Path == "/admin/tokens" && r.Method == http.MethodPost:
-		h.handleAddToken(w, r)
-	case r.URL.Path == "/admin/tokens" && r.Method == http.MethodDelete:
-		h.handleDelToken(w, r)
 	case r.URL.Path == "/admin/subs" && r.Method == http.MethodGet:
 		h.handleListSubs(w)
 	case r.URL.Path == "/admin/subs" && r.Method == http.MethodPost:
 		h.handleUpsertSubs(w, r)
 	case r.URL.Path == "/admin/subs" && r.Method == http.MethodDelete:
 		h.handleDeleteSub(w, r)
-	case r.URL.Path == "/admin/ech" && r.Method == http.MethodGet:
-		h.handleGetECH(w)
-	case r.URL.Path == "/admin/ech" && (r.Method == http.MethodPost || r.Method == http.MethodPut):
-		h.handleSetECH(w, r)
-	case r.URL.Path == "/admin/reload" && r.Method == http.MethodPost:
-		h.handleReload(w)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
 	return true
-}
-
-func (h *AdminHandler) handleStatus(w http.ResponseWriter) {
-	active := int64(0)
-	maxG, maxU := int64(0), int64(0)
-	if h.connLimit != nil {
-		active = h.connLimit.Active()
-		maxG = h.connLimit.MaxGlobal()
-		maxU = h.connLimit.MaxPerTok()
-	}
-	bw := 0.0
-	if h.bwLimit != nil {
-		bw = h.bwLimit.Rate()
-	}
-	dialCap := 0
-	if h.dialGuard != nil {
-		dialCap = h.dialGuard.Cap()
-	}
-	body := map[string]any{
-		"ok":             true,
-		"version":        Version,
-		"protocol":       Protocol,
-		"api_level":      APILevel,
-		"active_tunnels": active,
-		"max_conn":       maxG,
-		"max_conn_user":  maxU,
-		"token_count":    h.validator.Count(),
-		"bw_per_user":    bw,
-		"max_dial":       dialCap,
-		"uptime_sec":     time.Since(h.startedAt).Seconds(),
-	}
-	writeJSON(w, body)
-}
-
-func (h *AdminHandler) handleListTokens(w http.ResponseWriter) {
-	var list []TokenRecord
-	if h.tokenStore != nil {
-		list = h.tokenStore.List()
-	} else {
-		for _, t := range h.validator.ListTokens() {
-			list = append(list, TokenRecord{
-				Token:     t.Token,
-				Label:     t.Label,
-				CreatedAt: t.CreatedAt,
-				ExpiresAt: t.ExpiresAt,
-			})
-		}
-	}
-	writeJSON(w, map[string]any{"tokens": list, "count": len(list)})
-}
-
-type addTokenAdminReq struct {
-	Token    string `json:"token"`
-	Label    string `json:"label"`
-	TTLHours int    `json:"ttl_hours"`
-}
-
-func (h *AdminHandler) handleAddToken(w http.ResponseWriter, r *http.Request) {
-	var req addTokenAdminReq
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid json body: " + err.Error()})
-			return
-		}
-	}
-	ttl := time.Duration(req.TTLHours) * time.Hour
-	if ttl <= 0 {
-		ttl = 365 * 24 * time.Hour
-	}
-	var tok string
-	var err error
-	if h.tokenStore != nil {
-		tok, err = h.tokenStore.AddReturn(req.Token, req.Label, ttl)
-	} else {
-		tok = req.Token
-		if tok == "" {
-			tok, err = GenerateToken()
-		}
-		if err == nil {
-			h.validator.AddToken(tok, req.Label, ttl)
-		}
-	}
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, map[string]any{"ok": true, "token": tok, "label": req.Label})
-}
-
-func (h *AdminHandler) handleDelToken(w http.ResponseWriter, r *http.Request) {
-	tok := r.URL.Query().Get("token")
-	if tok == "" {
-		http.Error(w, "token required", http.StatusBadRequest)
-		return
-	}
-	var err error
-	if h.tokenStore != nil {
-		err = h.tokenStore.Remove(tok)
-	} else {
-		h.validator.RemoveToken(tok)
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, map[string]any{"ok": true, "removed": tok})
 }
 
 func (h *AdminHandler) handleListSubs(w http.ResponseWriter) {
@@ -399,86 +247,9 @@ func (h *AdminHandler) handleDeleteSub(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true, "deleted_slug": slug})
 }
 
-func (h *AdminHandler) handleReload(w http.ResponseWriter) {
-	if h.tokenStore == nil {
-		http.Error(w, "no token store", http.StatusServiceUnavailable)
-		return
-	}
-	n, err := h.tokenStore.Reload()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, map[string]any{"ok": true, "token_count": n})
-}
-
-func (h *AdminHandler) handleGetECH(w http.ResponseWriter) {
-	h.mu.RLock()
-	ech := h.echConfig
-	h.mu.RUnlock()
-	if ech == "" && h.subStore != nil {
-		ech = h.subStore.GetECH()
-	}
-	writeJSON(w, map[string]any{
-		"ok":         true,
-		"ech":        ech,
-		"ech_config": ech,
-		"enabled":    ech != "",
-	})
-}
-
-func (h *AdminHandler) handleSetECH(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		ECH       string `json:"ech"`
-		ECHConfig string `json:"ech_config"`
-		CamelECH  string `json:"echConfig"`
-	}
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid json body: " + err.Error()})
-			return
-		}
-	}
-	val := strings.TrimSpace(req.ECHConfig)
-	if val == "" {
-		val = strings.TrimSpace(req.CamelECH)
-	}
-	if val == "" {
-		val = strings.TrimSpace(req.ECH)
-	}
-
-	h.mu.Lock()
-	h.echConfig = val
-	h.mu.Unlock()
-
-	if h.subStore != nil {
-		if err := h.subStore.SetECH(val); err != nil {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": "update ech failed: " + err.Error()})
-			return
-		}
-	}
-
-	writeJSON(w, map[string]any{
-		"ok":         true,
-		"ech":        val,
-		"ech_config": val,
-		"enabled":    val != "",
-		"message":    "ech config updated",
-	})
-}
-
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
-}
-
-// Revoke removes a token from TokenStore and Validator, persisting changes to disk.
-func (s *TokenStore) Revoke(token string) error {
-	return s.Remove(token)
 }
