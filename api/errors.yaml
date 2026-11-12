@@ -11,6 +11,8 @@ EDGE_RATE_LIMITED:          {http: 429, desc: "限流"}
 EDGE_METERING_UNAUTHORIZED: {http: 404, desc: "计量只读密钥无效（对外表现为伪装站，不暴露接口）"}
 EDGE_USAGE_CURSOR_EXPIRED:  {http: 410, desc: "计量游标早于保留期或无法识别，需从头读取（C6）"}
 EDGE_INTERNAL:              {http: 500, desc: "节点内部错误（不含细节）"}
+EDGE_ADMIN_UNAUTHORIZED:    {http: 200, desc: "管理密钥无效（对外表现为伪装站，不暴露接口，C13）"}
+EDGE_WARP_UNAVAILABLE:      {http: 409, desc: "本机没有可用的 WARP 代理（C13）"}
 EDGE_NOT_READY:             {http: 503, desc: "排空中或未就绪"}
 EGRESS_UNAVAILABLE:         {http: 503, desc: "场景出口不可用（fail-closed）"}
 EGRESS_REBOUND:             {http: 200, desc: "环境出口已重新绑定"}

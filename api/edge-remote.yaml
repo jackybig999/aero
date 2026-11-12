@@ -1,0 +1,198 @@
+openapi: 3.1.0
+info:
+  title: AERO edge remote management API (C13)
+  version: 0.1.0
+  description: |
+    状态：draft（2026-11-12 起草，待用户确认）。flag `remote_admin_v1` 默认 OFF。
+    用途：中台（sub）管理节点的唯一通道（ADR-0016）。edge 是独立可部署的基石：没有中台也能完整运行；
+    中台只调用本接口与 C6，不经 SSH 读写 edge 的任何文件。SSH 只用于安装/升级/卸载 edge 程序本身。
+    传输：HTTPS（edge 主端口，TCP 或 QUIC），中台必须按节点域名校验证书。
+    鉴权：Authorization: Bearer <admin_key>（安装时由中台生成并写入）。不接受 URL 中的密钥。
+    未鉴权、密钥错误、未知路径：一律返回与伪装站相同的响应（EDGE_ADMIN_UNAUTHORIZED，不暴露接口存在）。
+    限流：每个密钥 120 次/分钟（429 + Retry-After）。
+    所有修改由 edge 自己校验并原子写入 ConfigPath（L0 §8.8）；本接口不提供执行任意命令、读写任意文件、
+    修改宿主系统配置的能力。
+    错误响应：application/problem+json（RFC 9457），code 取自 api/errors.yaml。
+    与旧接口的关系：本契约生效后删除 /admin/status、/admin/version、/admin/reload、/admin/tokens、
+    /admin/ech 写入；/admin/subs 在签名 token（C3）开启并过渡 30 天后删除（订阅由 sub 签发 token，
+    edge 离线验签，不再需要注入用户）。
+servers:
+  - url: https://{node}
+    variables:
+      node:
+        default: node.example.com
+security:
+  - adminKey: []
+paths:
+  /admin/v1/status:
+    get:
+      operationId: getRemoteStatus
+      summary: 节点状态快照（替代中台经 SSH 采集的服务状态、端口、证书、主机负载）
+      responses:
+        "200":
+          description: 不含任何密钥、用户 token 或用户访问的目的地址
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RemoteStatus" }
+  /admin/v1/purity:
+    get:
+      operationId: getPurity
+      summary: 出口 IP 纯净度（edge 自身探测的缓存结果；替代中台经 SSH 在节点上运行 curl）
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: true 时触发一次新的探测（每 10 分钟至多一次，否则返回缓存）
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Purity" }
+  /admin/v1/usage-api:
+    put:
+      operationId: setUsageAPI
+      summary: 开关 C6 计量接口；开启时返回计量只读密钥（替代中台经 SSH 读取 edge.json）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              additionalProperties: false
+              properties:
+                enabled: { type: boolean }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UsageAPIState" }
+    get:
+      operationId: getUsageAPI
+      summary: 计量接口状态与密钥（中台丢失密钥时重新获取）
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UsageAPIState" }
+  /admin/v1/warp:
+    put:
+      operationId: setWarp
+      summary: WARP 出口插件开关（只使用宿主上已安装的官方客户端，edge 不安装）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              additionalProperties: false
+              properties:
+                enabled: { type: boolean }
+                all: { type: boolean, default: false, description: 全部流量经 WARP；否则只用于 AI 场景 }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WarpState" }
+        "409":
+          description: 本机没有可用的 WARP 代理（EDGE_WARP_UNAVAILABLE）
+  /admin/v1/cert/reload:
+    post:
+      operationId: reloadCert
+      summary: 重新加载证书（替代中台经 SSH 删除证书目录并重启）。证书签发与续期不经中台。
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CertInfo" }
+  /admin/v1/restart:
+    post:
+      operationId: restart
+      summary: 优雅重启（排空后退出，由服务管理器按 Restart=always 拉起）；替代中台经 SSH 执行 systemctl restart
+      responses:
+        "202":
+          description: 已开始排空；连接将在 drain_timeout 内关闭
+components:
+  securitySchemes:
+    adminKey:
+      type: http
+      scheme: bearer
+      description: 管理密钥（安装时由中台生成，≥128 位随机）；与计量只读密钥、用户 token 互不复用。
+  schemas:
+    RemoteStatus:
+      type: object
+      required: [node_id, version, ready, uptime_sec, listen_ports, cert, sessions, usage_api, warp, host]
+      properties:
+        node_id: { type: string, description: 与 C6 相同；usage_api 从未开启时为空 }
+        version: { type: string }
+        ready: { type: boolean, description: 与 /readyz 一致 }
+        uptime_sec: { type: integer, minimum: 0 }
+        listen_ports:
+          type: array
+          items: { type: integer }
+          description: 实际监听的端口（主端口在前；端口轮试结果）
+        cert: { $ref: "#/components/schemas/CertInfo" }
+        sessions:
+          type: object
+          required: [active, tunnels]
+          properties:
+            active: { type: integer, minimum: 0, description: 在线 QUIC 连接 }
+            tunnels: { type: integer, minimum: 0, description: 活动隧道（CONNECT-IP/UDP/TCP） }
+        usage_api: { type: boolean }
+        warp: { $ref: "#/components/schemas/WarpState" }
+        host:
+          type: object
+          description: 只读采集（/proc）；edge 不修改宿主
+          required: [cpu_percent, load1, mem_total, mem_used, disk_total, disk_used]
+          properties:
+            cpu_percent: { type: number }
+            load1: { type: number }
+            mem_total: { type: integer }
+            mem_used: { type: integer }
+            disk_total: { type: integer, description: edge 数据目录所在文件系统 }
+            disk_used: { type: integer }
+    CertInfo:
+      type: object
+      required: [domain, issuer, not_after, days_left]
+      properties:
+        domain: { type: string }
+        issuer: { type: string }
+        not_after: { type: integer, description: Unix 秒 }
+        days_left: { type: integer }
+    Purity:
+      type: object
+      required: [checked_at, egress_ip_country, results]
+      properties:
+        checked_at: { type: integer }
+        egress_ip_country: { type: string }
+        results:
+          type: object
+          description: 各服务可用性（google、youtube、gemini、cloudflare…）与 WARP 出口下的结果
+          additionalProperties: true
+    UsageAPIState:
+      type: object
+      required: [enabled, node_id]
+      properties:
+        enabled: { type: boolean }
+        node_id: { type: string }
+        metering_key: { type: string, description: 仅 enabled=true 时返回；64 位十六进制 }
+    WarpState:
+      type: object
+      required: [enabled, all, available]
+      properties:
+        enabled: { type: boolean }
+        all: { type: boolean }
+        available: { type: boolean, description: 本机是否检测到可用的 WARP 代理 }
+    Problem:
+      type: object
+      required: [type, title, code]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        code: { type: string }
+        detail: { type: string }
+x-aero-open-questions:
+  - 证书签发：目前由宿主上的 acme.sh 签发、edge 发现并加载；是否改为 edge 内置 ACME（DNS-01，Cloudflare 令牌只由 edge 持有）？本契约只提供重新加载。
+  - 重启：依赖服务单元的 Restart=always（安装时写入）。edge 不以其他方式自行拉起。

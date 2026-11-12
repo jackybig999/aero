@@ -18,6 +18,7 @@
 | C10 | 环境绑定 | client ↔ desk | OpenAPI（`127.0.0.1:19877`） | `api/desk-env.yaml` | 环境 ID、出口 IP、时区、出口变更通知 | 绑定中 → 已绑定 → 出口失效 → 已重绑定 |
 | C11 | 客户端本地 UI | client 后端 → 内嵌 UI | OpenAPI | `api/client-ui.yaml` | 连接状态、错误码、场景开关 | 连接：未连接 → 连接中 → 已连接 → 重连中 → 失败（按错误码细分） |
 | C12 | 候选端口列表 | 共享常量 | 生成代码 | `api/ports.yaml` | 端口顺序 | — |
+| C13 | edge 远程管理接口 | edge → sub（sub 调用） | OpenAPI 3.1（HTTPS，管理密钥 Bearer，未鉴权返回伪装站） | `api/edge-remote.yaml` | 状态（含主机负载、证书、端口）、纯净度、计量开关与密钥、WARP 开关、证书重新加载、优雅重启；中台不再经 SSH 读写 edge 文件（ADR-0016） | — |
 
 ## 删除的旧接口
 - M1 过渡（2026-11-10）：`/sub/admin` 匿名访问已关闭（返回 404，与未知路径不可区分）；管理员订阅暂由不可猜测的 `/sub/{secret}` 提供，M3 由 C3 签名 token + C5 订阅契约取代。
