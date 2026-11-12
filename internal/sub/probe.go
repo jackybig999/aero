@@ -1312,62 +1312,36 @@ done
 }
 
 // RenewCert renews or forces reissuance of TLS certificate on the remote VPS.
+// RenewCert 让节点重新加载证书（C13 /admin/v1/cert/reload）。证书由节点系统的 acme.sh/certbot 签发与续期，
+// 中台不删除证书、不登录节点；force 已无意义（保留参数以兼容管理端请求）。
 func (s *VPSService) RenewCert(ctx context.Context, id uint64, force bool) (map[string]any, error) {
-	cred, err := s.store.GetCredentials(id)
+	ep, err := s.endpointFor(id)
 	if err != nil {
 		return nil, err
 	}
-	if cred.SSHPassword == "" {
-		return nil, fmt.Errorf("no password stored for host %d", id)
+	var ci edgeCertInfo
+	if err := edgeAPI(ctx, ep, http.MethodPost, "/admin/v1/cert/reload", nil, &ci); err != nil {
+		return nil, err
 	}
-
-	client, err := dialSSH(SSHCredentials{
-		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 6*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("ssh dial target vps: %w", err)
-	}
-	defer client.Close()
-
-	forceCmd := ""
-	if force {
-		forceCmd = "rm -rf /var/lib/aero/certs/* /var/lib/aero/tls/* 2>/dev/null; "
-	}
-	script := forceCmd + `systemctl restart aero-edge 2>/dev/null || true; sleep 2; systemctl is-active aero-edge`
-	out, err := runSSH(client, script, 15*time.Second)
-	active := strings.Contains(out, "active")
 	InvalidateDiagCache(id)
 	return map[string]any{
-		"ok":             active || err == nil,
-		"service_active": active,
-		"forced":         force,
-		"log":            strings.TrimSpace(out),
-		"message":        "证书申请/续签指令已下发，Edge 守护进程已重启",
+		"ok":      true,
+		"cert":    ci,
+		"message": fmt.Sprintf("节点已重新加载证书：%s，%s 签发，剩余 %d 天（签发与续期由节点上的 acme.sh/certbot 完成）", ci.Domain, ci.Issuer, ci.DaysLeft),
 	}, nil
 }
 
-// RestartEdge restarts the aero-edge service on remote VPS.
+// RestartEdge 请求节点优雅重启（C13 /admin/v1/restart）：edge 排空后退出，由服务单元拉起。
 func (s *VPSService) RestartEdge(ctx context.Context, id uint64) (map[string]any, error) {
-	cred, err := s.store.GetCredentials(id)
+	ep, err := s.endpointFor(id)
 	if err != nil {
 		return nil, err
 	}
-	client, err := dialSSH(SSHCredentials{
-		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 6*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("ssh dial target vps: %w", err)
+	if err := edgeAPI(ctx, ep, http.MethodPost, "/admin/v1/restart", nil, nil); err != nil {
+		return nil, err
 	}
-	defer client.Close()
-
-	out, err := runSSH(client, "systemctl restart aero-edge 2>/dev/null || true; sleep 1; systemctl is-active aero-edge", 12*time.Second)
-	active := strings.Contains(out, "active")
 	InvalidateDiagCache(id)
-	return map[string]any{
-		"ok":             active || err == nil,
-		"service_active": active,
-		"log":            strings.TrimSpace(out),
-	}, nil
+	return map[string]any{"ok": true, "message": "已请求优雅重启：节点排空连接后由 systemd 重新拉起"}, nil
 }
 
 // ============================================================================
@@ -2193,7 +2167,8 @@ WantedBy=multi-user.target
 
 // configureEdgeService 全新安装时写入最小配置（已有配置不覆盖，返回 created=false），写入服务单元并重启服务。
 func configureEdgeService(client *ssh.Client, host, adminKey string, customPort int, issuer *TokenIssuer) (created bool, err error) {
-	cfg := map[string]any{"domain": host, "data_dir": "/var/lib/aero", "admin_key": adminKey}
+	// remote_admin_v1：中台只经 C13 管理节点（ADR-0016）
+	cfg := map[string]any{"domain": host, "data_dir": "/var/lib/aero", "admin_key": adminKey, "remote_admin_v1": true}
 	if customPort > 0 {
 		cfg["listen"] = fmt.Sprintf(":%d", customPort)
 	}

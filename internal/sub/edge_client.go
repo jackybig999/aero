@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -77,4 +79,102 @@ func edgeDo(ctx context.Context, host, ip string, port int, method, path, key st
 		lastErr = fmt.Errorf("%s: %w", tgt, err)
 	}
 	return nil, lastErr
+}
+
+// ---- C13 远程管理接口（api/edge-remote.yaml）----
+
+// errEdgeAPIUnavailable：节点返回伪装站（未开启 remote_admin_v1 或管理密钥不匹配）。
+var errEdgeAPIUnavailable = errors.New("节点管理接口不可用：未开启 remote_admin_v1 或管理密钥不匹配")
+
+type edgeRemoteStatus struct {
+	NodeID      string       `json:"node_id"`
+	Version     string       `json:"version"`
+	Ready       bool         `json:"ready"`
+	UptimeSec   int64        `json:"uptime_sec"`
+	ListenPorts []int        `json:"listen_ports"`
+	Cert        edgeCertInfo `json:"cert"`
+	Sessions    struct {
+		Active  int   `json:"active"`
+		Tunnels int64 `json:"tunnels"`
+	} `json:"sessions"`
+	UsageAPI bool          `json:"usage_api"`
+	Warp     edgeWarpState `json:"warp"`
+	Host     struct {
+		CPUPercent float64 `json:"cpu_percent"`
+		Load1      float64 `json:"load1"`
+		MemTotal   uint64  `json:"mem_total"`
+		MemUsed    uint64  `json:"mem_used"`
+		DiskTotal  uint64  `json:"disk_total"`
+		DiskUsed   uint64  `json:"disk_used"`
+	} `json:"host"`
+}
+
+type edgeCertInfo struct {
+	Domain   string `json:"domain"`
+	Issuer   string `json:"issuer"`
+	NotAfter int64  `json:"not_after"`
+	DaysLeft int    `json:"days_left"`
+}
+
+type edgeWarpState struct {
+	Enabled   bool `json:"enabled"`
+	All       bool `json:"all"`
+	Available bool `json:"available"`
+}
+
+type edgeUsageState struct {
+	Enabled     bool   `json:"enabled"`
+	NodeID      string `json:"node_id"`
+	MeteringKey string `json:"metering_key"`
+}
+
+// edgeAPI 以节点管理密钥调用 C13：in 非 nil 时作为 JSON 请求体，out 非 nil 时解码 JSON 响应。
+func edgeAPI(ctx context.Context, ep EndpointInfo, method, path string, in, out any) error {
+	if ep.AdminKey == "" {
+		return errors.New("节点没有登记管理密钥")
+	}
+	var body []byte
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = b
+	}
+	resp, err := edgeDo(ctx, ep.Host, ep.IP, ep.Port, method, path, ep.AdminKey, body, 8*time.Second)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	ct := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "text/html") {
+		return errEdgeAPIUnavailable
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		var p struct {
+			Code  string `json:"code"`
+			Title string `json:"title"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&p)
+		return fmt.Errorf("%s %s: http %d %s %s", method, path, resp.StatusCode, p.Code, p.Title)
+	}
+	if out == nil {
+		return nil
+	}
+	if !strings.HasPrefix(ct, "application/json") {
+		return fmt.Errorf("%s %s: unexpected content type %q", method, path, ct)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
+}
+
+// endpointFor 返回已安装节点的登记信息。
+func (s *VPSService) endpointFor(vpsID uint64) (EndpointInfo, error) {
+	if s.eps == nil {
+		return EndpointInfo{}, errors.New("no endpoint store")
+	}
+	ep, ok := s.eps.Get(vpsID)
+	if !ok || !ep.Installed {
+		return EndpointInfo{}, fmt.Errorf("vps %d 未安装 edge", vpsID)
+	}
+	return ep, nil
 }
