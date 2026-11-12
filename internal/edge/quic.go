@@ -5,12 +5,10 @@
 package edge
 
 import (
-	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -678,12 +676,6 @@ const (
 	DefaultMaxGlobalUDP    = 4096
 )
 
-// OfflinePolicy defines disaster-recovery behavior when middle-platform is unreachable.
-type OfflinePolicy struct {
-	GracePeriod      time.Duration `json:"grace_period"`        // Default 30m
-	MaxBurstPerToken int64         `json:"max_burst_per_token"` // Default 500MB (500*1024*1024)
-}
-
 type udpSessionTracker struct {
 	token      string
 	isSTUN     *atomic.Bool
@@ -732,13 +724,6 @@ type QUICServer struct {
 	nextHopDialer        func(nextHopAddr, target, hopCred string) (net.Conn, error)
 	nextHopUDPDialer     func(nextHopAddr, target, hopCred string) (net.Conn, error)
 
-	// Disaster recovery & offline grace period
-	offlinePolicy  OfflinePolicy
-	offlineMu      sync.Mutex
-	offlineSince   time.Time
-	offlineBacklog map[string]*MeteringReportRecord
-	offlineBurst   map[string]int64
-
 	// WebRTC STUN fast aging & session tracking
 	udpSessions     map[*udpSessionTracker]struct{}
 	stunIdleTimeout time.Duration
@@ -785,24 +770,6 @@ func (s *QUICServer) startTokenEnforcer() {
 	})
 }
 
-// MeteringReportRecord represents an edge traffic usage record to be synced with midplatform.
-type MeteringReportRecord struct {
-	Token     string `json:"token"`
-	BytesUp   int64  `json:"bytes_up"`
-	BytesDown int64  `json:"bytes_down"`
-}
-
-type meteringReportReq struct {
-	NodeID  string                 `json:"node_id"`
-	Records []MeteringReportRecord `json:"records"`
-}
-
-type meteringReportResp struct {
-	Code          int      `json:"code"`
-	RevokedTokens []string `json:"revoked_tokens"`
-	Message       string   `json:"message"`
-}
-
 // SetTokenStore sets the token store for token management and revocation.
 func (s *QUICServer) SetTokenStore(ts *TokenStore) {
 	s.tokenStore = ts
@@ -811,45 +778,6 @@ func (s *QUICServer) SetTokenStore(ts *TokenStore) {
 // TokenStore returns the associated TokenStore instance.
 func (s *QUICServer) TokenStore() *TokenStore {
 	return s.tokenStore
-}
-
-// SetOfflinePolicy sets the offline disaster-recovery policy.
-func (s *QUICServer) SetOfflinePolicy(policy OfflinePolicy) {
-	s.offlineMu.Lock()
-	defer s.offlineMu.Unlock()
-	s.offlinePolicy = policy
-}
-
-// OfflinePolicy returns the current offline disaster-recovery policy.
-func (s *QUICServer) OfflinePolicy() OfflinePolicy {
-	s.offlineMu.Lock()
-	defer s.offlineMu.Unlock()
-	return s.offlinePolicy
-}
-
-// OfflineBacklog returns a snapshot of current unsynced backlog records.
-func (s *QUICServer) OfflineBacklog() map[string]MeteringReportRecord {
-	s.offlineMu.Lock()
-	defer s.offlineMu.Unlock()
-	res := make(map[string]MeteringReportRecord, len(s.offlineBacklog))
-	for k, v := range s.offlineBacklog {
-		res[k] = *v
-	}
-	return res
-}
-
-// SetOfflineSinceForTest overrides offlineSince timestamp for unit tests.
-func (s *QUICServer) SetOfflineSinceForTest(t time.Time) {
-	s.offlineMu.Lock()
-	defer s.offlineMu.Unlock()
-	s.offlineSince = t
-}
-
-// OfflineSince returns the time when edge first detected middle-platform failure.
-func (s *QUICServer) OfflineSince() time.Time {
-	s.offlineMu.Lock()
-	defer s.offlineMu.Unlock()
-	return s.offlineSince
 }
 
 // SetUDPIdleTimeoutsForTest sets custom idle timeouts for STUN and standard UDP sessions in unit tests.
@@ -917,165 +845,6 @@ func isSTUNPayload(payload []byte) bool {
 		return binary.BigEndian.Uint32(payload[4:8]) == 0x2112A442
 	}
 	return false
-}
-
-// SyncMeteringWithMid reports traffic to the middle platform and applies returned token revocations.
-// In the event of network partition or midplatform failure, it operates under an offline grace period
-// (default 30m) without disrupting active sessions, accumulating unsynced traffic into a local backlog,
-// enforcing MaxBurstPerToken, and automatically packing the backlog for bulk sync once connectivity resumes.
-func (s *QUICServer) SyncMeteringWithMid(ctx context.Context, midURL, adminKey string, records []MeteringReportRecord) ([]string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	url := strings.TrimSpace(midURL)
-	if !strings.HasSuffix(url, "/admin/metering") {
-		url = strings.TrimRight(url, "/") + "/admin/metering"
-	}
-
-	nodeID := "edge"
-	if s.cfg != nil && s.cfg.Domain != "" {
-		nodeID = s.cfg.Domain
-	}
-
-	// 1. Pack incoming records with existing offline backlog for bulk metering sync
-	s.offlineMu.Lock()
-	mergedMap := make(map[string]*MeteringReportRecord)
-	for tok, r := range s.offlineBacklog {
-		mergedMap[tok] = &MeteringReportRecord{
-			Token:     tok,
-			BytesUp:   r.BytesUp,
-			BytesDown: r.BytesDown,
-		}
-	}
-	for _, r := range records {
-		tok := strings.TrimSpace(r.Token)
-		if tok == "" {
-			continue
-		}
-		if existing, ok := mergedMap[tok]; ok {
-			existing.BytesUp += r.BytesUp
-			existing.BytesDown += r.BytesDown
-		} else {
-			mergedMap[tok] = &MeteringReportRecord{
-				Token:     tok,
-				BytesUp:   r.BytesUp,
-				BytesDown: r.BytesDown,
-			}
-		}
-	}
-	bulkRecords := make([]MeteringReportRecord, 0, len(mergedMap))
-	for _, rec := range mergedMap {
-		bulkRecords = append(bulkRecords, *rec)
-	}
-	s.offlineMu.Unlock()
-
-	reqData := meteringReportReq{
-		NodeID:  nodeID,
-		Records: bulkRecords,
-	}
-	reqBytes, err := json.Marshal(reqData)
-	if err != nil {
-		return nil, fmt.Errorf("marshal metering report: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBytes))
-	if err != nil {
-		return nil, fmt.Errorf("create metering request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if adminKey != "" {
-		req.Header.Set("Aero-Admin-Key", adminKey)
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, sendErr := client.Do(req)
-
-	// Check for network partition or midplatform failure
-	if sendErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
-		var postErr error
-		if sendErr != nil {
-			postErr = fmt.Errorf("send metering report: %w", sendErr)
-		} else {
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			postErr = fmt.Errorf("metering report returned HTTP %d: %s", resp.StatusCode, string(body))
-		}
-
-		s.offlineMu.Lock()
-		defer s.offlineMu.Unlock()
-
-		now := time.Now()
-		if s.offlineSince.IsZero() {
-			s.offlineSince = now
-		}
-
-		// Preserve merged backlog locally
-		s.offlineBacklog = mergedMap
-
-		// Track offline burst per token
-		var burstExceeded []string
-		for _, rec := range records {
-			tok := strings.TrimSpace(rec.Token)
-			if tok == "" {
-				continue
-			}
-			s.offlineBurst[tok] += (rec.BytesUp + rec.BytesDown)
-			if s.offlinePolicy.MaxBurstPerToken > 0 && s.offlineBurst[tok] > s.offlinePolicy.MaxBurstPerToken {
-				burstExceeded = append(burstExceeded, tok)
-			}
-		}
-
-		// Sever tokens that exceeded single-token offline burst limit
-		for _, tok := range burstExceeded {
-			if s.connTracker != nil {
-				s.connTracker.CloseByToken(tok)
-			}
-		}
-
-		// Evaluate grace period
-		withinGrace := now.Sub(s.offlineSince) <= s.offlinePolicy.GracePeriod
-		if !withinGrace {
-			// Grace period expired: block/sever all active sessions
-			if s.connTracker != nil {
-				s.connTracker.CloseAll()
-			}
-			return nil, fmt.Errorf("midplatform offline grace period (%v) expired: %w", s.offlinePolicy.GracePeriod, postErr)
-		}
-
-		// Within grace period: existing active sessions are not blocked!
-		return nil, fmt.Errorf("midplatform offline (within grace period %v): %w", s.offlinePolicy.GracePeriod, postErr)
-	}
-	defer resp.Body.Close()
-
-	var mResp meteringReportResp
-	if err := json.NewDecoder(resp.Body).Decode(&mResp); err != nil {
-		return nil, fmt.Errorf("decode metering response: %w", err)
-	}
-
-	// Middle platform sync succeeded: clear backlog, burst counters, and offline timer
-	s.offlineMu.Lock()
-	s.offlineBacklog = make(map[string]*MeteringReportRecord)
-	s.offlineBurst = make(map[string]int64)
-	s.offlineSince = time.Time{}
-	s.offlineMu.Unlock()
-
-	for _, token := range mResp.RevokedTokens {
-		token = strings.TrimSpace(token)
-		if token == "" {
-			continue
-		}
-		if s.tokenStore != nil {
-			_ = s.tokenStore.Revoke(token)
-		} else if s.validator != nil {
-			s.validator.RemoveToken(token)
-		}
-		if s.connTracker != nil {
-			s.connTracker.CloseByToken(token)
-		}
-	}
-
-	return mResp.RevokedTokens, nil
 }
 
 // SetServerConfig sets the server configuration for QUICServer
@@ -1410,14 +1179,8 @@ func newQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		maxGlobalUDP:     DefaultMaxGlobalUDP,
 		udpTempl:         uritemplate.MustNew("https://placeholder/.well-known/masque/udp/{target_host}/{target_port}/"),
 		ipTempl:          uritemplate.MustNew("https://placeholder/.well-known/masque/ip/*/*/"),
-		offlinePolicy: OfflinePolicy{
-			GracePeriod:      30 * time.Minute,
-			MaxBurstPerToken: 500 * 1024 * 1024,
-		},
-		offlineBacklog: make(map[string]*MeteringReportRecord),
-		offlineBurst:   make(map[string]int64),
-		udpSessions:    make(map[*udpSessionTracker]struct{}),
-		stopCh:         make(chan struct{}),
+		udpSessions:      make(map[*udpSessionTracker]struct{}),
+		stopCh:           make(chan struct{}),
 
 		tokenEnforceInterval: defaultTokenEnforceInterval,
 	}

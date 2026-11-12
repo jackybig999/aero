@@ -4069,169 +4069,6 @@ func TestPhase7Gate_MultiHopChaining(t *testing.T) {
 	ingressSrv.SetNextHopUDPDialerForTest(nil)
 }
 
-// TestPhase8Gate_EdgeQuotaRevocationAndDisconnect (Phase 8 Gate)
-// 验证边缘节点配额同步、即时会话阻断与吊销后的 401 拦截
-func TestPhase8Gate_EdgeQuotaRevocationAndDisconnect(t *testing.T) {
-	dataDir := t.TempDir()
-	listenAddr, host := findTestAddr()
-	clientToken := "tok_phase8_edge_test_user"
-	adminKey := "phase8_edge_admin_secret"
-
-	cfg := ServerConfig{
-		Listen:                     listenAddr,
-		Domain:                     host,
-		DataDir:                    dataDir,
-		Token:                      clientToken,
-		AdminKey:                   adminKey,
-		AllowSelfSignedCertForTest: true,
-	}
-
-	srv, err := NewServer(cfg)
-	if err != nil {
-		t.Fatalf("NewServer failed: %v", err)
-	}
-	srv.quicServer.SetTokenStore(srv.tokenStore)
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("srv.Start failed: %v", err)
-	}
-	defer srv.Close()
-	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
-		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
-	})
-
-	// 1. 搭建模拟商业中台计量服务
-	var reportReceived atomic.Bool
-	midLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen 127.0.0.1 failed: %v", err)
-	}
-	midServer := &httptest.Server{
-		Listener: midLn,
-		Config: &http.Server{
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/admin/metering" {
-					http.NotFound(w, r)
-					return
-				}
-				if r.Header.Get("Aero-Admin-Key") != adminKey {
-					w.WriteHeader(http.StatusUnauthorized)
-					return
-				}
-				reportReceived.Store(true)
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"code":           0,
-					"revoked_tokens": []string{clientToken},
-					"message":        "ok",
-				})
-			}),
-		},
-	}
-	midServer.Start()
-	defer midServer.Close()
-
-	// 2. 搭建客户端并连接 Edge 服务器
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h3"},
-	}
-	quicConf := DefaultQUICConfig()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
-	if err != nil {
-		t.Fatalf("quic.DialAddr failed: %v", err)
-	}
-	defer qConn.CloseWithError(0, "normal")
-
-	tr := &http3.Transport{EnableDatagrams: true}
-	h3Conn := tr.NewClientConn(qConn)
-
-	// 发送初始有效请求以验证连接成功并在服务器端完成绑定
-	req1, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req1.Header.Set("Content-Type", "application/dns-message")
-	req1.Header.Set("Authorization", "Bearer "+clientToken)
-	req1.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
-	req1.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
-
-	resp1, err := h3Conn.RoundTrip(req1)
-	if err != nil {
-		t.Fatalf("RoundTrip 1 failed: %v", err)
-	}
-	_ = resp1.Body.Close()
-
-	if resp1.StatusCode == http.StatusUnauthorized {
-		t.Fatalf("expected initial request to succeed, got 401")
-	}
-
-	// 3. 调用 SyncMeteringWithMid，注入模拟中台返回的 revoked_tokens 包含该客户端 token
-	revoked, err := srv.quicServer.SyncMeteringWithMid(ctx, midServer.URL, adminKey, []MeteringReportRecord{
-		{
-			Token:     clientToken,
-			BytesUp:   1024,
-			BytesDown: 2048,
-		},
-	})
-	if err != nil {
-		t.Fatalf("SyncMeteringWithMid failed: %v", err)
-	}
-	if !reportReceived.Load() {
-		t.Fatalf("midplatform did not receive metering report")
-	}
-	if len(revoked) != 1 || revoked[0] != clientToken {
-		t.Fatalf("expected revoked_tokens [%s], got %v", clientToken, revoked)
-	}
-
-	// 4. 断言该 token 被立即撤销
-	if srv.validator.Validate(clientToken) {
-		t.Fatalf("expected token %s to be revoked from validator", clientToken)
-	}
-
-	// 5. 断言现有连接被切断
-	select {
-	case <-qConn.Context().Done():
-		// 连接已被切断
-	case <-time.After(1 * time.Second):
-		t.Fatalf("expected active QUIC connection to be severed after token revocation")
-	}
-
-	// 6. 断言后续带有该 token 的请求严格返回 401 Unauthorized
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel2()
-
-	qConn2, err := quic.DialAddr(ctx2, srv.quicListener.Addr().String(), tlsConf, quicConf)
-	if err != nil {
-		t.Fatalf("quic.DialAddr for second attempt failed: %v", err)
-	}
-	defer qConn2.CloseWithError(0, "normal")
-
-	h3Conn2 := tr.NewClientConn(qConn2)
-	req2, err := http.NewRequestWithContext(ctx2, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req2.Header.Set("Content-Type", "application/dns-message")
-	req2.Header.Set("Authorization", "Bearer "+clientToken)
-	req2.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
-	req2.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
-
-	resp2, err := h3Conn2.RoundTrip(req2)
-	if err != nil {
-		t.Fatalf("subsequent RoundTrip failed: %v", err)
-	}
-	_ = resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 Unauthorized for revoked token, got %d", resp2.StatusCode)
-	}
-}
-
 // TestFinalGate_SalamanderDualKeyRollover 验证服务端配置主密钥与备用密钥时，使用备用密钥的客户端能够正常握手与传输数据；使用未授权密钥则被静默丢弃。
 func TestFinalGate_SalamanderDualKeyRollover(t *testing.T) {
 	dataDir := t.TempDir()
@@ -4385,206 +4222,13 @@ func TestFinalGate_SalamanderDualKeyRollover(t *testing.T) {
 	}
 }
 
-// TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging 验证中台离线时在 30 分钟宽限期内会话不中断，
-// 网络恢复后将离线积压流量打包批量回补上报，以及 WebRTC STUN 探针 15 秒快速老化与 >=60 防雪崩回收。
-func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
-	dataDir := t.TempDir()
-	listenAddr, host := findTestAddr()
-	clientToken := "gate_offline_and_webrtc_test_tok"
-	adminKey := "gate_offline_admin_secret"
+// WebRTC STUN 探针识别，以及 UDP 上下文达到高水位时优先回收静默的 STUN 探针、不回收正常媒体流。
+func TestWebRTCSTUNDetectionAndFastAging(t *testing.T) {
+	qs := NewQUICServer(NewValidator(), nil, nil, nil, nil)
+	t.Cleanup(qs.Close)
+	clientToken := "webrtc_test_tok"
 
-	cfg := ServerConfig{
-		Listen:                     listenAddr,
-		Domain:                     host,
-		DataDir:                    dataDir,
-		Token:                      clientToken,
-		AdminKey:                   adminKey,
-		AllowSelfSignedCertForTest: true,
-	}
-
-	srv, err := NewServer(cfg)
-	if err != nil {
-		t.Fatalf("NewServer failed: %v", err)
-	}
-	srv.quicServer.SetTokenStore(srv.tokenStore)
-	srv.quicServer.SetAllowLoopbackForTest(true)
-
-	if err := srv.Start(); err != nil {
-		t.Fatalf("srv.Start failed: %v", err)
-	}
-	defer srv.Close()
-	srv.quicServer.SetICMPForwardHookForTest(func(target net.IP, echoReq []byte) ([]byte, error) {
-		return nil, errors.New("icmp echo disabled in unit test to avoid real 1.1.1.1 replies")
-	})
-
-	// 1. 验证离线容灾策略默认值 (30m 宽限期, 500MB 突发流量)
-	defPolicy := srv.quicServer.OfflinePolicy()
-	if defPolicy.GracePeriod != 30*time.Minute {
-		t.Fatalf("expected default GracePeriod 30m, got %v", defPolicy.GracePeriod)
-	}
-	if defPolicy.MaxBurstPerToken != 500*1024*1024 {
-		t.Fatalf("expected default MaxBurstPerToken 500MB, got %d", defPolicy.MaxBurstPerToken)
-	}
-
-	// 2. 建立客户端 QUIC 连接
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h3"},
-	}
-	quicConf := DefaultQUICConfig()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	qConn, err := quic.DialAddr(ctx, srv.quicListener.Addr().String(), tlsConf, quicConf)
-	if err != nil {
-		t.Fatalf("quic.DialAddr failed: %v", err)
-	}
-	defer qConn.CloseWithError(0, "normal")
-
-	tr := &http3.Transport{EnableDatagrams: true}
-	h3Conn := tr.NewClientConn(qConn)
-
-	// 验证初始请求成功绑定 Token
-	req1, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req1.Header.Set("Content-Type", "application/dns-message")
-	req1.Header.Set("Authorization", "Bearer "+clientToken)
-	req1.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
-	req1.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
-
-	resp1, err := h3Conn.RoundTrip(req1)
-	if err != nil {
-		t.Fatalf("RoundTrip 1 failed: %v", err)
-	}
-	_ = resp1.Body.Close()
-	if resp1.StatusCode == http.StatusUnauthorized {
-		t.Fatalf("expected initial request to succeed, got 401")
-	}
-
-	// 3. 模拟中台离线（网络分区/不可达）
-	deadLn, err := net.Listen("tcp", "[::1]:0")
-	if err != nil {
-		deadLn, _ = net.Listen("tcp", "127.0.0.1:0")
-	}
-	offlineURL := "http://" + deadLn.Addr().String() + "/admin/metering"
-	_ = deadLn.Close()
-
-	records1 := []MeteringReportRecord{
-		{
-			Token:     clientToken,
-			BytesUp:   1000,
-			BytesDown: 1000,
-		},
-	}
-	ctxOffline, cancelOffline := context.WithTimeout(context.Background(), 1*time.Second)
-	_, err = srv.quicServer.SyncMeteringWithMid(ctxOffline, offlineURL, adminKey, records1)
-	cancelOffline()
-	if err == nil {
-		t.Fatalf("expected error when midplatform is offline, got nil")
-	}
-
-	// 断言：处于 30 分钟宽限期内，不阻断现有活跃会话！
-	if !srv.validator.Validate(clientToken) {
-		t.Fatalf("expected clientToken to remain valid within offline grace period")
-	}
-	if srv.quicServer.OfflineSince().IsZero() {
-		t.Fatalf("expected offlineSince to be recorded on mid failure")
-	}
-	backlog := srv.quicServer.OfflineBacklog()
-	if len(backlog) != 1 || backlog[clientToken].BytesUp != 1000 {
-		t.Fatalf("expected offline backlog to store unsynced records, got: %v", backlog)
-	}
-
-	// 断言现有会话仍可顺畅通信
-	reqGrace, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+host+"/dns-query", bytes.NewReader([]byte{0, 1, 2, 3}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	reqGrace.Header.Set("Content-Type", "application/dns-message")
-	reqGrace.Header.Set("Authorization", "Bearer "+clientToken)
-	reqGrace.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
-	reqGrace.Header.Set("Aero-Nonce", hex.EncodeToString(make([]byte, 32)))
-	respGrace, err := h3Conn.RoundTrip(reqGrace)
-	if err != nil {
-		t.Fatalf("RoundTrip during offline grace period failed: %v", err)
-	}
-	_ = respGrace.Body.Close()
-	if respGrace.StatusCode == http.StatusUnauthorized {
-		t.Fatalf("session blocked prematurely during offline grace period")
-	}
-
-	// 4. 模拟中台故障恢复，测试批量回补上报 (Bulk Metering Sync)
-	var midReceivedReq atomic.Pointer[meteringReportReq]
-	midLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen 127.0.0.1 failed: %v", err)
-	}
-	midServer := &httptest.Server{
-		Listener: midLn,
-		Config: &http.Server{
-			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/admin/metering" {
-					http.NotFound(w, r)
-					return
-				}
-				var mReq meteringReportReq
-				if err := json.NewDecoder(r.Body).Decode(&mReq); err != nil {
-					http.Error(w, err.Error(), 400)
-					return
-				}
-				midReceivedReq.Store(&mReq)
-				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(meteringReportResp{
-					Code:          0,
-					RevokedTokens: []string{},
-					Message:       "ok",
-				})
-			}),
-		},
-	}
-	midServer.Start()
-	defer midServer.Close()
-
-	records2 := []MeteringReportRecord{
-		{
-			Token:     clientToken,
-			BytesUp:   500,
-			BytesDown: 500,
-		},
-	}
-	_, err = srv.quicServer.SyncMeteringWithMid(ctx, midServer.URL, adminKey, records2)
-	if err != nil {
-		t.Fatalf("SyncMeteringWithMid recovery failed: %v", err)
-	}
-
-	// 断言中台成功接收到打包积压的批量流量 (1000+500 = 1500)
-	recv := midReceivedReq.Load()
-	if recv == nil || len(recv.Records) != 1 {
-		t.Fatalf("midServer did not receive expected bulk report: %v", recv)
-	}
-	if recv.Records[0].BytesUp != 1500 {
-		t.Fatalf("expected bulk merged BytesUp=1500, got %d", recv.Records[0].BytesUp)
-	}
-	if len(srv.quicServer.OfflineBacklog()) != 0 {
-		t.Fatalf("expected offline backlog to be cleared after recovery")
-	}
-	if !srv.quicServer.OfflineSince().IsZero() {
-		t.Fatalf("expected offlineSince to be reset after recovery")
-	}
-
-	// 5. 验证宽限期超过 30 分钟后阻断会话
-	srv.quicServer.SetOfflineSinceForTest(time.Now().Add(-31 * time.Minute))
-	ctxExpired, cancelExpired := context.WithTimeout(context.Background(), 1*time.Second)
-	_, err = srv.quicServer.SyncMeteringWithMid(ctxExpired, offlineURL, adminKey, records1)
-	cancelExpired()
-	if err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Fatalf("expected grace period expired error, got: %v", err)
-	}
-
-	// 6. 验证 WebRTC STUN 探针与非 STUN 端口/特征识别
+	// WebRTC STUN 探针与非 STUN 端口/特征识别
 	if !isSTUNTarget("10.0.0.1:3478") || !isSTUNTarget("webrtc.example.com:19302") || !isSTUNTarget("turn.aero:5349") {
 		t.Fatalf("expected isSTUNTarget to return true for standard STUN ports")
 	}
@@ -4600,8 +4244,8 @@ func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
 		t.Fatalf("expected isSTUNPayload to return false for non-STUN payload")
 	}
 
-	// 7. 验证看门狗快速老化与 >=60 防雪崩优先回收
-	srv.quicServer.SetUDPIdleTimeoutsForTest(40*time.Millisecond, 400*time.Millisecond)
+	// 看门狗快速老化与 >=60 防雪崩优先回收
+	qs.SetUDPIdleTimeoutsForTest(40*time.Millisecond, 400*time.Millisecond)
 
 	var stunClosed atomic.Bool
 	stunTracker := &udpSessionTracker{
@@ -4614,8 +4258,8 @@ func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
 	}
 	stunTracker.isSTUN.Store(true)
 	stunTracker.lastActive.Store(time.Now().UnixNano())
-	srv.quicServer.registerUDPSession(stunTracker)
-	defer srv.quicServer.unregisterUDPSession(stunTracker)
+	qs.registerUDPSession(stunTracker)
+	defer qs.unregisterUDPSession(stunTracker)
 
 	var normalClosed atomic.Bool
 	normalTracker := &udpSessionTracker{
@@ -4628,22 +4272,22 @@ func TestFinalGate_EdgeOfflineGraceAndWebRTCFastAging(t *testing.T) {
 	}
 	normalTracker.isSTUN.Store(false)
 	normalTracker.lastActive.Store(time.Now().UnixNano())
-	srv.quicServer.registerUDPSession(normalTracker)
-	defer srv.quicServer.unregisterUDPSession(normalTracker)
+	qs.registerUDPSession(normalTracker)
+	defer qs.unregisterUDPSession(normalTracker)
 
 	// 模拟并发 UDP Context 达到预警阈值 60，STUN 探针静默 60ms (> 40ms 设定超时)
-	srv.quicServer.udpMu.Lock()
-	srv.quicServer.tokenUDPCtx[clientToken] = 60
-	srv.quicServer.udpMu.Unlock()
+	qs.udpMu.Lock()
+	qs.tokenUDPCtx[clientToken] = 60
+	qs.udpMu.Unlock()
 	stunTracker.lastActive.Store(time.Now().Add(-60 * time.Millisecond).UnixNano())
 	normalTracker.lastActive.Store(time.Now().Add(-60 * time.Millisecond).UnixNano())
 
 	// 申请 UDP Slot 触发高水位防雪崩清理
-	acquired := srv.quicServer.acquireUDPSlot(clientToken)
+	acquired := qs.acquireUDPSlot(clientToken)
 	if !acquired {
 		t.Fatalf("expected acquireUDPSlot to succeed after reclaiming stale STUN probe")
 	}
-	defer srv.quicServer.releaseUDPSlot(clientToken)
+	defer qs.releaseUDPSlot(clientToken)
 
 	// 断言 STUN 探针被立即回收关闭，而正常长连接媒体流未被回收
 	if !stunClosed.Load() {

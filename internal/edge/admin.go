@@ -160,13 +160,6 @@ func (h *AdminHandler) handleStatus(w http.ResponseWriter) {
 		"max_dial":       dialCap,
 		"uptime_sec":     time.Since(h.startedAt).Seconds(),
 	}
-	if h.quicServer != nil {
-		policy := h.quicServer.OfflinePolicy()
-		body["offline_policy"] = map[string]any{
-			"grace_period_sec": policy.GracePeriod.Seconds(),
-			"max_burst_bytes":  policy.MaxBurstPerToken,
-		}
-	}
 	writeJSON(w, body)
 }
 

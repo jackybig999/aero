@@ -324,8 +324,6 @@ func main() {
 	subBuilder.RegisterRoutes(api)
 	sub.NewVPSHandler(vpsSvc).RegisterRoutes(api)
 	aeroHandler := sub.NewAeroHandler(vpsSvc)
-	aeroHandler.SetAeroDB(aeroDB)
-	aeroHandler.SetAdminKey(adminKey)
 	aeroHandler.RegisterRoutes(api)
 	gatewayRegistry := sub.NewGatewayRegistry(payDB, box)
 	_ = gatewayRegistry.Reload()
