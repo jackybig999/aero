@@ -1481,15 +1481,16 @@ func (s *VPSService) InstallAeroOnVPS(vpsID uint64) (*EndpointInfo, error) {
 		host = cred.IP
 	}
 	ep := EndpointInfo{
-		VPSID:     vpsID,
-		Name:      cred.Name,
-		Host:      host,
-		IP:        cred.IP,
-		Port:      st.Port,
-		AdminKey:  st.AdminKey,
-		HasAdmin:  st.AdminKey != "",
-		Installed: true,
-		UpdatedAt: time.Now(),
+		VPSID:       vpsID,
+		Name:        cred.Name,
+		Host:        host,
+		IP:          cred.IP,
+		Port:        st.Port,
+		AdminKey:    st.AdminKey,
+		HasAdmin:    st.AdminKey != "",
+		MeteringKey: st.MeteringKey,
+		Installed:   true,
+		UpdatedAt:   time.Now(),
 	}
 	if s.eps != nil {
 		if err := s.eps.Upsert(ep); err != nil {
@@ -2115,16 +2116,17 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		host = h
 	}
 	ep := EndpointInfo{
-		VPSID:     vpsID,
-		Name:      cred.Name,
-		Host:      host,
-		IP:        cred.IP,
-		Port:      st.Port,
-		AdminKey:  st.AdminKey,
-		HasAdmin:  st.AdminKey != "",
-		Installed: true,
-		Version:   strings.TrimPrefix(tag, "v"),
-		UpdatedAt: time.Now(),
+		VPSID:       vpsID,
+		Name:        cred.Name,
+		Host:        host,
+		IP:          cred.IP,
+		Port:        st.Port,
+		AdminKey:    st.AdminKey,
+		HasAdmin:    st.AdminKey != "",
+		MeteringKey: st.MeteringKey,
+		Installed:   true,
+		Version:     strings.TrimPrefix(tag, "v"),
+		UpdatedAt:   time.Now(),
 	}
 	if svc.eps != nil {
 		if err := svc.eps.Upsert(ep); err != nil {
@@ -2274,9 +2276,10 @@ echo "RESULT=ok"
 }
 
 type edgeServiceState struct {
-	Port      int
-	AdminKey  string
-	Firewalls []string // 处于启用状态的宿主防火墙（只检测，不修改）
+	Port        int
+	AdminKey    string
+	MeteringKey string   // usage_api 开启后才有（C6）
+	Firewalls   []string // 处于启用状态的宿主防火墙（只检测，不修改）
 }
 
 // readEdgeServiceState 等待服务就绪后只读回读 edge 持久化的监听端口与管理密钥，并检测宿主防火墙。
@@ -2289,6 +2292,7 @@ done
 echo "ACTIVE=$(systemctl is-active aero-edge)"
 echo "LISTEN=$(grep -o '"listen"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
 echo "ADMIN_KEY=$(grep -o '"admin_key"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
+echo "METERING_KEY=$(grep -o '"metering_key"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then echo "FW_UFW=yes"; fi
 if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then echo "FW_FIREWALLD=yes"; fi
 `
@@ -2308,7 +2312,7 @@ if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewa
 	if err != nil || port <= 0 {
 		return edgeServiceState{}, fmt.Errorf("监听端口无效 %q", portStr)
 	}
-	st := edgeServiceState{Port: port, AdminKey: kv["ADMIN_KEY"]}
+	st := edgeServiceState{Port: port, AdminKey: kv["ADMIN_KEY"], MeteringKey: kv["METERING_KEY"]}
 	if kv["FW_UFW"] == "yes" {
 		st.Firewalls = append(st.Firewalls, "UFW")
 	}

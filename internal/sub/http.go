@@ -634,7 +634,7 @@ func (h *AeroHandler) GetEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.svc.eps != nil {
 		if ep, ok := h.svc.eps.Get(id); ok {
-			writeJSON(w, 200, map[string]any{"code": 0, "data": ep})
+			writeJSON(w, 200, map[string]any{"code": 0, "data": ep.public()})
 			return
 		}
 	}
@@ -667,7 +667,7 @@ func (h *AeroHandler) RefreshEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, errResp(1003, err.Error()))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"code": 0, "data": ep})
+	writeJSON(w, 200, map[string]any{"code": 0, "data": ep.public()})
 }
 
 func (h *AeroHandler) ListTokens(w http.ResponseWriter, r *http.Request) {

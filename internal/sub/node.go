@@ -1265,20 +1265,23 @@ func (s *FileVPSStore) GetCredentials(id uint64) (*Credentials, error) {
 // ----------------------------------------------------------------------
 
 type EndpointInfo struct {
-	VPSID     uint64    `json:"vps_id"`
-	Name      string    `json:"name"`
-	Region    string    `json:"region,omitempty"`
-	Host      string    `json:"host"`
-	IP        string    `json:"ip,omitempty"`
-	Port      int       `json:"port"`
-	SubSecret string    `json:"sub_secret"`
-	AdminKey  string    `json:"admin_key"`
-	HasAdmin  bool      `json:"has_admin"`
-	SubURL    string    `json:"sub_url"`
-	Installed bool      `json:"installed"`
-	Version   string    `json:"version,omitempty"`
-	ECHConfig string    `json:"ech_config,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	VPSID     uint64 `json:"vps_id"`
+	Name      string `json:"name"`
+	Region    string `json:"region,omitempty"`
+	Host      string `json:"host"`
+	IP        string `json:"ip,omitempty"`
+	Port      int    `json:"port"`
+	SubSecret string `json:"sub_secret"`
+	AdminKey  string `json:"admin_key"`
+	HasAdmin  bool   `json:"has_admin"`
+	// MeteringKey 是节点 C6 计量只读密钥（usage_api 开启后经 SSH 只读回读）；只用于拉取 /v1/usage，
+	// 不经管理接口返回（见 public）。
+	MeteringKey string    `json:"metering_key,omitempty"`
+	SubURL      string    `json:"sub_url"`
+	Installed   bool      `json:"installed"`
+	Version     string    `json:"version,omitempty"`
+	ECHConfig   string    `json:"ech_config,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 func (ep *EndpointInfo) UnmarshalJSON(data []byte) error {
@@ -1300,6 +1303,12 @@ func (ep *EndpointInfo) UnmarshalJSON(data []byte) error {
 		ep.ECHConfig = aux.LegacyECH
 	}
 	return nil
+}
+
+// public 返回给管理接口的副本：不含计量只读密钥。
+func (ep EndpointInfo) public() EndpointInfo {
+	ep.MeteringKey = ""
+	return ep
 }
 
 type EndpointStore struct {
@@ -1841,5 +1850,5 @@ func (h *VPSHandler) InstallAero(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, errResp(1003, err.Error()))
 		return
 	}
-	writeJSON(w, 200, map[string]any{"code": 0, "data": ep})
+	writeJSON(w, 200, map[string]any{"code": 0, "data": ep.public()})
 }

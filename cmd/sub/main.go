@@ -167,6 +167,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("endpoint store failed: %v", err)
 	}
+	// C6：每 60 秒拉取已开启 usage_api 的节点计量（只读，edge 不推送）
+	usageCollector, err := sub.OpenUsageCollector(filepath.Join(dataDir, "usage.db"), epStore)
+	if err != nil {
+		log.Fatalf("usage collector: %v", err)
+	}
+	defer usageCollector.Close()
+	go usageCollector.Run(context.Background())
 
 	// 6. VPS Asset Management & Probe Engine
 	box, err := sub.NewSecretBox()
