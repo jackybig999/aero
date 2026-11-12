@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -399,33 +400,39 @@ func (h *NodeHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		vpsID := n.VPSID
 		nodeName := n.Name
 		nodeIP := n.IP
-		if vpsID > 0 && h.vpsSvc != nil {
-			if cred, err := h.vpsSvc.store.GetCredentials(vpsID); err == nil && cred != nil && cred.IP != "" {
-				go func(c *Credentials) {
-					client, dialErr := dialSSH(SSHCredentials{
-						Host: c.IP, Port: c.SSHPort, User: c.SSHUsername, Password: c.SSHPassword,
-					}, 10*time.Second)
-					if dialErr == nil {
-						defer client.Close()
-						cleanCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; pkill -9 -f aero-edge 2>/dev/null || true; pkill -9 -f aero 2>/dev/null || true; fuser -k 443/tcp 2>/dev/null || true; rm -rf /usr/local/bin/aero-edge /usr/local/bin/aero /etc/systemd/system/aero-edge.service /etc/aero /var/lib/aero; systemctl daemon-reload"
-						_, _ = runSSH(client, cleanCmd, 15*time.Second)
-					}
-				}(cred)
-			}
-			if h.vpsSvc.eps != nil {
-				if ep, ok := h.vpsSvc.eps.Get(vpsID); ok {
-					ep.Installed = false
-					ep.UpdatedAt = time.Now()
-					_ = h.vpsSvc.eps.Upsert(ep)
-				}
-			}
-		}
-		if h.aeroDB != nil {
-			_, _ = h.aeroDB.db.Exec(`DELETE FROM node WHERE id = ? OR vps_id = ? OR name = ? OR address LIKE ?`, id, vpsID, nodeName, "%"+nodeIP+"%")
-		}
+		// 只删除中台登记，不触碰节点上的 edge（卸载须走显式的卸载任务）。
+		h.deleteNodeRows(id, vpsID, nodeName, nodeIP)
 	}
 	_ = h.svc.DeleteNode(id)
 	writeJSON(w, http.StatusOK, map[string]any{"code": 0, "message": "success"})
+}
+
+// deleteNodeRows 删除 aero.db 中匹配的节点记录；只用非空条件（空 IP 曾生成 address LIKE '%%' 删除全部节点）。
+func (h *NodeHandler) deleteNodeRows(id, vpsID uint64, name, ip string) {
+	if h.aeroDB == nil {
+		return
+	}
+	var conds []string
+	var args []any
+	add := func(cond string, arg any) { conds = append(conds, cond); args = append(args, arg) }
+	if id > 0 {
+		add("id = ?", id)
+	}
+	if vpsID > 0 {
+		add("vps_id = ?", vpsID)
+	}
+	if name != "" {
+		add("name = ?", name)
+	}
+	if ip != "" {
+		add("address LIKE ?", "%"+ip+"%")
+	}
+	if len(conds) == 0 {
+		return
+	}
+	if _, err := h.aeroDB.db.Exec("DELETE FROM node WHERE "+strings.Join(conds, " OR "), args...); err != nil {
+		log.Printf("[NODE] delete node rows: %v", err)
+	}
 }
 
 func (h *NodeHandler) CascadeDelete(w http.ResponseWriter, r *http.Request) {
@@ -448,30 +455,8 @@ func (h *NodeHandler) CascadeDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"code": 1002, "message": "vps_id or ip required"})
 		return
 	}
-	if vpsID > 0 && h.vpsSvc != nil {
-		if cred, err := h.vpsSvc.store.GetCredentials(vpsID); err == nil && cred != nil && cred.IP != "" {
-			go func(c *Credentials) {
-				client, dialErr := dialSSH(SSHCredentials{
-					Host: c.IP, Port: c.SSHPort, User: c.SSHUsername, Password: c.SSHPassword,
-				}, 10*time.Second)
-				if dialErr == nil {
-					defer client.Close()
-					cleanCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; pkill -9 -f aero-edge 2>/dev/null || true; pkill -9 -f aero 2>/dev/null || true; fuser -k 443/tcp 2>/dev/null || true; rm -rf /usr/local/bin/aero-edge /usr/local/bin/aero /etc/systemd/system/aero-edge.service /etc/aero /var/lib/aero; systemctl daemon-reload"
-					_, _ = runSSH(client, cleanCmd, 15*time.Second)
-				}
-			}(cred)
-		}
-		if h.vpsSvc.eps != nil {
-			if ep, ok := h.vpsSvc.eps.Get(vpsID); ok {
-				ep.Installed = false
-				ep.UpdatedAt = time.Now()
-				_ = h.vpsSvc.eps.Upsert(ep)
-			}
-		}
-	}
-	if h.aeroDB != nil {
-		_, _ = h.aeroDB.db.Exec(`DELETE FROM node WHERE vps_id = ? OR address LIKE ?`, vpsID, "%"+ip+"%")
-	}
+	// 只删除中台登记，不触碰节点上的 edge（卸载须走显式的卸载任务）。
+	h.deleteNodeRows(0, vpsID, "", ip)
 	ids, err := h.svc.DeleteMatching(vpsID, ip)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"code": 1006, "message": err.Error()})
@@ -1490,19 +1475,7 @@ func (s *VPSService) Delete(id uint64) error {
 		ip = vps.IP
 	}
 
-	if cred, credErr := s.store.GetCredentials(id); credErr == nil && cred != nil && cred.IP != "" {
-		go func(c *Credentials) {
-			client, err := dialSSH(SSHCredentials{
-				Host: c.IP, Port: c.SSHPort, User: c.SSHUsername, Password: c.SSHPassword,
-			}, 10*time.Second)
-			if err == nil {
-				defer client.Close()
-				cleanCmd := "systemctl stop aero-edge 2>/dev/null; systemctl disable aero-edge 2>/dev/null; pkill -9 -f aero-edge 2>/dev/null || true; pkill -9 -f '/usr/local/bin/aero' 2>/dev/null || true; fuser -k 443/tcp 2>/dev/null || true; rm -rf /usr/local/bin/aero-edge /usr/local/bin/aero /etc/systemd/system/aero-edge.service /etc/aero /var/lib/aero; systemctl daemon-reload"
-				_, _ = runSSH(client, cleanCmd, 15*time.Second)
-			}
-		}(cred)
-	}
-
+	// 只忘记该 VPS（删除中台登记与凭据）；节点上的 edge 继续独立运行。要卸载请先运行卸载任务。
 	err := s.store.Delete(id)
 	if err == nil {
 		if s.eps != nil {

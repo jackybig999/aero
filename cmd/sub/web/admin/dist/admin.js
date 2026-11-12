@@ -1376,7 +1376,7 @@ async function saveEditPass() {
 }
 
 window.delVPS = async (id) => {
-  if (!await modalConfirm(`警告：确认彻底删除 VPS #${id}？将联动清理节点与关联订阅！`, '删除 VPS')) return;
+  if (!await modalConfirm(`确认从中台删除 VPS #${id}？只删除中台登记（节点记录、SSH 凭据），节点上的 edge 继续运行；需要卸载请先执行“卸载”。`, '删除 VPS')) return;
   try {
     await apiCall(`/vps/${id}/`, { method: 'DELETE' });
     alert('已删除');
@@ -2443,10 +2443,10 @@ window.nodeHeartbeat = async (id) => {
 };
 
 window.delNode = async (id) => {
-  if (!await modalConfirm(`确认彻底删除节点 #${id}？将同时终止远端服务并清理节点记录！`, '删除节点')) return;
+  if (!await modalConfirm(`确认从中台删除节点 #${id}？只删除中台记录，节点上的 edge 不受影响；需要卸载请执行“卸载”。`, '删除节点')) return;
   try {
     await apiCall(`/nodes/${id}/`, { method: 'DELETE' });
-    alert('节点及远端服务已彻底删除清理');
+    alert('已删除中台节点记录');
     loadNodes();
     loadVPS();
     loadDashboard();
