@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: AERO edge remote management API (C13)
-  version: 0.1.0
+  version: 1.0.0
   description: |
-    状态：draft（2026-11-12 起草，待用户确认）。flag `remote_admin_v1` 默认 OFF。
+    状态：final（2026-11-12，用户确认）。flag `remote_admin_v1` 默认 OFF。
     用途：中台（sub）管理节点的唯一通道（ADR-0016）。edge 是独立可部署的基石：没有中台也能完整运行；
     中台只调用本接口与 C6，不经 SSH 读写 edge 的任何文件。SSH 只用于安装/升级/卸载 edge 程序本身。
     传输：HTTPS（edge 主端口，TCP 或 QUIC），中台必须按节点域名校验证书。
@@ -193,6 +193,8 @@ components:
         title: { type: string }
         code: { type: string }
         detail: { type: string }
-x-aero-open-questions:
-  - 证书签发：目前由宿主上的 acme.sh 签发、edge 发现并加载；是否改为 edge 内置 ACME（DNS-01，Cloudflare 令牌只由 edge 持有）？本契约只提供重新加载。
-  - 重启：依赖服务单元的 Restart=always（安装时写入）。edge 不以其他方式自行拉起。
+x-aero-decisions:
+  - 证书（用户 2026-11-12）：使用宿主上系统的 acme.sh 或 certbot 及其默认位置；edge 只读查找与热加载，不签发。
+    安装前由 `aero-edge check-cert` 只读预检：证书已存在则跳过；没有 ACME 客户端或没有证书时提示运维安装/签发后重试，中台不在节点上安装任何东西。
+    本接口只提供重新加载（续期后文件变化也会自动热加载）。
+  - 重启（用户 2026-11-12）：edge 排空后退出，由服务单元的 Restart=always 拉起；edge 不以其他方式自行拉起。
