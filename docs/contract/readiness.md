@@ -15,4 +15,4 @@
 | C9 出口 warp | draft | 插件形态已实现：只读状态 + 持久化开关（ADR-0012 §6） | 未执行 | `warp_proxy` 非空即开 | 按节点配置 | edge 不安装 WARP |
 | 端口中途跳变 | draft | 进程内多端口监听已实现 | 未执行 | `port_hopping` | OFF | 不使用 DNAT（ADR-0012） |
 | C7 本地管理接口 | final | 未开始 | 未执行 | `local_admin_api` | OFF | 落地后 deploy/aero 改为调用本接口 |
-| C13 远程管理接口 | final | edge 已实现（/admin/v1/*；计量运行时开关；证书重新加载；重启经排空退出）；中台已切换：状态/诊断/指标/纯净度/证书/重启/刷新节点/计量密钥均经 C13，SSH 只剩安装、升级、卸载 | remote_admin_test 对照 schema 与错误码 | `remote_admin_v1` | OFF | 落地后中台删除 SSH 版状态/诊断/纯净度/证书/重启/密钥回读（ADR-0016） |
+| C13 远程管理接口 | final | edge 已实现（/admin/v1/*；计量运行时开关；证书重新加载；重启经排空退出）；中台已切换：状态/诊断/指标/纯净度/证书/重启/刷新节点/计量密钥均经 C13，SSH 只剩安装、升级、卸载 | remote_admin_test 对照 schema 与错误码 | `remote_admin_v1` | ON（默认，用户 2026-11-12；显式 false 关闭） | 已有节点升级后即可由中台管理；中台已删除 SSH 版状态/诊断/纯净度/证书/重启/密钥回读（ADR-0016） |

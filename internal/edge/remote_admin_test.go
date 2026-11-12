@@ -25,7 +25,7 @@ type remoteFixture struct {
 }
 
 // newRemoteFixture 启动一个使用文件证书的 edge（可测试证书重新加载）。
-func newRemoteFixture(t *testing.T, enabled bool) *remoteFixture {
+func newRemoteFixture(t *testing.T, enabled *bool) *remoteFixture {
 	t.Helper()
 	dir := t.TempDir()
 	certDir := filepath.Join(dir, "cert")
@@ -80,11 +80,15 @@ func (f *remoteFixture) persisted(t *testing.T) map[string]any {
 
 // 关闭、未鉴权、密钥错误、URL 中的密钥、未知路径：一律伪装站；旧 /admin/* 未鉴权也不再返回 403。
 func TestRemoteAdminHiddenUnlessAuthenticated(t *testing.T) {
-	off := newRemoteFixture(t, false)
+	off := newRemoteFixture(t, new(bool)) // 显式 false
+	def := newRemoteFixture(t, nil)       // 未配置：默认开启
+	if rec := def.do(http.MethodGet, "/admin/v1/status", testAdminKey, nil); rec.Code != http.StatusOK || isCover(rec) {
+		t.Fatalf("default (unset) must enable C13: %d", rec.Code)
+	}
 	if rec := off.do(http.MethodGet, "/admin/v1/status", testAdminKey, nil); !isCover(rec) {
 		t.Fatalf("flag off: %d %s", rec.Code, rec.Header().Get("Content-Type"))
 	}
-	f := newRemoteFixture(t, true)
+	f := newRemoteFixture(t, nil)
 	for name, rec := range map[string]*httptest.ResponseRecorder{
 		"no key":       f.do(http.MethodGet, "/admin/v1/status", "", nil),
 		"wrong key":    f.do(http.MethodGet, "/admin/v1/status", "wrong", nil),
@@ -106,7 +110,7 @@ func TestRemoteAdminHiddenUnlessAuthenticated(t *testing.T) {
 }
 
 func TestRemoteAdminStatusAndCertReload(t *testing.T) {
-	f := newRemoteFixture(t, true)
+	f := newRemoteFixture(t, nil)
 	rec := f.do(http.MethodGet, "/admin/v1/status", testAdminKey, nil)
 	var st remoteStatus
 	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil || rec.Code != http.StatusOK {
@@ -129,7 +133,7 @@ func TestRemoteAdminStatusAndCertReload(t *testing.T) {
 
 // 计量开关：开启返回密钥并持久化，C6 接口随之可用；关闭后 C6 回到伪装站并持久化。
 func TestRemoteAdminUsageToggle(t *testing.T) {
-	f := newRemoteFixture(t, true)
+	f := newRemoteFixture(t, nil)
 	if rec := f.do(http.MethodPut, "/admin/v1/usage-api", testAdminKey, `{"enabled":true,"x":1}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown field accepted: %d", rec.Code)
 	}
@@ -166,7 +170,7 @@ func TestRemoteAdminUsageToggle(t *testing.T) {
 }
 
 func TestRemoteAdminWarpRestartAndRateLimit(t *testing.T) {
-	f := newRemoteFixture(t, true)
+	f := newRemoteFixture(t, nil)
 	if rec := f.do(http.MethodPut, "/admin/v1/warp", testAdminKey, map[string]bool{"enabled": true}); rec.Code != http.StatusConflict || problemCode(t, rec) != "EDGE_WARP_UNAVAILABLE" {
 		t.Fatalf("warp without local proxy: %d", rec.Code)
 	}

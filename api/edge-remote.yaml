@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: AERO edge remote management API (C13)
-  version: 1.0.1
+  version: 1.0.2
   description: |
-    状态：final（2026-11-12，用户确认）。flag `remote_admin_v1` 默认 OFF。
+    状态：final（2026-11-12，用户确认）。flag `remote_admin_v1` 默认 ON（1.0.2，用户 2026-11-12 决定；显式 false 关闭）。
     用途：中台（sub）管理节点的唯一通道（ADR-0016）。edge 是独立可部署的基石：没有中台也能完整运行；
     中台只调用本接口与 C6，不经 SSH 读写 edge 的任何文件。SSH 只用于安装/升级/卸载 edge 程序本身。
     传输：HTTPS（edge 主端口，TCP 或 QUIC），中台必须按节点域名校验证书。

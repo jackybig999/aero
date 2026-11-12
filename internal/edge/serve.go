@@ -86,8 +86,9 @@ type ServerConfig struct {
 	UsageAPI    bool   `json:"usage_api,omitempty" yaml:"usage_api"`
 	MeteringKey string `json:"metering_key,omitempty" yaml:"metering_key"`
 	NodeID      string `json:"node_id,omitempty" yaml:"node_id"`
-	// RemoteAdminV1 开启 C13 远程管理接口（api/edge-remote.yaml，ADR-0016）。
-	RemoteAdminV1 bool `json:"remote_admin_v1,omitempty" yaml:"remote_admin_v1"`
+	// RemoteAdminV1 控制 C13 远程管理接口（api/edge-remote.yaml，ADR-0016）：未配置时开启，显式 false 关闭
+	// （用户决定 2026-11-12）。接口仍需管理密钥，未鉴权返回伪装站。
+	RemoteAdminV1 *bool `json:"remote_admin_v1,omitempty" yaml:"remote_admin_v1"`
 	// DrainTimeoutSec 是收到停止信号后的排空上限（秒，L0 §8.6）；0 表示默认 15 秒。
 	DrainTimeoutSec int `json:"drain_timeout,omitempty"`
 	// ConfigPath 是 edge 持久化自身配置的文件路径，仅由 cmd/edge 显式设置。
@@ -508,7 +509,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	srv.certDiscovered = certDiscovered
 	srv.usageMeter = usageMeter // Start 时启用
 	srv.restartCh = make(chan struct{})
-	if cfg.RemoteAdminV1 {
+	if cfg.RemoteAdminV1 == nil || *cfg.RemoteAdminV1 {
 		srv.remoteAdmin = newRemoteAdmin(srv, cfg.AdminKey)
 	}
 	constructed = true
