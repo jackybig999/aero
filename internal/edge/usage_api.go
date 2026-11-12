@@ -44,14 +44,11 @@ type usageAPI struct {
 	nodeID string
 	status func() nodeStatus // 由 Server 提供（就绪状态、在线会话）
 	now    func() time.Time
-
-	mu          sync.Mutex
-	windowStart time.Time
-	count       int
+	lim    minuteLimiter
 }
 
 func newUsageAPI(meter *UsageMeter, key, nodeID string, status func() nodeStatus) *usageAPI {
-	return &usageAPI{meter: meter, key: []byte(key), nodeID: nodeID, status: status, now: time.Now}
+	return &usageAPI{meter: meter, key: []byte(key), nodeID: nodeID, status: status, now: time.Now, lim: minuteLimiter{max: usageAPIRatePerMinute}}
 }
 
 // TryServe 处理 /v1/usage 与 /v1/status；返回 false 表示交给伪装站。
@@ -64,7 +61,7 @@ func (a *usageAPI) TryServe(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	if retry := a.take(); retry > 0 {
+	if retry := a.lim.take(a.now()); retry > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retry))
 		writeProblem(w, http.StatusTooManyRequests, "EDGE_RATE_LIMITED", "rate limited")
 		return true
@@ -93,18 +90,25 @@ func (a *usageAPI) TryServe(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// take 按固定一分钟窗口计数；超限时返回距窗口结束的秒数（≥1）。
-func (a *usageAPI) take() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := a.now()
-	if now.Sub(a.windowStart) >= time.Minute {
-		a.windowStart, a.count = now, 0
+// minuteLimiter 按固定一分钟窗口计数（每个密钥一个实例）。
+type minuteLimiter struct {
+	mu          sync.Mutex
+	max         int
+	windowStart time.Time
+	count       int
+}
+
+// take 计入一次请求；超限时返回距窗口结束的秒数（≥1），否则返回 0。
+func (l *minuteLimiter) take(now time.Time) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now.Sub(l.windowStart) >= time.Minute {
+		l.windowStart, l.count = now, 0
 	}
-	if a.count >= usageAPIRatePerMinute {
-		return int(a.windowStart.Add(time.Minute).Sub(now)/time.Second) + 1
+	if l.count >= l.max {
+		return int(l.windowStart.Add(time.Minute).Sub(now)/time.Second) + 1
 	}
-	a.count++
+	l.count++
 	return 0
 }
 

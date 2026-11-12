@@ -14,6 +14,8 @@ import (
 func statfsDiskUsage(rootDir string, m *SystemMetrics) {
 }
 
+func diskBytes(dir string) (total, used uint64, ok bool) { return 0, 0, false }
+
 func collectPlatformMetrics(prev *rawMetricsSample) (*SystemMetrics, *rawMetricsSample) {
 	now := time.Now()
 	m := &SystemMetrics{

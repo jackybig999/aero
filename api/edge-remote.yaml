@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: AERO edge remote management API (C13)
-  version: 1.0.0
+  version: 1.0.1
   description: |
     状态：final（2026-11-12，用户确认）。flag `remote_admin_v1` 默认 OFF。
     用途：中台（sub）管理节点的唯一通道（ADR-0016）。edge 是独立可部署的基石：没有中台也能完整运行；
@@ -13,6 +13,7 @@ info:
     所有修改由 edge 自己校验并原子写入 ConfigPath（L0 §8.8）；本接口不提供执行任意命令、读写任意文件、
     修改宿主系统配置的能力。
     错误响应：application/problem+json（RFC 9457），code 取自 api/errors.yaml。
+    请求体不符合 schema（缺少必填字段、未知字段、非 JSON）时返回 400 EDGE_BAD_REQUEST（1.0.1 补充）。
     与旧接口的关系：本契约生效后删除 /admin/status、/admin/version、/admin/reload、/admin/tokens、
     /admin/ech 写入；/admin/subs 在签名 token（C3）开启并过渡 30 天后删除（订阅由 sub 签发 token，
     edge 离线验签，不再需要注入用户）。

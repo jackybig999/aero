@@ -8,24 +8,31 @@ package edge
 
 import "golang.org/x/sys/unix"
 
-func statfsDiskUsage(rootDir string, m *SystemMetrics) {
+// diskBytes 返回 dir 所在文件系统的总字节与已用字节（只读）。
+func diskBytes(dir string) (total, used uint64, ok bool) {
 	var stat unix.Statfs_t
-	if err := unix.Statfs(rootDir, &stat); err == nil && stat.Blocks > 0 {
-		bsize := uint64(stat.Bsize)
-		totalBytes := stat.Blocks * bsize
-		freeBytes := stat.Bavail * bsize
-		usedBytes := uint64(0)
-		if totalBytes >= freeBytes {
-			usedBytes = totalBytes - freeBytes
-		}
-		m.DiskTotalGB = round2(float64(totalBytes) / (1024.0 * 1024.0 * 1024.0))
-		m.DiskFreeGB = round2(float64(freeBytes) / (1024.0 * 1024.0 * 1024.0))
-		m.DiskUsedGB = round2(float64(usedBytes) / (1024.0 * 1024.0 * 1024.0))
-		if totalBytes > 0 {
-			m.DiskUsagePct = round2((float64(usedBytes) / float64(totalBytes)) * 100.0)
-			m.DiskUsagePercent = m.DiskUsagePct
-		}
+	if err := unix.Statfs(dir, &stat); err != nil || stat.Blocks == 0 {
+		return 0, 0, false
 	}
+	bsize := uint64(stat.Bsize)
+	total, free := stat.Blocks*bsize, stat.Bavail*bsize
+	if total >= free {
+		used = total - free
+	}
+	return total, used, true
+}
+
+func statfsDiskUsage(rootDir string, m *SystemMetrics) {
+	total, used, ok := diskBytes(rootDir)
+	if !ok {
+		return
+	}
+	const gb = 1024.0 * 1024.0 * 1024.0
+	m.DiskTotalGB = round2(float64(total) / gb)
+	m.DiskFreeGB = round2(float64(total-used) / gb)
+	m.DiskUsedGB = round2(float64(used) / gb)
+	m.DiskUsagePct = round2((float64(used) / float64(total)) * 100.0)
+	m.DiskUsagePercent = m.DiskUsagePct
 }
 
 func collectPlatformMetrics(prev *rawMetricsSample) (*SystemMetrics, *rawMetricsSample) {

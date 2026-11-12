@@ -86,6 +86,8 @@ type ServerConfig struct {
 	UsageAPI    bool   `json:"usage_api,omitempty" yaml:"usage_api"`
 	MeteringKey string `json:"metering_key,omitempty" yaml:"metering_key"`
 	NodeID      string `json:"node_id,omitempty" yaml:"node_id"`
+	// RemoteAdminV1 开启 C13 远程管理接口（api/edge-remote.yaml，ADR-0016）。
+	RemoteAdminV1 bool `json:"remote_admin_v1,omitempty" yaml:"remote_admin_v1"`
 	// DrainTimeoutSec 是收到停止信号后的排空上限（秒，L0 §8.6）；0 表示默认 15 秒。
 	DrainTimeoutSec int `json:"drain_timeout,omitempty"`
 	// ConfigPath 是 edge 持久化自身配置的文件路径，仅由 cmd/edge 显式设置。
@@ -123,12 +125,18 @@ type Server struct {
 
 	startedAt time.Time
 
-	instanceLock *instanceLock
-	hostStateDir string      // 非空：已修改宿主（规则、ip_forward），Close 时按该目录的状态日志还原
-	usageMeter   *UsageMeter // C6 计量；nil 表示 usage_api 关闭
-	usageAPI     *usageAPI
-	usageDone    chan struct{} // 计量落盘协程退出
-	warpMu       sync.Mutex    // 串行化 WARP 开关的修改与持久化
+	instanceLock   *instanceLock
+	hostStateDir   string                   // 非空：已修改宿主（规则、ip_forward），Close 时按该目录的状态日志还原
+	dataDir        string                   // 数据目录（绝对路径）
+	usageMeter     *UsageMeter              // C6 计量；nil 表示 usage_api 关闭（cfgMu 保护）
+	usageAPI       atomic.Pointer[usageAPI] // ServeHTTP 并发读取
+	usageStop      chan struct{}            // 通知计量落盘协程退出
+	usageDone      chan struct{}            // 计量落盘协程已退出
+	remoteAdmin    *remoteAdmin             // C13；nil 表示 remote_admin_v1 关闭
+	certDiscovered bool                     // 证书来自系统 ACME 默认位置（重新加载时重新查找）
+	restartCh      chan struct{}            // C13 重启请求：Run 排空后返回，由服务管理器拉起
+	restartOnce    sync.Once
+	cfgMu          sync.Mutex // 串行化运行时配置修改与持久化（WARP、计量开关）
 
 	// ready 为真表示可以接流量：Start 完成后置位，排空开始时清除（/readyz）。
 	ready atomic.Bool
@@ -229,6 +237,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 
 	// 2. TLS 证书：未显式配置时，从系统 acme.sh / certbot 的默认位置查找（只读）。
+	certDiscovered := false
 	if cfg.CertFile == "" || cfg.KeyFile == "" {
 		dirs := systemCertDirs()
 		var found bool
@@ -247,6 +256,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			}
 		}
 		if found {
+			certDiscovered = true
 			log.Printf("[EDGE] using system certificate %s (domain %s)", cfg.CertFile, cfg.Domain)
 		} else if !cfg.AllowSelfSignedCertForTest {
 			return nil, errNoSystemCert(normalizeCertDomain(cfg.Domain), dirs)
@@ -393,9 +403,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	quicServer := NewQUICServerWithIPv6Prefix(validator, connLimit, bwLimit, dialGuard, rateLimit, ipv6Prefix)
 	quicServer.SetServerConfig(&cfg)
-	if usageMeter != nil {
-		quicServer.SetUsageMeter(usageMeter)
-	}
 	if cfg.AuthSignedToken {
 		keys, err := parseTokenIssuers(cfg.TokenIssuers)
 		if err != nil {
@@ -497,10 +504,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	srv.instanceLock = lock
 	srv.hostStateDir = hostStateDir
-	if usageMeter != nil {
-		srv.usageMeter = usageMeter
-		srv.usageAPI = newUsageAPI(usageMeter, cfg.MeteringKey, cfg.NodeID, srv.nodeStatus)
-		log.Printf("[USAGE] C6 metering enabled (node %s, key %s)", cfg.NodeID, MaskToken(cfg.MeteringKey))
+	srv.dataDir = absDataDir
+	srv.certDiscovered = certDiscovered
+	srv.usageMeter = usageMeter // Start 时启用
+	srv.restartCh = make(chan struct{})
+	if cfg.RemoteAdminV1 {
+		srv.remoteAdmin = newRemoteAdmin(srv, cfg.AdminKey)
 	}
 	constructed = true
 	return srv, nil
@@ -658,13 +667,11 @@ func (s *Server) Start() error {
 		s.metricsCollector.Start(s.ctx)
 	}
 
+	s.cfgMu.Lock()
 	if s.usageMeter != nil {
-		s.usageDone = make(chan struct{})
-		go func() {
-			defer close(s.usageDone)
-			s.usageMeter.Run(s.ctx.Done())
-		}()
+		s.startUsageLocked(s.usageMeter)
 	}
+	s.cfgMu.Unlock()
 
 	s.ready.Store(true)
 	log.Printf("[EDGE] Server started on %s (TLS + QUIC)", s.cfg.Listen)
@@ -700,7 +707,20 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.usageAPI.TryServe(w, r) { // 未鉴权时返回 false，最终落到伪装站
+	if s.usageAPI.Load().TryServe(w, r) { // 未鉴权时返回 false，最终落到伪装站
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/v1/") {
+		if s.remoteAdmin == nil { // remote_admin_v1 关闭
+			s.serveCover(w, r)
+		} else {
+			s.remoteAdmin.serve(w, r) // 未鉴权时返回伪装站
+		}
+		return
+	}
+	// 旧管理接口：未鉴权一律返回伪装站，不暴露接口存在（ADR-0016）
+	if strings.HasPrefix(r.URL.Path, "/admin") && s.adminHandler != nil && !s.adminHandler.adminOK(r) {
+		s.serveCover(w, r)
 		return
 	}
 	if s.geoHandler != nil && s.geoHandler.TryServe(w, r) {
@@ -779,15 +799,9 @@ func (s *Server) Close() {
 	if s.quicServer != nil {
 		s.quicServer.Close()
 	}
-	if s.usageMeter != nil { // 会话已全部关闭：等落盘协程退出后做最后一次落盘
-		if s.usageDone != nil {
-			<-s.usageDone
-		}
-		if err := s.usageMeter.Close(); err != nil {
-			log.Printf("[USAGE] [ERROR] final flush: %v", err)
-		}
-		s.usageMeter = nil
-	}
+	s.cfgMu.Lock()
+	s.stopUsageLocked() // 会话已全部关闭：等落盘协程退出后做最后一次落盘
+	s.cfgMu.Unlock()
 	if s.hostStateDir != "" {
 		if err := RestoreHost(s.hostStateDir); err != nil {
 			log.Printf("[EDGE] [ERROR] restore host state (run `aero-edge cleanup-host`): %v", err)
@@ -897,12 +911,17 @@ func Run(cfg ServerConfig) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	sig := <-sigCh
+	reason := "restart requested via remote admin API"
+	select {
+	case sig := <-sigCh:
+		reason = "signal " + sig.String()
+	case <-server.restartCh:
+	}
 	drain := time.Duration(cfg.DrainTimeoutSec) * time.Second
 	if drain <= 0 {
 		drain = 15 * time.Second
 	}
-	log.Printf("[EDGE] Received signal %v, draining (up to %v)...", sig, drain)
+	log.Printf("[EDGE] %s, draining (up to %v)...", reason, drain)
 	ctx, cancel := context.WithTimeout(context.Background(), drain)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
@@ -987,6 +1006,29 @@ func (d *DynamicCertLoader) CurrentCert() *tls.Certificate {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.cachedCert
+}
+
+// Files 返回当前证书与私钥路径。
+func (d *DynamicCertLoader) Files() (certFile, keyFile string) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.certFile, d.keyFile
+}
+
+// Reload 立即从给定路径加载证书（路径可与当前不同）；失败时保持现有证书。
+func (d *DynamicCertLoader) Reload(certFile, keyFile string) error {
+	c, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return fmt.Errorf("load %s: %w", certFile, err)
+	}
+	var mod time.Time
+	if fi, err := os.Stat(certFile); err == nil {
+		mod = fi.ModTime()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.certFile, d.keyFile, d.cachedCert, d.certModTime = certFile, keyFile, &c, mod
+	return nil
 }
 
 // CertModTime returns the last recorded ModTime of the certificate file
@@ -1125,6 +1167,7 @@ func persistServerConfig(cfg ServerConfig) error {
 	set("token", cfg.Token)
 	set("metering_key", cfg.MeteringKey)
 	set("node_id", cfg.NodeID)
+	existing["usage_api"] = cfg.UsageAPI // 显式写入，否则运行时关闭无法持久化
 	// WARP 开关显式写入（关闭时为空串），否则“关闭”无法持久化
 	existing["warp_proxy"] = cfg.WarpProxy
 	existing["warp_all"] = cfg.WarpAll
@@ -1320,8 +1363,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // SetWarpEgress 打开或关闭 WARP 出口插件（经本机官方客户端 SOCKS5 代理），立即生效并持久化到配置文件。
 // edge 只使用、不安装 WARP（ADR-0012 第 6 条）。
 func (s *Server) SetWarpEgress(enabled, all bool) error {
-	s.warpMu.Lock()
-	defer s.warpMu.Unlock()
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
 	cfg := s.cfg
 	if enabled {
 		cfg.WarpProxy, cfg.WarpAll = warpLocalProxy, all
