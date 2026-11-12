@@ -32,6 +32,9 @@ jobs:
       - name: Component Isolation Gate (ADR-0009)
         run: bash tools/check-imports.sh
 
+      - name: Version Consistency Gate
+        run: bash tools/check-version.sh
+
       - name: Vet & Test Edge, Sub & Client
         run: |
           go vet ./internal/edge ./cmd/edge ./internal/sub ./cmd/sub ./internal/client ./cmd/client
