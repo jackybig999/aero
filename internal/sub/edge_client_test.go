@@ -119,3 +119,59 @@ func TestEdgeAPIOutcomes(t *testing.T) {
 		t.Fatal("unknown vps accepted")
 	}
 }
+
+// 诊断、指标、纯净度只经 C13（中台不登录节点）；管理接口不可用时如实报告。
+func TestDiagnoseProbeAndPurityViaC13(t *testing.T) {
+	apiUp := true
+	ep := fakeEdge(t, func(w http.ResponseWriter, r *http.Request) {
+		if !apiUp || r.Header.Get("Authorization") != "Bearer adm" {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte("<html></html>"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/admin/v1/status":
+			_, _ = w.Write([]byte(`{"node_id":"node-1","version":"1.4.0","ready":true,"uptime_sec":90,"listen_ports":[2083,8443],
+				"cert":{"domain":"example.com","issuer":"R11","not_after":4102444800,"days_left":60},
+				"sessions":{"active":3,"tunnels":5},"usage_api":true,"warp":{"enabled":false,"all":false,"available":false},
+				"host":{"cpu_percent":12.5,"load1":0.3,"mem_total":2147483648,"mem_used":1073741824,"disk_total":21474836480,"disk_used":5368709120}}`))
+		case "/admin/v1/purity":
+			if r.URL.Query().Get("refresh") != "true" {
+				t.Error("purity probe must ask for a refresh")
+			}
+			_, _ = w.Write([]byte(`{"checked_at":1700000000,"egress_ip_country":"US","results":{"score":90,"ip_country":"US","google_clean":true,"gemini_ok":true}}`))
+		}
+	})
+	store := NewMemoryVPSStore()
+	h, _ := store.Create(CreateVPSParams{Name: "n1", IP: "198.51.100.7", Domain: "example.com"})
+	ep.VPSID = h.ID
+	eps, _ := NewEndpointStore(filepath.Join(t.TempDir(), "eps.json"))
+	_ = eps.Upsert(ep)
+	svc := NewVPSService(store, nil, eps)
+	ctx := context.Background()
+
+	met, err := svc.Probe(ctx, h.ID)
+	if err != nil || met.Source != "edge-api" || met.MemPercent != 50 || met.DiskPercent != 25 || met.Cert["days_left"] != 60 {
+		t.Fatalf("probe: %+v %v", met, err)
+	}
+	pr, err := svc.ProbePurity(ctx, h.ID)
+	if err != nil || pr.PurityScore != 90 || !pr.GoogleClean || pr.IPCountry != "US" {
+		t.Fatalf("purity: %+v %v", pr, err)
+	}
+	InvalidateDiagCache(h.ID)
+	d, err := svc.Diagnose(ctx, h.ID)
+	if err != nil || d["via"] != "edge-remote-api" || d["ok"] != true || d["version"] != "1.4.0" || len(d["ports"].([]map[string]any)) != 2 {
+		t.Fatalf("diagnose: %v %v", d, err)
+	}
+
+	apiUp = false // 例如节点未开启 remote_admin_v1
+	InvalidateDiagCache(h.ID)
+	d, _ = svc.Diagnose(ctx, h.ID)
+	if d["ok"] != false || !strings.Contains(d["log_tail"].(string), "管理接口不可用") {
+		t.Fatalf("diagnose without API must not claim healthy: %v", d)
+	}
+	if _, err := svc.Probe(ctx, h.ID); err == nil {
+		t.Fatal("probe without API must fail")
+	}
+}

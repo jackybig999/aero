@@ -19,7 +19,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -105,215 +104,51 @@ func runSSH(client *ssh.Client, cmd string, timeout time.Duration) (string, erro
 	}
 }
 
-// EvaluatePurity parses probe command output into a PurityResult.
-func EvaluatePurity(rawOutput string, vpsID uint64, ipCountry ...string) PurityResult {
-	res := PurityResult{
-		VPSID:       vpsID,
-		RawOutput:   strings.TrimSpace(rawOutput),
-		ProbeAt:     time.Now(),
-		PurityScore: 0,
-	}
-	if len(ipCountry) > 0 {
-		res.IPCountry = strings.ToUpper(strings.TrimSpace(ipCountry[0]))
-	}
-
-	// 智能定位打靶特征行，过滤 remote .bashrc 或 motd 的杂音输出
-	var probeLine string
-	for _, line := range strings.Split(rawOutput, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "RAW_YT:") || strings.Contains(line, "YT:") || (strings.Contains(line, "G:") && strings.Contains(line, "CF:")) {
-			probeLine = line
-			break
-		}
-	}
-	if probeLine == "" {
-		probeLine = strings.TrimSpace(rawOutput)
-	}
-
-	parts := strings.Split(probeLine, ",")
-	rawGCode, rawCFCode, rawAICode := "000", "000", ""
-	rawYTLoc, rawGeminiCode, rawGemCC := "", "", ""
-	ytCN, gHK := "0", "0"
-	warpCli, warpPort, warpTrace, warpGeminiCode, warpGemCC := "0", "0", "0", "", ""
-
-	for _, p := range parts {
-		kv := strings.SplitN(strings.TrimSpace(p), ":", 2)
-		if len(kv) == 2 {
-			k := strings.ToUpper(strings.TrimSpace(kv[0]))
-			v := strings.TrimSpace(kv[1])
-			switch k {
-			case "RAW_YT", "YT":
-				rawYTLoc = strings.ToUpper(v)
-			case "YT_CN":
-				ytCN = v
-			case "RAW_GEM_CC":
-				rawGemCC = strings.ToUpper(v)
-			case "RAW_GEMINI", "GEMINI":
-				rawGeminiCode = v
-			case "G_HK":
-				gHK = v
-			case "RAW_G", "G":
-				rawGCode = v
-			case "RAW_CF", "CF":
-				rawCFCode = v
-			case "AI":
-				rawAICode = v
-			case "WARP_CLI", "WARPINST":
-				warpCli = v
-			case "WARP_PORT", "WARPPORT":
-				warpPort = v
-			case "WARP_TRACE", "WARPTRACE":
-				warpTrace = v
-			case "WARP_GEM_CC":
-				warpGemCC = strings.ToUpper(v)
-			case "WARP_GEMINI":
-				warpGeminiCode = v
-			case "WARP":
-				if v == "1" {
-					warpTrace = "1"
-				}
-			}
-		}
-	}
-
-	// 1. 原生源 IP 体质判定 (绝对直连，不走任何代理)
-	if ytCN == "1" {
-		res.YouTubeLoc = "CN"
-	} else {
-		res.YouTubeLoc = rawYTLoc
-	}
-
-	// 原生 Gemini 状态：
-	// 若抓取到了国家码 rawGemCC:
-	//   若 rawGemCC == "CHN" 或 rawGemCC == "" -> NativeGeminiOK = false
-	//   若 rawGemCC != "CHN" 且 rawGemCC != "" -> NativeGeminiOK = true
-	// 若未抓取到 rawGemCC (单测/旧输出)，回退检查 rawGeminiCode:
-	if rawGemCC != "" {
-		res.NativeGeminiOK = (rawGemCC != "CHN" && rawGemCC != "000")
-	} else if rawGeminiCode != "" {
-		res.NativeGeminiOK = (rawGeminiCode == "200" || rawGeminiCode == "301" || rawGeminiCode == "302" || rawGeminiCode == "307")
-	} else {
-		res.NativeGeminiOK = false
-	}
-
-	// 2. 地区漂移判定：YouTube 识别国家与 VPS 源 IP 物理国家是否一致
-	if res.YouTubeLoc != "" && res.IPCountry != "" && res.YouTubeLoc != res.IPCountry {
-		res.IsRegionMismatched = true
-	} else {
-		res.IsRegionMismatched = false
-	}
-
-	// 3. 送中判定 (不可篡改的源 IP 事实)
-	// 满足以下任一即判定为源 IP 送中：
-	// A. YouTube 页面包含 www.google.cn 或标记为 CN
-	// B. Google 搜索被重定向到 google.com.hk (gHK == "1")
-	// C. Gemini 归属国识别为 CHN (rawGemCC == "CHN") 或原生 Gemini 阻断
-	// D. 显式 AI 阻断 (403 或 429)
-	if ytCN == "1" || res.YouTubeLoc == "CN" || gHK == "1" || rawGemCC == "CHN" || !res.NativeGeminiOK || rawAICode == "403" || rawAICode == "429" {
-		res.IsCNMarked = true
-		res.AIBlocked = true
-	} else {
-		res.IsCNMarked = false
-		res.AIBlocked = false
-	}
-
-	// 4. WARP 救援与接管层判定
-	res.WARPInstalled = (warpCli == "1")
-	res.WARPRunning = (warpPort == "1" && warpTrace == "1")
-	if warpGemCC != "" {
-		res.WARPGeminiOK = (warpGemCC != "CHN" && warpGemCC != "000")
-	} else if warpGeminiCode != "" {
-		res.WARPGeminiOK = (warpGeminiCode == "200" || warpGeminiCode == "301" || warpGeminiCode == "302" || warpGeminiCode == "307")
-	} else {
-		res.WARPGeminiOK = false
-	}
-	res.IsWARPEgress = res.WARPRunning
-
-	// 5. 综合 Gemini 可用性 (原生或通过 WARP 成功解锁)
-	res.GeminiOK = res.NativeGeminiOK || (res.WARPRunning && res.WARPGeminiOK)
-
-	// 6. 原生源 IP 纯净度基础评分
-	if rawGCode == "200" || rawGCode == "302" {
-		res.GoogleClean = true
-		res.PurityScore += 30
-	}
-	if rawCFCode == "200" {
-		res.CFClean = true
-		res.PurityScore += 20
-	}
-	if res.NativeGeminiOK {
-		res.PurityScore += 30
-	}
-	if res.YouTubeLoc != "" && res.YouTubeLoc != "CN" && !res.IsRegionMismatched {
-		res.PurityScore += 20
-	}
-
-	// 7. 若 WARP 成功接管并解锁 Gemini，加分保护但绝不篡改 IsCNMarked 的真实物理标记
-	if res.WARPRunning && res.WARPGeminiOK {
-		if res.PurityScore < 90 {
-			res.PurityScore = 95
-		}
-	}
-
-	return res
+// edgePurityReport 对应 edge PurityReport（C13 Purity.results）。
+type edgePurityReport struct {
+	Score              int    `json:"score"`
+	IPCountry          string `json:"ip_country"`
+	YouTubeLoc         string `json:"youtube_loc"`
+	GoogleClean        bool   `json:"google_clean"`
+	CFClean            bool   `json:"cf_clean"`
+	NativeGeminiOK     bool   `json:"native_gemini_ok"`
+	GeminiOK           bool   `json:"gemini_ok"`
+	WARPInstalled      bool   `json:"warp_installed"`
+	WARPRunning        bool   `json:"warp_running"`
+	WARPGeminiOK       bool   `json:"warp_gemini_ok"`
+	IsCNMarked         bool   `json:"is_cn_marked"`
+	IsRegionMismatched bool   `json:"is_region_mismatched"`
+	AIBlocked          bool   `json:"ai_blocked"`
+	IsWARPEgress       bool   `json:"is_warp_egress"`
+	ProbeError         string `json:"probe_error"`
 }
 
-// ProbePurity executes remote probe from target VPS egress IP.
+// ProbePurity 读取节点出口纯净度（C13 /admin/v1/purity，edge 自行探测；中台不登录节点）。
 func (s *VPSService) ProbePurity(ctx context.Context, id uint64) (*PurityResult, error) {
-	cred, err := s.store.GetCredentials(id)
+	ep, err := s.endpointFor(id)
 	if err != nil {
 		return nil, err
 	}
-	if cred.SSHPassword == "" {
-		return nil, fmt.Errorf("no password stored for host %d", id)
+	var p struct {
+		CheckedAt int64            `json:"checked_at"`
+		Results   edgePurityReport `json:"results"`
 	}
-
-	ipCountry := ResolveIPCountryCode(cred.IP)
-
-	client, err := dialSSH(SSHCredentials{
-		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 8*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("ssh dial target vps: %w", err)
-	}
-	defer client.Close()
-
-	cmd := `set +e; ` +
-		`yt_raw=$(curl -s4 -L -m 6 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://www.youtube.com/premium" 2>/dev/null); ` +
-		`yt_cn=0; (echo "$yt_raw" | grep -q 'www.google.cn') && yt_cn=1; ` +
-		`yt_cc=""; ` +
-		`if [ "$yt_cn" = "1" ]; then ` +
-		`  yt_cc="CN"; ` +
-		`else ` +
-		`  yt_cc=$(echo "$yt_raw" | grep -woP '"INNERTUBE_CONTEXT_GL"\s{0,}:\s{0,}"\K[^"]+' | head -1); ` +
-		`  [ -z "$yt_cc" ] && yt_cc=$(echo "$yt_raw" | grep -oE '"countryCode":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
-		`  [ -z "$yt_cc" ] && yt_cc=$(echo "$yt_raw" | grep -oE '"gl":"[A-Z]{2}"' | head -1 | cut -d'"' -f4); ` +
-		`fi; ` +
-		`gem_raw=$(curl -s4 -L -m 6 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" "https://gemini.google.com" 2>/dev/null); ` +
-		`raw_gem_cc=$(echo "$gem_raw" | grep -o ',2,1,200,"[A-Z]\{3\}"' | head -1 | sed 's/,2,1,200,"//;s/"//'); ` +
-		`g_dest=$(curl -s4 -m 5 -o /dev/null -w "%{url_effective}" -L "https://www.google.com/search?q=aero" 2>/dev/null || echo ""); ` +
-		`g_hk=0; (echo "$g_dest" | grep -q 'google.com.hk') && g_hk=1; ` +
-		`raw_g=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" "https://www.google.com/search?q=aero" 2>/dev/null || echo "000"); ` +
-		`raw_cf=$(curl -s4 -m 5 -o /dev/null -w "%{http_code}" "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null || echo "000"); ` +
-		`warp_cli=$(command -v warp-cli >/dev/null 2>&1 && echo "1" || echo "0"); ` +
-		`warp_port=$( (ss -tlnp 2>/dev/null | grep -q ":40000 ") && echo "1" || echo "0"); ` +
-		`warp_trace=$(curl -s4 -m 3 --socks5-hostname 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | grep -q "warp=on" && echo "1" || (curl -s4 -m 3 --socks5 127.0.0.1:40000 "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null | grep -q "warp=on" && echo "1" || echo "0")); ` +
-		`warp_gem_cc=""; ` +
-		`if [ "$warp_port" = "1" ]; then ` +
-		`  w_gem_raw=$(curl -s4 -m 6 --socks5-hostname 127.0.0.1:40000 -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "https://gemini.google.com" 2>/dev/null || curl -s4 -m 6 --socks5 127.0.0.1:40000 -L -A "Mozilla/5.0" "https://gemini.google.com" 2>/dev/null); ` +
-		`  warp_gem_cc=$(echo "$w_gem_raw" | grep -o ',2,1,200,"[A-Z]\{3\}"' | head -1 | sed 's/,2,1,200,"//;s/"//'); ` +
-		`  [ -z "$warp_gem_cc" ] && (echo "$w_gem_raw" | grep -q '45631641,null,true') && warp_gem_cc="USA"; ` +
-		`fi; ` +
-		`echo "RAW_YT:$yt_cc,YT_CN:$yt_cn,RAW_GEM_CC:$raw_gem_cc,G_HK:$g_hk,RAW_G:$raw_g,RAW_CF:$raw_cf,WARP_CLI:$warp_cli,WARP_PORT:$warp_port,WARP_TRACE:$warp_trace,WARP_GEM_CC:$warp_gem_cc"`
-
-	out, err := runSSH(client, cmd, 15*time.Second)
-	res := EvaluatePurity(out, id, ipCountry)
-	if err != nil {
+	res := PurityResult{VPSID: id, ProbeAt: time.Now()}
+	if err := edgeAPI(ctx, ep, http.MethodGet, "/admin/v1/purity?refresh=true", nil, &p); err != nil {
 		res.ProbeError = err.Error()
+		_ = s.store.UpdatePurity(id, &res)
+		return &res, err
 	}
-
+	r := p.Results
+	res = PurityResult{
+		VPSID: id, IPCountry: r.IPCountry, PurityScore: r.Score, AIBlocked: r.AIBlocked, GoogleClean: r.GoogleClean,
+		CFClean: r.CFClean, IsWARPEgress: r.IsWARPEgress, YouTubeLoc: r.YouTubeLoc, GeminiOK: r.GeminiOK,
+		NativeGeminiOK: r.NativeGeminiOK, IsCNMarked: r.IsCNMarked, IsRegionMismatched: r.IsRegionMismatched,
+		WARPInstalled: r.WARPInstalled, WARPRunning: r.WARPRunning, WARPGeminiOK: r.WARPGeminiOK,
+		ProbeAt: time.Unix(p.CheckedAt, 0), ProbeError: r.ProbeError,
+	}
 	_ = s.store.UpdatePurity(id, &res)
-	return &res, err
+	return &res, nil
 }
 
 func (s *VPSService) ProbeAllPurity(ctx context.Context) map[uint64]*PurityResult {
@@ -374,11 +209,6 @@ func (s *VPSService) StartPurityTicker(ctx context.Context, interval time.Durati
 // VPS Diagnostics, DNS & TLS Probing (from vps_diag.go)
 // ============================================================================
 
-func parseF(s string) float64 {
-	f, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	return f
-}
-
 func parseKV(out string) map[string]string {
 	m := make(map[string]string)
 	for _, line := range strings.Split(out, "\n") {
@@ -400,104 +230,61 @@ func (s *VPSService) CFReady() bool {
 	return tok != ""
 }
 
-// Probe executes host metric collection via SSH and persists results.
+// Probe 经 C13 状态接口采集节点指标并保存（中台不登录节点）。未安装 edge 的主机没有指标。
 func (s *VPSService) Probe(ctx context.Context, id uint64) (*HostMetrics, error) {
-	cred, err := s.store.GetCredentials(id)
-	if err != nil {
-		return nil, err
-	}
-	if cred.SSHPassword == "" {
-		_ = s.store.UpdateMetrics(id, nil, false, "未配置 SSH 密码", 0)
-		return nil, fmt.Errorf("no password stored for host %d", id)
-	}
-
-	start := time.Now()
-	client, err := dialSSH(SSHCredentials{
-		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 6*time.Second)
+	ep, err := s.endpointFor(id)
 	if err != nil {
 		_ = s.store.UpdateMetrics(id, nil, false, err.Error(), 0)
-		return nil, fmt.Errorf("ssh dial target vps: %w", err)
+		return nil, err
 	}
-	defer client.Close()
-
+	start := time.Now()
+	var st edgeRemoteStatus
+	err = edgeAPI(ctx, ep, http.MethodGet, "/admin/v1/status", nil, &st)
 	latency := time.Since(start).Milliseconds()
-
-	script := `set -e
-OS=$(uname -s 2>/dev/null || echo Linux)
-ARCH=$(uname -m 2>/dev/null || echo x86_64)
-LOAD=$(cat /proc/loadavg 2>/dev/null || echo "0 0 0")
-UP=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
-read -r _ u1 n1 s1 i1 _ < /proc/stat 2>/dev/null || true
-sleep 0.3
-read -r _ u2 n2 s2 i2 _ < /proc/stat 2>/dev/null || true
-tot1=$((u1+n1+s1+i1)); tot2=$((u2+n2+s2+i2))
-dt=$((tot2-tot1)); di=$((i2-i1))
-if [ "$dt" -gt 0 ]; then CPU=$(awk -v d=$dt -v i=$di 'BEGIN{printf "%.1f", (1-i/d)*100}'); else CPU=0; fi
-read MT MU MF MA MS MH MB MC <<< $(free -b 2>/dev/null | awk '/^Mem:/{print $2,$3,$4,$6,$7}')
-read DT DU DF <<< $(df -B1 / 2>/dev/null | awk 'NR==2{print $2,$3,$4}')
-echo "os=$OS"
-echo "arch=$ARCH"
-echo "load=$LOAD"
-echo "uptime=$UP"
-echo "cpu=$CPU"
-echo "mem_total=$MT"
-echo "mem_used=$MU"
-echo "disk_total=$DT"
-echo "disk_used=$DU"
-`
-	out, err := runSSH(client, script, 8*time.Second)
 	if err != nil {
 		_ = s.store.UpdateMetrics(id, nil, false, err.Error(), latency)
-		return nil, fmt.Errorf("ssh probe command failed: %w", err)
+		return nil, err
 	}
-
-	kv := parseKV(out)
-	met := &HostMetrics{
-		OS:          kv["os"],
-		Arch:        kv["arch"],
-		CPUPercent:  parseF(kv["cpu"]),
-		UptimeSec:   int64(parseF(kv["uptime"])),
-		LatencyMS:   latency,
-		CollectedAt: time.Now(),
-		Source:      "ssh",
-		ProbeOK:     true,
-	}
-	parts := strings.Fields(kv["load"])
-	if len(parts) >= 3 {
-		met.Load1, met.Load5, met.Load15 = parseF(parts[0]), parseF(parts[1]), parseF(parts[2])
-	}
-	mt, mu := parseF(kv["mem_total"]), parseF(kv["mem_used"])
-	met.MemTotalMB, met.MemUsedMB = mt/1024/1024, mu/1024/1024
-	if mt > 0 {
-		met.MemPercent = mu / mt * 100
-	}
-	dt, du := parseF(kv["disk_total"]), parseF(kv["disk_used"])
-	met.DiskTotalGB, met.DiskUsedGB = dt/1024/1024/1024, du/1024/1024/1024
-	if dt > 0 {
-		met.DiskPercent = du / dt * 100
-	}
-
-	vps, _ := s.store.Get(id)
-	if vps != nil && vps.Domain != "" {
-		targetPort := 443
-		if s.eps != nil {
-			if ep, ok := s.eps.Get(id); ok && ep.Port > 0 {
-				targetPort = ep.Port
-			}
-		}
-		candidatePorts := []int{targetPort}
-		for _, cp := range []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443} {
-			if cp != targetPort {
-				candidatePorts = append(candidatePorts, cp)
-			}
-		}
-		certMap, _ := ProbeTLSCertificate(vps.Domain, cred.IP, candidatePorts...)
-		met.Cert = certMap
-	}
-
+	met := hostMetricsFromStatus(&st, latency)
 	_ = s.store.UpdateMetrics(id, met, true, "", latency)
 	return met, nil
+}
+
+// hostMetricsFromStatus 把 C13 状态换算为中台指标（UptimeSec 为 edge 运行时长）。
+func hostMetricsFromStatus(st *edgeRemoteStatus, latency int64) *HostMetrics {
+	const mib, gib = 1 << 20, 1 << 30
+	h := st.Host
+	m := &HostMetrics{
+		CPUPercent: h.CPUPercent, Load1: h.Load1,
+		MemTotalMB: float64(h.MemTotal) / mib, MemUsedMB: float64(h.MemUsed) / mib,
+		DiskTotalGB: float64(h.DiskTotal) / gib, DiskUsedGB: float64(h.DiskUsed) / gib,
+		UptimeSec: st.UptimeSec, CollectedAt: time.Now(), Source: "edge-api", ProbeOK: true, LatencyMS: latency,
+		Cert: certMapFromEdge(st.Cert),
+	}
+	if h.MemTotal > 0 {
+		m.MemPercent = float64(h.MemUsed) / float64(h.MemTotal) * 100
+	}
+	if h.DiskTotal > 0 {
+		m.DiskPercent = float64(h.DiskUsed) / float64(h.DiskTotal) * 100
+	}
+	return m
+}
+
+// certMapFromEdge 把 C13 CertInfo 换算为管理端使用的证书描述。
+func certMapFromEdge(c edgeCertInfo) map[string]any {
+	ok := c.NotAfter > 0 && c.DaysLeft >= 0
+	detail := "未读取到证书"
+	if c.NotAfter > 0 {
+		detail = fmt.Sprintf("有效 (剩余 %d 天 · %s)", c.DaysLeft, c.Issuer)
+		if !ok {
+			detail = "已过期：请在节点上用 acme.sh/certbot 续期后重新加载"
+		}
+	}
+	return map[string]any{
+		"mode": "acme-system", "ok": ok, "domain": c.Domain, "issuer": c.Issuer,
+		"not_after": time.Unix(c.NotAfter, 0).Format("2006-01-02 15:04:05"), "days_left": c.DaysLeft,
+		"file_count": 1, "dir": "节点系统 ACME（acme.sh / certbot 默认位置）", "detail": detail,
+	}
 }
 
 var (
@@ -863,56 +650,6 @@ func InvalidateDiagCache(id uint64) {
 	diagCacheMu.Unlock()
 }
 
-// probeEdgeAdminAPI 经 edge 管理接口读取状态（edgeDo：严格 TLS，密钥只在请求头）。
-func probeEdgeAdminAPI(ctx context.Context, host, ip string, port int, adminKey string) (map[string]any, bool) {
-	if adminKey == "" {
-		return nil, false
-	}
-	resp, err := edgeDo(ctx, host, ip, port, http.MethodGet, "/admin/status", adminKey, nil, 1200*time.Millisecond)
-	if err != nil {
-		return nil, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, false
-	}
-	var st struct {
-		OK            bool    `json:"ok"`
-		Version       string  `json:"version"`
-		Protocol      string  `json:"protocol"`
-		UptimeSec     float64 `json:"uptime_sec"`
-		TokenCount    int     `json:"token_count"`
-		ActiveTunnels int64   `json:"active_tunnels"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&st); err != nil || !st.OK {
-		return nil, false
-	}
-	// 证书信息取自已校验通过的对端证书
-	certMap := map[string]any{"mode": "acme-online", "ok": false, "domain": host, "file_count": 1, "dir": "在线直连 (AERO Edge 守护进程)"}
-	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
-		leaf := resp.TLS.PeerCertificates[0]
-		daysLeft := int(time.Until(leaf.NotAfter).Hours() / 24)
-		issuer := leaf.Issuer.CommonName
-		if issuer == "" && len(leaf.Issuer.Organization) > 0 {
-			issuer = leaf.Issuer.Organization[0]
-		}
-		certMap["ok"] = daysLeft >= 0
-		certMap["issuer"] = issuer
-		certMap["not_after"] = leaf.NotAfter.Format("2006-01-02 15:04:05")
-		certMap["days_left"] = daysLeft
-		certMap["detail"] = fmt.Sprintf("有效 (剩余 %d 天 · %s)", daysLeft, issuer)
-	}
-	return map[string]any{
-		"service_active": true,
-		"cert":           certMap,
-		"version":        st.Version,
-		"protocol":       st.Protocol,
-		"uptime_sec":     st.UptimeSec,
-		"token_count":    st.TokenCount,
-		"active_tunnels": st.ActiveTunnels,
-	}, true
-}
-
 // Diagnose inspects the target VPS via fast TLS probe and lightweight SSH.
 func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, error) {
 	vps, err := s.store.Get(id)
@@ -941,14 +678,12 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 	// 0. 中台安装状态前置门禁：若该节点尚未安装或已被卸载，直接返回未安装状态，杜绝外部其他进程端口误报
 	isInstalled := false
 	targetPort := 443
-	adminKey := ""
 	if s.eps != nil {
 		if ep, ok := s.eps.Get(id); ok {
 			isInstalled = ep.Installed
 			if ep.Port > 0 {
 				targetPort = ep.Port
 			}
-			adminKey = ep.AdminKey
 		}
 	}
 
@@ -988,330 +723,96 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 		}, nil
 	}
 
-	// 1. 内存极速诊断缓存：15 秒内免重复打靶，提升中台 Dashboard 与并发探活响应速度至 <1ms
+	// 1. 诊断缓存：15 秒内复用
 	diagCacheMu.RLock()
-	if cached, ok := diagCache[id]; ok {
-		if time.Since(cached.createdAt) < 15*time.Second {
-			res := cloneDiagMap(cached.diag)
-			diagCacheMu.RUnlock()
-			res["purity"] = purityMap
-			return res, nil
-		}
+	if cached, ok := diagCache[id]; ok && time.Since(cached.createdAt) < 15*time.Second {
+		res := cloneDiagMap(cached.diag)
+		diagCacheMu.RUnlock()
+		res["purity"] = purityMap
+		return res, nil
 	}
 	diagCacheMu.RUnlock()
 
-	// 2. 毫秒级原生 Edge Admin API 探针：仅需 150~300ms 探测 443、TLS 证书及内核进程状态，彻底免去 SSH 握手高昂延迟
-	if isInstalled && adminKey != "" {
-		if edgeData, ok := probeEdgeAdminAPI(ctx, vps.Domain, vps.IP, targetPort, adminKey); ok {
-			// AERO 服务正常在线 -> 确保拉取/同步至中台节点库
-			if s.nodeSvc != nil {
-				geo := ResolveIPRegion(vps.IP)
-				s.nodeSvc.mu.Lock()
-				found := false
-				for _, n := range s.nodeSvc.nodes {
-					if n.VPSID == id || (vps.IP != "" && n.IP == vps.IP) {
-						n.Status = true
-						n.Region = geo
-						n.UpdatedAt = time.Now()
-						found = true
-						break
-					}
-				}
-				s.nodeSvc.mu.Unlock()
-				if !found {
-					targetHost := vps.Domain
-					if targetHost == "" {
-						targetHost = vps.IP
-					}
-					_, _ = s.nodeSvc.CreateNode(vps.Name, geo, targetHost, "aero-quic", int32(targetPort), 500, false, 100, id)
-				}
+	target := fmt.Sprintf("https://%s:%d", vps.Domain, targetPort)
+	node := func(online bool, detail string) []map[string]any {
+		return []map[string]any{{"name": "AERO HTTP/3 QUIC", "kind": "aero", "online": online, "target": target, "detail": detail}}
+	}
+	var res map[string]any
+
+	// 2. 节点状态只经 C13 读取（ADR-0016：中台不登录节点）
+	ep, _ := s.endpointFor(id)
+	var st edgeRemoteStatus
+	if apiErr := edgeAPI(ctx, ep, http.MethodGet, "/admin/v1/status", nil, &st); apiErr == nil {
+		s.markNodeOnline(id, vps, targetPort)
+		ports := make([]map[string]any, 0, len(st.ListenPorts))
+		for _, p := range st.ListenPorts {
+			ports = append(ports, map[string]any{"port": p, "proto": "tcp/udp", "role": "https/quic/aero", "listen": true})
+		}
+		res = map[string]any{
+			"via": "edge-remote-api", "ok": st.Ready, "version": st.Version,
+			"service":      map[string]any{"status": map[bool]string{true: "active", false: "draining"}[st.Ready], "active": st.Ready, "version": st.Version},
+			"ports":        ports,
+			"cert":         certMapFromEdge(st.Cert),
+			"subscription": map[string]any{"secret_set": "yes", "local_ok": st.Ready, "public_ok": st.Ready},
+			"nodes":        node(st.Ready, "HTTP/3 QUIC (原生单栈)"),
+			"log_tail": fmt.Sprintf("[Edge 诊断] %s · 运行 %d 秒 · 在线连接 %d · 活动隧道 %d · 监听端口 %v · 计量接口 %v · WARP %v",
+				st.Version, st.UptimeSec, st.Sessions.Active, st.Sessions.Tunnels, st.ListenPorts, st.UsageAPI, st.Warp.Enabled),
+		}
+	} else {
+		// 3. 管理接口不可用：只做公开的 TLS 证书探测（不发送任何密钥），如实报告
+		candidates := []int{targetPort}
+		for _, cp := range []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443} {
+			if cp != targetPort {
+				candidates = append(candidates, cp)
 			}
-			res := map[string]any{
-				"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "edge-admin-api",
-				"ok":        true,
-				"installed": true,
-				"version":   edgeData["version"],
-				"service":   map[string]any{"status": "active", "active": true, "main_pid": "active", "version": edgeData["version"]},
-				"ports": []map[string]any{
-					{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": true},
-					{"port": 80, "proto": "tcp", "role": "http/acme", "listen": true},
-				},
-				"cert":         edgeData["cert"],
-				"subscription": map[string]any{"secret_set": "yes", "local_ok": true, "public_ok": true},
-				"nodes": []map[string]any{
-					{
-						"name":   "AERO HTTP/3 QUIC",
-						"kind":   "aero",
-						"online": true,
-						"target": fmt.Sprintf("https://%s:%d", vps.Domain, targetPort),
-						"detail": "HTTP/3 QUIC (原生单栈)",
-					},
-				},
-				"log_tail": fmt.Sprintf("[Edge 诊断] 服务正常在线 (%s, %s) · 运行时长: %.0f 秒 · 活跃连接: %v · 授权凭据: %v\n[协议监听] 端口 %d (QUIC/H3 原生单栈) 极速响应",
-					edgeData["version"], edgeData["protocol"], edgeData["uptime_sec"], edgeData["active_tunnels"], edgeData["token_count"], targetPort),
-				"purity": purityMap,
-			}
-			diagCacheMu.Lock()
-			diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
-			diagCacheMu.Unlock()
-			return res, nil
 		}
-	}
-
-	// 3. Fallback 原生 TLS 握手抓取真实证书信息（顺位探测候选端口池）
-	candidatePorts := []int{targetPort}
-	for _, cp := range []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443} {
-		if cp != targetPort {
-			candidatePorts = append(candidatePorts, cp)
-		}
-	}
-	fastCert, certOK := ProbeTLSCertificate(vps.Domain, vps.IP, candidatePorts...)
-	certMap := fastCert
-
-	// 若原生 TLS 握手成功（证书有效），瞬间返回诊断结果
-	if certOK && certMap != nil {
-		res := map[string]any{
-			"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-native-probe",
-			"ok":        true,
-			"installed": true,
-			"service":   map[string]any{"status": "active", "active": true, "main_pid": "active"},
-			"ports": []map[string]any{
-				{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": true},
-				{"port": 80, "proto": "tcp", "role": "http/acme", "listen": true},
-			},
-			"cert":         certMap,
-			"subscription": map[string]any{"secret_set": "yes", "local_ok": true, "public_ok": true},
-			"nodes": []map[string]any{
-				{
-					"name":   "AERO HTTP/3 QUIC",
-					"kind":   "aero",
-					"online": true,
-					"target": fmt.Sprintf("https://%s:%d", vps.Domain, targetPort),
-					"detail": "HTTP/3 QUIC (原生单栈)",
-				},
-			},
-			"purity": purityMap,
-		}
-		diagCacheMu.Lock()
-		diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
-		diagCacheMu.Unlock()
-		return res, nil
-	}
-
-	cred, err := s.store.GetCredentials(id)
-	if err != nil || cred == nil || cred.SSHPassword == "" {
+		certMap, certOK := ProbeTLSCertificate(vps.Domain, vps.IP, candidates...)
 		if certMap == nil {
-			certMap = map[string]any{
-				"mode": "autocert", "domain": vps.Domain, "ok": false, "days_left": 0, "dir": "", "detail": "未配置 SSH 密码且 TLS 探测未通过",
-			}
+			certMap = map[string]any{"mode": "acme-system", "ok": false, "domain": vps.Domain, "days_left": 0, "dir": "", "detail": "TLS 探测未通过"}
 		}
-		return map[string]any{
-			"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-probe",
-			"ok":        certOK,
-			"installed": isInstalled,
-			"service":   map[string]any{"status": "unknown", "active": certOK, "main_pid": "0"},
-			"ports": []map[string]any{
-				{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": certOK},
-			},
+		res = map[string]any{
+			"via": "tls-probe", "ok": false,
+			"service":      map[string]any{"status": "unknown", "active": certOK},
+			"ports":        []map[string]any{{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": certOK}},
 			"cert":         certMap,
-			"subscription": map[string]any{"secret_set": "yes", "local_ok": certOK, "public_ok": certOK},
-			"nodes": []map[string]any{
-				{
-					"name":   "AERO HTTP/3 QUIC",
-					"kind":   "aero",
-					"online": certOK,
-					"target": fmt.Sprintf("https://%s:%d", vps.Domain, targetPort),
-					"detail": "HTTP/3 QUIC (原生单栈)",
-				},
-			},
-			"purity": purityMap,
-		}, nil
-	}
-
-	client, err := dialSSH(SSHCredentials{
-		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 4*time.Second)
-	if err != nil {
-		if certMap == nil {
-			certMap = map[string]any{
-				"mode": "autocert", "domain": vps.Domain, "ok": false, "days_left": 0, "dir": "", "detail": fmt.Sprintf("SSH不可达 (%v)", err),
-			}
-		}
-		return map[string]any{
-			"vps_id": id, "domain": vps.Domain, "ip": vps.IP, "via": "tls-direct",
-			"ok":        certOK,
-			"installed": isInstalled,
-			"service":   map[string]any{"status": "active", "active": certOK, "main_pid": "0"},
-			"ports": []map[string]any{
-				{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": certOK},
-			},
-			"cert":         certMap,
-			"subscription": map[string]any{"secret_set": "yes", "local_ok": certOK, "public_ok": certOK},
-			"nodes": []map[string]any{
-				{
-					"name":   "AERO HTTP/3 QUIC",
-					"kind":   "aero",
-					"online": certOK,
-					"target": fmt.Sprintf("https://%s:%d", vps.Domain, targetPort),
-					"detail": "HTTP/3 QUIC (原生单栈)",
-				},
-			},
-			"purity": purityMap,
-		}, nil
-	}
-	defer client.Close()
-
-	// 只读 SSH 探针：服务状态、端口监听与证书有效期（edge 状态只经管理接口读取，不在节点上带密钥调用）
-	script := fmt.Sprintf(`set +e
-ST=$(systemctl is-active aero-edge aero 2>/dev/null | grep -E '^(active|activating)$' | head -1)
-[ -z "$ST" ] && ST="inactive"
-PID=$(pgrep -f "aero-edge" 2>/dev/null | head -1)
-[ -z "$PID" ] && PID=$(pgrep -f "aero" 2>/dev/null | head -1)
-[ -z "$PID" ] && PID=0
-echo "SERVICE=$ST"
-echo "MAIN_PID=$PID"
-
-for P in %d 443 80 8443; do
-  LINE=$(ss -lntp 2>/dev/null | grep -E ":$P\b" | head -1)
-  if [ -n "$LINE" ]; then
-    echo "PORT_${P}=yes"
-    PNAME=$(echo "$LINE" | grep -o 'users:(("[^"]*"' | tr -d 'users:(("' | head -1)
-    [ -n "$PNAME" ] && echo "PORT_${P}_PROC=$PNAME"
-  else
-    echo "PORT_${P}=no"
-  fi
-done
-
-DOMAIN="%s"
-for D in "/etc/letsencrypt/live/$DOMAIN" "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/$DOMAIN" "/var/lib/aero/tls" "/var/lib/aero/certs" "/var/lib/aero"; do
-  if [ -f "$D/fullchain.pem" ] || [ -f "$D/fullchain.cer" ]; then
-    F="$D/fullchain.pem"
-    [ ! -f "$F" ] && F="$D/fullchain.cer"
-    echo "CERT_FOUND=$D"
-    ENDDATE=$(openssl x509 -enddate -noout -in "$F" 2>/dev/null | cut -d= -f2)
-    ISSUER=$(openssl x509 -issuer -noout -in "$F" 2>/dev/null | sed 's/.*CN = //; s/.*O = //')
-    [ -n "$ENDDATE" ] && echo "CERT_ENDDATE=$ENDDATE"
-    [ -n "$ISSUER" ] && echo "CERT_ISSUER=$ISSUER"
-    break
-  fi
-done
-`, targetPort, vps.Domain)
-
-	out, err := runSSH(client, script, 5*time.Second)
-	if err != nil {
-		out = "" // 探测失败如实报告未知，不伪造“运行中”
-	}
-
-	kv := parseKV(out)
-	svcActive := kv["SERVICE"] == "active" || certOK
-	if !svcActive && kv["MAIN_PID"] != "0" && kv["MAIN_PID"] != "" {
-		for _, p := range []int{targetPort, 443, 8443} {
-			proc := kv[fmt.Sprintf("PORT_%d_PROC", p)]
-			if strings.Contains(proc, "aero") || strings.Contains(proc, "ao-dg") {
-				svcActive = true
-				break
-			}
+			"subscription": map[string]any{"secret_set": "yes", "local_ok": false, "public_ok": certOK},
+			"nodes":        node(certOK, "管理接口不可用"),
+			"log_tail":     "[Edge 诊断] 管理接口不可用：" + apiErr.Error(),
 		}
 	}
-
-	portTargetListen := kv[fmt.Sprintf("PORT_%d", targetPort)] == "yes" || certOK
-
-	// 解析 SSH 探针获取的真实证书目录和有效期，杜绝写死假路径
-	if kv["CERT_FOUND"] != "" && kv["CERT_ENDDATE"] != "" {
-		enddateStr := strings.TrimSpace(kv["CERT_ENDDATE"])
-		var expTime time.Time
-		for _, layout := range []string{"Jan _2 15:04:05 2006 GMT", "Jan 02 15:04:05 2006 GMT", time.RFC1123, time.RFC822} {
-			if t, err := time.Parse(layout, enddateStr); err == nil {
-				expTime = t
-				break
-			}
-		}
-		daysLeft := 0
-		if !expTime.IsZero() {
-			daysLeft = int(time.Until(expTime).Hours() / 24)
-		}
-		issuer := kv["CERT_ISSUER"]
-		if issuer == "" {
-			issuer = "Let's Encrypt / ACME"
-		}
-		certMap = map[string]any{
-			"mode":       "acme-filesystem",
-			"domain":     vps.Domain,
-			"ok":         daysLeft >= 0,
-			"issuer":     issuer,
-			"not_after":  expTime.Format("2006-01-02 15:04:05"),
-			"days_left":  daysLeft,
-			"file_count": 1,
-			"dir":        kv["CERT_FOUND"],
-			"detail":     fmt.Sprintf("已签发有效 (来自 %s · 剩余 %d 天 · %s)", kv["CERT_FOUND"], daysLeft, issuer),
-		}
-	} else if certMap == nil || !certOK {
-		certMap = map[string]any{
-			"mode":       "autocert",
-			"domain":     vps.Domain,
-			"ok":         false,
-			"not_after":  "",
-			"days_left":  0,
-			"file_count": 0,
-			"dir":        "",
-			"detail":     "证书申请中或待配置域名解析 (DNS 尚未生效或 ACME 签发排队中)",
-		}
-	}
-
-	ports := []map[string]any{
-		{"port": targetPort, "proto": "tcp/udp", "role": "https/quic/aero", "listen": portTargetListen, "proc": kv[fmt.Sprintf("PORT_%d_PROC", targetPort)]},
-		{"port": 80, "proto": "tcp", "role": "http/acme", "listen": kv["PORT_80"] == "yes", "proc": kv["PORT_80_PROC"]},
-	}
-	if targetPort != 443 {
-		role443 := "https/other"
-		if pProc := kv["PORT_443_PROC"]; pProc != "" {
-			role443 = "https/" + pProc
-		}
-		ports = append(ports, map[string]any{"port": 443, "proto": "tcp", "role": role443, "listen": kv["PORT_443"] == "yes", "proc": kv["PORT_443_PROC"]})
-	}
-	if targetPort != 8443 {
-		ports = append(ports, map[string]any{"port": 8443, "proto": "tcp", "role": "fallback", "listen": kv["PORT_8443"] == "yes", "proc": kv["PORT_8443_PROC"]})
-	}
-
-	nodes := []map[string]any{
-		{
-			"name":   "AERO HTTP/3 QUIC",
-			"kind":   "aero",
-			"online": portTargetListen,
-			"target": fmt.Sprintf("https://%s:%d", vps.Domain, targetPort),
-			"detail": "HTTP/3 QUIC (原生单栈)",
-		},
-	}
-
-	res := map[string]any{
-		"vps_id":    id,
-		"domain":    vps.Domain,
-		"ip":        vps.IP,
-		"via":       "hybrid-fast",
-		"ok":        isInstalled && (svcActive || portTargetListen),
-		"installed": isInstalled,
-		"service": map[string]any{
-			"status":   kv["SERVICE"],
-			"active":   svcActive,
-			"main_pid": kv["MAIN_PID"],
-		},
-		"ports": ports,
-		"cert":  certMap,
-		"subscription": map[string]any{
-			"secret_set": "yes",
-			"local_ok":   svcActive,
-			"public_ok":  true,
-		},
-		"nodes":  nodes,
-		"purity": purityMap,
-	}
+	res["vps_id"], res["domain"], res["ip"], res["installed"] = id, vps.Domain, vps.IP, true
+	res["purity"] = purityMap
 	diagCacheMu.Lock()
 	diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
 	diagCacheMu.Unlock()
 	return res, nil
 }
 
-// RenewCert renews or forces reissuance of TLS certificate on the remote VPS.
+// markNodeOnline 节点在线时同步中台节点库（不存在则登记）。
+func (s *VPSService) markNodeOnline(id uint64, vps *VPSHost, port int) {
+	if s.nodeSvc == nil {
+		return
+	}
+	geo := ResolveIPRegion(vps.IP)
+	s.nodeSvc.mu.Lock()
+	found := false
+	for _, n := range s.nodeSvc.nodes {
+		if n.VPSID == id || (vps.IP != "" && n.IP == vps.IP) {
+			n.Status, n.Region, n.UpdatedAt = true, geo, time.Now()
+			found = true
+			break
+		}
+	}
+	s.nodeSvc.mu.Unlock()
+	if !found {
+		host := vps.Domain
+		if host == "" {
+			host = vps.IP
+		}
+		_, _ = s.nodeSvc.CreateNode(vps.Name, geo, host, "aero-quic", int32(port), 500, false, 100, id)
+	}
+}
+
 // RenewCert 让节点重新加载证书（C13 /admin/v1/cert/reload）。证书由节点系统的 acme.sh/certbot 签发与续期，
 // 中台不删除证书、不登录节点；force 已无意义（保留参数以兼容管理端请求）。
 func (s *VPSService) RenewCert(ctx context.Context, id uint64, force bool) (map[string]any, error) {
@@ -1422,38 +923,6 @@ var countryCN = map[string]string{
 }
 
 var geoCountryCache sync.Map
-
-// ResolveIPCountryCode resolves an IP address to its 2-letter ISO country code (e.g. "US", "HK", "JP").
-func ResolveIPCountryCode(ip string) string {
-	ip = strings.TrimSpace(ip)
-	if ip == "" || ip == "127.0.0.1" || strings.HasPrefix(ip, "192.168.") || strings.HasPrefix(ip, "10.") {
-		return "LOCAL"
-	}
-	if val, ok := geoCountryCache.Load(ip); ok {
-		if s, ok := val.(string); ok && s != "" {
-			return s
-		}
-	}
-
-	url := fmt.Sprintf("http://ip-api.com/json/%s?fields=status,countryCode", ip)
-	resp, err := geoClient.Get(url)
-	if err == nil && resp.StatusCode == http.StatusOK {
-		var data struct {
-			Status      string `json:"status"`
-			CountryCode string `json:"countryCode"`
-		}
-		if jsonErr := json.NewDecoder(resp.Body).Decode(&data); jsonErr == nil && data.Status == "success" {
-			_ = resp.Body.Close()
-			cc := strings.ToUpper(strings.TrimSpace(data.CountryCode))
-			if cc != "" {
-				geoCountryCache.Store(ip, cc)
-				return cc
-			}
-		}
-		_ = resp.Body.Close()
-	}
-	return ""
-}
 
 // ResolveIPRegion resolves an IP address to a human-readable Region string e.g. "美国 · 洛杉矶".
 // Results are cached in-memory to prevent redundant external queries.
