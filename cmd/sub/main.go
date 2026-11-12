@@ -173,6 +173,7 @@ func main() {
 		log.Fatalf("usage collector: %v", err)
 	}
 	defer usageCollector.Close()
+	usageCollector.SetUserStore(userDB) // 按自然月（UTC）写入 traffic.used_bytes
 	go usageCollector.Run(context.Background())
 
 	// 6. VPS Asset Management & Probe Engine

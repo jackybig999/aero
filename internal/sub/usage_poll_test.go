@@ -186,3 +186,63 @@ func TestEndpointPublicHidesMeteringKey(t *testing.T) {
 		t.Fatalf("metering key exposed: %s %v", b, err)
 	}
 }
+
+// 自然月汇总（用户决定 2026-11-12）：写入本月所有节点上下行之和；上月不计；跨月清零；未知 uid 丢弃。
+// 两种 UserStore 都要验证。
+func TestUsageCollectorAppliesNaturalMonth(t *testing.T) {
+	for name, store := range adminSeedStores(t) {
+		t.Run(name, func(t *testing.T) {
+			c, _, add := newUsageFixture(t)
+			c.SetUserStore(store)
+			now := time.Date(2026, 11, 12, 10, 0, 0, 0, time.UTC)
+			c.now = func() time.Time { return now }
+			id, err := store.CreateUser(&User{Username: "meter_" + name, Email: name + "@example.com", UUID: "u_abc123"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, _ := store.GetUser(id)
+			uid := tokenUID(u)
+			if err := store.UpdateTraffic(id, -1, 500_000); err != nil { // 支付回调写入的上限
+				t.Fatal(err)
+			}
+
+			a := &fakeUsageEdge{nodeID: "node-a", key: "ka", pageSize: 10}
+			b := &fakeUsageEdge{nodeID: "node-b", key: "kb", pageSize: 10}
+			add(a, 1)
+			add(b, 2)
+			nov := monthStart(now).Unix()
+			a.put(uid, "sub", nov-3600, 1_000, 1_000) // 10 月最后一小时：不计入 11 月
+			a.put(uid, "sub", nov+3600, 100, 200)
+			b.put(uid, "sub", nov+7200, 10, 20)
+			a.put("ghost-99999", "sub", nov, 1, 1) // 不存在的用户
+			c.PollOnce(context.Background())
+			if err := c.ApplyMonthly(); err != nil {
+				t.Fatal(err)
+			}
+			ts, _ := store.GetTraffic(id)
+			if ts.UsedBytes != 330 || ts.LimitBytes != 500_000 {
+				t.Fatalf("traffic = used %d limit %d, want 330 / 500000 (limit untouched)", ts.UsedBytes, ts.LimitBytes)
+			}
+			if left, _ := c.queryStrings(`SELECT uid FROM uid_dirty`); len(left) != 0 {
+				t.Fatalf("dirty uids left: %v", left)
+			}
+
+			now = time.Date(2026, 12, 1, 0, 5, 0, 0, time.UTC) // 跨月：无新数据也要清零
+			if err := c.ApplyMonthly(); err != nil {
+				t.Fatal(err)
+			}
+			if ts, _ := store.GetTraffic(id); ts.UsedBytes != 0 || ts.LimitBytes != 500_000 {
+				t.Fatalf("after month rollover: used %d limit %d", ts.UsedBytes, ts.LimitBytes)
+			}
+		})
+	}
+}
+
+func TestUserIDFromTokenUID(t *testing.T) {
+	for uid, want := range map[string]uint64{"u_abc123-42": 42, "user-00000012": 12, "nodash": 0, "x-0": 0, "x-abc": 0} {
+		got, ok := userIDFromTokenUID(uid)
+		if got != want || ok != (want > 0) {
+			t.Errorf("%s: got %d %v", uid, got, ok)
+		}
+	}
+}

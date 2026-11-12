@@ -1105,17 +1105,18 @@ func (a *AeroDB) GetTraffic(id uint64) (*TrafficStats, error) {
 	return &ts, nil
 }
 
+// UpdateTraffic 只更新给出的字段（usedBytes ≥ 0；limitBytes > 0 或 -1），单条语句完成：计量汇总与支付回调
+// 并发更新同一用户时互不覆盖（原先先读后整行替换会丢失对方的修改）。
 func (a *AeroDB) UpdateTraffic(id uint64, usedBytes, limitBytes int64) error {
-	nowStr := time.Now().Format(time.RFC3339)
-	ts, _ := a.GetTraffic(id)
-	if usedBytes >= 0 {
-		ts.UsedBytes = usedBytes
-	}
-	if limitBytes > 0 || limitBytes == -1 {
-		ts.LimitBytes = limitBytes
-	}
-	_, err := a.db.Exec(`INSERT OR REPLACE INTO traffic (user_id, used_bytes, limit_bytes, is_connected, updated_at)
-		VALUES (?, ?, ?, ?, ?)`, id, ts.UsedBytes, ts.LimitBytes, 0, nowStr)
+	setUsed := usedBytes >= 0
+	setLimit := limitBytes > 0 || limitBytes == -1
+	_, err := a.db.Exec(`INSERT INTO traffic (user_id, used_bytes, limit_bytes, is_connected, updated_at)
+		VALUES (?1, CASE WHEN ?2 THEN ?3 ELSE 0 END, CASE WHEN ?4 THEN ?5 ELSE 107374182400 END, 0, ?6)
+		ON CONFLICT (user_id) DO UPDATE SET
+			used_bytes = CASE WHEN ?2 THEN ?3 ELSE used_bytes END,
+			limit_bytes = CASE WHEN ?4 THEN ?5 ELSE limit_bytes END,
+			updated_at = ?6`,
+		id, setUsed, usedBytes, setLimit, limitBytes, time.Now().Format(time.RFC3339))
 	return err
 }
 

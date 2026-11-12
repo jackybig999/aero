@@ -11,7 +11,7 @@
 | C5 订阅 | draft | 已实现（需重写） | 未执行 | `subscription_v2` | OFF | |
 | C5 ECH | draft | 未开始 | 未执行 | `ech_enabled` | OFF | 先验证 quic-go 路径与国内网络 |
 | C5 内层 IPv6 | draft | 部分实现（需重写） | 未执行 | `ipv6_inner` | OFF | 启动自检门禁 |
-| C6 计量 | final | edge 已实现：按 uid/小时累计（usage.db，90 天保留，单调 seq）；`/v1/usage`、`/v1/status`（计量只读密钥、60 次/分钟、未鉴权返回伪装站）；中台已实现拉取：每 60 秒、按 (node_id, uid, period_start) 覆盖写入独立 usage.db，410/节点重装从头重读，严格校验 TLS；计量密钥经 SSH 只读回读，管理接口不返回。汇总进用户已用流量与配额（计费周期）待定 | 结构字段与错误码由 usage_api_test 对照契约 | `usage_api` | OFF | 只计量签名 token。CONNECT-IP 按 IP 报文长度；TCP/UDP relay 按 payload 字节（不含 IP/传输层头，低于契约“IP 层”口径，待用户决定是否接受或补估算）。无法识别的游标按 410 处理。`classes` 字段待出口健康检查落地后输出 |
+| C6 计量 | final | edge 已实现：按 uid/小时累计（usage.db，90 天保留，单调 seq）；`/v1/usage`、`/v1/status`（计量只读密钥、60 次/分钟、未鉴权返回伪装站）；中台已实现拉取：每 60 秒、按 (node_id, uid, period_start) 覆盖写入独立 usage.db，410/节点重装从头重读，严格校验 TLS；计量密钥经 SSH 只读回读，管理接口不返回。按自然月（UTC，用户决定 2026-11-12）汇总写入用户 traffic.used_bytes；超额后的处置（拒绝签发/吊销）待 C4 | 结构字段与错误码由 usage_api_test 对照契约 | `usage_api` | OFF | 只计量签名 token。CONNECT-IP 按 IP 报文长度；TCP/UDP relay 按 payload 字节（不含 IP/传输层头，低于契约“IP 层”口径，待用户决定是否接受或补估算）。无法识别的游标按 410 处理。`classes` 字段待出口健康检查落地后输出 |
 | C9 出口 warp | draft | 插件形态已实现：只读状态 + 持久化开关（ADR-0012 §6） | 未执行 | `warp_proxy` 非空即开 | 按节点配置 | edge 不安装 WARP |
 | 端口中途跳变 | draft | 进程内多端口监听已实现 | 未执行 | `port_hopping` | OFF | 不使用 DNAT（ADR-0012） |
 | C7 本地管理接口 | final | 未开始 | 未执行 | `local_admin_api` | OFF | 落地后 deploy/aero 改为调用本接口 |
