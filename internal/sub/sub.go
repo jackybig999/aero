@@ -8,8 +8,7 @@
 package sub
 
 import (
-	"bytes"
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -535,59 +534,15 @@ func (s *VPSService) SyncUsersToEdge(vpsID uint64, users []*User) error {
 		return err
 	}
 
-	targets := []string{}
-	if ep.Host != "" && net.ParseIP(ep.Host) == nil {
-		targets = append(targets, ep.Host)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := edgeDo(ctx, ep.Host, ep.IP, port, http.MethodPost, "/admin/subs", ep.AdminKey, body, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("sync subs to vps %d: %w", vpsID, err)
 	}
-	if ep.IP != "" && ep.IP != ep.Host {
-		targets = append(targets, ep.IP)
-	}
-	if len(targets) == 0 && ep.Host != "" {
-		targets = append(targets, ep.Host)
-	}
-
-	var lastSyncErr error
-	synced := false
-	for _, tgt := range targets {
-		url := fmt.Sprintf("https://%s:%d/admin/subs", tgt, port)
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			lastSyncErr = err
-			continue
-		}
-		if ep.Host != "" && net.ParseIP(ep.Host) == nil {
-			req.Host = ep.Host
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Aero-Admin-Key", ep.AdminKey)
-
-		client := &http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-					ServerName:         ep.Host,
-				},
-				DisableKeepAlives: true,
-			},
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastSyncErr = fmt.Errorf("sync to %s:%d failed: %w", tgt, port, err)
-			continue
-		}
-		_ = resp.Body.Close()
-
-		if resp.StatusCode >= 400 {
-			lastSyncErr = fmt.Errorf("sync to %s:%d returned http %d", tgt, port, resp.StatusCode)
-			continue
-		}
-		synced = true
-		break
-	}
-	if !synced {
-		return lastSyncErr
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("sync subs to vps %d: http %d", vpsID, resp.StatusCode)
 	}
 	return nil
 }

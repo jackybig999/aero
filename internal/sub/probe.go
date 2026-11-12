@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -861,114 +862,54 @@ func InvalidateDiagCache(id uint64) {
 	diagCacheMu.Unlock()
 }
 
+// probeEdgeAdminAPI 经 edge 管理接口读取状态（edgeDo：严格 TLS，密钥只在请求头）。
 func probeEdgeAdminAPI(ctx context.Context, host, ip string, port int, adminKey string) (map[string]any, bool) {
 	if adminKey == "" {
 		return nil, false
 	}
-	if port <= 0 {
-		port = 443
+	resp, err := edgeDo(ctx, host, ip, port, http.MethodGet, "/admin/status", adminKey, nil, 1200*time.Millisecond)
+	if err != nil {
+		return nil, false
 	}
-
-	targets := []string{}
-	if host != "" && net.ParseIP(host) == nil {
-		targets = append(targets, host)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
 	}
-	if ip != "" && ip != host {
-		targets = append(targets, ip)
+	var st struct {
+		OK            bool    `json:"ok"`
+		Version       string  `json:"version"`
+		Protocol      string  `json:"protocol"`
+		UptimeSec     float64 `json:"uptime_sec"`
+		TokenCount    int     `json:"token_count"`
+		ActiveTunnels int64   `json:"active_tunnels"`
 	}
-
-	for _, tgt := range targets {
-		url := fmt.Sprintf("https://%s:%d/admin/status?key=%s", tgt, port, adminKey)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			continue
-		}
-		if host != "" && net.ParseIP(host) == nil {
-			req.Host = host
-		}
-		req.Header.Set("X-Aero-Admin-Key", adminKey)
-		req.Header.Set("User-Agent", "AERO-MidPlatform/1.0")
-
-		client := &http.Client{
-			Timeout: 1200 * time.Millisecond,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-					ServerName:         host,
-				},
-				DisableKeepAlives: true,
-			},
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			var st struct {
-				OK            bool    `json:"ok"`
-				Version       string  `json:"version"`
-				Protocol      string  `json:"protocol"`
-				UptimeSec     float64 `json:"uptime_sec"`
-				CertDaysLeft  int     `json:"cert_days_left"`
-				CertIssuer    string  `json:"cert_issuer"`
-				CertNotAfter  string  `json:"cert_not_after"`
-				TokenCount    int     `json:"token_count"`
-				ActiveTunnels int64   `json:"active_tunnels"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&st); err == nil && st.OK {
-				issuer := st.CertIssuer
-				daysLeft := st.CertDaysLeft
-				notAfter := st.CertNotAfter
-				certOK := daysLeft > 0
-
-				// 优先从真实 TLS 对端证书 (PeerCertificates) 中提取精准有效期与签发机构
-				if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
-					leaf := resp.TLS.PeerCertificates[0]
-					realDays := int(time.Until(leaf.NotAfter).Hours() / 24)
-					if realDays >= 0 {
-						daysLeft = realDays
-						certOK = true
-					}
-					if leaf.Issuer.CommonName != "" {
-						issuer = leaf.Issuer.CommonName
-					} else if len(leaf.Issuer.Organization) > 0 {
-						issuer = leaf.Issuer.Organization[0]
-					}
-					notAfter = leaf.NotAfter.Format("2006-01-02 15:04:05")
-				}
-
-				if issuer == "" {
-					issuer = "Let's Encrypt / ACME"
-				}
-
-				certMap := map[string]any{
-					"mode":       "acme-online",
-					"ok":         certOK,
-					"domain":     host,
-					"issuer":     issuer,
-					"not_after":  notAfter,
-					"days_left":  daysLeft,
-					"file_count": 1,
-					"dir":        "在线直连 (AERO Edge 守护进程)",
-					"detail":     fmt.Sprintf("有效 (剩余 %d 天 · %s)", daysLeft, issuer),
-				}
-
-				return map[string]any{
-					"service_active": true,
-					"cert":           certMap,
-					"version":        st.Version,
-					"protocol":       st.Protocol,
-					"uptime_sec":     st.UptimeSec,
-					"token_count":    st.TokenCount,
-					"active_tunnels": st.ActiveTunnels,
-				}, true
-			}
-		}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&st); err != nil || !st.OK {
+		return nil, false
 	}
-	return nil, false
+	// 证书信息取自已校验通过的对端证书
+	certMap := map[string]any{"mode": "acme-online", "ok": false, "domain": host, "file_count": 1, "dir": "在线直连 (AERO Edge 守护进程)"}
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		leaf := resp.TLS.PeerCertificates[0]
+		daysLeft := int(time.Until(leaf.NotAfter).Hours() / 24)
+		issuer := leaf.Issuer.CommonName
+		if issuer == "" && len(leaf.Issuer.Organization) > 0 {
+			issuer = leaf.Issuer.Organization[0]
+		}
+		certMap["ok"] = daysLeft >= 0
+		certMap["issuer"] = issuer
+		certMap["not_after"] = leaf.NotAfter.Format("2006-01-02 15:04:05")
+		certMap["days_left"] = daysLeft
+		certMap["detail"] = fmt.Sprintf("有效 (剩余 %d 天 · %s)", daysLeft, issuer)
+	}
+	return map[string]any{
+		"service_active": true,
+		"cert":           certMap,
+		"version":        st.Version,
+		"protocol":       st.Protocol,
+		"uptime_sec":     st.UptimeSec,
+		"token_count":    st.TokenCount,
+		"active_tunnels": st.ActiveTunnels,
+	}, true
 }
 
 // Diagnose inspects the target VPS via fast TLS probe and lightweight SSH.
@@ -1219,7 +1160,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 	}
 	defer client.Close()
 
-	// 极简轻量级 SSH 探针：检查实际端口、服务状态、1ms 本地 Edge Admin 回环以及远端标准证书目录
+	// 只读 SSH 探针：服务状态、端口监听与证书有效期（edge 状态只经管理接口读取，不在节点上带密钥调用）
 	script := fmt.Sprintf(`set +e
 ST=$(systemctl is-active aero-edge aero 2>/dev/null | grep -E '^(active|activating)$' | head -1)
 [ -z "$ST" ] && ST="inactive"
@@ -1240,11 +1181,6 @@ for P in %d 443 80 8443; do
   fi
 done
 
-if [ -n "%s" ]; then
-  EDGE_LOCAL=$(curl -k -s -m 1 "https://127.0.0.1:%d/admin/status?key=%s" 2>/dev/null | tr -d '\r\n')
-  [ -n "$EDGE_LOCAL" ] && echo "EDGE_STATUS=$EDGE_LOCAL"
-fi
-
 DOMAIN="%s"
 for D in "/etc/letsencrypt/live/$DOMAIN" "/root/.acme.sh/${DOMAIN}_ecc" "/root/.acme.sh/$DOMAIN" "/var/lib/aero/tls" "/var/lib/aero/certs" "/var/lib/aero"; do
   if [ -f "$D/fullchain.pem" ] || [ -f "$D/fullchain.cer" ]; then
@@ -1258,27 +1194,15 @@ for D in "/etc/letsencrypt/live/$DOMAIN" "/root/.acme.sh/${DOMAIN}_ecc" "/root/.
     break
   fi
 done
-`, targetPort, adminKey, targetPort, adminKey, vps.Domain)
+`, targetPort, vps.Domain)
 
 	out, err := runSSH(client, script, 5*time.Second)
 	if err != nil {
-		out = fmt.Sprintf("SERVICE=active\nMAIN_PID=0\nPORT_%d=yes\nPORT_443=yes\nPORT_80=yes\nPORT_8443=no\n", targetPort)
+		out = "" // 探测失败如实报告未知，不伪造“运行中”
 	}
 
 	kv := parseKV(out)
 	svcActive := kv["SERVICE"] == "active" || certOK
-	edgeVer := ""
-	if edgeStatusRaw := kv["EDGE_STATUS"]; edgeStatusRaw != "" {
-		var edgeStatus map[string]any
-		if err := json.Unmarshal([]byte(edgeStatusRaw), &edgeStatus); err == nil && edgeStatus != nil {
-			if okVal, _ := edgeStatus["ok"].(bool); okVal {
-				svcActive = true
-				if verVal, ok := edgeStatus["version"].(string); ok && verVal != "" {
-					edgeVer = verVal
-				}
-			}
-		}
-	}
 	if !svcActive && kv["MAIN_PID"] != "0" && kv["MAIN_PID"] != "" {
 		for _, p := range []int{targetPort, 443, 8443} {
 			proc := kv[fmt.Sprintf("PORT_%d_PROC", p)]
@@ -1369,7 +1293,6 @@ done
 			"status":   kv["SERVICE"],
 			"active":   svcActive,
 			"main_pid": kv["MAIN_PID"],
-			"version":  edgeVer,
 		},
 		"ports": ports,
 		"cert":  certMap,
@@ -1380,9 +1303,6 @@ done
 		},
 		"nodes":  nodes,
 		"purity": purityMap,
-	}
-	if edgeVer != "" {
-		res["version"] = edgeVer
 	}
 	diagCacheMu.Lock()
 	diagCache[id] = diagCacheEntry{diag: cloneDiagMap(res), createdAt: time.Now()}
