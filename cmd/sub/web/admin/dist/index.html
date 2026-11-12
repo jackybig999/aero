@@ -365,25 +365,6 @@
 
           <!-- 右列: Token 矩阵与安全说明 -->
           <div style="display:flex;flex-direction:column;gap:12px">
-            <div class="card">
-              <div class="card-title">
-                <span>🔑 客户端 Token 授权矩阵</span>
-                <button class="btn btn-sm btn-blue" id="btnOpenAddAeroToken">+ 新增 Token</button>
-              </div>
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th>Token 凭据</th>
-                    <th>标签备注</th>
-                    <th>有效期</th>
-                    <th style="width:60px">操作</th>
-                  </tr>
-                </thead>
-                <tbody id="aeroTokensTableBody">
-                  <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无 Token 凭据</td></tr>
-                </tbody>
-              </table>
-            </div>
 
             <div class="card">
               <div class="card-title">
@@ -916,32 +897,6 @@
       <div class="log-box" id="aeroTaskLogBox" style="font-family:monospace;font-size:11px;background:#090e18;padding:10px;border-radius:6px;border:1px solid var(--line);max-height:180px;height:180px;overflow-y:auto;white-space:pre-wrap;color:#94a3b8">正在等待远端输出...</div>
     </div>
   </div>
-
-  <!-- AERO 新增 Token 弹窗 -->
-  <div class="modal-backdrop" id="aeroTokenModal">
-    <div class="modal-content" style="max-width:440px;width:90%">
-      <h3 style="margin-bottom:12px">新增客户端授权 Token</h3>
-      <div style="display:flex;flex-direction:column;gap:10px">
-        <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Token 密匙 (留空自动生成)</label>
-          <input type="text" id="newAeroTokenVal" class="input-text" style="width:100%" placeholder="自定义 Token 或留空自动生成" />
-        </div>
-        <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">用户/设备标签备注</label>
-          <input type="text" id="newAeroTokenLabel" class="input-text" style="width:100%" placeholder="例如: iPhone_15_Pro 或 Office_Mac" />
-        </div>
-        <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">有效时长 (小时，0 为永久有效)</label>
-          <input type="number" id="newAeroTokenTTL" class="input-text" style="width:100%" value="0" />
-        </div>
-      </div>
-      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
-        <button class="btn" id="btnCancelAeroToken">取消</button>
-        <button class="btn btn-blue" id="btnSaveAeroToken">保存并分发</button>
-      </div>
-    </div>
-  </div>
-
 
   <!-- Modal: 超级管理员全节点详细订阅 -->
   <div class="modal-backdrop" id="adminMultiSubModal">

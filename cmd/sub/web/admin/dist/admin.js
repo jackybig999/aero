@@ -1596,34 +1596,8 @@ async function loadAeroDiagnose(vpsId, force = false) {
 
     // 9. IP Purity & WARP Protection
     renderPurityInfo(diag.purity);
-
-    // 10. Load Tokens
-    await loadAeroTokens(vpsId);
   } catch (e) {
     if (statusEl) statusEl.textContent = `诊断失败: ${e.message}`;
-  }
-}
-
-async function loadAeroTokens(vpsId) {
-  const tbody = $('aeroTokensTableBody');
-  if (!tbody) return;
-  try {
-    const list = await apiCall(`/aero/vps/${vpsId}/tokens/`).catch(() => []);
-    const items = (list && list.results) || (Array.isArray(list) ? list : []);
-    if (!items.length) {
-      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px">暂无 Token 凭据</td></tr>';
-      return;
-    }
-    tbody.innerHTML = items.map(t => `
-      <tr>
-        <td class="mono"><b>${escapeHtml(t.token)}</b></td>
-        <td>${escapeHtml(t.label || '—')}</td>
-        <td><span class="tag tag-blue">${t.ttl_hours ? t.ttl_hours + '小时' : '永久有效'}</span></td>
-        <td><button class="btn btn-sm btn-danger" onclick="delAeroToken('${escapeHtml(t.token)}')">删</button></td>
-      </tr>
-    `).join('');
-  } catch (e) {
-    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--red)">加载 Token 失败: ${e.message}</td></tr>`;
   }
 }
 
@@ -2224,17 +2198,6 @@ async function loadAeroTasks() {
   } catch (_) {}
 }
 
-window.delAeroToken = async (tok) => {
-  if (!currentAeroVpsId) return;
-  if (!await modalConfirm(`确认删除 Token [${tok}]？`, '删除凭证')) return;
-  try {
-    await apiCall(`/aero/vps/${currentAeroVpsId}/tokens/?token=${encodeURIComponent(tok)}`, { method: 'DELETE' });
-    loadAeroTokens(currentAeroVpsId);
-  } catch (e) {
-    alert(`删除失败: ${e.message}`);
-  }
-};
-
 function initAeroEvents() {
   $('btnAeroRefresh')?.addEventListener('click', () => {
     if (currentAeroVpsId) loadAeroDiagnose(currentAeroVpsId, true);
@@ -2295,35 +2258,6 @@ function initAeroEvents() {
     if (aeroTaskPollTimer) {
       clearInterval(aeroTaskPollTimer);
       aeroTaskPollTimer = null;
-    }
-  });
-
-  $('btnOpenAddAeroToken')?.addEventListener('click', () => {
-    $('newAeroTokenVal').value = '';
-    $('newAeroTokenLabel').value = '';
-    $('newAeroTokenTTL').value = '0';
-    $('aeroTokenModal').classList.add('active');
-  });
-
-  $('btnCancelAeroToken')?.addEventListener('click', () => {
-    $('aeroTokenModal').classList.remove('active');
-  });
-
-  $('btnSaveAeroToken')?.addEventListener('click', async () => {
-    if (!currentAeroVpsId) return alert('请先选择 VPS 主机');
-    const token = $('newAeroTokenVal').value.trim();
-    const label = $('newAeroTokenLabel').value.trim();
-    const ttl = parseInt($('newAeroTokenTTL').value, 10) || 0;
-    try {
-      await apiCall(`/aero/vps/${currentAeroVpsId}/tokens/`, {
-        method: 'POST',
-        body: JSON.stringify({ token, label, ttl_hours: ttl })
-      });
-      alert('Token 凭证已分发至目标 Edge');
-      $('aeroTokenModal').classList.remove('active');
-      loadAeroTokens(currentAeroVpsId);
-    } catch (e) {
-      alert(`保存失败: ${e.message}`);
     }
   });
 

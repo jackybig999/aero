@@ -460,9 +460,6 @@ func (h *AeroHandler) RegisterRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/v1/aero/vps/{id}/endpoint/", h.GetEndpoint)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/endpoint/refresh/", h.RefreshEndpoint)
-	mux.HandleFunc("GET /api/v1/aero/vps/{id}/tokens/", h.ListTokens)
-	mux.HandleFunc("POST /api/v1/aero/vps/{id}/tokens/", h.AddToken)
-	mux.HandleFunc("DELETE /api/v1/aero/vps/{id}/tokens/", h.DelToken)
 
 	mux.HandleFunc("GET /api/v1/aero/vps/{id}/status/", h.Diagnose)
 	mux.HandleFunc("GET /api/v1/aero/vps/{id}/diagnose/", h.Diagnose)
@@ -673,56 +670,6 @@ func (h *AeroHandler) RefreshEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"code": 0, "data": ep.public()})
-}
-
-func (h *AeroHandler) ListTokens(w http.ResponseWriter, r *http.Request) {
-	id, err := parseVPSID(r)
-	if err != nil {
-		writeJSON(w, 422, errResp(1002, "invalid vps id"))
-		return
-	}
-	v, _ := h.svc.Get(id)
-	defTok := "aero_default_user_token"
-	if v != nil && v.Name != "" {
-		defTok = "tok_" + v.Name
-	}
-	tokens := []map[string]any{
-		{
-			"token":      defTok,
-			"token_mask": defTok[:4] + "…" + defTok[len(defTok)-3:],
-			"label":      "默认用户",
-			"created_at": time.Now().Format("2006-01-02 15:04:05"),
-		},
-	}
-	writeJSON(w, 200, map[string]any{"code": 0, "data": map[string]any{"results": tokens}})
-}
-
-func (h *AeroHandler) AddToken(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Token    string `json:"token"`
-		Label    string `json:"label"`
-		TTLHours int    `json:"ttl_hours"`
-	}
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			writeJSON(w, http.StatusBadRequest, errResp(1001, "invalid json body: "+err.Error()))
-			return
-		}
-	}
-	tok := req.Token
-	if tok == "" {
-		tok = "tok_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	}
-	item := map[string]any{
-		"token":      tok,
-		"token_mask": tok[:4] + "…",
-		"label":      req.Label,
-	}
-	writeJSON(w, 201, map[string]any{"code": 0, "data": item})
-}
-
-func (h *AeroHandler) DelToken(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"code": 0, "message": "deleted"})
 }
 
 func (h *AeroHandler) Diagnose(w http.ResponseWriter, r *http.Request) {
