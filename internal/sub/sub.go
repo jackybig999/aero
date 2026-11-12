@@ -291,13 +291,7 @@ func (sb *SubBuilder) BuildSubscriptionDoc(user *User, isp, purpose string, allo
 			}
 
 			// 候选备选端口池 (覆盖常见的标准 443 及完整候选端口池)
-			var altPorts []int
-			allCandidates := []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
-			for _, cp := range allCandidates {
-				if cp != port {
-					altPorts = append(altPorts, cp)
-				}
-			}
+			altPorts := portsFrom(port)[1:]
 
 			// 方案 A 物理域名锁死: ServerName 始终等于物理节点域名
 			srv := map[string]any{

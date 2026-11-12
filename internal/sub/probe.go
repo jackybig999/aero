@@ -760,13 +760,7 @@ func (s *VPSService) Diagnose(ctx context.Context, id uint64) (map[string]any, e
 		}
 	} else {
 		// 3. 管理接口不可用：只做公开的 TLS 证书探测（不发送任何密钥），如实报告
-		candidates := []int{targetPort}
-		for _, cp := range []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443} {
-			if cp != targetPort {
-				candidates = append(candidates, cp)
-			}
-		}
-		certMap, certOK := ProbeTLSCertificate(vps.Domain, vps.IP, candidates...)
+		certMap, certOK := ProbeTLSCertificate(vps.Domain, vps.IP, portsFrom(targetPort)...)
 		if certMap == nil {
 			certMap = map[string]any{"mode": "acme-system", "ok": false, "domain": vps.Domain, "days_left": 0, "dir": "", "detail": "TLS 探测未通过"}
 		}
@@ -848,53 +842,6 @@ func (s *VPSService) RestartEdge(ctx context.Context, id uint64) (map[string]any
 // ============================================================================
 // Harvest & VPS Edge Installation (from vps_install.go)
 // ============================================================================
-
-// InstallAeroOnVPS 刷新节点信息：只读读取已安装 edge 的端口与管理密钥（不安装、不修改节点）。
-func (s *VPSService) InstallAeroOnVPS(vpsID uint64) (*EndpointInfo, error) {
-	cred, err := s.store.GetCredentials(vpsID)
-	if err != nil {
-		return nil, err
-	}
-	if cred.SSHPassword == "" {
-		return nil, fmt.Errorf("no password stored for host %d", vpsID)
-	}
-
-	client, err := dialSSH(SSHCredentials{
-		Host: cred.IP, Port: cred.SSHPort, User: cred.SSHUsername, Password: cred.SSHPassword,
-	}, 10*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("ssh dial failed: %w", err)
-	}
-	defer client.Close()
-
-	// 只读回读 edge 持久化的端口与管理密钥（与安装流程相同来源 /etc/aero/edge.json）
-	st, err := readEdgeServiceState(client)
-	if err != nil {
-		return nil, err
-	}
-	host := cred.Domain
-	if host == "" {
-		host = cred.IP
-	}
-	ep := EndpointInfo{
-		VPSID:       vpsID,
-		Name:        cred.Name,
-		Host:        host,
-		IP:          cred.IP,
-		Port:        st.Port,
-		AdminKey:    st.AdminKey,
-		HasAdmin:    st.AdminKey != "",
-		MeteringKey: st.MeteringKey,
-		Installed:   true,
-		UpdatedAt:   time.Now(),
-	}
-	if s.eps != nil {
-		if err := s.eps.Upsert(ep); err != nil {
-			return nil, err
-		}
-	}
-	return &ep, nil
-}
 
 // ============================================================================
 // GeoIP Resolution & Cache (from geoip.go)
@@ -1487,17 +1434,16 @@ func RunInstallTask(taskID uint64, vpsID uint64, customPort int, svc *VPSService
 		host = h
 	}
 	ep := EndpointInfo{
-		VPSID:       vpsID,
-		Name:        cred.Name,
-		Host:        host,
-		IP:          cred.IP,
-		Port:        st.Port,
-		AdminKey:    st.AdminKey,
-		HasAdmin:    st.AdminKey != "",
-		MeteringKey: st.MeteringKey,
-		Installed:   true,
-		Version:     strings.TrimPrefix(tag, "v"),
-		UpdatedAt:   time.Now(),
+		VPSID:     vpsID,
+		Name:      cred.Name,
+		Host:      host,
+		IP:        cred.IP,
+		Port:      st.Port,
+		AdminKey:  st.AdminKey,
+		HasAdmin:  st.AdminKey != "",
+		Installed: true,
+		Version:   strings.TrimPrefix(tag, "v"),
+		UpdatedAt: time.Now(),
 	}
 	if svc.eps != nil {
 		if err := svc.eps.Upsert(ep); err != nil {
@@ -1694,7 +1640,6 @@ done
 echo "ACTIVE=$(systemctl is-active aero-edge)"
 echo "LISTEN=$(grep -o '"listen"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
 echo "ADMIN_KEY=$(grep -o '"admin_key"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
-echo "METERING_KEY=$(grep -o '"metering_key"[[:space:]]*:[[:space:]]*"[^"]*"' /etc/aero/edge.json | sed 's/.*"\([^"]*\)"$/\1/')"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then echo "FW_UFW=yes"; fi
 if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then echo "FW_FIREWALLD=yes"; fi
 `
@@ -1714,7 +1659,7 @@ if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewa
 	if err != nil || port <= 0 {
 		return edgeServiceState{}, fmt.Errorf("监听端口无效 %q", portStr)
 	}
-	st := edgeServiceState{Port: port, AdminKey: kv["ADMIN_KEY"], MeteringKey: kv["METERING_KEY"]}
+	st := edgeServiceState{Port: port, AdminKey: kv["ADMIN_KEY"]}
 	if kv["FW_UFW"] == "yes" {
 		st.Firewalls = append(st.Firewalls, "UFW")
 	}

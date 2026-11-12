@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -173,5 +174,58 @@ func TestDiagnoseProbeAndPurityViaC13(t *testing.T) {
 	}
 	if _, err := svc.Probe(ctx, h.ID); err == nil {
 		t.Fatal("probe without API must fail")
+	}
+}
+
+// 刷新节点：登记端口不可达时依次尝试候选端口；计量密钥经 C13 获取并登记（不经管理接口返回）。
+func TestRefreshEndpointAndUsageToggleViaC13(t *testing.T) {
+	usageOn := false
+	ep := fakeEdge(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /admin/v1/status":
+			_, _ = fmt.Fprintf(w, `{"version":"1.4.0","ready":true,"listen_ports":[2087],"usage_api":%v}`, usageOn)
+		case "PUT /admin/v1/usage-api":
+			usageOn = true
+			_, _ = w.Write([]byte(`{"enabled":true,"node_id":"node-1","metering_key":"mk-123"}`))
+		case "GET /admin/v1/usage-api":
+			_, _ = fmt.Fprintf(w, `{"enabled":%v,"node_id":"node-1","metering_key":"mk-123"}`, usageOn)
+		}
+	})
+	inner := edgeDial
+	edgeDial = func(ctx context.Context, network, addr string, timeout time.Duration) (net.Conn, error) {
+		if _, p, _ := net.SplitHostPort(addr); p == "9" { // 登记端口已失效
+			return nil, errors.New("connection refused")
+		}
+		return inner(ctx, network, addr, timeout)
+	}
+	ep.Port = 9
+	eps, _ := NewEndpointStore(filepath.Join(t.TempDir(), "eps.json"))
+	_ = eps.Upsert(ep)
+	svc := &VPSService{eps: eps}
+	ctx := context.Background()
+
+	got, err := svc.RefreshEndpoint(ctx, ep.VPSID)
+	if err != nil || got.Port != 2087 || got.Version != "1.4.0" || got.MeteringKey != "" {
+		t.Fatalf("refresh: %+v %v", got, err)
+	}
+	if on, err := svc.SetUsageAPI(ctx, ep.VPSID, true); err != nil || !on {
+		t.Fatalf("enable usage: %v %v", on, err)
+	}
+	if stored, _ := eps.Get(ep.VPSID); stored.MeteringKey != "mk-123" || stored.Port != 2087 {
+		t.Fatalf("metering key not stored: %+v", stored)
+	}
+	// 采集器：没有登记密钥时经 C13 取得
+	_ = eps.SetMeteringKey(ep.VPSID, "")
+	c := &UsageCollector{eps: eps}
+	stored, _ := eps.Get(ep.VPSID)
+	if key := c.fetchMeteringKey(ctx, stored); key != "mk-123" {
+		t.Fatalf("collector key fetch: %q", key)
+	}
+	if again, _ := eps.Get(ep.VPSID); again.MeteringKey != "mk-123" {
+		t.Fatal("collector did not store the fetched key")
+	}
+	if _, err := (&VPSService{eps: eps}).RefreshEndpoint(ctx, 12345); err == nil {
+		t.Fatal("unknown vps accepted")
 	}
 }

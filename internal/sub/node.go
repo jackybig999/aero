@@ -1359,6 +1359,19 @@ func (s *EndpointStore) Upsert(ep EndpointInfo) error {
 	return s.persistLocked()
 }
 
+// SetMeteringKey 只更新节点的计量只读密钥（不覆盖并发写入的其他字段）；节点未登记时忽略。
+func (s *EndpointStore) SetMeteringKey(vpsID uint64, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ep, ok := s.items[vpsID]
+	if !ok || ep.MeteringKey == key {
+		return nil
+	}
+	ep.MeteringKey = key
+	s.items[vpsID] = ep
+	return s.persistLocked()
+}
+
 func (s *EndpointStore) Delete(vpsID uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1818,7 +1831,7 @@ func (h *VPSHandler) InstallAero(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 422, errResp(1002, "invalid vps id"))
 		return
 	}
-	ep, err := h.svc.InstallAeroOnVPS(id)
+	ep, err := h.svc.RefreshEndpoint(r.Context(), id)
 	if err != nil {
 		writeJSON(w, 500, errResp(1003, err.Error()))
 		return

@@ -22,7 +22,7 @@ import (
 // C6 计量拉取（api/edge-public.yaml，ADR-0001：sub 只读 edge，edge 不推送）。
 // 每 60 秒按游标读取各节点 /v1/usage；记录是 (node_id, uid, period_start) 的累计值，按该三元组覆盖写入，
 // 重复读取幂等。游标早于保留期（410）或节点标识变化时从头重读。只保存 iss=sub 的记录。
-// 只轮询已登记计量只读密钥的节点（节点开启 usage_api 后经 SSH 只读回读）。
+// 计量只读密钥经 C13 GET /admin/v1/usage-api 取得（节点开启 usage_api 后才有）。
 //
 // 汇总（用户决定 2026-11-12）：按自然月（UTC，每月 1 日清零）把该用户在所有节点上的上下行之和写入
 // traffic.used_bytes。每轮只重算本轮有变化的用户；跨月时把上月写过的用户清零。
@@ -118,13 +118,33 @@ func (c *UsageCollector) Run(ctx context.Context) {
 // PollOnce 拉取所有已登记计量密钥的节点；单个节点失败只记录日志，不影响其他节点。
 func (c *UsageCollector) PollOnce(ctx context.Context) {
 	for _, ep := range c.eps.List() {
-		if !ep.Installed || ep.MeteringKey == "" || ep.Host == "" || ep.Port <= 0 {
+		if !ep.Installed || ep.Host == "" || ep.Port <= 0 {
 			continue
+		}
+		if ep.MeteringKey == "" { // 节点开启计量后经 C13 取得只读密钥
+			if ep.MeteringKey = c.fetchMeteringKey(ctx, ep); ep.MeteringKey == "" {
+				continue
+			}
 		}
 		if err := c.pollNode(ctx, ep); err != nil && ctx.Err() == nil {
 			log.Printf("[USAGE] poll vps %d (%s): %v", ep.VPSID, ep.Host, err)
 		}
 	}
+}
+
+// fetchMeteringKey 经 C13 读取节点的计量只读密钥并登记；节点未开启计量或接口不可用时返回空。
+func (c *UsageCollector) fetchMeteringKey(ctx context.Context, ep EndpointInfo) string {
+	if ep.AdminKey == "" {
+		return ""
+	}
+	var us edgeUsageState
+	if err := edgeAPI(ctx, ep, http.MethodGet, "/admin/v1/usage-api", nil, &us); err != nil || !us.Enabled || us.MeteringKey == "" {
+		return ""
+	}
+	if err := c.eps.SetMeteringKey(ep.VPSID, us.MeteringKey); err != nil {
+		log.Printf("[USAGE] store metering key for vps %d: %v", ep.VPSID, err)
+	}
+	return us.MeteringKey
 }
 
 type usagePageResp struct {

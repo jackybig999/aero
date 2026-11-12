@@ -473,7 +473,30 @@ func (h *AeroHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/warp/install/", h.InstallWARP)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/purity/check/", h.CheckPurity)
 	mux.HandleFunc("GET /api/v1/aero/vps/{id}/purity/", h.GetPurity)
+	mux.HandleFunc("PUT /api/v1/aero/vps/{id}/usage-api/", h.SetUsageAPI)
 
+}
+
+// SetUsageAPI 开关节点计量（经 C13；密钥由中台登记，不返回给管理端）。
+func (h *AeroHandler) SetUsageAPI(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Enabled == nil {
+		writeJSON(w, 422, errResp(1002, "enabled is required"))
+		return
+	}
+	enabled, err := h.svc.SetUsageAPI(r.Context(), id, *req.Enabled)
+	if err != nil {
+		writeJSON(w, 502, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": 0, "data": map[string]bool{"enabled": enabled}})
 }
 
 func (h *AeroHandler) VPSOptions(w http.ResponseWriter, r *http.Request) {
@@ -644,7 +667,7 @@ func (h *AeroHandler) RefreshEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 422, errResp(1002, "invalid vps id"))
 		return
 	}
-	ep, err := h.svc.InstallAeroOnVPS(id)
+	ep, err := h.svc.RefreshEndpoint(r.Context(), id)
 	if err != nil {
 		writeJSON(w, 500, errResp(1003, err.Error()))
 		return

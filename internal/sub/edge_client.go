@@ -178,3 +178,74 @@ func (s *VPSService) endpointFor(vpsID uint64) (EndpointInfo, error) {
 	}
 	return ep, nil
 }
+
+// edgeCandidatePorts 与 edge 的 StandardCandidatePorts 顺序一致（C12，ADR-0005 端口轮试）。
+var edgeCandidatePorts = []int{443, 2083, 2087, 8443, 2053, 2096, 10443, 24443, 34443, 44443}
+
+// portsFrom 返回以 first 开头、其后为其余候选端口的列表。
+func portsFrom(first int) []int {
+	out := make([]int, 0, len(edgeCandidatePorts)+1)
+	if first > 0 {
+		out = append(out, first)
+	}
+	for _, p := range edgeCandidatePorts {
+		if p != first {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// RefreshEndpoint 经 C13 刷新节点登记（端口、版本、计量密钥）：依次尝试登记端口与候选端口
+// （edge 遇端口被占用时会改用候选端口）。不登录节点、不读取节点文件；需要中台安装时登记的管理密钥。
+func (s *VPSService) RefreshEndpoint(ctx context.Context, vpsID uint64) (*EndpointInfo, error) {
+	if s.eps == nil {
+		return nil, errors.New("no endpoint store")
+	}
+	ep, ok := s.eps.Get(vpsID)
+	if !ok || ep.AdminKey == "" {
+		return nil, fmt.Errorf("vps %d 没有中台登记的管理密钥：请经中台安装 edge", vpsID)
+	}
+	var lastErr error
+	for _, p := range portsFrom(ep.Port) {
+		try := ep
+		try.Port = p
+		var st edgeRemoteStatus
+		attempt, cancel := context.WithTimeout(ctx, 3*time.Second)
+		err := edgeAPI(attempt, try, http.MethodGet, "/admin/v1/status", nil, &st)
+		cancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		ep.Port, ep.Version, ep.Installed = p, st.Version, true
+		if len(st.ListenPorts) > 0 {
+			ep.Port = st.ListenPorts[0]
+		}
+		ep.MeteringKey = ""
+		if st.UsageAPI {
+			var us edgeUsageState
+			if err := edgeAPI(ctx, ep, http.MethodGet, "/admin/v1/usage-api", nil, &us); err == nil && us.Enabled {
+				ep.MeteringKey = us.MeteringKey
+			}
+		}
+		if err := s.eps.Upsert(ep); err != nil {
+			return nil, err
+		}
+		return &ep, nil
+	}
+	return nil, fmt.Errorf("vps %d 管理接口不可达: %w", vpsID, lastErr)
+}
+
+// SetUsageAPI 开关节点 C6 计量（C13 PUT /admin/v1/usage-api），并登记返回的计量只读密钥。
+func (s *VPSService) SetUsageAPI(ctx context.Context, vpsID uint64, enabled bool) (bool, error) {
+	ep, err := s.endpointFor(vpsID)
+	if err != nil {
+		return false, err
+	}
+	var us edgeUsageState
+	if err := edgeAPI(ctx, ep, http.MethodPut, "/admin/v1/usage-api", map[string]bool{"enabled": enabled}, &us); err != nil {
+		return false, err
+	}
+	return us.Enabled, s.eps.SetMeteringKey(vpsID, us.MeteringKey)
+}
