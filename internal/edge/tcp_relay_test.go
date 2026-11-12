@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -19,6 +20,12 @@ import (
 
 // startRelayTestEdge 启动本机 edge，并为 target 打开一条已建立的标准 CONNECT 流。
 func startRelayTestEdge(t *testing.T, target string, tune func(*QUICServer)) *http3.RequestStream {
+	t.Helper()
+	return startRelayTestEdgeAs(t, target, "relay_token", tune)
+}
+
+// startRelayTestEdgeAs 同上，以给定 token 鉴权。
+func startRelayTestEdgeAs(t *testing.T, target, token string, tune func(*QUICServer)) *http3.RequestStream {
 	t.Helper()
 	listenAddr, host := findTestAddr()
 	srv, err := NewServer(ServerConfig{Listen: listenAddr, Domain: host, DataDir: t.TempDir(), Token: "relay_token", AllowSelfSignedCertForTest: true})
@@ -45,7 +52,7 @@ func startRelayTestEdge(t *testing.T, target string, tune func(*QUICServer)) *ht
 		t.Fatal(err)
 	}
 	req.Proto = "HTTP/1.1"
-	req.Header.Set("Authorization", "Bearer relay_token")
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Aero-Timestamp", strconv.FormatInt(time.Now().UnixMilli(), 10))
 	req.Header.Set("Aero-Nonce", hex.EncodeToString(bytes.Repeat([]byte{0x4d}, 32)))
 	str, err := h3.OpenRequestStream(ctx)
@@ -133,5 +140,37 @@ func TestTCPRelayTrulyIdleConnectionIsClosed(t *testing.T) {
 	_, err := io.ReadAll(str)
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("idle relay was not closed by the server within 3s")
+	}
+}
+
+// C6：签名 token 的 TCP relay 按 payload 字节计入该 uid 的计量（上行 5000、下行为回复长度）。
+func TestTCPRelayMetersSignedTokenUsage(t *testing.T) {
+	f := newSignedAuthFixture(t) // 只借用签发密钥与校验器
+	meter, err := OpenUsageMeter(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer meter.Close()
+	tok := f.token(t, "user_relay01", 3, time.Hour)
+	str := startRelayTestEdgeAs(t, readAllThenReply(t), tok, func(s *QUICServer) {
+		s.SetTokenVerifier(f.qs.tokenVerifier)
+		s.SetUsageMeter(meter)
+	})
+	if _, err := str.Write(bytes.Repeat([]byte("x"), 5000)); err != nil {
+		t.Fatal(err)
+	}
+	_ = str.Close()
+	str.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(str)
+	if err != nil || string(got) != "received:5000" {
+		t.Fatalf("relay: %q %v", got, err)
+	}
+	cell := meter.Cell(tok)
+	deadline := time.Now().Add(time.Second)
+	for cell.up.Load() != 5000 || cell.down.Load() != int64(len(got)) {
+		if time.Now().After(deadline) {
+			t.Fatalf("metered up=%d down=%d, want 5000/%d", cell.up.Load(), cell.down.Load(), len(got))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

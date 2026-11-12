@@ -452,3 +452,52 @@ func TestGlobalTunnelReaderDownlinkExitsAfterUnregister(t *testing.T) {
 		}
 	})
 }
+
+// C6：CONNECT-IP 会话的上下行按 IP 报文长度计入 binding 的计量单元。
+func TestGlobalTunnelReaderMetersUsage(t *testing.T) {
+	cell := &usageCell{uid: "user_meter01", iss: "sub"}
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: up=%d down=%d", what, cell.up.Load(), cell.down.Load())
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	router := NewGlobalTunnelRouter()
+	device := &readerTestDevice{packets: make(chan []byte, 1), closed: make(chan struct{}), writes: make(chan []byte, 1)}
+	reader, err := NewGlobalTunnelReader(nil, device, router)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	reader.Start()
+
+	// 下行：TUN → 会话
+	downIP := netip.MustParseAddr("10.88.0.5")
+	downConn := &readerTestConn{writes: make(chan []byte, 1)}
+	if _, err := router.Register(GlobalTunnelBinding{IPv4: downIP, Conn: downConn, usage: cell}); err != nil {
+		t.Fatal(err)
+	}
+	down := buildRouterTestIPv4(netip.MustParseAddr("192.0.2.10"), downIP)
+	device.packets <- down
+	<-downConn.writes
+	waitFor("downlink", func() bool { return cell.down.Load() == int64(len(down)) })
+
+	// 上行：会话 → TUN
+	upIP := netip.MustParseAddr("10.88.0.6")
+	upConn := &reverseReaderConn{packets: make(chan []byte, 1), closed: make(chan struct{})}
+	b := GlobalTunnelBinding{IPv4: upIP, Conn: upConn, usage: cell}
+	if b.Generation, err = router.Register(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.StartBinding(nil, b); err != nil {
+		t.Fatal(err)
+	}
+	up := buildRouterTestIPv4(upIP, netip.MustParseAddr("8.8.8.8"))
+	upConn.packets <- up
+	<-device.writes
+	waitFor("uplink", func() bool { return cell.up.Load() == int64(len(up)) })
+}

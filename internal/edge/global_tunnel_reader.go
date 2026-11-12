@@ -196,6 +196,7 @@ func (r *GlobalTunnelReader) StartBinding(parent context.Context, binding Global
 					if _, writeErr := writer.Write(packet); writeErr != nil {
 						return
 					}
+					binding.usage.Add(int64(n), 0)
 				}
 			}
 			if err != nil || ctx.Err() != nil {
@@ -424,6 +425,9 @@ func (r *GlobalTunnelReader) runDownlink(d *tunnelDownlink) {
 			}
 		case p := <-d.ch:
 			icmpPkt, err := d.conn.WritePacket((*p.buf)[:p.n])
+			if err == nil {
+				d.binding.usage.Add(0, int64(p.n))
+			}
 			putDownlinkBuf(p.buf)
 			if len(icmpPkt) > 0 && canWrite {
 				_, _ = writer.Write(icmpPkt)

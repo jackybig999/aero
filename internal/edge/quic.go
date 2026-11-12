@@ -675,7 +675,8 @@ type udpSessionTracker struct {
 type QUICServer struct {
 	cfg              *ServerConfig
 	validator        *Validator
-	tokenVerifier    *TokenVerifier // 非 nil 即启用 C3 签名 token（auth_signed_token）
+	tokenVerifier    *TokenVerifier             // 非 nil 即启用 C3 签名 token（auth_signed_token）
+	usageMeter       atomic.Pointer[UsageMeter] // C6 计量；nil 表示不计量
 	connLimiter      *ConnLimiter
 	bandwidthLimiter *BandwidthLimiter
 	dialGuard        *DialGuard
@@ -1834,6 +1835,12 @@ func (s *QUICServer) tokenStillValid(token string) bool {
 	return err == nil
 }
 
+// SetUsageMeter 启用 C6 计量（nil 关闭）；只影响之后建立的会话。
+func (s *QUICServer) SetUsageMeter(m *UsageMeter) { s.usageMeter.Store(m) }
+
+// usageCell 返回 token 的计量单元；未启用计量或不透明 token 返回 nil（Add 为无操作）。
+func (s *QUICServer) usageCell(token string) *usageCell { return s.usageMeter.Load().Cell(token) }
+
 // SetTokenVerifier 启用 C3 签名 token 校验（nil 关闭）。
 func (s *QUICServer) SetTokenVerifier(v *TokenVerifier) {
 	s.tokenVerifier = v
@@ -1874,6 +1881,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	usage := s.usageCell(token) // relay 计 payload 字节（不含 IP/传输层头）
 
 	target := strings.TrimPrefix(r.RequestURI, "//")
 	if target == "" || !strings.Contains(target, ":") {
@@ -1971,6 +1979,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 				if s.bandwidthLimiter != nil {
 					s.bandwidthLimiter.Take(token, n)
 				}
+				usage.Add(int64(n), 0)
 				_ = targetConn.SetWriteDeadline(time.Now().Add(idle))
 				if _, werr := targetConn.Write(buf[:n]); werr != nil {
 					cancel()
@@ -2005,6 +2014,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 				if s.bandwidthLimiter != nil {
 					s.bandwidthLimiter.Take(token, n)
 				}
+				usage.Add(0, int64(n))
 				if _, werr := str.Write(buf[:n]); werr != nil {
 					cancel()
 					return
@@ -2047,6 +2057,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	usage := s.usageCell(token) // relay 计 payload 字节（不含 IP/传输层头）
 
 	origHost := r.Host
 	r.Host = "placeholder"
@@ -2238,6 +2249,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 				if s.bandwidthLimiter != nil {
 					s.bandwidthLimiter.Take(token, len(payload))
 				}
+				usage.Add(int64(len(payload)), 0)
 				if _, err := targetUDP.Write(payload); err != nil {
 					if isTransientUDPErr(err) {
 						continue // 目标端口暂不可达（ICMP），不终止会话
@@ -2265,6 +2277,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 				if s.bandwidthLimiter != nil {
 					s.bandwidthLimiter.Take(token, n)
 				}
+				usage.Add(0, int64(n))
 				if serr := str.SendDatagram(buf[:1+n]); serr != nil {
 					if isDroppableDatagramErr(serr) {
 						continue // 单个报文超过 QUIC 数据报上限：丢弃该报文，会话继续
@@ -2369,22 +2382,18 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var generation uint64
+	// 同一份 binding 先登记到路由表（下行按目的地址查到它），再交给 reader（上行）。
+	binding := GlobalTunnelBinding{Token: token, IPv4: assignedPrefix.Addr(), Conn: conn, usage: s.usageCell(token)}
+	if assignedIPv6.IsValid() {
+		binding.IPv6 = assignedIPv6.Addr()
+	}
 	if s.globalRouter != nil {
-		binding := GlobalTunnelBinding{
-			Token: token,
-			IPv4:  assignedPrefix.Addr(),
-			Conn:  conn,
-		}
-		if assignedIPv6.IsValid() {
-			binding.IPv6 = assignedIPv6.Addr()
-		}
-		generation, err = s.globalRouter.Register(binding)
+		binding.Generation, err = s.globalRouter.Register(binding)
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		defer s.globalRouter.Unregister(assignedPrefix.Addr(), generation)
+		defer s.globalRouter.Unregister(assignedPrefix.Addr(), binding.Generation)
 	}
 
 	reader := s.globalTunnelReader()
@@ -2395,16 +2404,6 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if reader != nil {
-		binding := GlobalTunnelBinding{
-			Token:      token,
-			IPv4:       assignedPrefix.Addr(),
-			IPv6:       assignedIPv6.Addr(),
-			Generation: generation,
-			Conn:       conn,
-		}
-		if !assignedIPv6.IsValid() {
-			binding.IPv6 = netip.Addr{}
-		}
 		if err := reader.StartBinding(r.Context(), binding); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return

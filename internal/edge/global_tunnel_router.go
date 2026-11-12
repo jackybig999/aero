@@ -23,6 +23,7 @@ type GlobalTunnelBinding struct {
 	IPv6       netip.Addr
 	Generation uint64
 	Conn       IPPacketConn
+	usage      *usageCell // C6 计量（nil 表示不计量）
 }
 
 // GlobalTunnelRouter is the shared address-to-CONNECT-IP binding table.
