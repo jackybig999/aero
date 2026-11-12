@@ -27,6 +27,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,6 +82,11 @@ type ServerConfig struct {
 	// C3 签名 token（api/token.md）：开关与 sub 的签发公钥（kid → 32 字节 Ed25519 公钥 base64）。
 	AuthSignedToken bool              `json:"auth_signed_token,omitempty" yaml:"auth_signed_token"`
 	TokenIssuers    map[string]string `json:"token_issuers,omitempty" yaml:"token_issuers"`
+	// C6 只读接口（api/edge-public.yaml）：开关、计量只读密钥（32 字节随机 hex，开启时自动生成并持久化）、
+	// 节点稳定标识（不是域名）。关闭时不计量、不生成。
+	UsageAPI    bool   `json:"usage_api,omitempty" yaml:"usage_api"`
+	MeteringKey string `json:"metering_key,omitempty" yaml:"metering_key"`
+	NodeID      string `json:"node_id,omitempty" yaml:"node_id"`
 	// DrainTimeoutSec 是收到停止信号后的排空上限（秒，L0 §8.6）；0 表示默认 15 秒。
 	DrainTimeoutSec int `json:"drain_timeout,omitempty"`
 	// ConfigPath 是 edge 持久化自身配置的文件路径，仅由 cmd/edge 显式设置。
@@ -119,8 +125,11 @@ type Server struct {
 	startedAt time.Time
 
 	instanceLock *instanceLock
-	hostStateDir string     // 非空：已修改宿主（规则、ip_forward），Close 时按该目录的状态日志还原
-	warpMu       sync.Mutex // 串行化 WARP 开关的修改与持久化
+	hostStateDir string      // 非空：已修改宿主（规则、ip_forward），Close 时按该目录的状态日志还原
+	usageMeter   *UsageMeter // C6 计量；nil 表示 usage_api 关闭
+	usageAPI     *usageAPI
+	usageDone    chan struct{} // 计量落盘协程退出
+	warpMu       sync.Mutex    // 串行化 WARP 开关的修改与持久化
 
 	// ready 为真表示可以接流量：Start 完成后置位，排空开始时清除（/readyz）。
 	ready atomic.Bool
@@ -316,6 +325,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		sni = "localhost"
 	}
 
+	if cfg.UsageAPI {
+		if err := ensureUsageIdentity(&cfg); err != nil {
+			return nil, err
+		}
+	}
+
 	cfg.Token = tok
 	cfg.AdvertiseHost = adv
 	cfg.Domain = sni
@@ -356,6 +371,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	rateLimit := NewRateLimiter(cfg.RateIP)
 
+	// 4c. C6 计量（usage_api）
+	var usageMeter *UsageMeter
+	if cfg.UsageAPI {
+		if usageMeter, err = OpenUsageMeter(filepath.Join(absDataDir, "usage.db")); err != nil {
+			return nil, fmt.Errorf("usage_api: %w", err)
+		}
+		defer func() {
+			if !constructed {
+				_ = usageMeter.Close()
+			}
+		}()
+	}
+
 	// 5. QUIC Server
 	ipv6Prefix := strings.TrimSpace(cfg.IPv6Prefix)
 	if ipv6Prefix == "" && !cfg.AllowSelfSignedCertForTest {
@@ -368,6 +396,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	quicServer := NewQUICServerWithIPv6Prefix(validator, connLimit, bwLimit, dialGuard, rateLimit, ipv6Prefix)
 	quicServer.SetServerConfig(&cfg)
+	if usageMeter != nil {
+		quicServer.SetUsageMeter(usageMeter)
+	}
 	if cfg.AuthSignedToken {
 		keys, err := parseTokenIssuers(cfg.TokenIssuers)
 		if err != nil {
@@ -469,6 +500,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	srv.instanceLock = lock
 	srv.hostStateDir = hostStateDir
+	if usageMeter != nil {
+		srv.usageMeter = usageMeter
+		srv.usageAPI = newUsageAPI(usageMeter, cfg.MeteringKey, cfg.NodeID, srv.nodeStatus)
+		log.Printf("[USAGE] C6 metering enabled (node %s, key %s)", cfg.NodeID, MaskToken(cfg.MeteringKey))
+	}
 	constructed = true
 	return srv, nil
 }
@@ -625,6 +661,14 @@ func (s *Server) Start() error {
 		s.metricsCollector.Start(s.ctx)
 	}
 
+	if s.usageMeter != nil {
+		s.usageDone = make(chan struct{})
+		go func() {
+			defer close(s.usageDone)
+			s.usageMeter.Run(s.ctx.Done())
+		}()
+	}
+
 	s.ready.Store(true)
 	log.Printf("[EDGE] Server started on %s (TLS + QUIC)", s.cfg.Listen)
 	log.Printf("[EDGE] Subscriptions ready: Admin(/sub/<secret>, see console), User(/sub/{username}{6random}) (client-sub: %s/client-sub.json)", s.subStore.Dir())
@@ -659,6 +703,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.usageAPI.TryServe(w, r) { // 未鉴权时返回 false，最终落到伪装站
+		return
+	}
 	if s.geoHandler != nil && s.geoHandler.TryServe(w, r) {
 		return
 	}
@@ -734,6 +781,15 @@ func (s *Server) Close() {
 	}
 	if s.quicServer != nil {
 		s.quicServer.Close()
+	}
+	if s.usageMeter != nil { // 会话已全部关闭：等落盘协程退出后做最后一次落盘
+		if s.usageDone != nil {
+			<-s.usageDone
+		}
+		if err := s.usageMeter.Close(); err != nil {
+			log.Printf("[USAGE] [ERROR] final flush: %v", err)
+		}
+		s.usageMeter = nil
 	}
 	if s.hostStateDir != "" {
 		if err := RestoreHost(s.hostStateDir); err != nil {
@@ -1280,6 +1336,8 @@ func persistServerConfig(cfg ServerConfig) error {
 	set("data_dir", cfg.DataDir)
 	set("admin_key", cfg.AdminKey)
 	set("token", cfg.Token)
+	set("metering_key", cfg.MeteringKey)
+	set("node_id", cfg.NodeID)
 	// WARP 开关显式写入（关闭时为空串），否则“关闭”无法持久化
 	existing["warp_proxy"] = cfg.WarpProxy
 	existing["warp_all"] = cfg.WarpAll
@@ -1379,9 +1437,51 @@ func checkPortAvailable(addr string) bool {
 // generateSecureAdminKey 生成 128 位随机管理密钥（32 个十六进制字符）。随机源失败时
 // 返回错误，不退化为可预测的值（L0 §7.4）。
 func generateSecureAdminKey() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	k, err := randomHexBytes(16)
+	if err != nil {
 		return "", fmt.Errorf("read crypto random: %w", err)
+	}
+	return k, nil
+}
+
+// ensureUsageIdentity 为 usage_api 生成缺失的计量只读密钥（32 字节随机，hex）与节点标识；
+// 随后由 persistServerConfig 持久化，重启后保持不变（否则 sub 的拉取会失效）。
+func ensureUsageIdentity(cfg *ServerConfig) error {
+	if cfg.MeteringKey == "" {
+		k, err := randomHexBytes(32)
+		if err != nil {
+			return fmt.Errorf("generate metering key: %w", err)
+		}
+		cfg.MeteringKey = k
+	} else if len(cfg.MeteringKey) < 64 {
+		return fmt.Errorf("metering_key must be at least 64 hex characters (32 bytes)")
+	}
+	if cfg.NodeID == "" {
+		id, err := randomHexBytes(8)
+		if err != nil {
+			return fmt.Errorf("generate node id: %w", err)
+		}
+		cfg.NodeID = "node-" + id
+	}
+	return nil
+}
+
+// nodeStatus 供 C6 /v1/status：就绪状态与在线会话；每用户只给出 uid 与连接数（无地址、无目的地）。
+func (s *Server) nodeStatus() nodeStatus {
+	total, byUID := s.quicServer.connTracker.Sessions()
+	st := nodeStatus{Version: Version, Ready: s.ready.Load(), ActiveSessions: total}
+	for uid, n := range byUID {
+		st.SessionsByUID = append(st.SessionsByUID, uidSession{UID: uid, Sessions: n})
+	}
+	sort.Slice(st.SessionsByUID, func(i, j int) bool { return st.SessionsByUID[i].UID < st.SessionsByUID[j].UID })
+	return st
+}
+
+// randomHexBytes 返回 n 字节密码学随机数的十六进制编码。
+func randomHexBytes(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
 	}
 	return hex.EncodeToString(b), nil
 }

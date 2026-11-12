@@ -33,6 +33,9 @@ const (
 // ErrUsageCursorExpired 表示游标早于保留期，消费方需从头读取（HTTP 410）。
 var ErrUsageCursorExpired = errors.New("usage cursor older than retention")
 
+// errUsageCursorInvalid 表示游标无法识别；接口同样以 410 让消费方从头读取。
+var errUsageCursorInvalid = errors.New("invalid usage cursor")
+
 // usageCell 是某 uid 的未落盘计数。
 type usageCell struct {
 	uid, iss string
@@ -151,8 +154,8 @@ func (m *UsageMeter) Page(cursor string, limit int) ([]UsageRecord, string, erro
 	var after int64
 	if cursor != "" {
 		v, err := strconv.ParseInt(cursor, 10, 64)
-		if err != nil || v < 0 {
-			return nil, "", fmt.Errorf("invalid cursor")
+		if err != nil || v < 0 || len(cursor) > 64 {
+			return nil, "", errUsageCursorInvalid
 		}
 		after = v
 	}

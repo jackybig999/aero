@@ -598,6 +598,26 @@ func (ct *ConnTracker) CloseUnauthorized(valid func(token string) bool) int {
 	return len(toClose)
 }
 
+// Sessions 返回在线（未关闭）连接总数与签名 token 用户的每 uid 连接数（C6 /v1/status，C3 §7 跨节点汇总）。
+func (ct *ConnTracker) Sessions() (total int, byUID map[string]int) {
+	byUID = make(map[string]int)
+	if ct == nil {
+		return 0, byUID
+	}
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+	for c, b := range ct.conns {
+		if !connAlive(c) {
+			continue
+		}
+		total++
+		if b.uid != "" {
+			byUID[b.uid]++
+		}
+	}
+	return total, byUID
+}
+
 // CloseAllForShutdown 以 H3_NO_ERROR 关闭全部已跟踪连接并说明原因“server shutting down”，
 // 客户端据此立即重连。返回关闭的连接数。
 func (ct *ConnTracker) CloseAllForShutdown() int {
