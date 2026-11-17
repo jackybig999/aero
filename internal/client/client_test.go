@@ -515,6 +515,9 @@ func TestSubPhysicalDial(t *testing.T) {
 
 // 验收项：Netmon 防抖与指纹去重
 func TestNetmonDebounceAndFingerprint(t *testing.T) {
+	if gw, _, err := PhysicalDefaultGateway(); err != nil || gw == "" {
+		t.Skip("no physical default gateway in this environment (the watcher never fires without one)")
+	}
 	w := newDebounceWatcher()
 	w.debounce = 40 * time.Millisecond
 

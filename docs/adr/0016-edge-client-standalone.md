@@ -24,3 +24,11 @@
 - 中台中经 SSH 实现的状态、诊断、纯净度、证书、重启、密钥回读，在 C13 实现后改为接口调用，SSH 版本删除。
 - edge 需实现 C13；未鉴权时返回伪装站（现有 /admin/* 对错误密钥返回 403，暴露接口存在，一并修正）。
 - 没有域名的节点无法被中台安全管理（不会向无法校验身份的对端发送密钥）。
+
+## 修订（2026-11-17，用户决定）
+1. 安装只安装服务端：中台与手工安装都只运行 Release 中的 `edge-install.sh`（按 SHA256SUMS 校验程序、运维命令 `aero`、卸载脚本；写服务单元）。安装不写证书、不装 WARP、不做证书前置检查。
+2. 其余在节点上用 `aero` 完成：域名、证书、可选 WARP、端口、管理密钥。修改经 `aero-edge config` 由 edge 校验并原子写入自己的配置（`aero` 不再用 sed/python 改 edge 文件）；`aero-edge check` 全部通过才（重新）启动服务。没有证书时 edge 不对外监听、不修改宿主，等待 `aero setup`。
+3. 可选软件只在用户确认后安装，只用官方来源：acme.sh（get.acme.sh，证书在默认目录 /root/.acme.sh/<域名>_ecc/，edge 只读发现）；Cloudflare WARP（pkg.cloudflareclient.com，proxy 模式 127.0.0.1:40000，不改系统路由）。卸载 WARP 只移除安装时新增的软件包与官方源。edge 本身不安装任何软件。
+4. Web UI（edge 控制台、中台）只提供 WARP 规则流量接管开关（关闭 / 仅 AI 场景 / 全部流量），不提供安装。
+5. 管理密钥至少 32 位；更短时 C13 不启用。
+6. 宿主没有 iptables（如 Debian 13 默认只有 nft）时，edge 使用自有 nft 表 `inet aero_edge`，还原时整表删除。

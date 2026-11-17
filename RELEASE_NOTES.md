@@ -1,4 +1,26 @@
-## AERO 1.4.0
+## AERO 1.4.1
+
+### 安装只安装服务端，其余在服务器上用 aero 完成（ADR-0016 修订）
+- `edge-install.sh` 重写：按版本下载并对照 `SHA256SUMS` 校验 aero-edge、运维命令 `aero` 与卸载脚本，写入服务单元；不写配置、不生成或打印密钥、不安装其他软件、不改系统。此前的脚本下载 `latest` 不校验、用 sed 改配置、允许并打印弱密钥。
+- 新的 `aero` 命令：`aero setup` 依次完成域名、证书、可选 WARP、端口（默认 443，被占用自动轮试）、管理密钥，`aero-edge check` 全部通过后才启动服务；另有 `aero cert|warp|port|key|check|status|update|uninstall`。
+- 可选安装项需要用户确认，只用官方来源：acme.sh（证书在默认目录）、Cloudflare WARP（proxy 模式，不改系统路由）。卸载时逐项询问，只移除 aero 安装的内容。
+- edge 新增 `aero-edge config get|set` 与 `aero-edge check`；edge 的配置只由 edge 写入。
+- 没有证书时 edge 不再崩溃重启，也不对外监听，等待 `aero setup`。
+- 中台安装任务改为运行同一个 `edge-install.sh`，经 `aero-edge config` 写入域名与管理密钥（经标准输入，不出现在命令行），检查通过才启动；证书未就绪时提示在节点上执行 `aero setup`。卸载调用节点自带的卸载脚本。
+
+### WARP 规则流量接管开关
+- edge 控制台与中台只提供开关：关闭 / 仅 AI 场景 / 全部流量（中台经 C13）。删除中台“一键安装 WARP”。
+
+### 其他
+- 宿主没有 iptables（Debian 13 默认）时使用 edge 自有的 nft 表 `inet aero_edge`，停止时整表删除；此前这类宿主隧道出口不通，且还原会报错。
+- 管理密钥短于 32 位时不启用远程管理接口（`aero key` 生成新密钥）。
+- Release 附带 `aero`、`edge-install.sh`、`edge-uninstall.sh`，均列入 `SHA256SUMS`。
+- 新增版本统一门禁：所有组件与界面版本必须等于 `VERSION`。
+
+### 升级提示
+- 1.4.0 节点升级：`curl -fsSLO https://github.com/jackybig999/aero/releases/download/v1.4.1/edge-install.sh` 并核对 `SHA256SUMS` 后执行；检查通过会自动重启。
+
+## AERO 1.4.0（上一版本）
 
 ### 服务端与中台彻底解耦（ADR-0016）
 - edge 与客户端独立部署、独立运行；没有中台也能完整工作。中台只经 GitHub Release 与 edge 接口管理节点，SSH 只用于安装、升级、卸载 edge 程序本身。

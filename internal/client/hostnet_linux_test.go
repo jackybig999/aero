@@ -27,10 +27,13 @@ func inNetns(t *testing.T) bool {
 	if _, err := exec.LookPath("unshare"); err != nil {
 		t.Skip("unshare not available")
 	}
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		t.Skip("/dev/net/tun not present in this environment")
+	}
 	if _, err := exec.LookPath("ip"); err != nil {
 		t.Skip("iproute2 not available")
 	}
-	cmd := exec.Command("unshare", "-rn", os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v")
+	cmd := exec.Command("unshare", "-rnmpf", "--mount-proc", os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v")
 	cmd.Env = append(os.Environ(), "AERO_NETNS=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
