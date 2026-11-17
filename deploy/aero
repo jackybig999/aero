@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AERO Edge 节点运维命令 v1.4.3
+# AERO Edge 节点运维命令 v1.4.4
 #
 # 安装只安装服务端（edge-install.sh）；域名、证书、WARP、端口、管理密钥都在本机用本命令完成：
 # 修改经 `aero-edge config` 校验后由 edge 写入自己的配置，`aero-edge check` 全部通过后才（重新）启动服务。
@@ -227,9 +227,14 @@ cmd_update() {
   local v="${1:-}"
   [[ -n "$v" ]] || v=$(curl -fsSL https://api.github.com/repos/jackybig999/aero/releases/latest | grep -o '"tag_name": *"v[^"]*"' | grep -o '[0-9][0-9.]*')
   [[ -n "$v" ]] || { err "无法获取最新版本"; return 1; }
-  local tmp; tmp=$(mktemp)
-  curl -fsSL -o "$tmp" "https://github.com/jackybig999/aero/releases/download/v$v/edge-install.sh"
-  AERO_VERSION="$v" bash "$tmp"; rm -f "$tmp"
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "版本号无效: $v"; return 1; }
+  local tmp; tmp=$(mktemp -d)
+  local base="https://github.com/jackybig999/aero/releases/download/v$v"
+  if ! curl -fsSL -o "$tmp/edge-install.sh" "$base/edge-install.sh" || ! curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" \
+     || ! (cd "$tmp" && awk '$2=="edge-install.sh"' SHA256SUMS | grep -q . && awk '$2=="edge-install.sh"' SHA256SUMS | sha256sum -c --quiet -); then
+    err "下载或校验 v$v 安装脚本失败"; rm -rf "$tmp"; return 1
+  fi
+  AERO_VERSION="$v" bash "$tmp/edge-install.sh"; local rc=$?; rm -rf "$tmp"; return $rc
 }
 
 cmd_uninstall() {

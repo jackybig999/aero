@@ -123,3 +123,39 @@ func TestDiscoveredCertPathIsNotPersisted(t *testing.T) {
 		t.Fatal("explicitly configured cert path removed")
 	}
 }
+
+// 线上实测：1.4.2 写入的证书路径在升级后应被清除（启动时按自动发现处理）；默认目录里按域名找不到时沿用配置的路径。
+func TestLegacyPersistedCertPathMigrates(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LE_WORKING_DIR", "")
+	t.Setenv("ACME_HOME", "")
+	dir := filepath.Join(home, ".acme.sh", "n.example.com_ecc")
+	cf, kf := writeTestCert(t, dir, "fullchain.cer", "n.example.com.key", time.Now().Add(48*time.Hour), "n.example.com")
+	cfgPath := filepath.Join(t.TempDir(), "edge.json")
+	_ = os.WriteFile(cfgPath, []byte(`{"cert_file":"`+cf+`","key_file":"`+kf+`"}`), 0o600)
+	listen, _ := findTestAddr()
+	srv, err := NewServer(ServerConfig{Listen: listen, Domain: "n.example.com", CertFile: cf, KeyFile: kf, DataDir: t.TempDir(), ConfigPath: cfgPath, AllowSelfSignedCertForTest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	discovered := srv.certDiscovered
+	srv.Close()
+	if m, _ := readConfigMap(cfgPath); !discovered || m["cert_file"] != nil {
+		t.Fatalf("legacy path not migrated: discovered=%v cert_file=%v", discovered, m["cert_file"])
+	}
+
+	// 配置的路径在默认目录里，但域名对不上：沿用配置的路径（不因迁移而无法启动）
+	listen, _ = findTestAddr()
+	srv, err = NewServer(ServerConfig{Listen: listen, Domain: "other.example.org", CertFile: cf, KeyFile: kf, DataDir: t.TempDir(), AllowSelfSignedCertForTest: true})
+	if err != nil {
+		t.Fatalf("fallback to configured path failed: %v", err)
+	}
+	if srv.certDiscovered || srv.certLoader == nil {
+		t.Fatal("fallback must load the configured file, not be treated as discovered")
+	}
+	if f, _ := srv.certLoader.Files(); f != cf {
+		t.Fatalf("fallback loaded %s, want %s", f, cf)
+	}
+	srv.Close()
+}

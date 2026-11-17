@@ -243,6 +243,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	// 2. TLS 证书：未显式配置时，从系统 acme.sh / certbot 的默认位置查找（只读）。
 	certDiscovered := false
+	// 旧版本把自动发现的路径（系统 ACME 默认目录）写进了配置：按自动发现处理，找不到时再退回配置的路径。
+	explicitCert, explicitKey := cfg.CertFile, cfg.KeyFile
+	if explicitCert != "" && underSystemCertDir(explicitCert) {
+		cfg.CertFile, cfg.KeyFile = "", ""
+	}
 	if cfg.CertFile == "" || cfg.KeyFile == "" {
 		dirs := systemCertDirs()
 		var found bool
@@ -264,6 +269,8 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			certDiscovered = true
 			cfg.certAutoDiscovered = true
 			log.Printf("[EDGE] using system certificate %s (domain %s)", cfg.CertFile, cfg.Domain)
+		} else if explicitCert != "" && cfg.CertFile == "" {
+			cfg.CertFile, cfg.KeyFile = explicitCert, explicitKey // 默认目录里按域名找不到：沿用配置的路径
 		} else if !cfg.AllowSelfSignedCertForTest {
 			return nil, errNoSystemCert(normalizeCertDomain(cfg.Domain), dirs)
 		}
