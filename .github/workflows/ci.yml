@@ -49,6 +49,10 @@ jobs:
           GOOS=linux GOARCH=arm64 go build -v \
             -ldflags="-s -w" \
             -o dist/server/edge_linux_arm64 ./cmd/edge
+          # 节点运维命令与安装/卸载脚本随 Release 发布并进入 SHA256SUMS（安装时按同一版本校验）
+          install -m 0755 deploy/aero dist/server/aero
+          install -m 0755 deploy/edge-install.sh dist/server/edge-install.sh
+          install -m 0755 deploy/edge-uninstall.sh dist/server/edge-uninstall.sh
 
       - name: Build Midplatform Control Plane (linux/amd64 & linux/arm64)
         run: |

@@ -1,132 +1,89 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# AERO Edge — 纯净系统安装引导器 (Pure Delivery Installer)
-# 职责边界：纯粹的二进制产物部署与最简 Linux 标准 systemd 托管
-# 严禁：任何用户交互询问、任何参数解析、任何配置文件生成
-# ==============================================================================
+# AERO Edge 安装/升级（只安装服务端本身，ADR-0016）
+#
+# 只做三件事：下载同一版本的发布物并按 SHA256SUMS 校验；安装 aero-edge、运维命令 aero 与卸载脚本；
+# 写入 systemd 服务单元。不写 edge 配置、不安装其他软件、不改防火墙与内核参数、不生成或打印密钥。
+# 证书、WARP、端口、管理密钥等在安装后由 `aero setup` 在本机完成，检查通过后再启动服务。
+#
+# 用法：bash edge-install.sh            # 安装本脚本对应版本
+#       AERO_VERSION=1.4.1 bash edge-install.sh
 set -euo pipefail
 
-if [[ $EUID -ne 0 ]]; then
-    echo "错误: 必须使用 root 用户执行安装程序！"
-    exit 1
-fi
-
-ARCH="amd64"
-[ "$(uname -m)" = "aarch64" ] && ARCH="arm64"
-
-mkdir -p /usr/local/bin /etc/aero /var/lib/aero
-
-# 0. 平滑暂停可能正在运行的旧服务，避免 Linux ETXTBSY 写保护
-if systemctl is-active --quiet aero-edge 2>/dev/null; then
-    systemctl stop aero-edge 2>/dev/null || true
-fi
-
-# 1. 部署二进制产物 (采用 POSIX 原子临时文件替换，杜绝任何进程占用导致 curl 23 错误)
 REPO="jackybig999/aero"
-VERSION="1.4.0"
+VERSION="1.4.1"
+VERSION="${AERO_VERSION:-$VERSION}"
+BIN=/usr/local/bin/aero-edge
+CLI=/usr/local/bin/aero
+LIBDIR=/usr/local/lib/aero
+UNIT=/etc/systemd/system/aero-edge.service
+CONFIG=/etc/aero/edge.json
 
-echo "[1/3] 下载并安装 AERO Edge 核心程序..."
-DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/edge_linux_${ARCH}"
-TMP_EDGE="/usr/local/bin/aero-edge.tmp.$$"
-curl -fsSL "$DOWNLOAD_URL" -o "$TMP_EDGE" 2>/dev/null || {
-    curl -fsSL "https://github.com/${REPO}/releases/download/v${VERSION}/edge_linux_${ARCH}" -o "$TMP_EDGE"
-}
-chmod +x "$TMP_EDGE"
-mv -f "$TMP_EDGE" /usr/local/bin/aero-edge
+die() { echo "错误: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "需要 root 权限"
+command -v systemctl >/dev/null || die "需要 systemd"
+command -v curl >/dev/null || die "需要 curl"
+command -v sha256sum >/dev/null || die "需要 sha256sum"
+case "$(uname -m)" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) die "不支持的架构 $(uname -m)" ;;
+esac
 
-# 部署命令行管理工具
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
-if [[ -f "${SCRIPT_DIR}/aero" ]]; then
-    cp -f "${SCRIPT_DIR}/aero" /usr/local/bin/aero
-    chmod +x /usr/local/bin/aero
-else
-    TMP_CLI="/usr/local/bin/aero.tmp.$$"
-    curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/deploy/aero" -o "$TMP_CLI" 2>/dev/null || true
-    chmod +x "$TMP_CLI" 2>/dev/null || true
-    mv -f "$TMP_CLI" /usr/local/bin/aero 2>/dev/null || true
-fi
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+BASE="https://github.com/${REPO}/releases/download/v${VERSION}"
+echo "[1/3] 下载 AERO Edge v${VERSION}（${ARCH}）并校验..."
+for f in "edge_linux_${ARCH}" aero edge-uninstall.sh SHA256SUMS; do
+  curl -fsSL --retry 3 -o "$TMP/$f" "$BASE/$f" || die "下载 $f 失败"
+done
+( cd "$TMP"
+  for f in "edge_linux_${ARCH}" aero edge-uninstall.sh; do
+    line=$(awk -v n="$f" '$2==n || $2=="*"n' SHA256SUMS)
+    [[ -n "$line" ]] || die "SHA256SUMS 中没有 $f"
+    echo "$line" | sha256sum -c --quiet - || die "$f 校验失败"
+  done )
+chmod 0755 "$TMP/edge_linux_${ARCH}"
+GOT=$("$TMP/edge_linux_${ARCH}" -version | awk '{print $2}')
+[[ "$GOT" == "$VERSION" ]] || die "程序版本 $GOT 与 $VERSION 不一致"
 
-# 2. 注册 Linux 最简标准 systemd 托管服务
-echo "[2/3] 注册 systemd 系统守护进程..."
-cat > /etc/systemd/system/aero-edge.service <<EOF
+echo "[2/3] 安装程序..."
+UPGRADE=0
+systemctl is-active --quiet aero-edge 2>/dev/null && UPGRADE=1
+install -d -m 0755 "$LIBDIR"
+install -m 0755 "$TMP/edge_linux_${ARCH}" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+install -m 0755 "$TMP/aero" "$CLI"
+install -m 0755 "$TMP/edge-uninstall.sh" "$LIBDIR/edge-uninstall.sh"
+install -d -m 0700 /etc/aero
+
+echo "[3/3] 写入 systemd 服务单元..."
+cat > "$UNIT" <<'UNIT'
 [Unit]
-Description=AERO Edge Daemon
-After=network.target
+Description=AERO Edge Server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/aero-edge
-# 服务退出（含崩溃）后还原宿主：删除带标记的转发规则、还原 ip_forward（ADR-0012）
-ExecStopPost=/usr/local/bin/aero-edge cleanup-host
+Type=simple
+ExecStart=/usr/local/bin/aero-edge -config /etc/aero/edge.json
+# 退出（含崩溃）后还原宿主：删除 edge 自己的转发规则、还原 ip_forward（ADR-0012）
+ExecStopPost=/usr/local/bin/aero-edge cleanup-host -config /etc/aero/edge.json
 Restart=always
+RestartSec=5
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
+UNIT
 systemctl daemon-reload
-systemctl enable --now aero-edge 2>/dev/null || true
 
-# 3. 等待服务端完成自主初始化与避让自愈
-echo "[3/3] 等待 AERO 服务端完成初始化与配置写盘..."
-sleep 1.5
-
-# 从服务端已写盘的配置中读取真实生效状态
-DOMAIN=""
-PRIMARY_PORT="443"
-ADMIN_KEY=""
-if [[ -f "/etc/aero/edge.json" ]]; then
-    DOMAIN=$(grep -o '"domain":[^,]*' /etc/aero/edge.json 2>/dev/null | cut -d'"' -f4 || true)
-    ADMIN_KEY=$(grep -o '"admin_key":[^,]*' /etc/aero/edge.json 2>/dev/null | cut -d'"' -f4 || true)
-    P_STR=$(grep -o '"listen":[^,]*' /etc/aero/edge.json 2>/dev/null | cut -d'"' -f4 || true)
-    if [[ -n "$P_STR" ]]; then
-        PRIMARY_PORT="${P_STR#:}"
-    fi
+if [[ $UPGRADE -eq 1 ]]; then
+  if "$BIN" check -config "$CONFIG"; then
+    systemctl restart aero-edge
+    echo "已升级到 v${VERSION} 并重启服务。"
+  else
+    echo "已升级到 v${VERSION}，但检查未通过，服务保持运行旧进程；修复后执行: aero restart"
+  fi
+else
+  echo "已安装 AERO Edge v${VERSION}。服务尚未启动。"
+  echo "下一步：运行 aero setup（域名、证书、可选 WARP、端口、管理密钥），检查通过后自动启动服务。"
 fi
-
-PORT_SUFFIX=""
-if [[ -n "$PRIMARY_PORT" && "$PRIMARY_PORT" != "443" ]]; then
-    PORT_SUFFIX=":${PRIMARY_PORT}"
-fi
-DISPLAY_DOMAIN="${DOMAIN:-$(curl -s4 icanhazip.com 2>/dev/null || echo "127.0.0.1")}"
-
-# 控制台管理密钥确认与自定义引导 (支持 curl 管道交互)
-echo ""
-echo "===================================================="
-echo "          配置 AERO Edge Web 控制台访问密钥         "
-echo "===================================================="
-echo " 当前服务端生成密钥: ${ADMIN_KEY:-已生成}"
-echo " 密钥格式规范提示:   建议 8-32 位字符 (如: MySecret@2026 或 admin123)"
-echo " 用于直接访问控制台: https://${DISPLAY_DOMAIN}${PORT_SUFFIX}/console?key=<您的密钥>"
-echo "----------------------------------------------------"
-
-USER_KEY=""
-if [ -t 0 ] || [ -e /dev/tty ]; then
-    read -r -p "请输入自定义管理密钥 Key [直接回车使用上述生成的安全密钥]: " USER_KEY </dev/tty || USER_KEY=""
-fi
-
-if [[ -n "$USER_KEY" ]]; then
-    ADMIN_KEY="$USER_KEY"
-    if [[ -f "/etc/aero/edge.json" ]]; then
-        if grep -q '"admin_key"' /etc/aero/edge.json; then
-            sed -i 's/"admin_key": *"[^"]*"/"admin_key": "'"${ADMIN_KEY}"'"/' /etc/aero/edge.json
-        else
-            sed -i 's/{/{\n  "admin_key": "'"${ADMIN_KEY}"'",/' /etc/aero/edge.json
-        fi
-    fi
-    systemctl restart aero-edge 2>/dev/null || true
-fi
-
-echo ""
-echo "===================================================="
-echo "               AERO Edge 部署就绪                   "
-echo "===================================================="
-echo " 节点域名:       ${DISPLAY_DOMAIN}"
-echo " 监听主端口:     :${PRIMARY_PORT}"
-echo " 管理密钥:       ${ADMIN_KEY}"
-echo "----------------------------------------------------"
-echo " Web 控制台直达: https://${DISPLAY_DOMAIN}${PORT_SUFFIX}/console?key=${ADMIN_KEY}"
-echo " 管理员全量订阅: 登录 Web 控制台查看（链接含不可猜测的密钥路径）"
-echo "===================================================="
-echo "使用说明:"
-echo "  1. 复制上方 Web 控制台直达链接即可直接打开管理页面；"
-echo "  2. 随时在终端输入 'aero' 可进入循环菜单，或运行 'aero key' / 'aero port' 修改密钥与端口。"
