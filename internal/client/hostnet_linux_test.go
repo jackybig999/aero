@@ -25,20 +25,20 @@ func inNetns(t *testing.T) bool {
 		return true
 	}
 	if _, err := exec.LookPath("unshare"); err != nil {
-		t.Skip("unshare not available")
+		envSkip(t, "unshare not available")
 	}
 	if _, err := os.Stat("/dev/net/tun"); err != nil {
-		t.Skip("/dev/net/tun not present in this environment")
+		envSkip(t, "/dev/net/tun not present in this environment")
 	}
 	if _, err := exec.LookPath("ip"); err != nil {
-		t.Skip("iproute2 not available")
+		envSkip(t, "iproute2 not available")
 	}
 	cmd := exec.Command("unshare", "-rnmpf", "--mount-proc", os.Args[0], "-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v")
 	cmd.Env = append(os.Environ(), "AERO_NETNS=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "unshare failed") || strings.Contains(string(out), "Operation not permitted") {
-			t.Skipf("user/net namespaces not permitted here: %s", out)
+			envSkip(t, "user/net namespaces not permitted here: %s", out)
 		}
 		t.Fatalf("test in netns failed: %v\n%s", err, out)
 	}
@@ -351,4 +351,13 @@ func TestTunHostLinuxDeviceReadsAndCloseUnblocks(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not unblock a pending Read")
 	}
+}
+
+// envSkip 在环境不支持时跳过；CI 设置 AERO_REQUIRE_NETNS=1 时改为失败，避免命名空间测试被静默跳过。
+func envSkip(t *testing.T, format string, a ...any) {
+	t.Helper()
+	if os.Getenv("AERO_REQUIRE_NETNS") == "1" {
+		t.Fatalf("required environment missing (AERO_REQUIRE_NETNS=1): "+format, a...)
+	}
+	t.Skipf(format, a...)
 }

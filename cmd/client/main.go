@@ -42,7 +42,7 @@ func main() {
 	showVer := flag.Bool("version", false, "print version and exit")
 	listenAddr := flag.String("listen", "127.0.0.1:55555", "mixed proxy address (SOCKS5/HTTP CONNECT)")
 	apiAddr := flag.String("api", "127.0.0.1:19877", "client control API and UI address")
-	subURL := flag.String("sub", "", "subscription URL or file")
+	subURL := flag.String("sub", "", "subscription URL (https)")
 	mode := flag.String("mode", "tun", "operating mode: tun | sysproxy (alias: socks = local proxy only, host untouched)")
 	headless := flag.Bool("headless", false, "run in headless mode without GUI window")
 	flag.Parse()

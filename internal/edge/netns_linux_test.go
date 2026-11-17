@@ -18,7 +18,7 @@ func inNetns(t *testing.T) bool {
 		return true
 	}
 	if _, err := exec.LookPath("unshare"); err != nil {
-		t.Skip("unshare not available")
+		envSkip(t, "unshare not available")
 	}
 	// -m -p -f --mount-proc：在新的挂载与 PID 命名空间里挂载新的 /proc，使本命名空间的 /proc/sys/net 可写
 	// （部分容器把外层 /proc/sys 挂为只读）；仍然只影响该命名空间。
@@ -26,7 +26,7 @@ func inNetns(t *testing.T) bool {
 		"-test.run=^"+t.Name()+"$", "-test.count=1", "-test.v").CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "Operation not permitted") || strings.Contains(string(out), "unshare failed") {
-			t.Skipf("user/net namespaces not permitted: %s", out)
+			envSkip(t, "user/net namespaces not permitted: %s", out)
 		}
 		t.Fatalf("netns run failed: %v\n%s", err, out)
 	}
@@ -34,4 +34,13 @@ func inNetns(t *testing.T) bool {
 		t.Fatalf("netns run did not pass:\n%s", out)
 	}
 	return false
+}
+
+// envSkip 在环境不支持时跳过；CI 设置 AERO_REQUIRE_NETNS=1 时改为失败，避免命名空间测试被静默跳过。
+func envSkip(t *testing.T, format string, a ...any) {
+	t.Helper()
+	if os.Getenv("AERO_REQUIRE_NETNS") == "1" {
+		t.Fatalf("required environment missing (AERO_REQUIRE_NETNS=1): "+format, a...)
+	}
+	t.Skipf(format, a...)
 }
