@@ -244,10 +244,9 @@ func RestoreHost(dataDir string) error {
 			errs = append(errs, err)
 		}
 	}
-	if gone, err := removeNftTable(); err != nil {
+	nftGone, err := removeNftTable()
+	if err != nil {
 		errs = append(errs, err)
-	} else if gone {
-		removed++
 	}
 	j, ok, err := readHostState(dataDir)
 	switch {
@@ -265,8 +264,8 @@ func RestoreHost(dataDir string) error {
 			}
 		}
 	}
-	if removed > 0 || ok {
-		log.Printf("[EDGE-NET] Host restored: %d tagged rule(s) removed, ip_forward restored=%v", removed, ok)
+	if removed > 0 || nftGone || ok {
+		log.Printf("[EDGE-NET] Host restored: %d tagged iptables rule(s) removed, nft table %s removed=%v, ip_forward restored=%v", removed, edgeNftTable, nftGone, ok)
 	}
 	return errors.Join(errs...)
 }

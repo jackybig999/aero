@@ -1,4 +1,14 @@
-## AERO 1.4.1
+## AERO 1.4.2
+
+### 卸载彻底还原（实机验证：卸载后与装机前快照一致）
+- `aero warp install` 记录 WARP 依赖包新建的系统用户与组；`aero warp uninstall` 先停止 warp-svc，删除残留的 WARP 策略路由（fwmark 0x100cf），并删除这些用户与组（Debian 卸载软件包不删用户）。
+- `aero cert` 安装 acme.sh 前备份 `.bashrc` 并记录 crontab 状态；`aero uninstall` 卸载 acme.sh 后只在与安装前精确对应时还原（删除 acme.sh 留下的空 crontab 与 `.bashrc` 末尾空行）。
+- edge 还原宿主的日志分别说明 iptables 规则与 nft 表的删除情况。
+
+### 已知
+- Cloudflare 官方 `cloudflare-warp` 在 Debian 上硬依赖图形库，安装 WARP 会新增约 200 个软件包（约 760 MiB）；卸载时全部移除。
+
+## AERO 1.4.1（上一版本）
 
 ### 安装只安装服务端，其余在服务器上用 aero 完成（ADR-0016 修订）
 - `edge-install.sh` 重写：按版本下载并对照 `SHA256SUMS` 校验 aero-edge、运维命令 `aero` 与卸载脚本，写入服务单元；不写配置、不生成或打印密钥、不安装其他软件、不改系统。此前的脚本下载 `latest` 不校验、用 sed 改配置、允许并打印弱密钥。
