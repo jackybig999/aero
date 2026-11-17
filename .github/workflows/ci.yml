@@ -44,7 +44,15 @@ jobs:
           AERO_REQUIRE_NETNS: "1"   # 命名空间或 TUN 不可用时失败而不是跳过
         run: |
           go vet ./internal/edge ./cmd/edge ./internal/sub ./cmd/sub ./internal/client ./cmd/client ./tests/...
-          go test -race -shuffle=on -v ./internal/edge ./internal/sub ./internal/client ./tests/...
+          set +e
+          go test -race -shuffle=on -v ./internal/edge ./internal/sub ./internal/client ./tests/... > test.log 2>&1
+          rc=$?
+          cat test.log
+          # 失败详情写成注解（公开可读），便于不登录也能定位失败原因
+          if [ $rc -ne 0 ]; then
+            grep -E -- '--- FAIL|^FAIL|panic:|_test\.go:[0-9]+:' test.log | head -60 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit $rc
 
       - name: Build Edge Server (linux/amd64 & linux/arm64)
         run: |

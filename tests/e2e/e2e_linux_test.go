@@ -73,6 +73,14 @@ func TestEdgeClientEndToEnd(t *testing.T) {
 	_, file, _, _ := runtime.Caller(0)
 	root := filepath.Join(filepath.Dir(file), "..", "..")
 	for _, c := range []string{"edge", "client"} {
+		if pre := os.Getenv("AERO_E2E_BIN"); pre != "" { // 预先编译好的程序（在没有 Go 工具链的机器上运行）
+			b, err := os.ReadFile(filepath.Join(pre, c))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = os.WriteFile(filepath.Join(dir, c), b, 0o755)
+			continue
+		}
 		build := exec.Command("go", "build", "-o", filepath.Join(dir, c), "./cmd/"+c)
 		build.Dir = root
 		if out, err := build.CombinedOutput(); err != nil {
@@ -136,6 +144,8 @@ func runRoot(t *testing.T) {
 	b, _ := json.Marshal(cfg)
 	_ = os.WriteFile(cfgFile, b, 0o600)
 	httpc := tlsClient(t, caPEM)
+	// 新网络命名空间的 ip_forward 初值继承自宿主（宿主跑 docker 或 edge 时为 1）：记录后比较
+	fwdBefore, _ := os.ReadFile("/proc/sys/net/ipv4/ip_forward")
 	edge := startEdge(t, dir, cfgFile, httpc)
 	t.Logf("edge up (connect_ip=%v)", connectIP)
 
@@ -180,8 +190,11 @@ func runRoot(t *testing.T) {
 
 	stopProc(t, edge, "edge")
 	if connectIP { // edge 退出后宿主（命名空间 A）必须还原
-		if v, _ := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); strings.TrimSpace(string(v)) != "0" {
-			t.Errorf("ip_forward not restored: %s", v)
+		if v, _ := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); string(v) != string(fwdBefore) {
+			t.Errorf("ip_forward not restored: %q, was %q", v, fwdBefore)
+		}
+		if out, _ := exec.Command("sh", "-c", "nft list ruleset 2>/dev/null; iptables-save 2>/dev/null").CombinedOutput(); strings.Contains(string(out), "aero_edge") {
+			t.Errorf("edge rules left after exit:\n%s", out)
 		}
 	}
 	_ = inet.Process.Kill()
