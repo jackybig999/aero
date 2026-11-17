@@ -190,6 +190,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要标签，判断已发布版本之后是否有未发布的代码改动
 
       - name: Download All Build Artifacts
         uses: actions/download-artifact@v4
@@ -216,6 +218,15 @@ jobs:
           if gh api "repos/${{ github.repository }}/releases/tags/v$VER" >/dev/null 2>&1; then
             echo "RELEASE_EXISTS=1" >> $GITHUB_ENV
             echo "Release v$VER already exists; not republishing. Bump VERSION to publish." >> $GITHUB_STEP_SUMMARY
+            # 已发布版本之后又改了代码却没升版本号：这些改动不会进入任何 Release，明确提示
+            if git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
+              CHANGED=$(git diff --name-only "v$VER" HEAD -- cmd internal deploy go.mod go.sum)
+              if [ -n "$CHANGED" ]; then
+                N=$(echo "$CHANGED" | wc -l)
+                echo "::warning title=VERSION not bumped::v$VER is already released, but $N code file(s) changed since; they will not be published until VERSION is bumped."
+                { echo "### 未发布的代码改动（需升级 VERSION）"; echo '```'; echo "$CHANGED" | head -40; echo '```'; } >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
           fi
 
       - name: Generate SHA256SUMS

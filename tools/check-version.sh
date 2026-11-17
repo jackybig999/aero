@@ -30,4 +30,9 @@ for c in "${checks[@]}"; do
   fi
 done
 [ $fail -eq 0 ] && echo "版本统一检查通过（$v）"
+# 提醒（不失败）：本地已有 v$v 标签且之后改了代码，说明还需升级 VERSION 才会发布
+if git rev-parse -q --verify "refs/tags/v$v" >/dev/null 2>&1; then
+  changed=$(git diff --name-only "v$v" HEAD -- cmd internal deploy go.mod go.sum | wc -l)
+  [ "$changed" -gt 0 ] && echo "提醒: v$v 已发布，之后有 $changed 个代码文件改动；发布前需升级 VERSION"
+fi
 exit $fail
