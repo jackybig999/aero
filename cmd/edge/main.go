@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"runtime"
@@ -23,6 +24,12 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "check-cert" {
 		os.Exit(checkCertCmd(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "config" {
+		os.Exit(configCmd(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "check" {
+		os.Exit(checkCmd(os.Args[2:]))
 	}
 	showVer := flag.Bool("version", false, "print version and exit")
 	listen := flag.String("listen", ":443", "listen address (e.g. :443)")
@@ -159,6 +166,67 @@ func defaultDataDir() string {
 		return "/var/lib/aero"
 	}
 	return "./data"
+}
+
+const defaultConfigPath = "/etc/aero/edge.json"
+
+// configCmd 实现 `aero-edge config get <key>` 与 `aero-edge config set <key> <value|->`（-config 指定文件；- 从标准输入读取）。
+// edge 的配置只经这里修改（校验后原子写入），修改后需 `aero-edge check` 通过再重启服务生效。
+func configCmd(args []string) int {
+	fs := flag.NewFlagSet("config", flag.ContinueOnError)
+	path := fs.String("config", defaultConfigPath, "edge config file")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	a := fs.Args()
+	switch {
+	case len(a) == 2 && a[0] == "get":
+		v, err := edge.ConfigGet(*path, a[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config:", err)
+			return 1
+		}
+		fmt.Println(v)
+	case len(a) == 3 && a[0] == "set":
+		val := a[2]
+		if val == "-" { // 从标准输入读取（密钥不出现在命令行与进程列表中）
+			b, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "config:", err)
+				return 1
+			}
+			val = strings.TrimSpace(string(b))
+		}
+		v, err := edge.ConfigSet(*path, a[1], val)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "config:", err)
+			return 1
+		}
+		if a[1] == "admin_key" && a[2] == "random" {
+			fmt.Println(v) // 生成的密钥只显示这一次
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "usage: aero-edge config [-config FILE] get <key> | set <key> <value>")
+		return 2
+	}
+	return 0
+}
+
+// checkCmd 实现 `aero-edge check`：只读检查节点能否（重新）启动并对外服务；有 FAIL 时退出码 1。
+func checkCmd(args []string) int {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	path := fs.String("config", defaultConfigPath, "edge config file")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	rc := 0
+	for _, it := range edge.CheckNode(*path) {
+		fmt.Printf("%-4s %-12s %s\n", it.Level, it.Name, it.Detail)
+		if it.Level == "FAIL" {
+			rc = 1
+		}
+	}
+	return rc
 }
 
 // checkCertCmd 实现 `aero-edge check-cert -domain D`：只读检查系统 acme.sh/certbot 默认位置是否有覆盖 D 的

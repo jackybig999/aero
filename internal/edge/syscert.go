@@ -137,9 +137,9 @@ func errNoSystemCert(domain string, dirs []string) error {
 	if domain == "" {
 		domain = "<节点域名>"
 	}
-	return fmt.Errorf("production edge server strictly requires valid TLS certificate: none for %s in %s; "+
-		"issue one with the system acme.sh or certbot (default locations) or set cert_file/key_file "+
-		"(self-signed cert is prohibited)", domain, strings.Join(dirs, ", "))
+	return fmt.Errorf("%w: production edge server strictly requires valid TLS certificate: none for %s in %s; "+
+		"run `aero cert` (system acme.sh, default location) or set cert_file/key_file "+
+		"(self-signed cert is prohibited)", ErrNoCertificate, domain, strings.Join(dirs, ", "))
 }
 
 // CertCheck 是 `aero-edge check-cert` 的结果（安装前预检，只读）。

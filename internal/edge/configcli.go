@@ -1,0 +1,270 @@
+package edge
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// 节点上的 `aero-edge config` 与 `aero-edge check`（供运维命令 aero 调用）。
+// edge 的配置文件只由 edge 自己读写：aero 不再用 sed/python 改 edge.json，统一经这里校验后原子写入。
+// 修改后由 aero 执行 check，全部通过再重启服务生效（用户 2026-11-17：安装只装服务端，其余在节点上用命令完成）。
+
+// ErrNoCertificate 表示没有可用的 TLS 证书；edge 此时不对外监听，等待 `aero setup` 完成证书后重启。
+var ErrNoCertificate = errors.New("no usable TLS certificate")
+
+var (
+	nodeDomainRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,62}\.)+[A-Za-z]{2,63}$`)
+	adminKeyRe   = regexp.MustCompile(`^[A-Za-z0-9_-]{32,128}$`)
+)
+
+// minAdminKeyLen 是管理密钥的最短长度：C13 对公网开放，密钥是唯一凭据。
+const minAdminKeyLen = 32
+
+// configKeys 是允许经命令行修改的配置项（其余配置由 edge 自己维护）。
+var configKeys = []string{"domain", "listen", "admin_key", "warp", "usage_api", "remote_admin_v1", "token_issuer"}
+
+func readConfigMap(path string) (map[string]any, error) {
+	m := map[string]any{}
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return m, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return m, nil
+}
+
+// ConfigSet 校验并写入一项配置（原子替换，新文件 0600）。value 为 "random" 的 admin_key 自动生成。
+// 返回实际写入的值（生成的密钥由调用方显示给运维一次）。
+func ConfigSet(path, key, value string) (string, error) {
+	m, err := readConfigMap(path)
+	if err != nil {
+		return "", err
+	}
+	value = strings.TrimSpace(value)
+	switch key {
+	case "domain":
+		if !nodeDomainRe.MatchString(value) {
+			return "", fmt.Errorf("invalid domain %q", value)
+		}
+		m["domain"] = strings.ToLower(value)
+		value = strings.ToLower(value)
+	case "listen":
+		p, err := strconv.Atoi(strings.TrimPrefix(value, ":"))
+		if err != nil || p < 1 || p > 65535 {
+			return "", fmt.Errorf("invalid port %q", value)
+		}
+		value = ":" + strconv.Itoa(p)
+		m["listen"] = value
+	case "admin_key":
+		if value == "random" {
+			k, err := randomHexBytes(32)
+			if err != nil {
+				return "", err
+			}
+			value = k
+		}
+		if !adminKeyRe.MatchString(value) {
+			return "", fmt.Errorf("admin key must be %d-128 characters of [A-Za-z0-9_-]", minAdminKeyLen)
+		}
+		m["admin_key"] = value
+	case "warp": // off | ai | all：只使用本机官方 WARP 客户端的代理，edge 不安装 WARP
+		switch value {
+		case "off":
+			m["warp_proxy"], m["warp_all"] = "", false
+		case "ai", "all":
+			m["warp_proxy"], m["warp_all"] = warpLocalProxy, value == "all"
+		default:
+			return "", fmt.Errorf("warp must be off, ai or all")
+		}
+	case "token_issuer": // <kid>:<base64 Ed25519 公钥>，加入 token_issuers（C3）
+		kid, pub, _ := strings.Cut(value, ":")
+		if _, err := parseTokenIssuers(map[string]string{kid: pub}); err != nil {
+			return "", err
+		}
+		iss, _ := m["token_issuers"].(map[string]any)
+		if iss == nil {
+			iss = map[string]any{}
+		}
+		iss[kid] = pub
+		m["token_issuers"] = iss
+	case "usage_api", "remote_admin_v1":
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return "", fmt.Errorf("%s must be true or false", key)
+		}
+		m[key] = b
+	default:
+		return "", fmt.Errorf("unknown or read-only key %q (allowed: %s)", key, strings.Join(configKeys, ", "))
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	return value, replaceFileAtomic(path, data, 0o600)
+}
+
+// ConfigGet 返回一项配置的当前值（warp 以 off/ai/all 表示；未设置为空串）。
+func ConfigGet(path, key string) (string, error) {
+	m, err := readConfigMap(path)
+	if err != nil {
+		return "", err
+	}
+	switch key {
+	case "warp":
+		if p, _ := m["warp_proxy"].(string); p == "" {
+			return "off", nil
+		}
+		if all, _ := m["warp_all"].(bool); all {
+			return "all", nil
+		}
+		return "ai", nil
+	case "domain", "listen", "admin_key", "usage_api", "remote_admin_v1", "metering_key", "node_id", "cert_file", "key_file", "data_dir":
+		if v, ok := m[key]; ok && v != nil {
+			return fmt.Sprint(v), nil
+		}
+		return "", nil
+	}
+	return "", fmt.Errorf("unknown key %q", key)
+}
+
+// CheckItem 是一项检查结果。Level：OK、WARN、FAIL。
+type CheckItem struct {
+	Level, Name, Detail string
+}
+
+// CheckNode 检查节点是否可以（重新）启动并对外服务：配置、域名、证书、管理密钥、端口、防火墙工具、TUN、WARP。
+// 只读：不修改宿主与配置。有 FAIL 时运维不应重启服务。
+func CheckNode(path string) []CheckItem {
+	var out []CheckItem
+	add := func(level, name, format string, a ...any) {
+		out = append(out, CheckItem{level, name, fmt.Sprintf(format, a...)})
+	}
+	var cfg ServerConfig
+	b, err := os.ReadFile(path)
+	if err != nil {
+		add("FAIL", "config", "read %s: %v", path, err)
+		return out
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		add("FAIL", "config", "parse %s: %v", path, err)
+		return out
+	}
+	add("OK", "config", "%s", path)
+
+	domain := normalizeCertDomain(cfg.Domain)
+	if !nodeDomainRe.MatchString(domain) {
+		add("FAIL", "domain", "not set or invalid (aero setup / aero-edge config set domain <域名>)")
+	} else {
+		add("OK", "domain", "%s", domain)
+	}
+
+	if ci, err := checkCertificate(cfg, domain); err != nil {
+		add("FAIL", "certificate", "%v", err)
+	} else {
+		add("OK", "certificate", "%s (expires %s, %d days)", ci.file, ci.notAfter.UTC().Format("2006-01-02"), int(time.Until(ci.notAfter).Hours()/24))
+	}
+
+	switch {
+	case cfg.AdminKey == "":
+		add("WARN", "admin_key", "not set: edge generates a random key on first start")
+	case len(cfg.AdminKey) < minAdminKeyLen:
+		add("FAIL", "admin_key", "only %d characters; the remote management API needs at least %d (aero key)", len(cfg.AdminKey), minAdminKeyLen)
+	default:
+		add("OK", "admin_key", "%d characters", len(cfg.AdminKey))
+	}
+
+	dataDir := cfg.DataDir
+	if dataDir == "" {
+		dataDir = "/var/lib/aero"
+	}
+	listen := cfg.Listen
+	if listen == "" {
+		listen = ":443"
+	}
+	if lock, err := acquireInstanceLock(dataDir); err != nil {
+		add("OK", "listen", "%s (edge is running; port test skipped)", listen)
+	} else {
+		_ = lock.release()
+		if addr, moved := selectListenAddr(listen, StandardCandidatePorts, checkPortAvailable); !moved && !checkPortAvailable(listen) {
+			add("FAIL", "listen", "%s and all candidate ports are occupied", listen)
+		} else if moved {
+			add("WARN", "listen", "%s is occupied by another program; edge will rotate to %s", listen, addr)
+		} else {
+			add("OK", "listen", "%s free (TCP+UDP)", listen)
+		}
+	}
+
+	if fw, err := firewallBackend(); err != nil {
+		add("FAIL", "firewall", "%v", err)
+	} else {
+		add("OK", "firewall", "%s", fw)
+	}
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		add("FAIL", "tun", "/dev/net/tun unavailable: %v", err)
+	} else {
+		add("OK", "tun", "/dev/net/tun")
+	}
+
+	switch {
+	case cfg.WarpProxy == "" && warpLocalProxyAvailable():
+		add("OK", "warp", "off (local official WARP proxy available; aero warp ai|all to use it)")
+	case cfg.WarpProxy == "":
+		add("OK", "warp", "off")
+	case warpLocalProxyAvailable():
+		add("OK", "warp", "on via %s (all=%v)", cfg.WarpProxy, cfg.WarpAll)
+	default:
+		add("FAIL", "warp", "enabled but no WARP proxy on %s (aero warp install, or aero warp off)", cfg.WarpProxy)
+	}
+	return out
+}
+
+type certCheck struct {
+	file     string
+	notAfter time.Time
+}
+
+// checkCertificate 按与启动相同的规则找证书：显式 cert_file/key_file 优先，否则系统 acme.sh/certbot 默认位置。
+func checkCertificate(cfg ServerConfig, domain string) (certCheck, error) {
+	if cfg.CertFile != "" || cfg.KeyFile != "" {
+		pair, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			return certCheck{}, fmt.Errorf("cert_file/key_file: %w", err)
+		}
+		leaf, err := x509.ParseCertificate(pair.Certificate[0])
+		if err != nil {
+			return certCheck{}, err
+		}
+		if time.Now().After(leaf.NotAfter) {
+			return certCheck{}, fmt.Errorf("%s expired on %s", cfg.CertFile, leaf.NotAfter.UTC().Format("2006-01-02"))
+		}
+		if domain != "" && leaf.VerifyHostname(domain) != nil {
+			return certCheck{}, fmt.Errorf("%s does not cover %s", cfg.CertFile, domain)
+		}
+		return certCheck{cfg.CertFile, leaf.NotAfter}, nil
+	}
+	if domain == "" {
+		return certCheck{}, errors.New("domain not set")
+	}
+	c, ok := findSystemCert(systemCertDirs(), domain, time.Now())
+	if !ok {
+		return certCheck{}, fmt.Errorf("none for %s in %s (aero cert)", domain, strings.Join(systemCertDirs(), ", "))
+	}
+	return certCheck{c.CertFile, c.NotAfter}, nil
+}

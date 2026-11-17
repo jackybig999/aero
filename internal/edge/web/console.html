@@ -16,7 +16,7 @@
         </div>
         <div class="brand-text">
           <h1>AERO Edge Console</h1>
-          <span class="version-tag" id="appVersion">v1.4.0 • aero/3.0</span>
+          <span class="version-tag" id="appVersion">v1.4.1 • aero/3.0</span>
         </div>
       </div>
       <div class="nav-status">
@@ -128,17 +128,18 @@
           <div class="warp-controls">
             <div class="switch-row">
               <label class="switch-label">
-                <span>WARP 出站接管</span>
-                <small class="desc-text">开启后由 WARP SOCKS5 (127.0.0.1:40000) 接管出站流量；关闭则恢复原生直连</small>
+                <span>WARP 规则流量接管</span>
+                <small class="desc-text">仅 AI 场景：AI 服务经 WARP (127.0.0.1:40000)，其余直连；全部流量：所有出站经 WARP；关闭：全部直连</small>
               </label>
-              <label class="switch">
-                <input type="checkbox" id="warpToggle">
-                <span class="slider round"></span>
-              </label>
+              <select id="warpToggle" class="input-text" style="width:auto">
+                <option value="off">关闭</option>
+                <option value="ai">仅 AI 场景</option>
+                <option value="all">全部流量</option>
+              </select>
             </div>
           </div>
 
-          <p class="desc-text">WARP 是插件：请按 Cloudflare 官方文档在本机安装官方客户端并使用 proxy 模式（127.0.0.1:40000）。edge 只读取其状态，并按上方开关决定是否使用；edge 不安装、不配置 WARP。</p>
+          <p class="desc-text">WARP 是插件：在服务器上执行 <code>aero warp install</code>（Cloudflare 官方源，proxy 模式 127.0.0.1:40000）安装官方客户端；edge 只读取其状态并按上方开关决定是否使用，edge 不安装、不配置 WARP。</p>
         </div>
       </section>
 

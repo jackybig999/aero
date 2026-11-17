@@ -17,6 +17,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -510,7 +511,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	srv.usageMeter = usageMeter // Start 时启用
 	srv.restartCh = make(chan struct{})
 	if cfg.RemoteAdminV1 == nil || *cfg.RemoteAdminV1 {
-		srv.remoteAdmin = newRemoteAdmin(srv, cfg.AdminKey)
+		if len(cfg.AdminKey) >= minAdminKeyLen {
+			srv.remoteAdmin = newRemoteAdmin(srv, cfg.AdminKey)
+		} else {
+			log.Printf("[ADMIN] [WARN] remote management API disabled: admin key shorter than %d characters (run `aero key`)", minAdminKeyLen)
+		}
 	}
 	constructed = true
 	return srv, nil
@@ -887,6 +892,15 @@ func (s *Server) SetNextHopUDPDialerForTest(d func(nextHopAddr, target, hopCred 
 // Run starts the edge server and blocks until SIGINT/SIGTERM, supporting SIGHUP reloads
 func Run(cfg ServerConfig) error {
 	server, err := NewServer(cfg)
+	if errors.Is(err, ErrNoCertificate) {
+		// 未完成证书：不对外监听、不修改宿主，等待运维执行 `aero setup` 后重启（避免服务反复崩溃重启）。
+		log.Printf("[EDGE] waiting for setup: %v", err)
+		log.Printf("[EDGE] run `aero setup` on this server, then the service is restarted after `aero check` passes")
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		return nil
+	}
 	if err != nil {
 		return err
 	}

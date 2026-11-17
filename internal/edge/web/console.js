@@ -219,7 +219,7 @@
       el.warpStatusBadge.className = 'badge ' + (running ? 'badge-success' : (installed ? 'badge-warning' : 'badge-danger'));
 
       if (!document.activeElement || document.activeElement !== el.warpToggle) {
-        el.warpToggle.checked = !!running;
+        el.warpToggle.value = !running ? 'off' : (data.warp.warp_all ? 'all' : 'ai');
       }
     }
 
@@ -446,19 +446,19 @@
 
   // WARP Toggles
   async function updateWarpToggle() {
-    const enabled = el.warpToggle.checked;
+    const mode = el.warpToggle.value;
     try {
       const res = await fetch(getApiUrl('/console/api/warp/toggle'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: enabled, warp_all: true })
+        body: JSON.stringify({ enabled: mode !== 'off', warp_all: mode === 'all' })
       });
       const data = await res.json();
       if (!res.ok) {
         alert(data.error || '切换失败');
         fetchStatus();
       } else {
-        showToast(enabled ? 'WARP 出站接管已开启 (全量经由 WARP)' : 'WARP 出站接管已关闭 (直连)');
+        showToast({ off: 'WARP 接管已关闭（直连）', ai: 'WARP 接管：仅 AI 场景', all: 'WARP 接管：全部流量' }[mode]);
       }
     } catch (e) {
       alert(`WARP 设置失败: ${e.message}`);
