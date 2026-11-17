@@ -39,6 +39,9 @@ func TestEdgeTunIfreqRejectsInvalidNames(t *testing.T) {
 // 共享 TUN 下行读取协程一启动即退出，CONNECT-IP 无回包。本测试真正从设备读包，
 // 并验证 Close 能唤醒阻塞中的 Read。在独立用户 + 网络命名空间中运行，不触碰宿主网络。
 func TestGlobalTunnelDeviceReadsPacketsAndCloseUnblocks(t *testing.T) {
+	if _, err := os.Stat("/dev/net/tun"); err != nil {
+		t.Skip("/dev/net/tun not present in this environment")
+	}
 	if !inNetns(t) {
 		return
 	}

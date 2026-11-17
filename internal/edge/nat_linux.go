@@ -20,7 +20,8 @@ import (
 )
 
 // 宿主状态（ADR-0012，PROJECT_RULES“宿主全局状态”）。edge 对宿主的修改只有三类，且都可还原：
-//   - iptables 规则：一律带 aero_edge_default 标记、限定在自身 TUN 或自身地址池；
+//   - 防火墙规则：宿主有 iptables 时一律带 aero_edge_default 标记、限定在自身 TUN 或自身地址池；
+//     没有 iptables 而只有 nft 时（如 Debian 13 默认），只使用自有表 inet aero_edge，还原时整表删除；
 //   - net.ipv4.ip_forward：修改前把原值写入数据目录下的状态日志；
 //   - TUN 网卡：非持久，进程退出即由内核删除。
 // 还原（RestoreHost）按标记扫描删除规则、按日志还原 ip_forward，不依赖进程内存，因此同时用于
@@ -31,6 +32,7 @@ const (
 	edgeIPv4PoolCIDR = "10.88.0.0/16"
 	edgeIPv6PoolCIDR = "fd88:ae80::/64"
 	hostStateFile    = "host-state.json"
+	edgeNftTable     = "aero_edge" // nft 后端的自有表（family inet）
 )
 
 // edgeRuleChains 是 edge 可能写入规则的全部 (工具, 表, 链)；还原时只扫描这些链。
@@ -55,7 +57,75 @@ var (
 	}
 	defaultOutInterfaceFn = detectDefaultOutInterface
 	ipForwardPath         = "/proc/sys/net/ipv4/ip_forward"
+	lookPath              = exec.LookPath
+	// nftApply 以 `nft -f -` 执行规则脚本。
+	nftApply = func(script string) error {
+		cmd := exec.Command("nft", "-f", "-")
+		cmd.Stdin = strings.NewReader(script)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("nft -f: %w (%s)", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
 )
+
+// firewallBackend 选择规则工具：有 iptables 用 iptables（与宿主现有防火墙同处一套链，例如 ufw 的
+// FORWARD 策略），否则用 nft 自有表；两者都没有时返回错误（edge 不安装系统软件）。
+func firewallBackend() (string, error) {
+	if _, err := lookPath("iptables"); err == nil {
+		return "iptables", nil
+	}
+	if _, err := lookPath("nft"); err == nil {
+		return "nft", nil
+	}
+	return "", errors.New("neither iptables nor nft is installed; CONNECT-IP egress needs one of them")
+}
+
+// validIfName 限定写入 nft 脚本的网卡名（Linux IFNAMSIZ 15）。
+func validIfName(n string) bool {
+	if n == "" || len(n) > 15 {
+		return false
+	}
+	for _, c := range n {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// nftRuleset 生成自有表：与 iptables 后端等价的放行、MSS 钳制、NAT 与（isolate 时）隔离规则。
+func nftRuleset(devName, outIf string, isolate bool) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "table inet %s {\n", edgeNftTable)
+	b.WriteString("  chain forward {\n    type filter hook forward priority filter; policy accept;\n")
+	fmt.Fprintf(&b, "    iifname %q tcp flags syn / syn,rst tcp option maxseg size set 1200\n", devName)
+	fmt.Fprintf(&b, "    oifname %q tcp flags syn / syn,rst tcp option maxseg size set 1200\n", devName)
+	fmt.Fprintf(&b, "    iifname %q oifname %q accept\n", devName, outIf)
+	fmt.Fprintf(&b, "    iifname %q oifname %q ct state established,related accept\n", outIf, devName)
+	if isolate {
+		fmt.Fprintf(&b, "    iifname != %q oifname != %q drop\n", devName, devName)
+	}
+	b.WriteString("  }\n  chain postrouting {\n    type nat hook postrouting priority srcnat; policy accept;\n")
+	fmt.Fprintf(&b, "    ip saddr %s oifname %q masquerade\n", edgeIPv4PoolCIDR, outIf)
+	fmt.Fprintf(&b, "    ip6 saddr %s oifname %q masquerade\n", edgeIPv6PoolCIDR, outIf)
+	b.WriteString("  }\n}\n")
+	return b.String()
+}
+
+// removeNftTable 删除自有表（不存在时无操作），返回是否删除。
+func removeNftTable() (bool, error) {
+	if _, err := lookPath("nft"); err != nil {
+		return false, nil
+	}
+	if _, err := hostCmd("nft", "list", "table", "inet", edgeNftTable); err != nil {
+		return false, nil // 表不存在
+	}
+	if err := runHostCmd("nft", "delete", "table", "inet", edgeNftTable); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 func runHostCmd(name string, args ...string) error {
 	_, err := hostCmd(name, args...)
@@ -97,13 +167,23 @@ func PrepareHostForTunnel(dataDir, devName string) error {
 	if err := applyEdgeRules(devName, outIf, orig != "1"); err != nil {
 		return errors.Join(err, RestoreHost(dataDir))
 	}
-	log.Printf("[EDGE-NET] Host prepared for %s -> %s (ip_forward was %s; rules tagged %s)", devName, outIf, orig, edgeFirewallTag)
+	log.Printf("[EDGE-NET] Host prepared for %s -> %s (ip_forward was %s; %s)", devName, outIf, orig, ruleOwnerDesc())
 	return nil
 }
 
 // applyEdgeRules 下发转发放行、NAT 与 MSS 钳制，全部限定在 devName 或 edge 地址池。
 // isolate 为真时追加：非本 TUN 的转发一律丢弃（宿主原本未开启转发）。IPv6 规则失败只记录。
 func applyEdgeRules(devName, outIf string, isolate bool) error {
+	backend, err := firewallBackend()
+	if err != nil {
+		return err
+	}
+	if backend == "nft" {
+		if !validIfName(devName) || !validIfName(outIf) {
+			return fmt.Errorf("invalid interface name %q/%q", devName, outIf)
+		}
+		return nftApply(nftRuleset(devName, outIf, isolate))
+	}
 	tagged := func(spec ...string) []string {
 		return append(spec, "-m", "comment", "--comment", edgeFirewallTag)
 	}
@@ -155,11 +235,19 @@ func RestoreHost(dataDir string) error {
 	var errs []error
 	removed := 0
 	for _, c := range edgeRuleChains {
+		if _, err := lookPath(c.tool); err != nil {
+			continue // 未安装该工具：不可能有本标记规则
+		}
 		n, err := removeTaggedRules(c.tool, c.table, c.chain)
 		removed += n
 		if err != nil && c.tool == "iptables" {
 			errs = append(errs, err)
 		}
+	}
+	if gone, err := removeNftTable(); err != nil {
+		errs = append(errs, err)
+	} else if gone {
+		removed++
 	}
 	j, ok, err := readHostState(dataDir)
 	switch {
@@ -324,4 +412,12 @@ func detectDefaultOutInterface() string {
 		}
 	}
 	return ""
+}
+
+// ruleOwnerDesc 描述规则归属（日志）。
+func ruleOwnerDesc() string {
+	if b, _ := firewallBackend(); b == "nft" {
+		return "nft table inet " + edgeNftTable
+	}
+	return "rules tagged " + edgeFirewallTag
 }

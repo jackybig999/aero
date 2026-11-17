@@ -217,3 +217,98 @@ func TestHasTag(t *testing.T) {
 		}
 	}
 }
+
+// useNftBackend 让测试走 nft 后端（模拟没有 iptables 的宿主，如 Debian 13 默认）。
+func useNftBackend(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("nft"); err != nil {
+		t.Skip("nft not available")
+	}
+	prev := lookPath
+	lookPath = func(name string) (string, error) {
+		if name == "iptables" || name == "ip6tables" {
+			return "", exec.ErrNotFound
+		}
+		return exec.LookPath(name)
+	}
+	t.Cleanup(func() { lookPath = prev })
+}
+
+func nftTable(t *testing.T) string {
+	t.Helper()
+	out, _ := hostCmd("nft", "list", "table", "inet", edgeNftTable)
+	return out
+}
+
+// 无 iptables 的宿主：规则只在自有表 inet aero_edge 中；还原删除整表并还原 ip_forward；
+// 宿主自己的 nft 表不受影响；崩溃后重启不重复。
+func TestHostStateLifecycleNftOnly(t *testing.T) {
+	if !inNetns(t) {
+		return
+	}
+	useNftBackend(t)
+	useTestOutIf(t)
+	dir := t.TempDir()
+	setIPForward(t, "0")
+	if err := runHostCmd("nft", "add", "table", "inet", "host_own"); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareHostForTunnel(dir, testTun); err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	tbl := nftTable(t)
+	for _, want := range []string{"masquerade", "maxseg size set 1200", `iifname "aero-tun0" oifname "eth9" accept`, "drop", edgeIPv4PoolCIDR} {
+		if !strings.Contains(tbl, want) {
+			t.Errorf("table missing %q:\n%s", want, tbl)
+		}
+	}
+	if ipForward(t) != "1" {
+		t.Fatal("ip_forward not enabled")
+	}
+	if err := PrepareHostForTunnel(dir, testTun); err != nil { // 模拟崩溃后重启
+		t.Fatal(err)
+	}
+	if again := nftTable(t); strings.Count(again, "masquerade") != strings.Count(tbl, "masquerade") {
+		t.Fatalf("rules duplicated after restart:\n%s", again)
+	}
+	if err := RestoreHost(dir); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if nftTable(t) != "" || ipForward(t) != "0" {
+		t.Fatalf("not restored: table=%q ip_forward=%s", nftTable(t), ipForward(t))
+	}
+	if out, err := hostCmd("nft", "list", "table", "inet", "host_own"); err != nil || out == "" {
+		t.Fatal("host's own nft table was touched")
+	}
+	if err := RestoreHost(dir); err != nil {
+		t.Fatalf("second restore: %v", err)
+	}
+}
+
+// 宿主原本开启转发：nft 后端不添加隔离 drop。
+func TestHostStateNftNoIsolationWhenForwardingOn(t *testing.T) {
+	if !inNetns(t) {
+		return
+	}
+	useNftBackend(t)
+	useTestOutIf(t)
+	dir := t.TempDir()
+	setIPForward(t, "1")
+	if err := PrepareHostForTunnel(dir, testTun); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(nftTable(t), "drop") {
+		t.Fatal("isolation added although forwarding was on")
+	}
+	if err := RestoreHost(dir); err != nil || ipForward(t) != "1" {
+		t.Fatalf("restore: %v ip_forward=%s", err, ipForward(t))
+	}
+}
+
+func TestValidIfName(t *testing.T) {
+	for n, want := range map[string]bool{"eth0": true, "aero-tun0": true, "ens3.100": true, "": false, `a"b`: false, "a b": false, "abcdefghijklmnop": false} {
+		if validIfName(n) != want {
+			t.Errorf("%q", n)
+		}
+	}
+}
