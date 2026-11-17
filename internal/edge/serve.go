@@ -92,6 +92,9 @@ type ServerConfig struct {
 	RemoteAdminV1 *bool `json:"remote_admin_v1,omitempty" yaml:"remote_admin_v1"`
 	// DrainTimeoutSec 是收到停止信号后的排空上限（秒，L0 §8.6）；0 表示默认 15 秒。
 	DrainTimeoutSec int `json:"drain_timeout,omitempty"`
+	// certAutoDiscovered 表示 CertFile/KeyFile 来自系统 acme.sh/certbot 默认位置的自动发现：不写入配置，
+	// 每次启动重新查找（换域名、续期换目录后仍然正确）。
+	certAutoDiscovered bool
 	// ConfigPath 是 edge 持久化自身配置的文件路径，仅由 cmd/edge 显式设置。
 	// 为空时 NewServer 不读写任何宿主配置文件（测试与嵌入使用）。
 	ConfigPath string `json:"-"`
@@ -259,6 +262,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		}
 		if found {
 			certDiscovered = true
+			cfg.certAutoDiscovered = true
 			log.Printf("[EDGE] using system certificate %s (domain %s)", cfg.CertFile, cfg.Domain)
 		} else if !cfg.AllowSelfSignedCertForTest {
 			return nil, errNoSystemCert(normalizeCertDomain(cfg.Domain), dirs)
@@ -1175,8 +1179,13 @@ func persistServerConfig(cfg ServerConfig) error {
 	}
 	set("listen", cfg.Listen)
 	set("domain", cfg.Domain)
-	set("cert_file", cfg.CertFile)
-	set("key_file", cfg.KeyFile)
+	if cfg.certAutoDiscovered { // 自动发现的证书不写死；同时清除旧版本写入的同类路径
+		delete(existing, "cert_file")
+		delete(existing, "key_file")
+	} else {
+		set("cert_file", cfg.CertFile)
+		set("key_file", cfg.KeyFile)
+	}
 	set("data_dir", cfg.DataDir)
 	set("admin_key", cfg.AdminKey)
 	set("token", cfg.Token)

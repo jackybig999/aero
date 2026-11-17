@@ -80,3 +80,46 @@ func TestCheckNodeReportsFailures(t *testing.T) {
 		}
 	}
 }
+
+// 自动发现的证书路径不写入配置（并清除旧版本写入的路径）；换域名时清除默认目录下的旧证书路径。
+func TestDiscoveredCertPathIsNotPersisted(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LE_WORKING_DIR", "")
+	t.Setenv("ACME_HOME", "")
+	dir := filepath.Join(home, ".acme.sh", "n.example.com_ecc")
+	writeTestCert(t, dir, "fullchain.cer", "n.example.com.key", time.Now().Add(48*time.Hour), "n.example.com")
+	cfgPath := filepath.Join(t.TempDir(), "edge.json")
+	stale := filepath.Join(home, ".acme.sh", "old.example.com_ecc", "fullchain.cer")
+	_ = os.WriteFile(cfgPath, []byte(`{"cert_file":"`+stale+`","key_file":"x"}`), 0o600)
+	listen, _ := findTestAddr()
+	srv, err := NewServer(ServerConfig{Listen: listen, Domain: "n.example.com", DataDir: t.TempDir(), ConfigPath: cfgPath, AllowSelfSignedCertForTest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !srv.certDiscovered {
+		srv.Close()
+		t.Fatal("test setup: certificate was not discovered")
+	}
+	srv.Close()
+	m, _ := readConfigMap(cfgPath)
+	if _, ok := m["cert_file"]; ok {
+		t.Fatalf("discovered/stale cert path persisted: %v", m["cert_file"])
+	}
+	if m["domain"] != "n.example.com" {
+		t.Fatalf("domain not persisted: %v", m)
+	}
+
+	_ = os.WriteFile(cfgPath, []byte(`{"domain":"n.example.com","cert_file":"`+stale+`","key_file":"k"}`), 0o600)
+	if _, err := ConfigSet(cfgPath, "domain", "m.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := readConfigMap(cfgPath); m["cert_file"] != nil || m["key_file"] != nil {
+		t.Fatalf("default-dir cert path kept after domain change: %v", m)
+	}
+	_ = os.WriteFile(cfgPath, []byte(`{"cert_file":"/srv/certs/custom.pem","key_file":"/srv/certs/custom.key"}`), 0o600)
+	_, _ = ConfigSet(cfgPath, "domain", "m.example.com")
+	if m, _ := readConfigMap(cfgPath); m["cert_file"] != "/srv/certs/custom.pem" {
+		t.Fatal("explicitly configured cert path removed")
+	}
+}

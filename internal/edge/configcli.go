@@ -62,6 +62,11 @@ func ConfigSet(path, key, value string) (string, error) {
 		}
 		m["domain"] = strings.ToLower(value)
 		value = strings.ToLower(value)
+		// 换域名时，位于系统 ACME 默认目录的证书路径属于旧域名：删除，由 edge 按新域名重新发现
+		if cf, _ := m["cert_file"].(string); cf != "" && underSystemCertDir(cf) {
+			delete(m, "cert_file")
+			delete(m, "key_file")
+		}
 	case "listen":
 		p, err := strconv.Atoi(strings.TrimPrefix(value, ":"))
 		if err != nil || p < 1 || p > 65535 {
@@ -267,4 +272,14 @@ func checkCertificate(cfg ServerConfig, domain string) (certCheck, error) {
 		return certCheck{}, fmt.Errorf("none for %s in %s (aero cert)", domain, strings.Join(systemCertDirs(), ", "))
 	}
 	return certCheck{c.CertFile, c.NotAfter}, nil
+}
+
+// underSystemCertDir 报告 path 是否位于 acme.sh/certbot 的默认证书目录下。
+func underSystemCertDir(path string) bool {
+	for _, d := range systemCertDirs() {
+		if rel, err := filepath.Rel(d, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return true
+		}
+	}
+	return false
 }
