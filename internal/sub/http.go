@@ -467,7 +467,7 @@ func (h *AeroHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/restart/", h.RestartEdge)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/subs/sync/", h.SyncSubs)
 	mux.HandleFunc("POST /api/v1/aero/subs/broadcast/", h.BroadcastSubs)
-	mux.HandleFunc("POST /api/v1/aero/vps/{id}/warp/install/", h.InstallWARP)
+	mux.HandleFunc("PUT /api/v1/aero/vps/{id}/warp/", h.SetWarp)
 	mux.HandleFunc("POST /api/v1/aero/vps/{id}/purity/check/", h.CheckPurity)
 	mux.HandleFunc("GET /api/v1/aero/vps/{id}/purity/", h.GetPurity)
 	mux.HandleFunc("PUT /api/v1/aero/vps/{id}/usage-api/", h.SetUsageAPI)
@@ -758,11 +758,26 @@ func (h *AeroHandler) BroadcastSubs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"code": 0, "message": "broadcasted successfully"})
 }
 
-// InstallWARP 已停用（HTTP 410）：中台与 edge 都不安装 WARP（ADR-0012 第 6 条）。WARP 是插件，
-// 由运维按 Cloudflare 官方文档安装；edge 只读取其状态并以开关决定是否使用。旧实现以 apt 安装软件包，
-// 并以 `ufw allow 40000/tcp` 把 SOCKS5 代理端口对公网开放。
-func (h *AeroHandler) InstallWARP(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusGone, errResp(1010, "中台不再安装 WARP：请按 Cloudflare 官方文档在节点上安装官方客户端（proxy 模式），edge 只读取其状态并按开关使用"))
+// SetWarp 切换节点的 WARP 规则接管（off、ai、all），经 C13；WARP 客户端由节点上的 aero warp install 安装。
+func (h *AeroHandler) SetWarp(w http.ResponseWriter, r *http.Request) {
+	id, err := parseVPSID(r)
+	if err != nil {
+		writeJSON(w, 422, errResp(1002, "invalid vps id"))
+		return
+	}
+	var req struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || (req.Mode != "off" && req.Mode != "ai" && req.Mode != "all") {
+		writeJSON(w, 422, errResp(1002, "mode must be off, ai or all"))
+		return
+	}
+	st, err := h.svc.SetWarp(r.Context(), id, req.Mode)
+	if err != nil {
+		writeJSON(w, 502, errResp(1006, err.Error()))
+		return
+	}
+	writeJSON(w, 200, map[string]any{"code": 0, "data": st})
 }
 
 func (h *AeroHandler) CheckPurity(w http.ResponseWriter, r *http.Request) {

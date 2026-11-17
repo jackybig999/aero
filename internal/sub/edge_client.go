@@ -249,3 +249,17 @@ func (s *VPSService) SetUsageAPI(ctx context.Context, vpsID uint64, enabled bool
 	}
 	return us.Enabled, s.eps.SetMeteringKey(vpsID, us.MeteringKey)
 }
+
+// SetWarp 切换节点 WARP 规则接管（C13 PUT /admin/v1/warp）：off 关闭，ai 仅 AI 场景，all 全部流量。
+func (s *VPSService) SetWarp(ctx context.Context, vpsID uint64, mode string) (edgeWarpState, error) {
+	ep, err := s.endpointFor(vpsID)
+	if err != nil {
+		return edgeWarpState{}, err
+	}
+	var st edgeWarpState
+	err = edgeAPI(ctx, ep, http.MethodPut, "/admin/v1/warp", map[string]bool{"enabled": mode != "off", "all": mode == "all"}, &st)
+	if err == nil {
+		InvalidateDiagCache(vpsID)
+	}
+	return st, err
+}

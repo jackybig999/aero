@@ -40,7 +40,7 @@
         <div class="logo-badge">A</div>
         <div class="brand-text">
           <h1>AERO 管理台</h1>
-          <span class="brand-sub">官方管控中台 v1.4.0</span>
+          <span class="brand-sub">官方管控中台 v1.4.1</span>
         </div>
       </div>
       <nav class="nav-menu">
@@ -270,9 +270,13 @@
               <span id="aeroPurityDetails" style="font-size:11px;color:var(--muted)">YouTube: — · Gemini: —</span>
             </div>
             <div style="display:flex;gap:8px;align-items:center">
-              <button class="btn btn-sm btn-blue" id="btnAeroInstallWarp" title="安装/配置 Cloudflare 官方 WARP (SOCKS5 40000) 保护源IP与解锁 AI">
-                ⚡ 一键安装/配置官方 WARP
-              </button>
+              <label style="font-size:12px;color:var(--muted)" title="节点上的官方 WARP 客户端由节点运维命令 aero warp install 安装；这里只切换 edge 是否使用它">WARP 规则接管
+                <select id="aeroWarpMode" class="input-text" style="width:auto;margin-left:6px">
+                  <option value="off">关闭</option>
+                  <option value="ai">仅 AI 场景</option>
+                  <option value="all">全部流量</option>
+                </select>
+              </label>
               <button class="btn btn-sm" id="btnAeroCheckPurity" title="向远端 VPS 发送探测指令检测 YouTube 送中与 Gemini 状态">
                 🔄 IP 送中检测
               </button>

@@ -1596,6 +1596,7 @@ async function loadAeroDiagnose(vpsId, force = false) {
 
     // 9. IP Purity & WARP Protection
     renderPurityInfo(diag.purity);
+    renderAeroWarpMode(diag.warp);
   } catch (e) {
     if (statusEl) statusEl.textContent = `诊断失败: ${e.message}`;
   }
@@ -1645,7 +1646,7 @@ function renderPurityInfo(purity) {
   } else if (purity.warp_installed) {
     wTag.innerHTML = '<span class="tag tag-amber">⚠️ WARP 已安装未启动 (端口 40000 离线)</span>';
   } else if (purity.is_cn_marked) {
-    wTag.innerHTML = '<span class="tag tag-red">⚠️ 未配置 WARP (源 IP 送中，急需安装救援)</span>';
+    wTag.innerHTML = '<span class="tag tag-red">⚠️ 未配置 WARP（可在节点上执行 aero warp install）</span>';
   } else {
     wTag.innerHTML = '<span class="tag tag-muted">WARP 未安装</span>';
   }
@@ -1659,23 +1660,24 @@ function renderPurityInfo(purity) {
   pDetails.textContent = `${ipCountryStr} · ${ytStr}${mismatchStr} · ${nativeGemStr} · ${warpGemStr}`;
 }
 
-async function deployAeroWarp() {
+// WARP 规则接管开关（C13 PUT /admin/v1/warp）。WARP 客户端在节点上用 `aero warp install` 安装，中台不安装。
+async function setAeroWarpMode(mode) {
   if (!currentAeroVpsId) return alert('请先在上方下拉框选择目标 VPS 主机！');
   try {
-    const res = await apiCall(`/aero/vps/${currentAeroVpsId}/warp/install/`, {
-      method: 'POST'
-    });
-    const task = res.data || res;
-    const taskId = task.id || task.task_id;
-    if (taskId) {
-      openAeroTaskDrawer(taskId, 'warp_install');
-    } else {
-      alert('官方 WARP 配置指令已下发！');
-      loadAeroDiagnose(currentAeroVpsId);
-    }
+    const st = await apiCall(`/aero/vps/${currentAeroVpsId}/warp/`, { method: 'PUT', body: JSON.stringify({ mode }) });
+    alert(`WARP 规则接管已设为：${({off:'关闭',ai:'仅 AI 场景',all:'全部流量'})[mode]}`);
+    renderAeroWarpMode(st);
   } catch (e) {
-    alert(`下发失败: ${e.message}`);
+    alert(`切换失败: ${e.message}`);
+    loadAeroDiagnose(currentAeroVpsId);
   }
+}
+
+function renderAeroWarpMode(st) {
+  const sel = $('aeroWarpMode');
+  if (!sel || !st) return;
+  sel.value = !st.enabled ? 'off' : (st.all ? 'all' : 'ai');
+  sel.title = st.available ? '节点 WARP 代理可用' : '节点未检测到 WARP 代理：请在节点上执行 aero warp install';
 }
 
 async function checkAeroPurity() {
@@ -1833,7 +1835,7 @@ async function openAeroPreflightDrawer(action, customPort = 0) {
     const isOk = diag && diag.ok;
     const installedVer = (diag && (diag.version || (diag.service && diag.service.version))) || '';
     const src = latestAeroSourceStatus;
-    const releaseTag = (src && src.release_tag) || 'v1.4.0';
+    const releaseTag = (src && src.release_tag) || 'v1.4.1';
 
     if (isInstalled && isOk) {
       // 场景 1：目标主机已安装且正常在线（防重复安装拦截）
@@ -2017,7 +2019,7 @@ function openAeroTaskDrawer(taskId, action = 'task') {
   if (actionBar) actionBar.style.display = 'none';
 
   $('aeroTaskModalTitle').innerHTML = `<span>🚀 调度流水线详情 #${taskId}</span> <span class="tag tag-blue" id="aeroTaskModalStatusTag">RUNNING</span>`;
-  const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : (action === 'warp_install' ? '官方 WARP 出口保护与送中解除' : `${action.toUpperCase()} Edge`));
+  const actName = action === 'install' ? '安装 / 升级 Edge' : (action === 'uninstall' ? '深度卸载 Edge' : `${action.toUpperCase()} Edge`);
   const vpsLabel = getSelectedAeroVpsLabel();
   $('aeroTaskModalSub').textContent = `任务 #${taskId} · ${actName} · ${vpsLabel}`;
 
@@ -2054,23 +2056,6 @@ function openAeroTaskDrawer(taskId, action = 'task') {
           2. 若远端 Edge 内核已是最新版本，将智能跳过重复构建与多余传输，瞬间就绪<br/>
           3. 若非最新版，将彻底拉取最新官方包执行无缝热升级并重载守护进程<br/>
           4. 自动检测宿主网络环境，配置 UDP 443 标准监听与 2083 端口复用
-        </div>
-      `;
-    } else if (action === 'warp_install') {
-      noticeBox.style.display = 'block';
-      noticeBox.style.background = 'rgba(16, 185, 129, 0.12)';
-      noticeBox.style.border = '1px solid rgba(16, 185, 129, 0.35)';
-      noticeBox.style.color = '#6ee7b7';
-      noticeBox.innerHTML = `
-        <div style="font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:6px;color:#10b981">
-          <span>🛡️</span> Cloudflare 官方 WARP 出口保护流水线（核心防重复旁路门禁）：
-        </div>
-        <div style="font-size:12px;line-height:1.6">
-          1. <strong>防重复安装检测</strong>：若已安装且 40000 正常运行，严格触发旁路保护跳过安装配置，杜绝覆盖破坏存量环境<br/>
-          2. <strong>官方 APT 软件源</strong>：基于 Debian 系统标准 <code>pkg.cloudflareclient.com</code> 官方仓库安全安装<br/>
-          3. <strong>SOCKS5 本地代理</strong>：严格以 proxy 模式监听 <code>127.0.0.1:40000</code>，绝不修改宿主全局默认路由，确保 SSH 安全<br/>
-          4. <strong>UFW 增量安全放行</strong>：优先保护 22/tcp，仅增量放行 40000 端口，绝不重置或修改其他业务端口<br/>
-          5. <strong>AERO Edge 自动接管</strong>：重载 Edge 服务，自动将 Google、Gemini、OpenAI、Anthropic 出口重定向至 WARP 隧道
         </div>
       `;
     } else {
@@ -2223,8 +2208,7 @@ function initAeroEvents() {
     openAeroPreflightDrawer('uninstall');
   });
 
-  // 一键安装/配置官方 Cloudflare WARP 保护源 IP 与送中解锁
-  $('btnAeroInstallWarp')?.addEventListener('click', () => deployAeroWarp());
+  $('aeroWarpMode')?.addEventListener('change', (e) => setAeroWarpMode(e.target.value));
 
   // 重新检测 VPS 出口纯净度与 YouTube/Gemini 送中状态
   $('btnAeroCheckPurity')?.addEventListener('click', () => checkAeroPurity());
