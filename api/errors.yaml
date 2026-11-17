@@ -7,6 +7,7 @@ EDGE_DEVICE_LIMIT:          {http: 403, desc: "超过同时在线设备数"}
 EDGE_CLASS_NOT_ALLOWED:     {http: 403, desc: "token 未授权该流量场景"}
 EDGE_DEST_PROHIBITED:       {http: 403, desc: "目的地址被 ACL 拒绝"}
 EDGE_POOL_EXHAUSTED:        {http: 503, desc: "地址池耗尽"}
+EDGE_CONNECT_IP_DISABLED:   {http: 503, desc: "本节点关闭了 CONNECT-IP（connect_ip=false，只提供 TCP/UDP 代理与 DoH）"}
 EDGE_RATE_LIMITED:          {http: 429, desc: "限流"}
 EDGE_METERING_UNAUTHORIZED: {http: 404, desc: "计量只读密钥无效（对外表现为伪装站，不暴露接口）"}
 EDGE_USAGE_CURSOR_EXPIRED:  {http: 410, desc: "计量游标早于保留期或无法识别，需从头读取（C6）"}

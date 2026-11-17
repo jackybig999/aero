@@ -219,3 +219,17 @@ func TestSignedTokenLeaseFollowsUID(t *testing.T) {
 		t.Fatalf("after token rotation got %v (err %v), want the same address %v", again, err, first)
 	}
 }
+
+// connect_ip=false：已鉴权的 CONNECT-IP 请求得到 503 与明确的 Proxy-Status，而不是进入隧道。
+func TestConnectIPDisabledReturns503(t *testing.T) {
+	f := newSignedAuthFixture(t)
+	f.qs.connectIPDisabled = true
+	req := httptest.NewRequest(http.MethodConnect, "/.well-known/masque/ip/*/*/", nil)
+	req.RemoteAddr = "203.0.113.50:4000"
+	req.Header.Set("Authorization", "Bearer "+f.token(t, "user_tun00001", 3, time.Hour))
+	rec := httptest.NewRecorder()
+	f.qs.serveConnectIP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Header().Get("Proxy-Status"), "connect_ip_disabled") {
+		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("Proxy-Status"))
+	}
+}

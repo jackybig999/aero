@@ -685,25 +685,26 @@ type udpSessionTracker struct {
 
 // QUICServer manages QUIC connections, HTTP/3, MASQUE proxies, UDP contexts, and DNS
 type QUICServer struct {
-	cfg              *ServerConfig
-	validator        *Validator
-	tokenVerifier    *TokenVerifier             // 非 nil 即启用 C3 签名 token（auth_signed_token）
-	usageMeter       atomic.Pointer[UsageMeter] // C6 计量；nil 表示不计量
-	connLimiter      *ConnLimiter
-	bandwidthLimiter *BandwidthLimiter
-	dialGuard        *DialGuard
-	rateLimiter      *RateLimiter
-	dnsResolver      *DNSResolver
-	connTracker      *ConnTracker
-	ipPool           *IPPool
-	ipv6Pool         *IPv6Pool
-	globalRouter     *GlobalTunnelRouter
-	globalReaderMu   sync.Mutex
-	globalReader     *GlobalTunnelReader
-	authJail         *AuthFailureJail
-	masqueProxy      *masque.Proxy
-	connectIPProxy   *connectip.Proxy
-	h3Server         *http3.Server
+	cfg               *ServerConfig
+	validator         *Validator
+	tokenVerifier     *TokenVerifier             // 非 nil 即启用 C3 签名 token（auth_signed_token）
+	connectIPDisabled bool                       // connect_ip=false：CONNECT-IP 返回 503，不使用 TUN
+	usageMeter        atomic.Pointer[UsageMeter] // C6 计量；nil 表示不计量
+	connLimiter       *ConnLimiter
+	bandwidthLimiter  *BandwidthLimiter
+	dialGuard         *DialGuard
+	rateLimiter       *RateLimiter
+	dnsResolver       *DNSResolver
+	connTracker       *ConnTracker
+	ipPool            *IPPool
+	ipv6Pool          *IPv6Pool
+	globalRouter      *GlobalTunnelRouter
+	globalReaderMu    sync.Mutex
+	globalReader      *GlobalTunnelReader
+	authJail          *AuthFailureJail
+	masqueProxy       *masque.Proxy
+	connectIPProxy    *connectip.Proxy
+	h3Server          *http3.Server
 
 	udpTempl *uritemplate.Template
 	ipTempl  *uritemplate.Template
@@ -2094,6 +2095,11 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	token, ok := s.authRequest(w, r)
 	if !ok {
+		return
+	}
+	if s.connectIPDisabled {
+		w.Header().Set("Proxy-Status", `aero; error=connect_ip_disabled; details="CONNECT-IP is disabled on this node"`)
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 

@@ -87,6 +87,9 @@ type ServerConfig struct {
 	UsageAPI    bool   `json:"usage_api,omitempty" yaml:"usage_api"`
 	MeteringKey string `json:"metering_key,omitempty" yaml:"metering_key"`
 	NodeID      string `json:"node_id,omitempty" yaml:"node_id"`
+	// ConnectIP 控制 CONNECT-IP（全局隧道）：未配置时开启，需要 TUN 并修改宿主转发（ADR-0012）；
+	// 显式 false 时只提供 TCP/UDP 代理与 DoH，不创建 TUN、不修改宿主（适合没有 TUN 的 VPS）。
+	ConnectIP *bool `json:"connect_ip,omitempty" yaml:"connect_ip"`
 	// RemoteAdminV1 控制 C13 远程管理接口（api/edge-remote.yaml，ADR-0016）：未配置时开启，显式 false 关闭
 	// （用户决定 2026-11-12）。接口仍需管理密钥，未鉴权返回伪装站。
 	RemoteAdminV1 *bool `json:"remote_admin_v1,omitempty" yaml:"remote_admin_v1"`
@@ -429,7 +432,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		quicServer.SetAllowLoopbackForTest(true)
 	}
 	tunDevice := strings.TrimSpace(cfg.GlobalTUNDevice)
-	if tunDevice == "" && runtime.GOOS == "linux" && !cfg.AllowSelfSignedCertForTest {
+	if cfg.ConnectIP != nil && !*cfg.ConnectIP {
+		tunDevice = ""
+		quicServer.connectIPDisabled = true
+		log.Printf("[EDGE] CONNECT-IP disabled by config (connect_ip=false): no TUN, host untouched; TCP/UDP proxy and DoH only")
+	} else if tunDevice == "" && runtime.GOOS == "linux" && !cfg.AllowSelfSignedCertForTest {
 		tunDevice = "aero-tun0"
 	} else if tunDevice == "" && runtime.GOOS == "linux" {
 		if _, err := net.InterfaceByName("aero-tun0"); err == nil {
@@ -441,18 +448,19 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {
 			if strings.TrimSpace(cfg.GlobalTUNDevice) != "" || !cfg.AllowSelfSignedCertForTest {
 				quicServer.Close()
-				return nil, fmt.Errorf("attach global TUN %s failed: %w (production CONNECT-IP requires functional TUN interface)", tunDevice, err)
+				return nil, fmt.Errorf("attach global TUN %s failed: %w (CONNECT-IP requires a working TUN; set connect_ip=false to run TCP/UDP proxy only)", tunDevice, err)
 			}
 			log.Printf("[EDGE] [WARN] Auto-configured global TUN %s could not be attached: %v (CONNECT-IP proxy may be disabled)", tunDevice, err)
 		} else {
 			log.Printf("[EDGE] Global TUN device %s attached and active for CONNECT-IP data plane", tunDevice)
 			_ = ConfigureGlobalTunnelDevice(tunDevice, "10.88.0.1/16", "fd88:ae80::1/64", 1360)
 			// 只有 TUN 就绪后才修改宿主（ADR-0012）；失败时已做的修改由 PrepareHostForTunnel 自行还原。
+			// 准备失败时拒绝启动：否则 CONNECT-IP 照常接受连接但出口不通（静默断网）。
 			if err := PrepareHostForTunnel(absDataDir, tunDevice); err != nil {
-				log.Printf("[EDGE] [ERROR] CONNECT-IP forwarding not prepared, tunnel egress will fail: %v", err)
-			} else {
-				hostStateDir = absDataDir
+				quicServer.Close()
+				return nil, fmt.Errorf("prepare host for CONNECT-IP: %w (set connect_ip=false to run TCP/UDP proxy only)", err)
 			}
+			hostStateDir = absDataDir
 		}
 	} else if tunDevice != "" {
 		if err := quicServer.AttachGlobalTunnelDeviceByName(context.Background(), tunDevice); err != nil {

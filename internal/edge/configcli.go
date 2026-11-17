@@ -30,7 +30,7 @@ var (
 const minAdminKeyLen = 32
 
 // configKeys 是允许经命令行修改的配置项（其余配置由 edge 自己维护）。
-var configKeys = []string{"domain", "listen", "admin_key", "warp", "usage_api", "remote_admin_v1", "token_issuer"}
+var configKeys = []string{"domain", "listen", "admin_key", "warp", "usage_api", "remote_admin_v1", "connect_ip", "token_issuer"}
 
 func readConfigMap(path string) (map[string]any, error) {
 	m := map[string]any{}
@@ -106,7 +106,7 @@ func ConfigSet(path, key, value string) (string, error) {
 		}
 		iss[kid] = pub
 		m["token_issuers"] = iss
-	case "usage_api", "remote_admin_v1":
+	case "usage_api", "remote_admin_v1", "connect_ip":
 		b, err := strconv.ParseBool(value)
 		if err != nil {
 			return "", fmt.Errorf("%s must be true or false", key)
@@ -140,7 +140,7 @@ func ConfigGet(path, key string) (string, error) {
 			return "all", nil
 		}
 		return "ai", nil
-	case "domain", "listen", "admin_key", "usage_api", "remote_admin_v1", "metering_key", "node_id", "cert_file", "key_file", "data_dir":
+	case "domain", "listen", "admin_key", "usage_api", "remote_admin_v1", "connect_ip", "metering_key", "node_id", "cert_file", "key_file", "data_dir":
 		if v, ok := m[key]; ok && v != nil {
 			return fmt.Sprint(v), nil
 		}
@@ -216,15 +216,19 @@ func CheckNode(path string) []CheckItem {
 		}
 	}
 
-	if fw, err := firewallBackend(); err != nil {
-		add("FAIL", "firewall", "%v", err)
+	if cfg.ConnectIP != nil && !*cfg.ConnectIP {
+		add("OK", "connect_ip", "disabled by config: TCP/UDP proxy and DoH only, no TUN, host untouched")
 	} else {
-		add("OK", "firewall", "%s", fw)
-	}
-	if _, err := os.Stat("/dev/net/tun"); err != nil {
-		add("FAIL", "tun", "/dev/net/tun unavailable: %v", err)
-	} else {
-		add("OK", "tun", "/dev/net/tun")
+		if fw, err := firewallBackend(); err != nil {
+			add("FAIL", "firewall", "%v (or aero-edge config set connect_ip false)", err)
+		} else {
+			add("OK", "firewall", "%s", fw)
+		}
+		if _, err := os.Stat("/dev/net/tun"); err != nil {
+			add("FAIL", "tun", "/dev/net/tun unavailable: %v (or aero-edge config set connect_ip false)", err)
+		} else {
+			add("OK", "tun", "/dev/net/tun")
+		}
 	}
 
 	switch {

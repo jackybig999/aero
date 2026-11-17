@@ -159,3 +159,35 @@ func TestLegacyPersistedCertPathMigrates(t *testing.T) {
 	}
 	srv.Close()
 }
+
+// connect_ip=false：服务端不建 TUN、不改宿主；check 不再要求防火墙工具与 TUN。
+func TestConnectIPDisabledServerAndCheck(t *testing.T) {
+	off := false
+	dir := t.TempDir()
+	cf, kf := writeTestCert(t, filepath.Join(dir, "c"), "fullchain.pem", "privkey.pem", time.Now().Add(48*time.Hour), "n.example.com")
+	listen, _ := findTestAddr()
+	srv, err := NewServer(ServerConfig{Listen: listen, Domain: "n.example.com", CertFile: cf, KeyFile: kf, DataDir: dir, ConnectIP: &off})
+	if err != nil {
+		t.Fatalf("relay-only edge must start without TUN: %v", err)
+	}
+	if srv.hostStateDir != "" || !srv.quicServer.connectIPDisabled {
+		t.Fatalf("host touched=%q disabled=%v", srv.hostStateDir, srv.quicServer.connectIPDisabled)
+	}
+	srv.Close()
+	path := filepath.Join(dir, "edge.json")
+	b, _ := json.Marshal(map[string]any{"domain": "n.example.com", "cert_file": cf, "key_file": kf, "admin_key": strings.Repeat("a", 32), "data_dir": dir, "listen": "127.0.0.1:0", "connect_ip": false})
+	_ = os.WriteFile(path, b, 0o600)
+	names := map[string]string{}
+	for _, it := range CheckNode(path) {
+		names[it.Name] = it.Level
+	}
+	if names["connect_ip"] != "OK" || names["tun"] != "" || names["firewall"] != "" {
+		t.Fatalf("check: %v", names)
+	}
+	if _, err := ConfigSet(path, "connect_ip", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := ConfigGet(path, "connect_ip"); v != "true" {
+		t.Fatalf("connect_ip get = %q", v)
+	}
+}

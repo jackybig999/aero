@@ -166,6 +166,17 @@ cmd_warp() {
   esac
 }
 
+# 全局隧道（CONNECT-IP）：需要 TUN 并修改宿主转发；关闭后只提供 TCP/UDP 代理与 DoH，不建 TUN、不改宿主。
+cmd_tunnel() {
+  need_root
+  case "${1:-}" in
+    on) cfg_set connect_ip true ;;
+    off) cfg_set connect_ip false ;;
+    *) echo " 全局隧道: $( [[ "$(cfg_get connect_ip)" == false ]] && echo 关闭 || echo 开启 )（aero tunnel on|off）"; return 0 ;;
+  esac
+  check_and_restart
+}
+
 cmd_port() {
   need_root
   local p="${1:-}"
@@ -263,6 +274,7 @@ usage() {
   warp [status|install|uninstall|off|ai|all]
                      WARP 官方客户端（可选插件）与 edge 使用开关
   port [端口]        主端口（默认 443，被占用时自动轮试）
+  tunnel [on|off]    全局隧道 CONNECT-IP（关闭后不建 TUN、不改宿主，只提供 TCP/UDP 代理）
   key                生成新的管理密钥
   start|stop|restart|log
   info               节点地址与 Web 控制台链接
@@ -282,6 +294,7 @@ case "${1:-help}" in
   cert) cmd_cert ;;
   warp) cmd_warp "${2:-status}" ;;
   port) cmd_port "${2:-}" ;;
+  tunnel) cmd_tunnel "${2:-}" ;;
   key) cmd_key ;;
   start|restart) need_root; check_and_restart ;;
   stop) need_root; systemctl stop aero-edge && ok "已停止" ;;
