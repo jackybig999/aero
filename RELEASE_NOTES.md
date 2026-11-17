@@ -1,4 +1,9 @@
-## AERO 1.4.2
+## AERO 1.4.3
+
+- edge 不再把自动发现的证书路径（acme.sh/certbot 默认目录）写入 `edge.json`，每次启动重新查找；升级后自动清除旧版本写入的路径。此前用 `aero domain` 换域名后，配置仍指向旧域名的证书，检查失败。显式配置的证书路径保持不变。
+- `aero restart` 只认本次重启之后的启动日志，不再可能把 30 秒内上一次的启动误判为成功。
+
+## AERO 1.4.2（上一版本）
 
 ### 卸载彻底还原（实机验证：卸载后与装机前快照一致）
 - `aero warp install` 记录 WARP 依赖包新建的系统用户与组；`aero warp uninstall` 先停止 warp-svc，删除残留的 WARP 策略路由（fwmark 0x100cf），并删除这些用户与组（Debian 卸载软件包不删用户）。
