@@ -5,7 +5,6 @@
 package edge
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -64,7 +63,6 @@ type SubDocument struct {
 	ExpireAt          int64       `json:"expireAt,omitempty"`
 	TrafficLimitBytes int64       `json:"trafficLimitBytes,omitempty"`
 	TrafficUsedBytes  int64       `json:"trafficUsedBytes,omitempty"`
-	Signature         string      `json:"signature,omitempty"`
 	Servers           []SubServer `json:"servers"`
 	CreatedAt         int64       `json:"createdAt,omitempty"`
 }
@@ -126,7 +124,6 @@ type SubServer struct {
 	ISPAffinity string   `json:"isp_affinity,omitempty"`
 	AltPorts    []int    `json:"alt_ports,omitempty"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
-	ECHConfig   string   `json:"ech_config,omitempty" yaml:"ech_config"`
 }
 
 func (s *SubServer) UnmarshalJSON(data []byte) error {
@@ -134,20 +131,18 @@ func (s *SubServer) UnmarshalJSON(data []byte) error {
 	aux := struct {
 		*Alias
 		LegacyECHConfig string `json:"echConfig"`
+		SnakeECHConfig  string `json:"ech_config"` // 旧版写入 sub_meta.json 的同义字段（只读兼容，C5 §4）
 	}{
 		Alias: (*Alias)(s),
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	if s.ECHConfig == "" && aux.LegacyECHConfig != "" {
-		s.ECHConfig = aux.LegacyECHConfig
+	if s.ECH == "" {
+		s.ECH = aux.SnakeECHConfig
 	}
-	if s.ECH == "" && s.ECHConfig != "" {
-		s.ECH = s.ECHConfig
-	}
-	if s.ECHConfig == "" && s.ECH != "" {
-		s.ECHConfig = s.ECH
+	if s.ECH == "" {
+		s.ECH = aux.LegacyECHConfig
 	}
 	return nil
 }
@@ -160,9 +155,9 @@ type UserSub struct {
 	ExpireAt          int64       `json:"expireAt"` // unix epoch seconds
 	TrafficLimitBytes int64       `json:"trafficLimitBytes,omitempty"`
 	TrafficUsedBytes  int64       `json:"trafficUsedBytes,omitempty"`
-	Servers           []SubServer `json:"servers"`   // nodes allocated to user
-	Signature         string      `json:"signature"` // verification signature
-	CreatedAt         int64       `json:"createdAt"` // creation timestamp
+	Servers           []SubServer `json:"servers"`             // nodes allocated to user
+	Signature         string      `json:"signature,omitempty"` // 已废弃（C5 §5）：只为读取旧版 sub_meta.json，不再写入或输出
+	CreatedAt         int64       `json:"createdAt"`           // creation timestamp
 }
 
 func (u *UserSub) UnmarshalJSON(data []byte) error {
@@ -356,8 +351,8 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 		echVal = strings.TrimSpace(p.ECH)
 	}
 	if echVal == "" && len(s.meta.Document.Servers) > 0 {
-		if s.meta.Document.Servers[0].ECHConfig != "" {
-			echVal = s.meta.Document.Servers[0].ECHConfig
+		if s.meta.Document.Servers[0].ECH != "" {
+			echVal = s.meta.Document.Servers[0].ECH
 		} else {
 			echVal = s.meta.Document.Servers[0].ECH
 		}
@@ -385,7 +380,6 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 		ISPAffinity: p.ISPAffinity,
 		AltPorts:    altPorts,
 		ECH:         echVal,
-		ECHConfig:   echVal,
 	}
 
 	if s.meta.Secret == "" {
@@ -401,8 +395,6 @@ func (s *SubStore) Ensure(p EnsureSubParams) error {
 		CreatedAt: time.Now().Unix(),
 		Servers:   []SubServer{srv},
 	}
-	// Sign document with HMAC-SHA256(token)
-	doc.Signature = SignSub(doc, []byte(p.Token))
 	s.meta.Document = doc
 
 	if err := s.saveLocked(); err != nil {
@@ -505,8 +497,8 @@ func (s *SubStore) GetECH() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if len(s.meta.Document.Servers) > 0 {
-		if s.meta.Document.Servers[0].ECHConfig != "" {
-			return s.meta.Document.Servers[0].ECHConfig
+		if s.meta.Document.Servers[0].ECH != "" {
+			return s.meta.Document.Servers[0].ECH
 		}
 		return s.meta.Document.Servers[0].ECH
 	}
@@ -519,17 +511,12 @@ func (s *SubStore) SetECH(ech string) error {
 	defer s.mu.Unlock()
 	if len(s.meta.Document.Servers) == 0 {
 		s.meta.Document.Servers = []SubServer{{
-			Name:      "default",
-			Protocol:  "connect-ip",
-			ECH:       ech,
-			ECHConfig: ech,
+			Name:     "default",
+			Protocol: "connect-ip",
+			ECH:      ech,
 		}}
 	} else {
 		s.meta.Document.Servers[0].ECH = ech
-		s.meta.Document.Servers[0].ECHConfig = ech
-		if s.meta.Document.Servers[0].Token != "" {
-			s.meta.Document.Signature = SignSub(s.meta.Document, []byte(s.meta.Document.Servers[0].Token))
-		}
 	}
 	if err := s.saveLocked(); err != nil {
 		return err
@@ -563,18 +550,7 @@ func (s *SubStore) UpsertUserSub(sub UserSub) error {
 		sub.Servers = []SubServer{defaultSrv}
 	}
 
-	doc := SubDocument{
-		Version:           "aero/3.0",
-		UserID:            sub.Username,
-		ExpireAt:          sub.ExpireAt,
-		TrafficLimitBytes: sub.TrafficLimitBytes,
-		TrafficUsedBytes:  sub.TrafficUsedBytes,
-		Servers:           sub.Servers,
-		CreatedAt:         sub.CreatedAt,
-	}
-	if sub.Token != "" {
-		sub.Signature = SignSub(doc, []byte(sub.Token))
-	}
+	sub.Signature = "" // 已废弃（C5 §5）
 	s.meta.UserSubs[sub.Slug] = sub
 	return s.saveLocked()
 }
@@ -607,13 +583,6 @@ func (s *SubStore) AdminDocument() SubDocument {
 	doc.ExpireAt = 0          // permanent validity
 	doc.TrafficLimitBytes = 0 // unlimited traffic
 	doc.TrafficUsedBytes = 0
-	primaryToken := ""
-	if len(doc.Servers) > 0 {
-		primaryToken = doc.Servers[0].Token
-	}
-	if primaryToken != "" {
-		doc.Signature = SignSub(doc, []byte(primaryToken))
-	}
 	return doc
 }
 
@@ -678,43 +647,10 @@ func (s *SubStore) UserDocumentJSON(sub UserSub) ([]byte, error) {
 		ExpireAt:          sub.ExpireAt,
 		TrafficLimitBytes: sub.TrafficLimitBytes,
 		TrafficUsedBytes:  sub.TrafficUsedBytes,
-		Signature:         sub.Signature,
 		Servers:           servers,
 		CreatedAt:         sub.CreatedAt,
 	}
 	return json.Marshal(doc)
-}
-
-// ==========================================
-// 3. Subscription Signing & Verification
-// ==========================================
-
-type subSignBody struct {
-	Version           string      `json:"version"`
-	UserID            string      `json:"userId,omitempty"`
-	ExpireAt          int64       `json:"expireAt,omitempty"`
-	TrafficLimitBytes int64       `json:"trafficLimitBytes,omitempty"`
-	Servers           []SubServer `json:"servers"`
-	CreatedAt         int64       `json:"createdAt,omitempty"`
-}
-
-// SignSub creates HMAC-SHA256 signature encoded as base64 URL-safe
-func SignSub(doc SubDocument, key []byte) string {
-	body := subSignBody{
-		Version:           doc.Version,
-		UserID:            doc.UserID,
-		ExpireAt:          doc.ExpireAt,
-		TrafficLimitBytes: doc.TrafficLimitBytes,
-		Servers:           doc.Servers,
-		CreatedAt:         doc.CreatedAt,
-	}
-	data, err := json.Marshal(body)
-	if err != nil {
-		return ""
-	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(data)
-	return base64.URLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func randomHexSecret(n int) (string, error) {

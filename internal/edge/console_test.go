@@ -492,10 +492,7 @@ func TestConsoleAPI_UserHardening_EmailAndDirectURLAndSignature(t *testing.T) {
 	if err := json.Unmarshal(subRec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("unmarshal sub doc: %v", err)
 	}
-	initialSig := doc.Signature
-	if initialSig == "" {
-		t.Fatalf("expected non-empty initial signature")
-	}
+	assertSubConforms(t, subRec.Body.Bytes())
 
 	// 3. Record traffic usage and assert signature remains valid
 	if err := srv.subStore.RecordTraffic(slug, 1024*1024*50); err != nil {
@@ -515,14 +512,5 @@ func TestConsoleAPI_UserHardening_EmailAndDirectURLAndSignature(t *testing.T) {
 	if doc2.TrafficUsedBytes != 1024*1024*50 {
 		t.Errorf("expected 50MB used traffic, got %d", doc2.TrafficUsedBytes)
 	}
-	// Signature must be identical because TrafficUsedBytes is not part of subSignBody
-	if doc2.Signature != initialSig {
-		t.Errorf("traffic accumulation altered signature! before=%s, after=%s", initialSig, doc2.Signature)
-	}
-
-	// Token validation: verify that the signature verifies with the user token
-	userToken := res["token"].(string)
-	if !VerifySub(doc2, []byte(userToken)) {
-		t.Errorf("VerifySub failed after traffic accumulation!")
-	}
+	assertSubConforms(t, subRec2.Body.Bytes())
 }

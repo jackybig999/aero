@@ -1,0 +1,29 @@
+{
+  "version": "aero/3.0",
+  "userId": "alice",
+  "expireAt": 1893456000,
+  "trafficLimitBytes": 107374182400,
+  "trafficUsedBytes": 1048576,
+  "createdAt": 1763340000,
+  "switchStatus": "on",
+  "servers": [
+    {
+      "name": "us-1",
+      "host": "us.example.net",
+      "address": "us.example.net:443",
+      "ip": "198.51.100.7",
+      "token": "aero1.eyJ2IjoxfQ.c2ln",
+      "sni": "us.example.net",
+      "protocol": "connect-ip",
+      "alt_ports": [2083, 2087, 8443],
+      "line_type": "direct",
+      "isp_affinity": "BGP",
+      "ech": "AEX0001",
+      "country": "US",
+      "purityScore": 95,
+      "aiBlocked": false,
+      "warp_active": false,
+      "tags": ["ai"]
+    }
+  ]
+}

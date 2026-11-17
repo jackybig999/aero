@@ -329,11 +329,9 @@ func TestSubscriptionStoreAndSigning(t *testing.T) {
 		t.Fatalf("client-sub.json should be written: %v", err)
 	}
 
-	// Verify signature
-	doc := store.Document()
-	if !VerifySub(doc, []byte("token_abc")) {
-		t.Fatal("subscription signature verification failed")
-	}
+	// 订阅文档符合 C5（不再签名）
+	docJSON, _ := store.DocumentJSON()
+	assertSubConforms(t, docJSON)
 
 	// Test User Subscription (Slug)
 	userSub := UserSub{
@@ -444,51 +442,21 @@ func TestAdminHandlerAndTokenSync(t *testing.T) {
 	}
 }
 
+// C5 §4：旧名 ech_config / echConfig 只读兼容，统一读入 ech；输出只有 ech。
 func TestWireContract_SubServerECH(t *testing.T) {
-	// 1. SubServer unmarshals snake_case ech_config
-	raw1 := `{"name":"node1","host":"h1","token":"tok1","ech_config":"ECH_VAL_1"}`
-	var s1 SubServer
-	if err := json.Unmarshal([]byte(raw1), &s1); err != nil {
-		t.Fatalf("unmarshal s1: %v", err)
-	}
-	if s1.ECHConfig != "ECH_VAL_1" || s1.ECH != "ECH_VAL_1" {
-		t.Fatalf("s1 ECHConfig=%q ECH=%q, want ECH_VAL_1", s1.ECHConfig, s1.ECH)
-	}
-
-	// 2. SubServer unmarshals camelCase echConfig
-	raw2 := `{"name":"node2","host":"h2","token":"tok2","echConfig":"ECH_VAL_2"}`
-	var s2 SubServer
-	if err := json.Unmarshal([]byte(raw2), &s2); err != nil {
-		t.Fatalf("unmarshal s2: %v", err)
-	}
-	if s2.ECHConfig != "ECH_VAL_2" || s2.ECH != "ECH_VAL_2" {
-		t.Fatalf("s2 ECHConfig=%q ECH=%q, want ECH_VAL_2", s2.ECHConfig, s2.ECH)
-	}
-
-	// 3. SubServer unmarshals legacy ech
-	raw3 := `{"name":"node3","host":"h3","token":"tok3","ech":"ECH_VAL_3"}`
-	var s3 SubServer
-	if err := json.Unmarshal([]byte(raw3), &s3); err != nil {
-		t.Fatalf("unmarshal s3: %v", err)
-	}
-	if s3.ECHConfig != "ECH_VAL_3" || s3.ECH != "ECH_VAL_3" {
-		t.Fatalf("s3 ECHConfig=%q ECH=%q, want ECH_VAL_3", s3.ECHConfig, s3.ECH)
-	}
-
-	// 4. Test SignSub and VerifySub with ECH and ECHConfig populated
-	doc := SubDocument{
-		Version:   "aero/3.0",
-		CreatedAt: 1728000000,
-		Servers:   []SubServer{s1, s2, s3},
-	}
-	token := []byte("secret_token")
-	sig := SignSub(doc, token)
-	if sig == "" {
-		t.Fatal("SignSub generated empty signature")
-	}
-	doc.Signature = sig
-	if !VerifySub(doc, token) {
-		t.Fatal("VerifySub failed on signed document with ECHConfig")
+	for raw, want := range map[string]string{
+		`{"name":"n1","host":"h1","token":"t","ech_config":"ECH_VAL_1"}`: "ECH_VAL_1",
+		`{"name":"n2","host":"h2","token":"t","echConfig":"ECH_VAL_2"}`:  "ECH_VAL_2",
+		`{"name":"n3","host":"h3","token":"t","ech":"ECH_VAL_3"}`:        "ECH_VAL_3",
+	} {
+		var s SubServer
+		if err := json.Unmarshal([]byte(raw), &s); err != nil || s.ECH != want {
+			t.Fatalf("%s: ECH=%q err=%v", raw, s.ECH, err)
+		}
+		out, _ := json.Marshal(s)
+		if strings.Contains(string(out), "ech_config") || strings.Contains(string(out), "echConfig") {
+			t.Fatalf("legacy ECH name re-emitted: %s", out)
+		}
 	}
 }
 
@@ -4425,11 +4393,8 @@ func TestEdge_M2_AdminSub_PermanentAndUnlimited(t *testing.T) {
 	if doc.TrafficLimitBytes != 0 {
 		t.Errorf("expected TrafficLimitBytes 0 for unlimited quota, got %d", doc.TrafficLimitBytes)
 	}
-	if doc.Signature == "" {
-		t.Errorf("expected non-empty signature on admin document")
-	}
-	if !VerifySub(doc, []byte(token)) {
-		t.Errorf("VerifySub failed for admin document with server token")
+	if raw, _ := json.Marshal(doc); strings.Contains(string(raw), "signature") {
+		t.Errorf("admin document still carries the deprecated signature (C5 §5)")
 	}
 	if len(doc.Servers) == 0 {
 		t.Fatalf("expected servers in admin document")
@@ -4503,8 +4468,8 @@ func TestEdge_M2_UserSub_NormalAndQuotaEnforcement(t *testing.T) {
 	if doc.TrafficLimitBytes != limit {
 		t.Errorf("expected TrafficLimitBytes %d, got %d", limit, doc.TrafficLimitBytes)
 	}
-	if !VerifySub(doc, []byte(userToken)) {
-		t.Errorf("VerifySub failed for user sub")
+	if len(doc.Servers) == 0 || doc.Servers[0].Token != userToken {
+		t.Errorf("user sub must carry the user's token")
 	}
 
 	// 2. Record traffic: 500 KB used (500 KB < 1 MB) -> 200 OK

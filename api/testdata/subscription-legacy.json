@@ -1,0 +1,23 @@
+{
+  "version": "aero/3.0",
+  "userId": "alice",
+  "expire_at": 1893456000,
+  "traffic_limit_bytes": 107374182400,
+  "signature": "c2lnbmF0dXJlLXRoYXQtbm8tbG9uZ2VyLW1hdGNoZXM=",
+  "servers": [
+    {
+      "name": "us-1",
+      "host": "us.example.net",
+      "serverName": "us.example.net",
+      "token": "tok_legacy",
+      "sni": "us.example.net",
+      "protocol": "connect-ip",
+      "altPorts": [2083],
+      "ech_config": "AEX0001",
+      "ispAffinity": "BGP",
+      "purity_score": 95,
+      "is_warp_egress": true,
+      "country_code": "US"
+    }
+  ]
+}

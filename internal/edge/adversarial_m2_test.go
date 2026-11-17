@@ -397,9 +397,7 @@ func TestAdversarial_ZeroPort_URL_Enforcement_And_SubscriptionContract(t *testin
 	if adminDoc.UserID != "admin" || adminDoc.ExpireAt != 0 || adminDoc.TrafficLimitBytes != 0 {
 		t.Fatalf("admin doc contract violation: UserID=%q, ExpireAt=%d, TrafficLimit=%d", adminDoc.UserID, adminDoc.ExpireAt, adminDoc.TrafficLimitBytes)
 	}
-	if !VerifySub(adminDoc, []byte("master_token_sec123")) {
-		t.Fatal("admin doc signature verification failed against master token")
-	}
+	assertSubConforms(t, bodyAdmin)
 
 	// 2b. User Sub: Quota enforcement and Expiry
 	userSlug := "jacky888xyz"
@@ -452,29 +450,6 @@ func TestAdversarial_ZeroPort_URL_Enforcement_And_SubscriptionContract(t *testin
 		t.Fatalf("expected 403 Forbidden for expired user, got %d (err: %v)", respExpired.StatusCode, err)
 	}
 	_ = respExpired.Body.Close()
-
-	// 2c. HMAC Tampering Detection: changing trafficLimitBytes in signed doc invalidates signature
-	validUserDoc := SubDocument{
-		Version:           "aero/3.0",
-		UserID:            "victim_user",
-		ExpireAt:          time.Now().Add(24 * time.Hour).Unix(),
-		TrafficLimitBytes: 500,
-		Servers:           adminDoc.Servers,
-		CreatedAt:         time.Now().Unix(),
-	}
-	sig := SignSub(validUserDoc, []byte("master_token_sec123"))
-	validUserDoc.Signature = sig
-
-	if !VerifySub(validUserDoc, []byte("master_token_sec123")) {
-		t.Fatal("valid user doc failed signature verification")
-	}
-
-	// Attacker tampers with trafficLimitBytes (e.g. changes 500 -> 999999999)
-	tamperedDoc := validUserDoc
-	tamperedDoc.TrafficLimitBytes = 999999999
-	if VerifySub(tamperedDoc, []byte("master_token_sec123")) {
-		t.Fatal("HMAC tampering attack succeeded! Tampered trafficLimitBytes was accepted by VerifySub!")
-	}
 }
 
 // TestAdversarial_AdminSubsAPI_DualFieldCompatibility tests POST /admin/subs

@@ -2,7 +2,6 @@ package edge
 
 import (
 	"context"
-	"crypto/hmac"
 	"encoding/binary"
 	"errors"
 	"net/netip"
@@ -62,15 +61,6 @@ func buildRouterTestIPv4(src, dst netip.Addr) []byte {
 	copy(packet[12:16], srcBytes[:])
 	copy(packet[16:20], dstBytes[:])
 	return packet
-}
-
-// VerifySub verifies HMAC-SHA256 signature
-func VerifySub(doc SubDocument, key []byte) bool {
-	if doc.Signature == "" || len(key) == 0 {
-		return false
-	}
-	expected := SignSub(doc, key)
-	return hmac.Equal([]byte(expected), []byte(doc.Signature))
 }
 
 // fetchAndUpdate pulls China direct rules from upstream, calculates SHA256,
