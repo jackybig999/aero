@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AERO Edge 节点运维命令 v1.4.1
+# AERO Edge 节点运维命令 v1.4.2
 #
 # 安装只安装服务端（edge-install.sh）；域名、证书、WARP、端口、管理密钥都在本机用本命令完成：
 # 修改经 `aero-edge config` 校验后由 edge 写入自己的配置，`aero-edge check` 全部通过后才（重新）启动服务。
@@ -12,6 +12,8 @@ DATA=/var/lib/aero
 ACME_HOME=/root/.acme.sh
 ACME=$ACME_HOME/acme.sh
 WARP_STATE=$DATA/warp-installed-packages   # aero 安装 WARP 时新增的软件包（卸载时只移除这些）
+WARP_USERS=$DATA/warp-installed-users      # 同上，依赖包新建的系统用户与组（Debian 卸载软件包不删用户）
+ACME_STATE=$DATA/acme-before                # 安装 acme.sh 前的 .bashrc 备份与 crontab 状态
 WARP_LIST=/etc/apt/sources.list.d/cloudflare-client.list
 WARP_KEY=/usr/share/keyrings/cloudflare-warp-archive-keyring.asc
 UNINSTALLER=/usr/local/lib/aero/edge-uninstall.sh
@@ -79,6 +81,9 @@ cmd_cert() {
     confirm "是否安装官方 acme.sh（https://get.acme.sh，会添加 acme.sh 自己的自动续期 cron）?" || { warn "已跳过。可自行签发到 acme.sh/certbot 默认目录后再执行 aero check"; return 1; }
     local email; email=$(ask "用于 Let's Encrypt 账户的邮箱: " AERO_EMAIL)
     [[ "$email" == *@*.* ]] || { err "邮箱无效"; return 1; }
+    mkdir -p "$ACME_STATE"
+    cp -p /root/.bashrc "$ACME_STATE/bashrc" 2>/dev/null || true
+    crontab -l >/dev/null 2>&1 && touch "$ACME_STATE/had-crontab" || true
     curl -fsSL https://get.acme.sh | sh -s email="$email" || { err "acme.sh 安装失败"; return 1; }
   fi
   confirm "用 80 端口（standalone）为 $d 签发 Let's Encrypt 证书?" || return 1
@@ -105,7 +110,9 @@ warp_install() {
   if command -v warp-cli >/dev/null; then ok "WARP 已安装"; return 0; fi
   confirm "从 Cloudflare 官方源 pkg.cloudflareclient.com 安装 WARP 客户端（代理模式，只监听 127.0.0.1:40000，不改系统路由）?" || return 1
   . /etc/os-release
-  local before; before=$(dpkg-query -W -f='${Package}\n' | sort)
+  local before users_before groups_before
+  before=$(dpkg-query -W -f='${Package}\n' | sort)
+  users_before=$(cut -d: -f1 /etc/passwd | sort); groups_before=$(cut -d: -f1 /etc/group | sort)
   curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$WARP_KEY"
   echo "deb [signed-by=$WARP_KEY] https://pkg.cloudflareclient.com/ ${VERSION_CODENAME} main" > "$WARP_LIST"
   if ! apt-get update >/dev/null \
@@ -116,6 +123,8 @@ warp_install() {
   fi
   mkdir -p "$DATA"
   comm -13 <(echo "$before") <(dpkg-query -W -f='${Package}\n' | sort) > "$WARP_STATE"
+  { comm -13 <(echo "$users_before") <(cut -d: -f1 /etc/passwd | sort) | sed 's/^/user /'
+    comm -13 <(echo "$groups_before") <(cut -d: -f1 /etc/group | sort) | sed 's/^/group /'; } > "$WARP_USERS"
   warp-cli --accept-tos registration new >/dev/null
   warp-cli --accept-tos mode proxy >/dev/null
   warp-cli --accept-tos proxy port 40000 >/dev/null
@@ -131,12 +140,19 @@ warp_uninstall() {
   confirm "卸载 WARP（只移除 aero 安装时新增的软件包与官方源）?" || return 1
   if [[ "$(cfg_get warp)" != off ]]; then cfg_set warp off; check_and_restart || true; fi
   warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+  systemctl stop warp-svc 2>/dev/null || true   # 停止服务，让它撤销自己的策略路由
   if [[ -s "$WARP_STATE" ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get purge -y $(cat "$WARP_STATE")
   else
     DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflare-warp
   fi
-  rm -f "$WARP_LIST" "$WARP_KEY" "$WARP_STATE"
+  # WARP 的策略路由（fwmark 0x100cf）在软件包移除后可能残留：只删除这一类规则
+  while ip rule show | grep -q 'fwmark 0x100cf'; do ip rule del pref "$(ip rule show | grep 'fwmark 0x100cf' | head -1 | cut -d: -f1)" || break; done
+  if [[ -s "$WARP_USERS" ]]; then  # 只删除安装时新增、且已无进程的系统用户与组
+    awk '$1=="user"{print $2}' "$WARP_USERS" | while read -r u; do pgrep -u "$u" >/dev/null || userdel "$u" 2>/dev/null || true; done
+    awk '$1=="group"{print $2}' "$WARP_USERS" | while read -r g; do groupdel "$g" 2>/dev/null || true; done
+  fi
+  rm -f "$WARP_LIST" "$WARP_KEY" "$WARP_STATE" "$WARP_USERS"
   ok "WARP 已卸载"
 }
 
@@ -222,6 +238,10 @@ cmd_uninstall() {
   if command -v warp-cli >/dev/null && [[ -s "$WARP_STATE" ]] && confirm "同时卸载由 aero 安装的 WARP?"; then warp_uninstall || true; fi
   if [[ -x "$ACME" ]] && confirm "同时卸载 acme.sh 及其证书（/root/.acme.sh）?"; then
     "$ACME" --uninstall >/dev/null 2>&1 || true; rm -rf "$ACME_HOME"
+    # acme.sh 卸载后会留下空 crontab 与 .bashrc 末尾空行：只在与安装前状态精确对应时还原
+    if [[ ! -e "$ACME_STATE/had-crontab" && -z "$(crontab -l 2>/dev/null)" ]]; then crontab -r 2>/dev/null || true; fi
+    if [[ -f "$ACME_STATE/bashrc" ]] && cmp -s <(cat "$ACME_STATE/bashrc"; echo) /root/.bashrc; then cp -p "$ACME_STATE/bashrc" /root/.bashrc; fi
+    rm -rf "$ACME_STATE"
   fi
   local purge=""; confirm "删除配置与数据（/etc/aero、/var/lib/aero）?" && purge=--purge
   bash "$UNINSTALLER" $purge
