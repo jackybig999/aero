@@ -500,6 +500,23 @@ type udpSessionTracker struct {
 }
 
 // QUICServer manages QUIC connections, HTTP/3, MASQUE proxies, UDP contexts, and DNS
+// 测试注入钩子的函数类型；字段用 atomic.Pointer 存放，保证服务运行后设置也无数据竞争。
+type (
+	resolveUDPFunc  func(network, addr string) (*net.UDPAddr, error)
+	udpDialFunc     func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
+	icmpForwardFunc func(target net.IP, echoReq []byte) ([]byte, error)
+	nextHopDialFunc func(nextHopAddr, target, hopCred string) (net.Conn, error)
+)
+
+// storeHook 把可为 nil 的函数存入 atomic.Pointer；nil 表示清除钩子。
+func storeHook[T any](p *atomic.Pointer[T], fn *T, isNil bool) {
+	if isNil {
+		p.Store(nil)
+		return
+	}
+	p.Store(fn)
+}
+
 type QUICServer struct {
 	cfg               *ServerConfig
 	validator         *Validator
@@ -533,18 +550,18 @@ type QUICServer struct {
 	tokenUDPCtx          map[string]int
 	globalUDPCtx         atomic.Int64
 	maxGlobalUDP         int64
-	allowLoopbackForTest bool
-	resolveUDPFn         func(network, addr string) (*net.UDPAddr, error)
-	udpDialFn            func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)
-	icmpForwardHook      func(target net.IP, echoReq []byte) ([]byte, error)
-	icmpv6ForwardHook    func(target net.IP, echoReq []byte) ([]byte, error)
-	nextHopDialer        func(nextHopAddr, target, hopCred string) (net.Conn, error)
-	nextHopUDPDialer     func(nextHopAddr, target, hopCred string) (net.Conn, error)
+	allowLoopbackForTest atomic.Bool // 测试钩子：服务运行后可能被设置，须并发安全
+	resolveUDPFn         atomic.Pointer[resolveUDPFunc]
+	udpDialFn            atomic.Pointer[udpDialFunc]
+	icmpForwardHook      atomic.Pointer[icmpForwardFunc]
+	icmpv6ForwardHook    atomic.Pointer[icmpForwardFunc]
+	nextHopDialer        atomic.Pointer[nextHopDialFunc]
+	nextHopUDPDialer     atomic.Pointer[nextHopDialFunc]
 
 	// WebRTC STUN fast aging & session tracking
 	udpSessions     map[*udpSessionTracker]struct{}
-	stunIdleTimeout time.Duration
-	udpIdleTimeout  time.Duration
+	stunIdleTimeout atomic.Int64 // time.Duration 纳秒；测试钩子可能在服务运行后设置
+	udpIdleTimeout  atomic.Int64 // time.Duration 纳秒
 
 	// tcpIdleTimeout 是标准 CONNECT 中继的空闲上限（双向均无流量）；0 表示默认值。
 	tcpIdleTimeout time.Duration
@@ -599,8 +616,8 @@ func (s *QUICServer) TokenStore() *TokenStore {
 
 // SetUDPIdleTimeoutsForTest sets custom idle timeouts for STUN and standard UDP sessions in unit tests.
 func (s *QUICServer) SetUDPIdleTimeoutsForTest(stunTimeout, normalTimeout time.Duration) {
-	s.stunIdleTimeout = stunTimeout
-	s.udpIdleTimeout = normalTimeout
+	s.stunIdleTimeout.Store(int64(stunTimeout))
+	s.udpIdleTimeout.Store(int64(normalTimeout))
 }
 
 func (s *QUICServer) registerUDPSession(tracker *udpSessionTracker) {
@@ -620,8 +637,8 @@ func (s *QUICServer) unregisterUDPSession(tracker *udpSessionTracker) {
 
 func (s *QUICServer) reclaimStaleSTUN(token string) {
 	timeout := 15 * time.Second
-	if s.stunIdleTimeout > 0 {
-		timeout = s.stunIdleTimeout
+	if d := time.Duration(s.stunIdleTimeout.Load()); d > 0 {
+		timeout = d
 	}
 
 	var toClose []func()
@@ -676,49 +693,49 @@ func (s *QUICServer) ServerConfig() *ServerConfig {
 
 // SetICMPForwardHookForTest sets custom ICMP forward hook for testing
 func (s *QUICServer) SetICMPForwardHookForTest(hook func(target net.IP, echoReq []byte) ([]byte, error)) {
-	s.icmpForwardHook = hook
+	storeHook(&s.icmpForwardHook, (*icmpForwardFunc)(&hook), hook == nil)
 }
 
 // SetICMPv6ForwardHookForTest sets custom ICMPv6 forward hook for testing
 func (s *QUICServer) SetICMPv6ForwardHookForTest(hook func(target net.IP, echoReq []byte) ([]byte, error)) {
-	s.icmpv6ForwardHook = hook
+	storeHook(&s.icmpv6ForwardHook, (*icmpForwardFunc)(&hook), hook == nil)
 }
 
 // SetAllowLoopbackForTest enables loopback dialing for unit tests.
 func (s *QUICServer) SetAllowLoopbackForTest(allow bool) {
-	s.allowLoopbackForTest = allow
+	s.allowLoopbackForTest.Store(allow)
 }
 
 // SetNextHopDialerForTest sets a custom dialer for next-hop cascading in tests
 func (s *QUICServer) SetNextHopDialerForTest(d func(nextHopAddr, target, hopCred string) (net.Conn, error)) {
-	s.nextHopDialer = d
+	storeHook(&s.nextHopDialer, (*nextHopDialFunc)(&d), d == nil)
 }
 
 // SetNextHopUDPDialerForTest sets a custom UDP dialer for next-hop cascading in tests
 func (s *QUICServer) SetNextHopUDPDialerForTest(d func(nextHopAddr, target, hopCred string) (net.Conn, error)) {
-	s.nextHopUDPDialer = d
+	storeHook(&s.nextHopUDPDialer, (*nextHopDialFunc)(&d), d == nil)
 }
 
 // SetUDPDialFunc sets custom UDP dial function for testing
 func (s *QUICServer) SetUDPDialFunc(fn func(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error)) {
-	s.udpDialFn = fn
+	storeHook(&s.udpDialFn, (*udpDialFunc)(&fn), fn == nil)
 }
 
 // SetResolveUDPFunc sets custom UDP resolution function for testing
 func (s *QUICServer) SetResolveUDPFunc(fn func(network, addr string) (*net.UDPAddr, error)) {
-	s.resolveUDPFn = fn
+	storeHook(&s.resolveUDPFn, (*resolveUDPFunc)(&fn), fn == nil)
 }
 
 func (s *QUICServer) resolveUDP(network, addr string) (*net.UDPAddr, error) {
-	if s.resolveUDPFn != nil {
-		return s.resolveUDPFn(network, addr)
+	if fn := s.resolveUDPFn.Load(); fn != nil {
+		return (*fn)(network, addr)
 	}
 	return net.ResolveUDPAddr(network, addr)
 }
 
 func (s *QUICServer) dialUDP(network string, laddr, raddr *net.UDPAddr) (*net.UDPConn, error) {
-	if s.udpDialFn != nil {
-		return s.udpDialFn(network, laddr, raddr)
+	if fn := s.udpDialFn.Load(); fn != nil {
+		return (*fn)(network, laddr, raddr)
 	}
 	return net.DialUDP(network, laddr, raddr)
 }
@@ -788,8 +805,8 @@ func (c *quicStreamConn) SetWriteDeadline(t time.Time) error {
 var _ net.Conn = (*quicStreamConn)(nil)
 
 func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred string) (net.Conn, error) {
-	if s.nextHopDialer != nil {
-		return s.nextHopDialer(nextHopAddr, target, hopCred)
+	if fn := s.nextHopDialer.Load(); fn != nil {
+		return (*fn)(nextHopAddr, target, hopCred)
 	}
 
 	sni := ""
@@ -806,7 +823,7 @@ func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred string) (net.Co
 
 	tlsConf := &tls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: s.allowLoopbackForTest,
+		InsecureSkipVerify: s.allowLoopbackForTest.Load(),
 		NextProtos:         []string{"h3"},
 	}
 	quicConf := DefaultQUICConfig()
@@ -865,8 +882,8 @@ func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred string) (net.Co
 }
 
 func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Conn, error) {
-	if s.nextHopUDPDialer != nil {
-		return s.nextHopUDPDialer(nextHopAddr, target, hopCred)
+	if fn := s.nextHopUDPDialer.Load(); fn != nil {
+		return (*fn)(nextHopAddr, target, hopCred)
 	}
 
 	// 生产真实链路：通过 MASQUE CONNECT-UDP 向上游下一跳中继建立隧道 (NEW-01)
@@ -884,7 +901,7 @@ func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Co
 
 	tlsConf := &tls.Config{
 		ServerName:         sni,
-		InsecureSkipVerify: s.allowLoopbackForTest,
+		InsecureSkipVerify: s.allowLoopbackForTest.Load(),
 		NextProtos:         []string{"h3"},
 	}
 	qConn, err := quic.DialAddr(context.Background(), nextHopAddr, tlsConf, &quic.Config{EnableDatagrams: true})
@@ -1490,7 +1507,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if !s.allowLoopbackForTest {
+	if !s.allowLoopbackForTest.Load() {
 		if blocked, why := IsBlockedTarget(target); blocked {
 			w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
 			w.WriteHeader(http.StatusForbidden)
@@ -1666,7 +1683,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.allowLoopbackForTest {
+	if !s.allowLoopbackForTest.Load() {
 		if blocked, why := IsBlockedTarget(proxyReq.Target); blocked {
 			w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
 			w.WriteHeader(http.StatusForbidden)
@@ -1689,7 +1706,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		targetUDP = uConn
-	} else if s.udpDialFn == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(proxyReq.Target, 0) {
+	} else if s.udpDialFn.Load() == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(proxyReq.Target, 0) {
 		warpConn, err := s.dialGuard.DialUDPViaWARP(proxyReq.Target, 10*time.Second)
 		if err != nil {
 			w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
@@ -1709,7 +1726,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if !s.allowLoopbackForTest {
+		if !s.allowLoopbackForTest.Load() {
 			if blocked, why := IsBlockedIP(dstAddr.IP); blocked {
 				w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
 				w.WriteHeader(http.StatusForbidden)
@@ -1717,7 +1734,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if s.udpDialFn == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(dstAddr.String(), dstAddr.Port) {
+		if s.udpDialFn.Load() == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(dstAddr.String(), dstAddr.Port) {
 			warpConn, err := s.dialGuard.DialUDPViaWARP(dstAddr.String(), 10*time.Second)
 			if err != nil {
 				w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
@@ -1787,8 +1804,8 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		checkInterval := 1 * time.Second
-		if s.stunIdleTimeout > 0 && s.stunIdleTimeout < 1*time.Second {
-			checkInterval = s.stunIdleTimeout / 4
+		if d := time.Duration(s.stunIdleTimeout.Load()); d > 0 && d < 1*time.Second {
+			checkInterval = d / 4
 			if checkInterval < 10*time.Millisecond {
 				checkInterval = 10 * time.Millisecond
 			}
@@ -1801,13 +1818,13 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 				return
 			case <-ticker.C:
 				timeout := 45 * time.Second
-				if s.udpIdleTimeout > 0 {
-					timeout = s.udpIdleTimeout
+				if d := time.Duration(s.udpIdleTimeout.Load()); d > 0 {
+					timeout = d
 				}
 				if isSTUN.Load() {
 					timeout = 15 * time.Second
-					if s.stunIdleTimeout > 0 {
-						timeout = s.stunIdleTimeout
+					if d := time.Duration(s.stunIdleTimeout.Load()); d > 0 {
+						timeout = d
 					}
 				}
 				if time.Since(time.Unix(0, lastActive.Load())) > timeout {

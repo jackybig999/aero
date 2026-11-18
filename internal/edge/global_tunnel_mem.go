@@ -52,14 +52,18 @@ func (d *inMemoryTunnelDevice) Write(pkt []byte) (int, error) {
 
 		// 1. ICMP Echo Request handling
 		if proto == 1 && len(pkt) >= 28 && pkt[20] == 8 {
-			if d.server != nil && !d.server.allowLoopbackForTest {
+			if d.server != nil && !d.server.allowLoopbackForTest.Load() {
 				if blocked, _ := IsBlockedIP(dstIP); blocked {
 					return len(pkt), nil
 				}
 			}
 			echoReq := pkt[20:]
-			if d.server != nil && d.server.icmpForwardHook != nil {
-				if reply, err := d.server.icmpForwardHook(dstIP, echoReq); err == nil && len(reply) > 0 {
+			var hook *icmpForwardFunc
+			if d.server != nil {
+				hook = d.server.icmpForwardHook.Load()
+			}
+			if hook != nil {
+				if reply, err := (*hook)(dstIP, echoReq); err == nil && len(reply) > 0 {
 					respPkt := buildIPv4ICMPPacket(dstIP, srcIP, reply)
 					if len(respPkt) > 0 {
 						select {
@@ -68,7 +72,7 @@ func (d *inMemoryTunnelDevice) Write(pkt []byte) (int, error) {
 						}
 					}
 				}
-			} else if d.server != nil && d.server.allowLoopbackForTest {
+			} else if d.server != nil && d.server.allowLoopbackForTest.Load() {
 				if reply, err := forwardRealICMPEcho(dstIP, echoReq, 2*time.Second); err == nil && len(reply) > 0 {
 					respPkt := buildIPv4ICMPPacket(dstIP, srcIP, reply)
 					if len(respPkt) > 0 {
