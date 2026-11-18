@@ -47,7 +47,7 @@
 - 限流：每个 token 每秒 50 次，超出返回 HTTP 429。
 
 ## 7. 拒绝与客户端处理
-edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details="<文本>"`）说明拒绝原因：
+edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details="<文本>"`）说明拒绝原因；`details` 只含固定文本或 `EDGE_*` 错误码，不含内部地址：
 
 | 状态 | `error` | 含义 | 客户端处理 |
 |---|---|---|---|
@@ -56,9 +56,11 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
 | 503 | `connect_ip_disabled`、`address_pool_exhausted`、`connection_limit_exceeded`、`udp_slot_limit_exceeded` | 本节点暂不能提供该服务 | 该节点记入 10 分钟冷却名单，换到其他可达节点并立即重连；没有可换节点时至少 60 秒后重试 |
 | 403 | `destination_ip_prohibited` | 目的地址被 §5 拒绝 | 只影响该次请求，不影响会话 |
 | 502 | `connection_refused`、`destination_ip_unroutable` | 目标不可达 | 只影响该次请求 |
+| 400 | `http_request_error`（`details="EDGE_BAD_REQUEST"`） | 请求格式错误：缺少目标、端口不是 1-65535 的数字、URI 无法解析 | 只影响该次请求；属于客户端缺陷，不重试 |
 
 客户端把拒绝原因反映到状态的 `error_code`（取 `details` 中的 `EDGE_*` 错误码，或按上表映射，见 `api/errors.yaml`）。
 
 ## 8. 未定稿
 - 场景参数（`class=ai|browser|game`）与场景授权（C3 第 6 步）尚未实现。
 - 多跳转发（edge `role=ingress|egress`、`Aero-Hop-Token`）存在于实现中但没有契约与测试，定稿前需决定保留或删除。
+- token 吊销（C3 第 5 步，`EDGE_AUTH_TOKEN_REVOKED`）、按 uid 的配额 `quota_bytes` 与带宽 `bw_bps` 尚未在 edge 执行：依赖中台下发吊销名单（C4），随中台对接实现。在此之前，被吊销的 token 在过期（最长 7 天）前仍被接受。

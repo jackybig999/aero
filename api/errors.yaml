@@ -16,7 +16,7 @@ EDGE_ADMIN_UNAUTHORIZED:    {http: 200, desc: "管理密钥无效（对外表现
 EDGE_WARP_UNAVAILABLE:      {http: 409, desc: "本机没有可用的 WARP 代理（C13）"}
 EDGE_BAD_REQUEST:           {http: 400, desc: "请求体不符合契约（缺少字段、未知字段或格式错误）"}
 EDGE_NOT_READY:             {http: 503, desc: "排空中或未就绪"}
-EGRESS_UNAVAILABLE:         {http: 503, desc: "场景出口不可用（fail-closed）"}
+EGRESS_UNAVAILABLE:         {http: 502, desc: "场景出口不可用（fail-closed）；只影响该次请求，不是节点不可用"}
 EGRESS_REBOUND:             {http: 200, desc: "环境出口已重新绑定"}
 CLIENT_UDP_BLOCKED:         {desc: "当前网络封锁 UDP，按设计不降级"}
 CLIENT_ECH_REJECTED:        {desc: "ECH 被拒或干扰，已切换混淆节点组"}
