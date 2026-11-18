@@ -45,13 +45,10 @@ jobs:
         run: |
           go vet ./internal/edge ./cmd/edge ./internal/sub ./cmd/sub ./internal/client ./cmd/client ./tests/...
           set +e
-          go test -race -shuffle=on -v ./internal/edge ./internal/sub ./internal/client ./tests/... > test.log 2>&1
+          go test -json -race -shuffle=on ./internal/edge ./internal/sub ./internal/client ./tests/... > test.json 2>&1
           rc=$?
-          cat test.log
-          # 失败详情写成注解（公开可读），便于不登录也能定位失败原因
-          if [ $rc -ne 0 ]; then
-            grep -E -- '--- FAIL|^FAIL|panic:|_test\.go:[0-9]+:' test.log | head -60 | while IFS= read -r l; do echo "::error::$l"; done
-          fi
+          # 输出完整文本日志；仅失败测试自身的输出写成 ::error:: 注解（公开可读）
+          python3 tools/ci-test-report.py test.json
           exit $rc
 
       - name: Build Edge Server (linux/amd64 & linux/arm64)
@@ -143,20 +140,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Push-Location internal/client
           # PowerShell 会把外部程序参数 -test.v 拆成 "-test" ".v"，参数须加引号
-          ./client.test.exe '-test.v' '-test.short' '-test.shuffle=on' *> ../../test.log
+          go tool test2json -t ./client.test.exe '-test.v' '-test.short' '-test.shuffle=on' *> ../../test.json
           $clientRc = $LASTEXITCODE
           Pop-Location
-          go test -v -short -shuffle=on ./internal/desk *>> test.log
+          go test -json -short -shuffle=on ./internal/desk *>> test.json
           $deskRc = $LASTEXITCODE
           $rc = if ($clientRc -ne 0) { $clientRc } else { $deskRc }
-          Get-Content test.log
-          # 宿主网络（wintun）测试的结果写成 notice，成功时也能确认它们真的跑了而不是被跳过
-          Select-String -Path test.log -Pattern '--- (PASS|SKIP|FAIL): Test(TunHostWindows|WindowsRoutes)' | ForEach-Object { Write-Output ("::notice::" + $_.Line.Trim()) }
-          # 失败详情写成注解（公开可读）：失败的测试行，以及日志末尾
+          # 完整文本日志；宿主网络（wintun）测试的结果写成 notice，成功时也能确认它们真的跑了而不是被跳过
+          python tools/ci-test-report.py test.json --notice '--- (PASS|SKIP|FAIL): Test(TunHostWindows|WindowsRoutes)'
           if ($rc -ne 0) {
             Write-Output "::error::client tests exit=$clientRc, desk tests exit=$deskRc"
-            Select-String -Path test.log -Pattern '--- FAIL|^FAIL|panic:|_test\.go:\d+:' | Select-Object -First 60 | ForEach-Object { Write-Output ("::error::" + $_.Line) }
-            Get-Content test.log -Tail 40 | ForEach-Object { Write-Output ("::error::tail: " + $_) }
           }
           exit $rc
 
