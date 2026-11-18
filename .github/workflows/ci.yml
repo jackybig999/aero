@@ -150,6 +150,8 @@ jobs:
           $deskRc = $LASTEXITCODE
           $rc = if ($clientRc -ne 0) { $clientRc } else { $deskRc }
           Get-Content test.log
+          # 宿主网络（wintun）测试的结果写成 notice，成功时也能确认它们真的跑了而不是被跳过
+          Select-String -Path test.log -Pattern '--- (PASS|SKIP|FAIL): Test(TunHostWindows|WindowsRoutes)' | ForEach-Object { Write-Output ("::notice::" + $_.Line.Trim()) }
           # 失败详情写成注解（公开可读）：失败的测试行，以及日志末尾
           if ($rc -ne 0) {
             Write-Output "::error::client tests exit=$clientRc, desk tests exit=$deskRc"
