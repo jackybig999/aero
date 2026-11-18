@@ -14,6 +14,9 @@ import (
 // instanceLock 是数据目录上的独占锁，保证同一数据目录只有一个 edge 实例（ADR-0005）。
 type instanceLock struct{ f *os.File }
 
+// errInstanceLockBusy 表示数据目录的实例锁已被另一个 edge 实例持有（区别于打开/加锁的其他失败）。
+var errInstanceLockBusy = errors.New("instance lock busy")
+
 func acquireInstanceLock(dir string) (*instanceLock, error) {
 	path := filepath.Join(dir, "edge.lock")
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
@@ -25,7 +28,7 @@ func acquireInstanceLock(dir string) (*instanceLock, error) {
 	if err != nil {
 		_ = f.Close()
 		if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
-			return nil, fmt.Errorf("another edge instance is already using data dir %s", dir)
+			return nil, fmt.Errorf("another edge instance is already using data dir %s: %w", dir, errInstanceLockBusy)
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}

@@ -6,7 +6,6 @@ package edge
 
 import (
 	"bytes"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -72,48 +71,26 @@ func NewConsoleHandler(
 	}
 }
 
-// authenticate validates the request against the configured admin key in constant-time.
+// authenticate 只接受 Authorization: Bearer <key>（常量时间比较）；
+// 不接受查询参数、自定义头与 Cookie，避免密钥进入访问日志/浏览器历史。
 func (h *ConsoleHandler) authenticate(r *http.Request) bool {
-	// 1. Authorization: Bearer <key>
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		key := strings.TrimPrefix(auth, "Bearer ")
-		if h.checkKey(key) {
-			return true
-		}
+	if h.bearerOK(r) {
+		return true
 	}
-	// 2. Custom header: X-Aero-Admin-Key or Aero-Admin-Key
-	if key := r.Header.Get("X-Aero-Admin-Key"); key != "" {
-		if h.checkKey(key) {
-			return true
-		}
-	}
-	if key := r.Header.Get("Aero-Admin-Key"); key != "" {
-		if h.checkKey(key) {
-			return true
-		}
-	}
-	// 3. Query param: ?key=... or ?admin_key=...
-	if key := r.URL.Query().Get("key"); key != "" {
-		if h.checkKey(key) {
-			return true
-		}
-	}
-	if key := r.URL.Query().Get("admin_key"); key != "" {
-		if h.checkKey(key) {
-			return true
-		}
-	}
-	// 4. 会话 Cookie：值为由管理密钥派生的会话值，不是原始密钥
-	if c, err := r.Cookie("aero_key"); err == nil && c.Value != "" {
-		if h.checkSession(c.Value) {
-			return true
-		}
-	}
-	// 5. Loopback fallback when no adminKey is configured
+	// 未配置 adminKey 时仅回环可用（Server 层对非回环已关闭）
 	if h.adminKey == "" {
 		return h.isLoopback(r)
 	}
 	return false
+}
+
+// bearerOK 判断请求是否带有正确的 Bearer 密钥。
+func (h *ConsoleHandler) bearerOK(r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	return h.checkKey(strings.TrimPrefix(auth, "Bearer "))
 }
 
 func (h *ConsoleHandler) checkKey(key string) bool {
@@ -124,20 +101,6 @@ func (h *ConsoleHandler) checkKey(key string) bool {
 	return subtle.ConstantTimeCompare([]byte(key), []byte(h.adminKey)) == 1
 }
 
-// sessionValue 由管理密钥派生控制台会话 Cookie 值（HMAC-SHA256），Cookie 不携带原始密钥。
-func (h *ConsoleHandler) sessionValue() string {
-	mac := hmac.New(sha256.New, []byte(h.adminKey))
-	mac.Write([]byte("aero-console-session-v1"))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func (h *ConsoleHandler) checkSession(value string) bool {
-	if h.adminKey == "" || value == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(value), []byte(h.sessionValue())) == 1
-}
-
 func (h *ConsoleHandler) isLoopback(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -145,6 +108,60 @@ func (h *ConsoleHandler) isLoopback(r *http.Request) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// consoleShellSegment 由管理密钥派生控制台外壳的隐藏路径段：hex(SHA-256("aero-console:"+key)) 前 16 位。
+func consoleShellSegment(adminKey string) string {
+	sum := sha256.Sum256([]byte("aero-console:" + adminKey))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// ConsoleShellPath 返回控制台外壳路径 /console/<h>/（不含密钥）。
+func ConsoleShellPath(adminKey string) string {
+	return "/console/" + consoleShellSegment(adminKey) + "/"
+}
+
+// ConsoleURL 返回完整控制台网址 https://<domain>[:port]/console/<h>/#k=<key>（端口 443 省略）。
+// 仅供运维命令（aero info）有意显示密钥时使用，不得写入日志。
+func ConsoleURL(domain string, port int, adminKey string) string {
+	host := domain
+	if port > 0 && port != 443 {
+		host = fmt.Sprintf("%s:%d", domain, port)
+	}
+	return "https://" + host + ConsoleShellPath(adminKey) + "#k=" + adminKey
+}
+
+// serveShell 在隐藏路径 /console/<h>/ 提供控制台外壳（HTML/CSS/JS，不含任何数据）。
+// 仅当 admin_key 合法（>= minAdminKeyLen）且 <h> 匹配（常量时间比较）时存在；否则返回 false，交由后续流程（伪装站）。
+func (h *ConsoleHandler) serveShell(w http.ResponseWriter, r *http.Request) bool {
+	if len(h.adminKey) < minAdminKeyLen || r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/console/") {
+		return false
+	}
+	seg, file, hasSlash := strings.Cut(strings.TrimPrefix(r.URL.Path, "/console/"), "/")
+	if !hasSlash {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(seg), []byte(consoleShellSegment(h.adminKey))) != 1 {
+		return false
+	}
+	switch file {
+	case "":
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		_, _ = w.Write(consoleHTML)
+	case "console.css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(consoleCSS)
+	case "console.js":
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(consoleJS)
+	default:
+		return false
+	}
+	return true
 }
 
 // TryServe processes /console requests. Returns false if path does not match /console.
@@ -173,39 +190,6 @@ func (h *ConsoleHandler) TryServe(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	switch {
-	case p == "/console" || p == "/console/":
-		// Set HttpOnly session cookie if key is present in query parameter
-		if key := r.URL.Query().Get("key"); key != "" && h.checkKey(key) {
-			http.SetCookie(w, &http.Cookie{
-				Name:     "aero_key",
-				Value:    h.sessionValue(),
-				Path:     "/console",
-				Secure:   true,
-				HttpOnly: true,
-				SameSite: http.SameSiteStrictMode,
-				MaxAge:   86400,
-			})
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(consoleHTML)
-		return true
-
-	case p == "/console/web/console.css":
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-		w.Header().Set("Cache-Control", "private, max-age=3600")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(consoleCSS)
-		return true
-
-	case p == "/console/web/console.js":
-		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		w.Header().Set("Cache-Control", "private, max-age=3600")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(consoleJS)
-		return true
-
 	case p == "/console/api/status" && r.Method == http.MethodGet:
 		h.handleAPIStatus(w, r)
 		return true

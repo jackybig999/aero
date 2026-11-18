@@ -150,7 +150,9 @@ func runRoot(t *testing.T) {
 	t.Logf("edge up (connect_ip=%v)", connectIP)
 
 	// 管理员订阅地址（经 edge 控制台接口，黑盒）
-	resp, err := httpc.Get("https://" + nodeDomain + "/console/api/status?key=" + adminKey)
+	statusReq, _ := http.NewRequest(http.MethodGet, "https://"+nodeDomain+"/console/api/status", nil)
+	statusReq.Header.Set("Authorization", "Bearer "+adminKey)
+	resp, err := httpc.Do(statusReq)
 	if err != nil {
 		t.Fatal(err)
 	}

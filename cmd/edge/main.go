@@ -28,6 +28,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "config" {
 		os.Exit(configCmd(os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "console-url" {
+		os.Exit(consoleURLCmd(os.Args[2:]))
+	}
 	if len(os.Args) > 1 && os.Args[1] == "check" {
 		os.Exit(checkCmd(os.Args[2:]))
 	}
@@ -227,6 +230,22 @@ func checkCmd(args []string) int {
 		}
 	}
 	return rc
+}
+
+// consoleURLCmd 实现 `aero-edge console-url [-config FILE]`：只读，输出控制台完整网址（含密钥，供 aero info 显示）。
+func consoleURLCmd(args []string) int {
+	fs := flag.NewFlagSet("console-url", flag.ContinueOnError)
+	path := fs.String("config", defaultConfigPath, "edge config file")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	u, err := edge.ConsoleURLFromConfig(*path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "console-url:", err)
+		return 1
+	}
+	fmt.Println(u)
+	return 0
 }
 
 // checkCertCmd 实现 `aero-edge check-cert -domain D`：只读检查系统 acme.sh/certbot 默认位置是否有覆盖 D 的

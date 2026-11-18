@@ -305,7 +305,14 @@ func (s *Server) setUsageAPI(enabled bool) (usageAPIState, error) {
 		}
 		meter = m
 	}
-	if err := persistServerConfig(cfg); err != nil {
+	updates := map[string]any{"usage_api": cfg.UsageAPI}
+	if cfg.MeteringKey != "" {
+		updates["metering_key"] = cfg.MeteringKey
+	}
+	if cfg.NodeID != "" {
+		updates["node_id"] = cfg.NodeID
+	}
+	if err := persistServerConfig(cfg.ConfigPath, updates); err != nil {
 		if meter != nil {
 			_ = meter.Close()
 		}

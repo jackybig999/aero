@@ -7,6 +7,7 @@ package edge
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -265,6 +266,9 @@ type WarpRouteConfig struct {
 // DialGuard provides concurrency limiting, SSRF protection, and intelligent Cloudflare WARP upstream routing
 type DialGuard struct {
 	sem          chan struct{}
+	tokMu        sync.Mutex     // 保护 perTok
+	perTok       map[string]int // 每个 token 正在拨号（含排队等待）的数量
+	perTokMax    int            // 单个 token 的并发拨号上限
 	AllowLocal   bool
 	warpCfg      atomic.Pointer[WarpRouteConfig]
 	warpHealthy  atomic.Bool
@@ -273,13 +277,34 @@ type DialGuard struct {
 	closeOnce    sync.Once
 }
 
+// maxDialsPerToken 是单个 token 并发拨号数的绝对上限；同时不超过总量的 1/8（见 NewDialGuard），
+// 防止一个用户的批量拨号占满全局信号量，让其他用户排队到超时（估算，待实测）。
+const maxDialsPerToken = 32
+
+// 拨号路径的可判定错误：调用方据此映射 C1 §7 的拒绝响应，而不是依赖错误文本。
+var (
+	errDialTokenLimit = errors.New("per-token dial limit exceeded")
+	errDialQueueFull  = errors.New("dial queue full")
+	errBlockedTarget  = errors.New("blocked target IP")
+	errWarpFailClosed = errors.New("AERO_WARP_FAIL_CLOSED")
+)
+
 // NewDialGuard creates a DialGuard; maxConcurrent <= 0 defaults to 256
 func NewDialGuard(maxConcurrent int) *DialGuard {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 256
 	}
+	perTokMax := maxConcurrent / 8
+	if perTokMax > maxDialsPerToken {
+		perTokMax = maxDialsPerToken
+	}
+	if perTokMax < 1 {
+		perTokMax = 1
+	}
 	dg := &DialGuard{
 		sem:          make(chan struct{}, maxConcurrent),
+		perTok:       make(map[string]int),
+		perTokMax:    perTokMax,
 		probeTrigger: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 	}
@@ -337,8 +362,46 @@ func (g *DialGuard) GetWarpStatus() (proxy string, all bool, enabled bool, healt
 	return cfg.ProxyAddr, cfg.WarpAll, true, g.warpHealthy.Load()
 }
 
-// DialTimeout dials with concurrency limiting, SSRF protection, and WARP unblocking
+// acquireToken 占用 token 的一个拨号名额；超限立即返回 false，不占全局槽位。token 为空不限制。
+func (g *DialGuard) acquireToken(token string) bool {
+	if g == nil || token == "" || g.perTok == nil {
+		return true
+	}
+	g.tokMu.Lock()
+	defer g.tokMu.Unlock()
+	if g.perTok[token] >= g.perTokMax {
+		return false
+	}
+	g.perTok[token]++
+	return true
+}
+
+func (g *DialGuard) releaseToken(token string) {
+	if g == nil || token == "" || g.perTok == nil {
+		return
+	}
+	g.tokMu.Lock()
+	defer g.tokMu.Unlock()
+	if g.perTok[token] <= 1 {
+		delete(g.perTok, token)
+	} else {
+		g.perTok[token]--
+	}
+}
+
+// DialTimeout 等同于不带 token 的 DialTimeoutFor（不做按 token 限制）。
 func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	return g.DialTimeoutFor("", network, address, timeout)
+}
+
+// DialTimeoutFor dials with concurrency limiting (global and per token), SSRF protection, and WARP unblocking.
+// token 非空时，该 token 并发拨号数超过上限立即返回 errDialTokenLimit。
+func (g *DialGuard) DialTimeoutFor(token, network, address string, timeout time.Duration) (net.Conn, error) {
+	if !g.acquireToken(token) {
+		return nil, errDialTokenLimit
+	}
+	defer g.releaseToken(token)
+
 	dialFn := safeDial
 	if g != nil && g.AllowLocal {
 		dialFn = net.DialTimeout
@@ -371,7 +434,7 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 		mode := os.Getenv("AERO_WARP_MODE")
 		failOpen := (warpCfg != nil && warpCfg.FailOpen) || strings.EqualFold(mode, "fail-open")
 		if (warpCfg.WarpAll || isTargetAIDomain(address)) && !failOpen {
-			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: direct dial refused to prevent AI region leak (target: %s)", address)
+			return nil, fmt.Errorf("%w: direct dial refused to prevent AI region leak (target: %s)", errWarpFailClosed, address)
 		}
 
 		log.Printf("[WARP-FALLBACK] Target %s dial via direct due to open circuit (fail-open=%v).", address, failOpen)
@@ -384,7 +447,7 @@ func (g *DialGuard) DialTimeout(network, address string, timeout time.Duration) 
 	case g.sem <- struct{}{}:
 		defer func() { <-g.sem }()
 	case <-time.After(timeout):
-		return nil, fmt.Errorf("dial queue full")
+		return nil, errDialQueueFull
 	}
 	return dialFn(network, address, timeout)
 }
@@ -1016,7 +1079,7 @@ func (g *DialGuard) DialUDPViaWARP(targetAddr string, timeout time.Duration) (ne
 		return nil, fmt.Errorf("warp proxy not configured")
 	}
 	if !g.warpHealthy.Load() {
-		return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: WARP circuit open, direct dial refused (target: %s)", targetAddr)
+		return nil, fmt.Errorf("%w: WARP circuit open, direct dial refused (target: %s)", errWarpFailClosed, targetAddr)
 	}
 	conn, err := dialUDPViaSOCKS5(cfg.ProxyAddr, targetAddr, timeout)
 	if err != nil {
@@ -1029,7 +1092,7 @@ func (g *DialGuard) DialUDPViaWARP(targetAddr string, timeout time.Duration) (ne
 		mode := os.Getenv("AERO_WARP_MODE")
 		failOpen := (cfg != nil && cfg.FailOpen) || strings.EqualFold(mode, "fail-open")
 		if !failOpen {
-			return nil, fmt.Errorf("AERO_WARP_FAIL_CLOSED: WARP UDP Associate failed to prevent AI region leak (target: %s): %w", targetAddr, err)
+			return nil, fmt.Errorf("%w: WARP UDP Associate failed to prevent AI region leak (target: %s): %v", errWarpFailClosed, targetAddr, err)
 		}
 		return nil, err
 	}
@@ -1059,7 +1122,7 @@ func safeDial(network, address string, timeout time.Duration) (net.Conn, error) 
 			if err == nil {
 				if ip := net.ParseIP(host); ip != nil {
 					if blocked, why := IsBlockedIP(ip); blocked {
-						return fmt.Errorf("blocked target IP %s (%s)", ip, why)
+						return fmt.Errorf("%w %s (%s)", errBlockedTarget, ip, why)
 					}
 				}
 			}

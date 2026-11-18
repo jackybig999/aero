@@ -401,7 +401,7 @@ func TestAdminHandlerAndTokenSync(t *testing.T) {
 	ts, _ := OpenTokenStore(tmpDir, v)
 	ss, _ := NewSubStore(tmpDir)
 
-	admin := NewAdminHandler("my-secret-key", v, ts, ss)
+	admin := NewAdminHandler(testConsoleKey, v, ts, ss)
 
 	// Unauthorized request (external IP, no key)
 	req := httptest.NewRequest(http.MethodGet, "/admin/subs", nil)
@@ -413,7 +413,7 @@ func TestAdminHandlerAndTokenSync(t *testing.T) {
 	}
 
 	// Authorized request with X-Aero-Admin-Key
-	req.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	req.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	rec = httptest.NewRecorder()
 	admin.TryServe(rec, req)
 	if rec.Code != http.StatusOK {
@@ -428,7 +428,7 @@ func TestAdminHandlerAndTokenSync(t *testing.T) {
 		"expire_at": 1893456000
 	}`
 	reqSub := httptest.NewRequest(http.MethodPost, "/admin/subs", strings.NewReader(subPayload))
-	reqSub.Header.Set("X-Aero-Admin-Key", "my-secret-key")
+	reqSub.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	reqSub.RemoteAddr = "203.0.113.195:12345"
 	recSub := httptest.NewRecorder()
 	admin.TryServe(recSub, reqSub)
@@ -530,7 +530,7 @@ func TestServerCoverAndHealth(t *testing.T) {
 		Listen:                     ":18443",
 		Domain:                     "localhost",
 		DataDir:                    tmpDir,
-		AdminKey:                   "adminkey",
+		AdminKey:                   testConsoleKey,
 		AllowSelfSignedCertForTest: true,
 	}
 
@@ -564,21 +564,21 @@ func TestServerCoverAndHealth(t *testing.T) {
 	reqHUnauth := httptest.NewRequest(http.MethodGet, "/health", nil)
 	recHUnauth := httptest.NewRecorder()
 	srv.ServeHTTP(recHUnauth, reqHUnauth)
-	if recHUnauth.Code != http.StatusNotFound {
-		t.Fatalf("unauthenticated health expected 404, got %d", recHUnauth.Code)
+	if recHUnauth.Code != http.StatusOK || strings.Contains(recHUnauth.Body.String(), "uptime_sec") {
+		t.Fatalf("unauthenticated health expected cover page, got %d", recHUnauth.Code)
 	}
 
-	// 2a. With query parameter admin_key
+	// 2a. 查询参数中的密钥不再被接受（返回伪装站）
 	reqHQuery := httptest.NewRequest(http.MethodGet, "/health?admin_key=adminkey", nil)
 	recHQuery := httptest.NewRecorder()
 	srv.ServeHTTP(recHQuery, reqHQuery)
-	if recHQuery.Code != http.StatusOK {
-		t.Fatalf("query authenticated health expected 200, got %d", recHQuery.Code)
+	if strings.Contains(recHQuery.Body.String(), "uptime_sec") {
+		t.Fatalf("query-param key must not authenticate health")
 	}
 
-	// 2b. With header Aero-Admin-Key
+	// 2b. With Authorization: Bearer
 	reqH := httptest.NewRequest(http.MethodGet, "/health", nil)
-	reqH.Header.Set("Aero-Admin-Key", "adminkey")
+	reqH.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	recH := httptest.NewRecorder()
 	srv.ServeHTTP(recH, reqH)
 	if recH.Code != http.StatusOK {
@@ -643,7 +643,7 @@ func TestServerHTTPHeadersAndNextProtos(t *testing.T) {
 		Listen:                     "127.0.0.1:18447",
 		Domain:                     "localhost",
 		DataDir:                    tmpDir,
-		AdminKey:                   "adminkey",
+		AdminKey:                   testConsoleKey,
 		AllowSelfSignedCertForTest: true,
 	}
 
@@ -861,7 +861,7 @@ func TestServerGracefulShutdownContext(t *testing.T) {
 		Listen:                     "127.0.0.1:18446",
 		Domain:                     "localhost",
 		DataDir:                    tmpDir,
-		AdminKey:                   "adminkey",
+		AdminKey:                   testConsoleKey,
 		AllowSelfSignedCertForTest: true,
 	}
 
@@ -896,7 +896,7 @@ func TestServerProductionRejectNoCert(t *testing.T) {
 		Listen:                     ":18448",
 		Domain:                     "localhost",
 		DataDir:                    tmpDir,
-		AdminKey:                   "adminkey",
+		AdminKey:                   testConsoleKey,
 		AllowSelfSignedCertForTest: false,
 	}
 
@@ -920,7 +920,7 @@ func TestGeoDataDirectListAndETag(t *testing.T) {
 		Listen:                     ":18449",
 		Domain:                     "localhost",
 		DataDir:                    tmpDir,
-		AdminKey:                   "adminkey",
+		AdminKey:                   testConsoleKey,
 		AllowSelfSignedCertForTest: true,
 	}
 
@@ -1178,7 +1178,7 @@ func TestGeoDataUpstreamFailoverAndConsole(t *testing.T) {
 		Listen:                     ":18451",
 		Domain:                     "localhost",
 		DataDir:                    tmpDir,
-		AdminKey:                   "adminkey",
+		AdminKey:                   testConsoleKey,
 		AllowSelfSignedCertForTest: true,
 	}
 	srv, err := NewServer(cfg)
@@ -1190,7 +1190,8 @@ func TestGeoDataUpstreamFailoverAndConsole(t *testing.T) {
 	srv.geoHandler = h
 
 	// GET /console/api/status
-	reqStatus := httptest.NewRequest(http.MethodGet, "/console/api/status?key=adminkey", nil)
+	reqStatus := httptest.NewRequest(http.MethodGet, "/console/api/status", nil)
+	reqStatus.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	wStatus := httptest.NewRecorder()
 	srv.ServeHTTP(wStatus, reqStatus)
 	if wStatus.Code != http.StatusOK {
@@ -1209,7 +1210,8 @@ func TestGeoDataUpstreamFailoverAndConsole(t *testing.T) {
 	}
 
 	// POST /console/api/geodata/update
-	reqUpdate := httptest.NewRequest(http.MethodPost, "/console/api/geodata/update?key=adminkey", nil)
+	reqUpdate := httptest.NewRequest(http.MethodPost, "/console/api/geodata/update", nil)
+	reqUpdate.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	wUpdate := httptest.NewRecorder()
 	srv.ServeHTTP(wUpdate, reqUpdate)
 	if wUpdate.Code != http.StatusOK {
@@ -1235,7 +1237,7 @@ func TestSubscriptionLineTypeAndISPAffinity(t *testing.T) {
 		Listen:                     ":18450",
 		Domain:                     "edge.example.com",
 		DataDir:                    tmpDir,
-		AdminKey:                   "adminkey",
+		AdminKey:                   testConsoleKey,
 		LineType:                   "iplc",
 		ISPAffinity:                "cm",
 		AllowSelfSignedCertForTest: true,
@@ -4409,7 +4411,7 @@ func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
 		t.Fatalf("OpenTokenStore: %v", err)
 	}
 
-	adminKey := "super_secret_admin_key_123"
+	adminKey := testConsoleKey
 	adminHandler := NewAdminHandler(adminKey, validator, tokenStore, subStore)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
@@ -4429,7 +4431,7 @@ func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
 		"traffic_limit_bytes": 52428800
 	}`
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/subs", strings.NewReader(payloadSnake))
-	req.Header.Set("X-Aero-Admin-Key", adminKey)
+	req.Header.Set("Authorization", "Bearer "+adminKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -4458,7 +4460,7 @@ func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
 		"trafficLimitBytes": 104857600
 	}`
 	req2, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/subs", strings.NewReader(payloadCamel))
-	req2.Header.Set("X-Aero-Admin-Key", adminKey)
+	req2.Header.Set("Authorization", "Bearer "+adminKey)
 	req2.Header.Set("Content-Type", "application/json")
 
 	resp2, err := http.DefaultClient.Do(req2)
@@ -4480,7 +4482,7 @@ func TestEdge_M2_AdminSubsAPI_QuotaIngestion(t *testing.T) {
 
 	// 3. GET /admin/subs -> verify admin_sub is returned
 	reqGet, _ := http.NewRequest(http.MethodGet, srv.URL+"/admin/subs", nil)
-	reqGet.Header.Set("X-Aero-Admin-Key", adminKey)
+	reqGet.Header.Set("Authorization", "Bearer "+adminKey)
 	respGet, err := http.DefaultClient.Do(reqGet)
 	if err != nil {
 		t.Fatalf("GET /admin/subs: %v", err)

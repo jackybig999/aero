@@ -487,7 +487,7 @@ func TestAdversarial_AdminSubsAPI_DualFieldCompatibility(t *testing.T) {
 		"traffic_used_bytes": 1048576
 	}`
 	req1, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/subs", strings.NewReader(snakePayload))
-	req1.Header.Set("X-Aero-Admin-Key", adminKey)
+	req1.Header.Set("Authorization", "Bearer "+adminKey)
 	req1.Header.Set("Content-Type", "application/json")
 	resp1, err := http.DefaultClient.Do(req1)
 	if err != nil || resp1.StatusCode != http.StatusOK {
@@ -514,7 +514,7 @@ func TestAdversarial_AdminSubsAPI_DualFieldCompatibility(t *testing.T) {
 		"trafficUsedBytes": 2097152
 	}`
 	req2, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/subs", strings.NewReader(camelPayload))
-	req2.Header.Set("X-Aero-Admin-Key", adminKey)
+	req2.Header.Set("Authorization", "Bearer "+adminKey)
 	req2.Header.Set("Content-Type", "application/json")
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil || resp2.StatusCode != http.StatusOK {
@@ -533,7 +533,7 @@ func TestAdversarial_AdminSubsAPI_DualFieldCompatibility(t *testing.T) {
 
 	// GET /admin/subs lists users; admin_sub is the unguessable /sub/{secret} (never /sub/admin)
 	reqList, _ := http.NewRequest(http.MethodGet, srv.URL+"/admin/subs", nil)
-	reqList.Header.Set("X-Aero-Admin-Key", adminKey)
+	reqList.Header.Set("Authorization", "Bearer "+adminKey)
 	respList, err := http.DefaultClient.Do(reqList)
 	if err != nil || respList.StatusCode != http.StatusOK {
 		t.Fatalf("GET /admin/subs failed with %d: %v", respList.StatusCode, err)

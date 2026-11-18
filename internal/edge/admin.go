@@ -42,15 +42,10 @@ func (h *AdminHandler) isLoopback(r *http.Request) bool {
 }
 
 func (h *AdminHandler) adminOK(r *http.Request) bool {
+	// 只接受 Authorization: Bearer <key>，不接受查询参数与自定义头。
 	var key string
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 		key = strings.TrimPrefix(auth, "Bearer ")
-	}
-	if key == "" {
-		key = r.Header.Get("X-Aero-Admin-Key")
-	}
-	if key == "" {
-		key = r.URL.Query().Get("key")
 	}
 
 	// 模式 A：配置了 adminKey，强校验必须匹配（彻底杜绝反代穿透绕过）

@@ -17,6 +17,9 @@ import (
 	"testing"
 )
 
+// testConsoleKey 满足 minAdminKeyLen，旧管理面才会开启。
+const testConsoleKey = "secret_key_secret_key_secret_key_123"
+
 // setupTestConsole creates an in-process edge server with Web Console enabled
 func setupTestConsole(t *testing.T, adminKey string) (*Server, string) {
 	tempDir := t.TempDir()
@@ -49,57 +52,13 @@ func setupTestConsole(t *testing.T, adminKey string) (*Server, string) {
 	return srv, tempDir
 }
 
-func TestConsoleAuth_ValidKey(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
-	defer srv.Close()
-
-	req := httptest.NewRequest(http.MethodGet, "/console?key=secret_key_123", nil)
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", rec.Code)
-	}
-
-	body := rec.Body.String()
-	if !strings.Contains(body, "AERO Edge Console") {
-		t.Errorf("expected body to contain 'AERO Edge Console', got: %s", body)
-	}
-
-	// Verify Set-Cookie header sets aero_key HttpOnly; SameSite=Strict
-	cookies := rec.Result().Cookies()
-	var foundCookie *http.Cookie
-	for _, c := range cookies {
-		if c.Name == "aero_key" {
-			foundCookie = c
-			break
-		}
-	}
-	if foundCookie == nil {
-		t.Fatalf("expected aero_key cookie to be set")
-	}
-	// Cookie 不得携带原始管理密钥（PROJECT_RULES §5.3）
-	if foundCookie.Value == "" || foundCookie.Value == "secret_key_123" || strings.Contains(foundCookie.Value, "secret_key_123") {
-		t.Errorf("cookie must hold a derived session value, not the admin key; got %q", foundCookie.Value)
-	}
-	if !foundCookie.Secure {
-		t.Errorf("expected cookie Secure to be true")
-	}
-	if !foundCookie.HttpOnly {
-		t.Errorf("expected cookie HttpOnly to be true")
-	}
-	if foundCookie.SameSite != http.SameSiteStrictMode {
-		t.Errorf("expected cookie SameSite Strict, got %v", foundCookie.SameSite)
-	}
-}
-
 func TestConsoleAuth_InvalidKey_CamouflageDecoy(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
 	// Access with wrong key
-	req := httptest.NewRequest(http.MethodGet, "/console?key=wrong_key_xyz", nil)
+	req := httptest.NewRequest(http.MethodGet, "/console", nil)
+	req.Header.Set("Authorization", "Bearer wrong_key_xyz")
 	rec := httptest.NewRecorder()
 
 	srv.ServeHTTP(rec, req)
@@ -121,7 +80,7 @@ func TestConsoleAuth_InvalidKey_CamouflageDecoy(t *testing.T) {
 }
 
 func TestConsoleAuth_NoKey_CamouflageDecoy(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
 	// External remote address (non-loopback)
@@ -141,73 +100,28 @@ func TestConsoleAuth_NoKey_CamouflageDecoy(t *testing.T) {
 	}
 }
 
-func TestConsoleAuth_CookieAuth(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
-	defer srv.Close()
-
-	// Access with cookie only, no query param
-	req := httptest.NewRequest(http.MethodGet, "/console", nil)
-	req.RemoteAddr = "203.0.113.195:48920"
-	// 先用密钥登录拿到服务端下发的会话 Cookie，再只凭该 Cookie 访问
-	login := httptest.NewRecorder()
-	srv.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "/console?key=secret_key_123", nil))
-	var session *http.Cookie
-	for _, c := range login.Result().Cookies() {
-		if c.Name == "aero_key" {
-			session = c
-		}
-	}
-	if session == nil {
-		t.Fatal("login did not set a session cookie")
-	}
-	req.AddCookie(&http.Cookie{Name: "aero_key", Value: session.Value})
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", rec.Code)
-	}
-	if !strings.Contains(rec.Body.String(), "AERO Edge Console") {
-		t.Errorf("expected console HTML with valid cookie auth")
-	}
-
-	// 把原始密钥直接放进 Cookie 不得通过鉴权（Cookie 只接受派生会话值）
-	raw := httptest.NewRequest(http.MethodGet, "/console/api/status", nil)
-	raw.AddCookie(&http.Cookie{Name: "aero_key", Value: "secret_key_123"})
-	rawRec := httptest.NewRecorder()
-	srv.ServeHTTP(rawRec, raw)
-	if rawRec.Code != http.StatusForbidden {
-		t.Fatalf("raw admin key in cookie: status %d, want 403", rawRec.Code)
-	}
-}
-
 func TestConsoleAPI_UnauthorizedReturns403(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
-	req := httptest.NewRequest(http.MethodGet, "/console/api/status?key=wrong_key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/console/api/status", nil)
+	req.Header.Set("Authorization", "Bearer wrong_key_xyz")
 	rec := httptest.NewRecorder()
 
 	srv.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 Forbidden for unauthorized API, got %d", rec.Code)
-	}
-	var errResp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
-		t.Fatalf("invalid json: %v", err)
-	}
-	if errResp["ok"] != false {
-		t.Errorf("expected ok: false in error response")
+	// 旧管理面未鉴权统一返回伪装站，不再单独暴露 403 JSON
+	if strings.Contains(rec.Body.String(), `"ok"`) || strings.Contains(rec.Body.String(), "status") && strings.Contains(rec.Body.String(), "uptime") {
+		t.Fatalf("unauthorized API leaked data: %s", rec.Body.String())
 	}
 }
 
 func TestConsoleAPI_Status_ZeroPortUrls(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
-	req := httptest.NewRequest(http.MethodGet, "/console/api/status?key=secret_key_123", nil)
+	req := httptest.NewRequest(http.MethodGet, "/console/api/status", nil)
+	req.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	rec := httptest.NewRecorder()
 
 	srv.ServeHTTP(rec, req)
@@ -258,12 +172,13 @@ func TestConsoleAPI_Status_ZeroPortUrls(t *testing.T) {
 }
 
 func TestConsoleAPI_Users_Lifecycle(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
 	// 1. Create user via POST /console/api/users
 	createPayload := `{"username":"alice","code":"888xyz","expire_days":30,"traffic_limit_gb":50}`
-	req := httptest.NewRequest(http.MethodPost, "/console/api/users?key=secret_key_123", strings.NewReader(createPayload))
+	req := httptest.NewRequest(http.MethodPost, "/console/api/users", strings.NewReader(createPayload))
+	req.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -314,7 +229,8 @@ func TestConsoleAPI_Users_Lifecycle(t *testing.T) {
 	}
 
 	// 3. List users via GET /console/api/users
-	listReq := httptest.NewRequest(http.MethodGet, "/console/api/users?key=secret_key_123", nil)
+	listReq := httptest.NewRequest(http.MethodGet, "/console/api/users", nil)
+	listReq.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	listRec := httptest.NewRecorder()
 	srv.ServeHTTP(listRec, listReq)
 
@@ -337,7 +253,8 @@ func TestConsoleAPI_Users_Lifecycle(t *testing.T) {
 	}
 
 	// 4. Delete user via DELETE /console/api/users?slug=alice888xyz
-	delReq := httptest.NewRequest(http.MethodDelete, "/console/api/users?key=secret_key_123&slug=alice888xyz", nil)
+	delReq := httptest.NewRequest(http.MethodDelete, "/console/api/users?slug=alice888xyz", nil)
+	delReq.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	delRec := httptest.NewRecorder()
 	srv.ServeHTTP(delRec, delReq)
 
@@ -387,11 +304,12 @@ func TestWebAssets_EmbeddingAndGzipSize(t *testing.T) {
 }
 
 func TestConsoleAPI_WarpToggle(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
 	// 1. Enabling WARP when port 40000 is closed must return 400 Bad Request
-	req := httptest.NewRequest(http.MethodPost, "/console/api/warp/toggle?key=secret_key_123", strings.NewReader(`{"enabled":true,"warp_all":false}`))
+	req := httptest.NewRequest(http.MethodPost, "/console/api/warp/toggle", strings.NewReader(`{"enabled":true,"warp_all":false}`))
+	req.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
@@ -401,7 +319,8 @@ func TestConsoleAPI_WarpToggle(t *testing.T) {
 	}
 
 	// 2. Disabling WARP
-	reqOff := httptest.NewRequest(http.MethodPost, "/console/api/warp/toggle?key=secret_key_123", strings.NewReader(`{"enabled":false}`))
+	reqOff := httptest.NewRequest(http.MethodPost, "/console/api/warp/toggle", strings.NewReader(`{"enabled":false}`))
+	reqOff.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	reqOff.Header.Set("Content-Type", "application/json")
 	recOff := httptest.NewRecorder()
 	srv.ServeHTTP(recOff, reqOff)
@@ -417,12 +336,13 @@ func TestConsoleAPI_WarpToggle(t *testing.T) {
 }
 
 func TestConsoleAPI_Users_Validation(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
 	// 1. Path traversal or invalid username rejected
 	badUserJSON := `{"username":"../admin","expire_days":30,"traffic_limit_gb":50}`
-	req := httptest.NewRequest(http.MethodPost, "/console/api/users?key=secret_key_123", strings.NewReader(badUserJSON))
+	req := httptest.NewRequest(http.MethodPost, "/console/api/users", strings.NewReader(badUserJSON))
+	req.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -431,7 +351,8 @@ func TestConsoleAPI_Users_Validation(t *testing.T) {
 
 	// 2. Invalid code length rejected
 	badCodeJSON := `{"username":"bob","code":"123","expire_days":30,"traffic_limit_gb":50}`
-	req2 := httptest.NewRequest(http.MethodPost, "/console/api/users?key=secret_key_123", strings.NewReader(badCodeJSON))
+	req2 := httptest.NewRequest(http.MethodPost, "/console/api/users", strings.NewReader(badCodeJSON))
+	req2.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	rec2 := httptest.NewRecorder()
 	srv.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusBadRequest {
@@ -440,7 +361,8 @@ func TestConsoleAPI_Users_Validation(t *testing.T) {
 
 	// 3. Unknown fields rejected per Rule 21
 	unknownFieldJSON := `{"username":"bob","code":"123456","expire_days":30,"traffic_limit_gb":50,"evil_unknown_field":"hack"}`
-	req3 := httptest.NewRequest(http.MethodPost, "/console/api/users?key=secret_key_123", strings.NewReader(unknownFieldJSON))
+	req3 := httptest.NewRequest(http.MethodPost, "/console/api/users", strings.NewReader(unknownFieldJSON))
+	req3.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	rec3 := httptest.NewRecorder()
 	srv.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusBadRequest {
@@ -449,12 +371,13 @@ func TestConsoleAPI_Users_Validation(t *testing.T) {
 }
 
 func TestConsoleAPI_UserHardening_EmailAndDirectURLAndSignature(t *testing.T) {
-	srv, _ := setupTestConsole(t, "secret_key_123")
+	srv, _ := setupTestConsole(t, testConsoleKey)
 	defer srv.Close()
 
 	// 1. Create user with email format username & permanent expiration (expire_days = 0)
 	payload := `{"username":"alice.dev@company-tech.com","code":"123abc","expire_days":0,"traffic_limit_gb":100}`
-	req := httptest.NewRequest(http.MethodPost, "/console/api/users?key=secret_key_123", strings.NewReader(payload))
+	req := httptest.NewRequest(http.MethodPost, "/console/api/users", strings.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 
@@ -513,4 +436,174 @@ func TestConsoleAPI_UserHardening_EmailAndDirectURLAndSignature(t *testing.T) {
 		t.Errorf("expected 50MB used traffic, got %d", doc2.TrafficUsedBytes)
 	}
 	assertSubConforms(t, subRec2.Body.Bytes())
+}
+
+// 新增：旧管理面鉴权加固（M6）。
+
+func legacyReq(method, path, bearer, remote string) *http.Request {
+	req := httptest.NewRequest(method, path, nil)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if remote != "" {
+		req.RemoteAddr = remote
+	}
+	return req
+}
+
+func TestLegacyAdminShortOrEmptyKeyDisabled(t *testing.T) {
+	for _, tc := range []struct{ name, key string }{{"short", "short_key_123"}, {"empty-ephemeral", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := setupTestConsole(t, tc.key)
+			defer srv.Close()
+			key := tc.key
+			if len(srv.cfg.AdminKey) >= minAdminKeyLen {
+				// 空密钥会被自动生成；此时改写为空以覆盖“空即关闭”
+				srv.cfg.AdminKey = ""
+				key = "x"
+			}
+			for _, p := range []string{"/admin/subs", "/console", "/console/api/status", "/health"} {
+				rec := httptest.NewRecorder()
+				srv.ServeHTTP(rec, legacyReq(http.MethodGet, p, key, "127.0.0.1:1234"))
+				body := rec.Body.String()
+				if rec.Code != http.StatusOK || strings.Contains(body, "AERO Edge Console") || strings.Contains(body, "uptime_sec") || strings.Contains(body, "subs") {
+					t.Fatalf("%s should serve cover page, got %d %.80s", p, rec.Code, body)
+				}
+			}
+		})
+	}
+}
+
+func TestLegacyAdminQueryKeyRejected(t *testing.T) {
+	srv, _ := setupTestConsole(t, testConsoleKey)
+	defer srv.Close()
+	for _, p := range []string{"/console?key=", "/console?admin_key=", "/admin/subs?key=", "/admin/subs?admin_key=", "/health?admin_key=", "/console/api/status?key="} {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, legacyReq(http.MethodGet, p+testConsoleKey, "", "198.51.100.7:1"))
+		if strings.Contains(rec.Body.String(), "AERO Edge Console") || strings.Contains(rec.Body.String(), "uptime_sec") || strings.Contains(rec.Body.String(), `"subs"`) {
+			t.Fatalf("%s accepted query key", p)
+		}
+	}
+}
+
+func TestLegacyAdminBearerAccepted(t *testing.T) {
+	srv, _ := setupTestConsole(t, testConsoleKey)
+	defer srv.Close()
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, legacyReq(http.MethodGet, "/console/api/status", testConsoleKey, "198.51.100.8:1"))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "{") {
+		t.Fatalf("bearer should open console API, got %d %.80s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, legacyReq(http.MethodGet, "/admin/subs", testConsoleKey, "198.51.100.8:1"))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"count"`) {
+		t.Fatalf("bearer should open /admin/subs, got %d %.80s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLegacyAdminBadKeyJailBansSameIP(t *testing.T) {
+	srv, _ := setupTestConsole(t, testConsoleKey)
+	defer srv.Close()
+	if srv.quicServer == nil {
+		t.Fatal("quic server missing")
+	}
+	const ip = "198.51.100.9"
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, legacyReq(http.MethodGet, "/admin/subs", "wrong_key_xyz", ip+":4000"))
+		if strings.Contains(rec.Body.String(), `"count"`) {
+			t.Fatal("wrong key accepted")
+		}
+	}
+	if !srv.quicServer.AuthJail().IsBanned(ip) {
+		t.Fatal("ip not banned after 5 failures")
+	}
+	// 封禁期间正确密钥也被拒
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, legacyReq(http.MethodGet, "/admin/subs", testConsoleKey, ip+":4001"))
+	if strings.Contains(rec.Body.String(), `"count"`) {
+		t.Fatal("banned ip accepted correct key")
+	}
+	// 其他 IP 不受影响
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, legacyReq(http.MethodGet, "/admin/subs", testConsoleKey, "198.51.100.10:1"))
+	if !strings.Contains(rec.Body.String(), `"count"`) {
+		t.Fatal("other ip should not be banned")
+	}
+	// 无凭据的探测不计入失败
+	for i := 0; i < 8; i++ {
+		srv.ServeHTTP(httptest.NewRecorder(), legacyReq(http.MethodGet, "/console", "", "198.51.100.11:1"))
+	}
+	if srv.quicServer.AuthJail().IsBanned("198.51.100.11") {
+		t.Fatal("credential-less probes must not be jailed")
+	}
+}
+
+func TestConsoleShellHiddenPath(t *testing.T) {
+	srv, _ := setupTestConsole(t, testConsoleKey)
+	defer srv.Close()
+	shell := ConsoleShellPath(testConsoleKey)
+	if strings.Contains(shell, testConsoleKey) || len(shell) != len("/console/")+16+1 {
+		t.Fatalf("unexpected shell path %q", shell)
+	}
+	// 合法路径：无需任何凭据，返回外壳与静态资源，且不下发 Cookie
+	for p, want := range map[string]string{shell: "AERO Edge Console", shell + "console.js": "fetch", shell + "console.css": "{"} {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, legacyReq(http.MethodGet, p, "", "198.51.100.20:1"))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("%s: got %d %.60s", p, rec.Code, rec.Body.String())
+		}
+		if len(rec.Result().Cookies()) != 0 {
+			t.Fatalf("%s must not set cookies", p)
+		}
+	}
+	// 外壳页面里的资源是相对路径，位于隐藏路径之下
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, legacyReq(http.MethodGet, shell, "", ""))
+	if strings.Contains(rec.Body.String(), "/console/web/") {
+		t.Fatal("shell still references absolute /console/web/ assets")
+	}
+	// 错误 h、旧路径、未知资源：伪装站
+	for _, p := range []string{"/console/0123456789abcdef/", "/console", "/console/", "/console/web/console.js", shell + "nope", "/console/" + shell[len("/console/"):len(shell)-1]} {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, legacyReq(http.MethodGet, p, "", "198.51.100.21:1"))
+		if strings.Contains(rec.Body.String(), "AERO Edge Console") {
+			t.Fatalf("%s leaked console shell", p)
+		}
+	}
+}
+
+func TestConsoleShellAbsentWithShortKey(t *testing.T) {
+	srv, _ := setupTestConsole(t, "short_key_123")
+	defer srv.Close()
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, legacyReq(http.MethodGet, ConsoleShellPath("short_key_123"), "", ""))
+	if strings.Contains(rec.Body.String(), "AERO Edge Console") {
+		t.Fatal("shell must not exist for short admin key")
+	}
+}
+
+func TestConsoleURLFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	write := func(listen string) string {
+		p := filepath.Join(dir, "c"+listen+".json")
+		b := `{"domain":"n.example.com","admin_key":"` + testConsoleKey + `","listen":"` + listen + `"}`
+		if err := os.WriteFile(p, []byte(b), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	prefix := "https://n.example.com"
+	tail := ConsoleShellPath(testConsoleKey) + "#k=" + testConsoleKey
+	for listen, want := range map[string]string{":443": prefix + tail, "": prefix + tail, ":8443": prefix + ":8443" + tail, "0.0.0.0:2083": prefix + ":2083" + tail} {
+		got, err := ConsoleURLFromConfig(write(listen))
+		if err != nil || got != want {
+			t.Fatalf("listen %q: got %q err %v, want %q", listen, got, err, want)
+		}
+	}
+	short := filepath.Join(dir, "short.json")
+	_ = os.WriteFile(short, []byte(`{"domain":"n.example.com","admin_key":"short"}`), 0o600)
+	if _, err := ConsoleURLFromConfig(short); err == nil {
+		t.Fatal("short key must error")
+	}
 }

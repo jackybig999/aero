@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // 宿主状态（ADR-0012，PROJECT_RULES“宿主全局状态”）。edge 对宿主的修改只有三类，且都可还原：
@@ -57,6 +58,7 @@ var (
 	}
 	defaultOutInterfaceFn = detectDefaultOutInterface
 	ipForwardPath         = "/proc/sys/net/ipv4/ip_forward"
+	bootIDPath            = "/proc/sys/kernel/random/boot_id"
 	lookPath              = exec.LookPath
 	// nftApply 以 `nft -f -` 执行规则脚本。
 	nftApply = func(script string) error {
@@ -127,6 +129,64 @@ func removeNftTable() (bool, error) {
 	return true, nil
 }
 
+// xtablesWaitArgs 返回 iptables/ip6tables 等待 xtables 锁的参数。宿主上 fail2ban/docker/ufw 也会持锁，
+// 不带 -w 时撞锁立即以退出码 4 失败，规则下发或还原因此中断。iptables 1.6.0 起支持 `-w <秒>`；
+// 1.4.20～1.5.x 只有不带秒数的 `-w`；更老的版本没有该选项。结果按工具缓存。
+var (
+	xtWaitMu    sync.Mutex
+	xtWaitCache = map[string][]string{}
+)
+
+func xtablesWaitArgs(tool string) []string {
+	xtWaitMu.Lock()
+	defer xtWaitMu.Unlock()
+	if a, ok := xtWaitCache[tool]; ok {
+		return a
+	}
+	var a []string
+	if out, err := hostCmd(tool, "--version"); err == nil {
+		a = waitArgsForVersion(out)
+	} else {
+		return []string{"-w", "5"} // 取不到版本：按现代版本处理，且不缓存失败结果
+	}
+	xtWaitCache[tool] = a
+	return a
+}
+
+// waitArgsForVersion 解析 `iptables v1.8.11 (nf_tables)` 形式的版本输出。
+func waitArgsForVersion(out string) []string {
+	f := strings.Fields(out)
+	if len(f) < 2 || !strings.HasPrefix(f[1], "v") {
+		return []string{"-w", "5"}
+	}
+	var major, minor, patch int
+	n, _ := fmt.Sscanf(strings.TrimPrefix(f[1], "v"), "%d.%d.%d", &major, &minor, &patch)
+	if n < 2 {
+		return []string{"-w", "5"}
+	}
+	switch {
+	case major > 1 || (major == 1 && minor >= 6):
+		return []string{"-w", "5"}
+	case major == 1 && minor == 4 && patch >= 20, major == 1 && minor == 5:
+		return []string{"-w"}
+	}
+	return nil
+}
+
+// xtablesCmd 以等待 xtables 锁的方式执行 iptables/ip6tables。
+func xtablesCmd(tool string, args ...string) (string, error) {
+	return hostCmd(tool, append(append([]string{}, xtablesWaitArgs(tool)...), args...)...)
+}
+
+// currentBootID 返回内核本次启动的标识；读取失败返回空串。
+func currentBootID() string {
+	b, err := os.ReadFile(bootIDPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
 func runHostCmd(name string, args ...string) error {
 	_, err := hostCmd(name, args...)
 	return err
@@ -135,6 +195,9 @@ func runHostCmd(name string, args ...string) error {
 // hostStateJournal 是修改前的宿主值。
 type hostStateJournal struct {
 	IPv4Forward string `json:"ipv4_forward"`
+	// BootID 是写入日志时的内核启动标识。重启后 ip_forward 已被宿主的 sysctl/docker 重新设置，
+	// 日志里的原值不再适用，RestoreHost 不得把它写回。旧版本日志没有该字段（空串），保持原行为。
+	BootID string `json:"boot_id,omitempty"`
 }
 
 // PrepareHostForTunnel 为 CONNECT-IP 准备宿主：先回收上次运行（含崩溃）的残留，再记录 ip_forward 原值、
@@ -156,7 +219,7 @@ func PrepareHostForTunnel(dataDir, devName string) error {
 	if err != nil {
 		return fmt.Errorf("prepare host: %w", err)
 	}
-	if err := writeHostState(dataDir, hostStateJournal{IPv4Forward: orig}); err != nil {
+	if err := writeHostState(dataDir, hostStateJournal{IPv4Forward: orig, BootID: currentBootID()}); err != nil {
 		return fmt.Errorf("prepare host: %w", err)
 	}
 	if orig != "1" {
@@ -210,7 +273,8 @@ func applyEdgeRules(devName, outIf string, isolate bool) error {
 		{"ip6tables", "nat", "-A", "POSTROUTING", tagged("-s", edgeIPv6PoolCIDR, "-o", outIf, "-j", "MASQUERADE")},
 	}
 	add := func(r rule) error {
-		return runHostCmd(r.tool, append([]string{"-t", r.table, r.op, r.chain}, r.spec...)...)
+		_, err := xtablesCmd(r.tool, append([]string{"-t", r.table, r.op, r.chain}, r.spec...)...)
+		return err
 	}
 	var errs []error
 	for _, r := range v4 {
@@ -230,7 +294,9 @@ func applyEdgeRules(devName, outIf string, isolate bool) error {
 }
 
 // RestoreHost 删除全部带本标记的规则，按状态日志还原 ip_forward 并删除日志。幂等；没有日志也没有
-// 本标记规则时不修改宿主。ip6tables 不可用时忽略（宿主无 IPv6 防火墙即无本标记规则）。
+// 本标记规则时不修改宿主。ip6tables 未安装时跳过（宿主无 IPv6 防火墙即无本标记规则）。
+// 日志的 boot_id 非空且与当前启动不同：宿主已重启，ip_forward 由宿主自己重新设置，不再还原
+// （否则会把宿主其他服务依赖的转发关掉）；规则与日志照常清理。
 func RestoreHost(dataDir string) error {
 	var errs []error
 	removed := 0
@@ -238,10 +304,15 @@ func RestoreHost(dataDir string) error {
 		if _, err := lookPath(c.tool); err != nil {
 			continue // 未安装该工具：不可能有本标记规则
 		}
-		n, err := removeTaggedRules(c.tool, c.table, c.chain)
+		n, listErr, delErr := removeTaggedRules(c.tool, c.table, c.chain)
 		removed += n
-		if err != nil && c.tool == "iptables" {
-			errs = append(errs, err)
+		// 工具已安装：失败（含 ip6tables）如实报告，不留静默残留。唯一例外：内核禁用 IPv6 时
+		// ip6tables 无法列出规则（没有 ip6 规则可清理），不应使 edge 启动或 cleanup 失败。
+		if listErr != nil && !(c.tool == "ip6tables" && !ipv6Available()) {
+			errs = append(errs, listErr)
+		}
+		if delErr != nil {
+			errs = append(errs, delErr)
 		}
 	}
 	nftGone, err := removeNftTable()
@@ -249,11 +320,16 @@ func RestoreHost(dataDir string) error {
 		errs = append(errs, err)
 	}
 	j, ok, err := readHostState(dataDir)
+	restoredForward := ok
 	switch {
 	case err != nil:
 		errs = append(errs, err)
 	case ok:
-		if cur, rerr := readIPForward(); rerr != nil || cur != j.IPv4Forward {
+		if boot := currentBootID(); j.BootID != "" && boot != "" && j.BootID != boot {
+			// 宿主已重启：edge 当时的修改早已被重置，当前值由宿主自己设置，不动它。
+			log.Printf("[EDGE-NET] Host rebooted since edge changed ip_forward; leaving ip_forward untouched")
+			restoredForward = false
+		} else if cur, rerr := readIPForward(); rerr != nil || cur != j.IPv4Forward {
 			if werr := os.WriteFile(ipForwardPath, []byte(j.IPv4Forward+"\n"), 0o644); werr != nil {
 				errs = append(errs, fmt.Errorf("restore ipv4 forwarding to %s: %w", j.IPv4Forward, werr))
 			}
@@ -265,18 +341,30 @@ func RestoreHost(dataDir string) error {
 		}
 	}
 	if removed > 0 || nftGone || ok {
-		log.Printf("[EDGE-NET] Host restored: %d tagged iptables rule(s) removed, nft table %s removed=%v, ip_forward restored=%v", removed, edgeNftTable, nftGone, ok)
+		log.Printf("[EDGE-NET] Host restored: %d tagged iptables rule(s) removed, nft table %s removed=%v, ip_forward restored=%v", removed, edgeNftTable, nftGone, restoredForward)
 	}
 	return errors.Join(errs...)
 }
 
-// removeTaggedRules 按 `-S` 输出删除链中所有带本标记的规则，返回删除条数。
-func removeTaggedRules(tool, table, chain string) (int, error) {
-	out, err := hostCmd(tool, "-t", table, "-S", chain)
-	if err != nil {
-		return 0, err
+// ipv6ProcPaths 是判断本机 IPv6 是否可用的 /proc 路径；任一不存在即视为不可用（内核禁用 IPv6）。可在测试中替换。
+var ipv6ProcPaths = []string{"/proc/net/if_inet6", "/proc/sys/net/ipv6"}
+
+func ipv6Available() bool {
+	for _, p := range ipv6ProcPaths {
+		if _, err := os.Stat(p); err != nil {
+			return false
+		}
 	}
-	n := 0
+	return true
+}
+
+// removeTaggedRules 按 `-S` 输出删除链中所有带本标记的规则，返回删除条数。
+// 列出失败（listErr）与删除失败（delErr）分开返回，调用方对前者可按场景放宽。
+func removeTaggedRules(tool, table, chain string) (n int, listErr, delErr error) {
+	out, err := xtablesCmd(tool, "-t", table, "-S", chain)
+	if err != nil {
+		return 0, err, nil
+	}
 	var errs []error
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
@@ -284,13 +372,13 @@ func removeTaggedRules(tool, table, chain string) (int, error) {
 			continue
 		}
 		args := append([]string{"-t", table, "-D"}, f[1:]...)
-		if err := runHostCmd(tool, args...); err != nil {
+		if _, err := xtablesCmd(tool, args...); err != nil {
 			errs = append(errs, err)
 			continue
 		}
 		n++
 	}
-	return n, errors.Join(errs...)
+	return n, nil, errors.Join(errs...)
 }
 
 func hasTag(fields []string) bool {

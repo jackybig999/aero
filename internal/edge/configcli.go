@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -206,10 +207,12 @@ func CheckNode(path string) []CheckItem {
 	if listen == "" {
 		listen = ":443"
 	}
-	if lock, err := acquireInstanceLock(dataDir); err != nil {
+	switch running, err := edgeInstanceRunning(dataDir); {
+	case err != nil:
+		add("WARN", "listen", "%s: cannot tell whether edge is running (%v); port test skipped", listen, err)
+	case running:
 		add("OK", "listen", "%s (edge is running; port test skipped)", listen)
-	} else {
-		_ = lock.release()
+	default:
 		if addr, moved := selectListenAddr(listen, StandardCandidatePorts, checkPortAvailable); !moved && !checkPortAvailable(listen) {
 			add("FAIL", "listen", "%s and all candidate ports are occupied", listen)
 		} else if moved {
@@ -245,6 +248,30 @@ func CheckNode(path string) []CheckItem {
 		add("FAIL", "warp", "enabled but no WARP proxy on %s (aero warp install, or aero warp off)", cfg.WarpProxy)
 	}
 	return out
+}
+
+// edgeInstanceRunning 只读地判断数据目录是否被运行中的 edge 占用：数据目录或 edge.lock 不存在
+// （全新安装、从未运行）说明没有实例，不创建任何文件；锁被占用才返回 true；其他错误原样返回。
+func edgeInstanceRunning(dataDir string) (bool, error) {
+	if _, err := os.Stat(filepath.Join(dataDir, "edge.lock")); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	lock, err := acquireInstanceLock(dataDir)
+	if err != nil {
+		if isInstanceLockBusy(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	_ = lock.release()
+	return false, nil
+}
+
+// isInstanceLockBusy 判断 acquireInstanceLock 的错误是否表示“锁已被另一个实例持有”。
+func isInstanceLockBusy(err error) bool {
+	return errors.Is(err, errInstanceLockBusy)
 }
 
 type certCheck struct {
@@ -289,4 +316,39 @@ func underSystemCertDir(path string) bool {
 		}
 	}
 	return false
+}
+
+// ConsoleURLFromConfig 只读：按配置文件计算控制台完整网址 https://<domain>[:端口]/console/<h>/#k=<key>（端口 443 省略）。
+// 输出含密钥，仅供 `aero info` 有意显示。
+func ConsoleURLFromConfig(path string) (string, error) {
+	domain, err := ConfigGet(path, "domain")
+	if err != nil {
+		return "", err
+	}
+	key, err := ConfigGet(path, "admin_key")
+	if err != nil {
+		return "", err
+	}
+	listen, err := ConfigGet(path, "listen")
+	if err != nil {
+		return "", err
+	}
+	if domain == "" {
+		return "", fmt.Errorf("domain is not set")
+	}
+	if len(key) < minAdminKeyLen {
+		return "", fmt.Errorf("admin_key shorter than %d characters (run `aero key`)", minAdminKeyLen)
+	}
+	port := 443
+	if listen != "" {
+		ps := listen
+		if _, p, err := net.SplitHostPort(listen); err == nil {
+			ps = p
+		}
+		ps = strings.TrimPrefix(ps, ":")
+		if n, err := strconv.Atoi(ps); err == nil && n > 0 && n < 65536 {
+			port = n
+		}
+	}
+	return ConsoleURL(domain, port, key), nil
 }

@@ -3,6 +3,7 @@
 package edge
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -310,5 +311,239 @@ func TestValidIfName(t *testing.T) {
 		if validIfName(n) != want {
 			t.Errorf("%q", n)
 		}
+	}
+}
+
+// useBootID 把 boot_id 来源换成临时文件；id 为空表示文件不存在（读取失败）。
+func useBootID(t *testing.T, id string) {
+	t.Helper()
+	prev := bootIDPath
+	bootIDPath = filepath.Join(t.TempDir(), "boot_id")
+	if id != "" {
+		if err := os.WriteFile(bootIDPath, []byte(id+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { bootIDPath = prev })
+}
+
+// 宿主在 edge 运行期间重启（断电/内核崩溃）：ip_forward 已由宿主自己重新设置，RestoreHost 不得改回
+// 日志里的原值；edge 自己的规则与日志照常清理。
+func TestRestoreHostAfterRebootKeepsIPForward(t *testing.T) {
+	if !inNetns(t) {
+		return
+	}
+	requireIptables(t)
+	useTestOutIf(t)
+	useBootID(t, "boot-A")
+	dir := t.TempDir()
+	setIPForward(t, "0")
+	if err := PrepareHostForTunnel(dir, testTun); err != nil {
+		t.Fatal(err)
+	}
+	if j, ok, err := readHostState(dir); err != nil || !ok || j.BootID != "boot-A" || j.IPv4Forward != "0" {
+		t.Fatalf("journal = %+v ok=%v err=%v", j, ok, err)
+	}
+	// 重启后：宿主 sysctl/docker 把转发设为 1，boot_id 变了；edge 的规则假定仍在（此处未被重置）
+	useBootID(t, "boot-B")
+	setIPForward(t, "1")
+	if err := RestoreHost(dir); err != nil {
+		t.Fatalf("RestoreHost: %v", err)
+	}
+	if got := ipForward(t); got != "1" {
+		t.Fatalf("ip_forward = %s after restore across reboot, want host value 1 untouched", got)
+	}
+	if left := rulesWith(t, edgeFirewallTag); len(left) != 0 {
+		t.Fatalf("tagged rules left:\n%s", strings.Join(left, "\n"))
+	}
+	if _, err := os.Stat(filepath.Join(dir, hostStateFile)); !os.IsNotExist(err) {
+		t.Fatalf("journal still present (err=%v)", err)
+	}
+}
+
+// 同一次启动内（崩溃后重启 edge）、旧版本日志（无 boot_id）、boot_id 读不到：仍按日志还原原值。
+func TestRestoreHostRestoresIPForwardWhenBootUnchangedOrUnknown(t *testing.T) {
+	if !inNetns(t) {
+		return
+	}
+	requireIptables(t)
+	useTestOutIf(t)
+	for name, tc := range map[string]struct{ journalBoot, nowBoot string }{
+		"same boot":          {"boot-A", "boot-A"},
+		"legacy journal":     {"", "boot-B"},
+		"boot id unreadable": {"boot-A", ""},
+	} {
+		dir := t.TempDir()
+		useBootID(t, tc.nowBoot)
+		setIPForward(t, "1")
+		raw := `{"ipv4_forward":"0"}`
+		if tc.journalBoot != "" {
+			raw = `{"ipv4_forward":"0","boot_id":"` + tc.journalBoot + `"}`
+		}
+		if err := os.WriteFile(filepath.Join(dir, hostStateFile), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := RestoreHost(dir); err != nil {
+			t.Fatalf("%s: RestoreHost: %v", name, err)
+		}
+		if got := ipForward(t); got != "0" {
+			t.Errorf("%s: ip_forward = %s, want restored 0", name, got)
+		}
+	}
+}
+
+func TestWaitArgsForVersion(t *testing.T) {
+	for out, want := range map[string]string{
+		"iptables v1.8.11 (nf_tables)\n": "-w 5",
+		"ip6tables v1.8.4 (legacy)":      "-w 5",
+		"iptables v1.6.0":                "-w 5",
+		"iptables v1.4.21":               "-w",
+		"iptables v1.4.20":               "-w",
+		"iptables v1.4.7":                "",
+		"garbage":                        "-w 5",
+	} {
+		if got := strings.Join(waitArgsForVersion(out), " "); got != want {
+			t.Errorf("waitArgsForVersion(%q) = %q, want %q", out, got, want)
+		}
+	}
+}
+
+// fakeHostTools 替换 hostCmd 与 lookPath（全部不触碰宿主）：installed 列出“已安装”的工具，
+// handler 返回对应命令的输出与错误；返回收集到的调用记录。
+func fakeHostTools(t *testing.T, installed []string, handler func(name string, args []string) (string, error)) *[]string {
+	t.Helper()
+	prevCmd, prevLook := hostCmd, lookPath
+	var calls []string
+	hostCmd = func(name string, args ...string) (string, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		return handler(name, args)
+	}
+	lookPath = func(name string) (string, error) {
+		for _, n := range installed {
+			if n == name {
+				return "/fake/" + name, nil
+			}
+		}
+		return "", exec.ErrNotFound
+	}
+	xtWaitMu.Lock()
+	xtWaitCache = map[string][]string{}
+	xtWaitMu.Unlock()
+	t.Cleanup(func() {
+		hostCmd, lookPath = prevCmd, prevLook
+		xtWaitMu.Lock()
+		xtWaitCache = map[string][]string{}
+		xtWaitMu.Unlock()
+	})
+	return &calls
+}
+
+// 所有 iptables/ip6tables 调用都带 -w 5，宿主上其他程序持有 xtables 锁时等待而不是立即失败。
+func TestRestoreHostUsesXtablesWait(t *testing.T) {
+	calls := fakeHostTools(t, []string{"iptables", "ip6tables"}, func(name string, args []string) (string, error) {
+		if len(args) > 0 && args[len(args)-1] == "--version" {
+			return name + " v1.8.11 (nf_tables)\n", nil
+		}
+		if args[len(args)-2] == "-S" && args[len(args)-1] == "FORWARD" && args[len(args)-3] == "filter" {
+			return "-P FORWARD ACCEPT\n-A FORWARD -i aero-tun0 -m comment --comment aero_edge_default -j ACCEPT\n", nil
+		}
+		return "", nil
+	})
+	if err := RestoreHost(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	deletes := 0
+	for _, c := range *calls {
+		if strings.HasSuffix(c, "--version") {
+			continue
+		}
+		if !strings.HasPrefix(c, "iptables -w 5 ") && !strings.HasPrefix(c, "ip6tables -w 5 ") {
+			t.Errorf("call without -w 5: %s", c)
+		}
+		if strings.Contains(c, " -D ") {
+			deletes++
+		}
+	}
+	if deletes != 2 { // iptables 与 ip6tables 的 filter/FORWARD 各一条
+		t.Fatalf("delete calls = %d, want 2: %v", deletes, *calls)
+	}
+}
+
+// ip6tables 已安装但还原失败必须报告；未安装则跳过。
+func TestRestoreHostReportsIp6tablesFailure(t *testing.T) {
+	fail := func(name string, args []string) (string, error) {
+		if name == "ip6tables" && len(args) >= 2 && args[len(args)-2] == "-S" {
+			return "", errors.New("ip6tables: exit status 4 (Resource temporarily unavailable)")
+		}
+		return "", nil
+	}
+	fakeHostTools(t, []string{"iptables", "ip6tables"}, fail)
+	err := RestoreHost(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "ip6tables") {
+		t.Fatalf("RestoreHost = %v, want ip6tables failure reported", err)
+	}
+	fakeHostTools(t, []string{"iptables"}, fail)
+	if err := RestoreHost(t.TempDir()); err != nil {
+		t.Fatalf("RestoreHost without ip6tables installed = %v, want nil", err)
+	}
+}
+
+// 全新安装：数据目录不存在时 cleanup-host 视为无需还原 ip_forward，不报错、不创建目录，
+// 但仍调用 RestoreHost 回收可能残留的规则。
+func TestCleanupHostMissingDataDir(t *testing.T) {
+	calls := fakeHostTools(t, []string{"iptables"}, func(name string, args []string) (string, error) {
+		return "", nil
+	})
+	dir := filepath.Join(t.TempDir(), "never-created")
+	if err := CleanupHost(dir); err != nil {
+		t.Fatalf("CleanupHost on missing dir = %v, want nil", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("CleanupHost created the data dir (err=%v)", err)
+	}
+	if len(*calls) == 0 {
+		t.Fatal("tagged rules scan was skipped for a missing data dir")
+	}
+}
+
+// 内核禁用 IPv6：ip6tables 已安装但 -S 必然失败，这不应使 RestoreHost（进而 edge 启动/cleanup）失败；
+// IPv6 可用时同样的失败仍报告；删除（-D）失败始终报告。
+func TestRestoreHostIp6tablesListFailureWithIPv6Disabled(t *testing.T) {
+	listFail := func(name string, args []string) (string, error) {
+		if name == "ip6tables" && len(args) >= 2 && args[len(args)-2] == "-S" {
+			return "", errors.New("ip6tables: can't initialize ip6tables table `filter'")
+		}
+		return "", nil
+	}
+	prev := ipv6ProcPaths
+	t.Cleanup(func() { ipv6ProcPaths = prev })
+	missing := filepath.Join(t.TempDir(), "no-ipv6")
+	present := t.TempDir()
+
+	ipv6ProcPaths = []string{missing, present}
+	fakeHostTools(t, []string{"iptables", "ip6tables"}, listFail)
+	if err := RestoreHost(t.TempDir()); err != nil {
+		t.Fatalf("IPv6 disabled + ip6tables -S failure: RestoreHost = %v, want nil", err)
+	}
+
+	ipv6ProcPaths = []string{present, present}
+	fakeHostTools(t, []string{"iptables", "ip6tables"}, listFail)
+	if err := RestoreHost(t.TempDir()); err == nil || !strings.Contains(err.Error(), "ip6tables") {
+		t.Fatalf("IPv6 available + ip6tables -S failure: RestoreHost = %v, want error", err)
+	}
+
+	// 删除失败：即使 IPv6 不可用也必须报告
+	ipv6ProcPaths = []string{missing, present}
+	fakeHostTools(t, []string{"ip6tables"}, func(name string, args []string) (string, error) {
+		switch {
+		case len(args) > 0 && args[len(args)-1] == "--version":
+			return "ip6tables v1.8.11 (nf_tables)", nil
+		case len(args) >= 2 && args[len(args)-2] == "-S":
+			return "-A FORWARD -m comment --comment aero_edge_default -j ACCEPT\n", nil
+		}
+		return "", errors.New("delete failed")
+	})
+	if err := RestoreHost(t.TempDir()); err == nil {
+		t.Fatal("ip6tables -D failure swallowed")
 	}
 }

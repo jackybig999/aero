@@ -212,3 +212,74 @@ func TestIngressRoleRefusedInProduction(t *testing.T) {
 		t.Fatal("check does not flag the ingress role")
 	}
 }
+
+// 回归：全新安装时数据目录尚未创建，check 必须照常做端口检查，且不得创建数据目录或 edge.lock。
+func TestCheckNodeListenWithMissingDataDirDoesNotCreateIt(t *testing.T) {
+	base := t.TempDir()
+	dataDir := filepath.Join(base, "not-yet")
+	path := filepath.Join(base, "edge.json")
+	b, _ := json.Marshal(map[string]any{"data_dir": dataDir, "listen": "127.0.0.1:0"})
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var listen CheckItem
+	for _, it := range CheckNode(path) {
+		if it.Name == "listen" {
+			listen = it
+		}
+	}
+	if listen.Level != "OK" || !strings.Contains(listen.Detail, "free") {
+		t.Fatalf("listen check = %+v, want a real port test", listen)
+	}
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("CheckNode created the data dir (err=%v)", err)
+	}
+}
+
+// 数据目录存在但还没有 edge.lock：不创建锁文件。
+func TestEdgeInstanceRunningDoesNotCreateLockFile(t *testing.T) {
+	dir := t.TempDir()
+	running, err := edgeInstanceRunning(dir)
+	if running || err != nil {
+		t.Fatalf("running=%v err=%v", running, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "edge.lock")); !os.IsNotExist(err) {
+		t.Fatalf("edge.lock created (err=%v)", err)
+	}
+}
+
+// 锁被占用才视为运行中；锁释放后恢复；其他错误（此处 data_dir 是普通文件）如实返回并在 check 中为 WARN。
+func TestEdgeInstanceRunningDetectsHeldLockAndOtherErrors(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := acquireInstanceLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, lerr := acquireInstanceLock(dir); !errors.Is(lerr, errInstanceLockBusy) {
+		t.Fatalf("second acquire = %v, want errInstanceLockBusy", lerr)
+	}
+	running, err := edgeInstanceRunning(dir)
+	if !running || err != nil {
+		t.Fatalf("held lock: running=%v err=%v", running, err)
+	}
+	_ = lock.release()
+	if running, err = edgeInstanceRunning(dir); running || err != nil {
+		t.Fatalf("released lock: running=%v err=%v", running, err)
+	}
+
+	notDir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if running, err = edgeInstanceRunning(notDir); running || err == nil {
+		t.Fatalf("data_dir is a file: running=%v err=%v, want error", running, err)
+	}
+	path := filepath.Join(t.TempDir(), "edge.json")
+	b, _ := json.Marshal(map[string]any{"data_dir": notDir, "listen": "127.0.0.1:0"})
+	_ = os.WriteFile(path, b, 0o600)
+	for _, it := range CheckNode(path) {
+		if it.Name == "listen" && it.Level != "WARN" {
+			t.Fatalf("listen with unreadable data dir = %+v, want WARN", it)
+		}
+	}
+}

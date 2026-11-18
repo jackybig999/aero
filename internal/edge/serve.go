@@ -369,7 +369,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap subscription: %w", err)
 	}
-	if err := persistServerConfig(cfg); err != nil {
+	if err := persistServerConfig(cfg.ConfigPath, fullConfigUpdates(cfg)); err != nil {
 		log.Printf("[EDGE] [WARN] persist config: %v", err)
 	}
 
@@ -711,9 +711,13 @@ func (s *Server) Start() error {
 	log.Printf("[EDGE] Subscriptions ready: Admin(/sub/<secret>, see console), User(/sub/{username}{6random}) (client-sub: %s/client-sub.json)", s.subStore.Dir())
 	log.Printf("[EDGE] Tokens loaded from %s (count: %d)", s.tokenStore.Path(), s.tokenStore.v.Count())
 	if s.cfg.AdminKey != "" {
-		log.Printf("[EDGE] Web Console ready at /console?key=%s", MaskToken(s.cfg.AdminKey))
+		if len(s.cfg.AdminKey) >= minAdminKeyLen {
+			log.Printf("[EDGE] Web Console shell at %s (API needs Authorization: Bearer)", ConsoleShellPath(s.cfg.AdminKey))
+		} else {
+			log.Printf("[EDGE] Web Console disabled: admin key shorter than %d characters", minAdminKeyLen)
+		}
 	} else {
-		log.Printf("[EDGE] Web Console ready at /console (loopback only)")
+		log.Printf("[EDGE] Web Console disabled: no admin key")
 	}
 
 	return nil
@@ -751,8 +755,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// 旧管理接口：未鉴权一律返回伪装站，不暴露接口存在（ADR-0016）
-	if strings.HasPrefix(r.URL.Path, "/admin") && s.adminHandler != nil && !s.adminHandler.adminOK(r) {
+	// 旧管理面（/admin*、/console*、/health）：密钥过短整体关闭；鉴权失败计入封禁；
+	// 未鉴权一律返回伪装站，不暴露接口存在（ADR-0016）
+	if s.consoleHandler != nil && s.consoleHandler.serveShell(w, r) { // 隐藏路径外壳，不含数据
+		return
+	}
+	if isLegacyAdminPath(r.URL.Path) && !s.legacyAdminGate(r) {
 		s.serveCover(w, r)
 		return
 	}
@@ -786,14 +794,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/health" {
-		reqKey := r.Header.Get("Aero-Admin-Key")
-		if reqKey == "" {
-			reqKey = r.URL.Query().Get("admin_key")
-		}
-		if s.cfg.AdminKey == "" || subtle.ConstantTimeCompare([]byte(reqKey), []byte(s.cfg.AdminKey)) != 1 {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
+		// 鉴权已由 legacyAdminGate 完成
 		writeJSON(w, map[string]any{
 			"status":     "ok",
 			"version":    Version,
@@ -810,6 +811,45 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.serveCover(w, r)
+}
+
+// isLegacyAdminPath 判断路径是否属于受 admin_key 保护的旧管理面。
+func isLegacyAdminPath(p string) bool {
+	return strings.HasPrefix(p, "/admin") || p == "/console" || strings.HasPrefix(p, "/console/") || p == "/health"
+}
+
+// legacyAdminGate 对旧管理面做统一鉴权：
+// admin_key 为空或短于 minAdminKeyLen 时整体关闭；被封禁的 IP 不再比较密钥；
+// 只接受 Authorization: Bearer <key>；
+// 带了凭据却错误时计入认证失败封禁（与数据面同一套 authJail）。返回 true 表示放行。
+func (s *Server) legacyAdminGate(r *http.Request) bool {
+	key := strings.TrimSpace(s.cfg.AdminKey)
+	if len(key) < minAdminKeyLen {
+		return false
+	}
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
+	}
+	var jail *AuthFailureJail
+	if s.quicServer != nil {
+		jail = s.quicServer.AuthJail()
+	}
+	if jail != nil && jail.IsBanned(ip) {
+		return false
+	}
+	presented := false
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		presented = true
+		got := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		if subtle.ConstantTimeCompare([]byte(got), []byte(key)) == 1 {
+			return true
+		}
+	}
+	if presented && jail != nil {
+		jail.RecordFailure(ip)
+	}
+	return false
 }
 
 func (s *Server) serveCover(w http.ResponseWriter, r *http.Request) {
@@ -1172,11 +1212,12 @@ func isGo126OrLater(ver string) bool {
 	return minor >= 26
 }
 
-// persistServerConfig 把当前生效配置合并写入 cfg.ConfigPath（键名与 ServerConfig 的
-// json tag 一致），保留文件中的其他键。ConfigPath 为空时不写任何文件。写盘按
-// L0 §8.8：同目录临时文件、Sync、Close、Rename，失败时保留原文件并返回错误。
-func persistServerConfig(cfg ServerConfig) error {
-	path := strings.TrimSpace(cfg.ConfigPath)
+// persistServerConfig 把 updates 合并写入配置文件 path：读取文件当前内容，只更新 updates 中的键
+// （值为 nil 表示删除该键），其余键原样保留，因此运维用 `aero-edge config set` 在运行期间写入的新值
+// 不会被进程内存里的旧值覆盖。path 为空时不写任何文件。写盘按 L0 §8.8：同目录临时文件、Sync、
+// Close、Rename，失败时保留原文件并返回错误；新文件一律 0600（即使旧文件权限更宽，文件含 admin_key）。
+func persistServerConfig(path string, updates map[string]any) error {
+	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil
 	}
@@ -1184,27 +1225,45 @@ func persistServerConfig(cfg ServerConfig) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create config dir: %w", err)
 	}
-	existing := make(map[string]any)
-	if data, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(data, &existing); err != nil {
-			return fmt.Errorf("parse existing %s: %w", path, err)
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("read %s: %w", path, err)
+	existing, err := readConfigMap(path)
+	if err != nil {
+		return err
 	}
-	// 旧版本写入的键名与读取时的 json tag 不一致，重启后证书路径丢失；统一改为 tag 名。
-	delete(existing, "cert")
-	delete(existing, "key")
+	for k, v := range updates {
+		if v == nil {
+			delete(existing, k)
+		} else {
+			existing[k] = v
+		}
+	}
+	data, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return writeFileAtomic(path, data, 0o600)
+}
+
+// fullConfigUpdates 返回启动时要持久化的完整生效配置（键名与 ServerConfig 的 json tag 一致）。
+// 仅启动路径使用（此时内存配置刚由该文件读入）；运行期的单项修改只传自己改动的键。
+func fullConfigUpdates(cfg ServerConfig) map[string]any {
+	u := map[string]any{
+		// 旧版本写入的键名与读取时的 json tag 不一致，重启后证书路径丢失；统一改为 tag 名。
+		"cert": nil,
+		"key":  nil,
+		// 显式写入：否则运行时关闭无法持久化
+		"usage_api":  cfg.UsageAPI,
+		"warp_proxy": cfg.WarpProxy,
+		"warp_all":   cfg.WarpAll,
+	}
 	set := func(k, v string) {
 		if v != "" {
-			existing[k] = v
+			u[k] = v
 		}
 	}
 	set("listen", cfg.Listen)
 	set("domain", cfg.Domain)
 	if cfg.certAutoDiscovered { // 自动发现的证书不写死；同时清除旧版本写入的同类路径
-		delete(existing, "cert_file")
-		delete(existing, "key_file")
+		u["cert_file"], u["key_file"] = nil, nil
 	} else {
 		set("cert_file", cfg.CertFile)
 		set("key_file", cfg.KeyFile)
@@ -1214,25 +1273,21 @@ func persistServerConfig(cfg ServerConfig) error {
 	set("token", cfg.Token)
 	set("metering_key", cfg.MeteringKey)
 	set("node_id", cfg.NodeID)
-	existing["usage_api"] = cfg.UsageAPI // 显式写入，否则运行时关闭无法持久化
-	// WARP 开关显式写入（关闭时为空串），否则“关闭”无法持久化
-	existing["warp_proxy"] = cfg.WarpProxy
-	existing["warp_all"] = cfg.WarpAll
-
-	data, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	return replaceFileAtomic(path, data, 0o600)
+	return u
 }
 
-// replaceFileAtomic 用同目录临时文件替换 target（L0 §8.8）。
+// replaceFileAtomic 用同目录临时文件替换 target（L0 §8.8）；target 已存在时沿用其权限，否则用 perm。
 func replaceFileAtomic(target string, data []byte, perm os.FileMode) error {
 	if info, err := os.Stat(target); err == nil {
 		perm = info.Mode().Perm()
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat %s: %w", target, err)
 	}
+	return writeFileAtomic(target, data, perm)
+}
+
+// writeFileAtomic 用同目录临时文件替换 target，新文件权限固定为 perm。
+func writeFileAtomic(target string, data []byte, perm os.FileMode) error {
 	f, err := os.CreateTemp(filepath.Dir(target), ".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp: %w", err)
@@ -1418,7 +1473,7 @@ func (s *Server) SetWarpEgress(enabled, all bool) error {
 	} else {
 		cfg.WarpProxy, cfg.WarpAll = "", false
 	}
-	if err := persistServerConfig(cfg); err != nil {
+	if err := persistServerConfig(cfg.ConfigPath, map[string]any{"warp_proxy": cfg.WarpProxy, "warp_all": cfg.WarpAll}); err != nil {
 		return fmt.Errorf("persist WARP setting: %w", err)
 	}
 	s.cfg.WarpProxy, s.cfg.WarpAll = cfg.WarpProxy, cfg.WarpAll

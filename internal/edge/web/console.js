@@ -3,17 +3,40 @@
   'use strict';
 
   // 1. Auth & State
-  const params = new URLSearchParams(window.location.search);
-  let adminKey = params.get('key') || sessionStorage.getItem('aero_admin_key') || '';
-  if (params.get('key')) {
-    sessionStorage.setItem('aero_admin_key', params.get('key'));
+  // 密钥来源：地址栏 #k=<key>（读到后立即从地址栏清除）或 sessionStorage；经 Authorization 头发送，不进 URL 查询串。
+  let adminKey = '';
+  const hashKey = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('k');
+  if (hashKey) {
+    sessionStorage.setItem('aero_admin_key', hashKey.trim());
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  }
+  adminKey = sessionStorage.getItem('aero_admin_key') || '';
+  if (!adminKey) {
+    // 没有密钥：显示最简输入框，提交后存入 sessionStorage 并重载
+    const form = document.createElement('form');
+    form.style.cssText = 'max-width:360px;margin:20vh auto;font-family:sans-serif;text-align:center';
+    form.innerHTML = '<p>请输入管理密钥</p><input type="password" id="aeroKeyInput" autocomplete="off" style="width:100%;padding:8px;box-sizing:border-box"><button type="submit" style="margin-top:12px;padding:6px 16px">确定</button>';
+    form.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const v = document.getElementById('aeroKeyInput').value.trim();
+      if (v) {
+        sessionStorage.setItem('aero_admin_key', v);
+        window.location.reload();
+      }
+    });
+    document.body.appendChild(form);
+    return;
   }
 
   function getApiUrl(path) {
-    if (!adminKey) return path;
-    const sep = path.includes('?') ? '&' : '?';
-    return `${path}${sep}key=${encodeURIComponent(adminKey)}`;
+    return path;
   }
+
+  // 在本作用域内遮蔽 fetch：所有 API 请求自动携带 Bearer 头。
+  const fetch = (url, opts = {}) => window.fetch(url, {
+    ...opts,
+    headers: { ...(opts.headers || {}), ...(adminKey ? { Authorization: `Bearer ${adminKey}` } : {}) },
+  });
 
   // 2. DOM Elements
   const el = {

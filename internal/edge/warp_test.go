@@ -233,7 +233,7 @@ func TestConsoleWarpInstallEndpointsGone(t *testing.T) {
 	h := NewConsoleHandler("console_key_0123456789", nil, nil, nil, nil, nil, nil, nil)
 	for _, path := range []string{"/console/api/warp/install", "/console/api/warp/uninstall", "/console/api/warp/logs"} {
 		req := httptest.NewRequest(http.MethodPost, path, nil)
-		req.Header.Set("X-Aero-Admin-Key", "console_key_0123456789")
+		req.Header.Set("Authorization", "Bearer console_key_0123456789")
 		rec := httptest.NewRecorder()
 		if !h.TryServe(rec, req) {
 			t.Fatalf("%s not handled", path)

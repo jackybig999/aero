@@ -100,6 +100,11 @@ type tunnelDownlink struct {
 	ch        chan downlinkPacket
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// mu 与 closed 使“入队”与“停止”互斥：stop 之后不会再有报文进入 ch，
+	// 因此发送协程退出前的 drain 能扣回队列中全部剩余报文的预算（否则全局预算会缓慢泄漏）。
+	mu     sync.Mutex
+	closed bool
 }
 
 // downlinkBufPool 存放单个下行报文副本；TUN MTU 为 1360，2048 足够，更大的报文单独分配。
@@ -110,6 +115,9 @@ var downlinkBufPool = sync.Pool{New: func() any {
 
 func (d *tunnelDownlink) stop() {
 	d.closeOnce.Do(func() {
+		d.mu.Lock()
+		d.closed = true // 先于 close(done)：drain 在 done 之后进行，此后不再有入队
+		d.mu.Unlock()
 		close(d.done)
 		// 关闭连接以解除阻塞中的 SendDatagram，保证发送协程有退出路径。
 		_ = d.conn.Close()
@@ -351,6 +359,11 @@ func (r *GlobalTunnelReader) enqueueDownlink(binding GlobalTunnelBinding, packet
 	d := r.downlinkFor(binding)
 	if d == nil {
 		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return // 会话已停止：不加预算、不入队
 	}
 	size := int64(len(packet))
 	if len(packet) <= 2048 {

@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -248,6 +249,7 @@ var connAlive = func(c *quic.Conn) bool {
 // connBinding 是连接绑定的 token 与（签名 token 的）uid；uid 用于本节点设备数计数（C3 §3 第 7 步）。
 type connBinding struct {
 	token, uid string
+	maxDevices int // 签名 token 的 max_devices；0 表示未限制或不透明 token
 	seq        uint64
 }
 
@@ -275,6 +277,17 @@ func (ct *ConnTracker) UID(c *quic.Conn) string {
 	ct.mu.RLock()
 	defer ct.mu.RUnlock()
 	return ct.conns[c].uid
+}
+
+// Limits 返回 c 绑定的 uid 与其设备数上限（不透明 token 或未绑定时为 "", 0）。
+func (ct *ConnTracker) Limits(c *quic.Conn) (uid string, maxDevices int) {
+	if c == nil {
+		return "", 0
+	}
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+	b := ct.conns[c]
+	return b.uid, b.maxDevices
 }
 
 // Bind associates token with c.
@@ -318,7 +331,7 @@ func (ct *ConnTracker) BindEvictOldest(c *quic.Conn, token, uid string, max int)
 		}
 	}
 	ct.seq++
-	ct.conns[c] = connBinding{token: token, uid: uid, seq: ct.seq}
+	ct.conns[c] = connBinding{token: token, uid: uid, maxDevices: max, seq: ct.seq}
 	return evict
 }
 
@@ -329,7 +342,7 @@ var closeEvictedConn = func(c *quic.Conn) {
 
 // Remove dissociates c.
 func (ct *ConnTracker) Remove(c *quic.Conn) {
-	if c == nil {
+	if ct == nil || c == nil {
 		return
 	}
 	ct.mu.Lock()
@@ -565,6 +578,9 @@ type QUICServer struct {
 
 	// tcpIdleTimeout 是标准 CONNECT 中继的空闲上限（双向均无流量）；0 表示默认值。
 	tcpIdleTimeout time.Duration
+
+	// connectIPSessions 登记活动的 CONNECT-IP 会话并限制其数量。
+	connectIPSessions connectIPSessionTable
 
 	// token 有效性集中执行（PROJECT_RULES：吊销、过期等 10 秒内断开）
 	tokenEnforceInterval time.Duration
@@ -1295,6 +1311,8 @@ func (s *QUICServer) ServeListener(ctx context.Context, ln *quic.Listener) error
 
 // handleQUICConn is the connection-level handler
 func (s *QUICServer) handleQUICConn(conn *quic.Conn) {
+	// 连接结束后立即摘除跟踪记录；否则只能等 5 分钟一次的 reaper，期间指针与绑定一直占用内存。
+	defer s.connTracker.Remove(conn)
 	if s.h3Server != nil {
 		_ = s.h3Server.ServeQUICConn(conn)
 	}
@@ -1481,6 +1499,63 @@ func (s *QUICServer) rejectAuth(w http.ResponseWriter, remoteIP, details string)
 	w.WriteHeader(http.StatusUnauthorized)
 }
 
+// 数据面拒绝响应（C1 §7）。details 只放固定文本或 EDGE_* 错误码（api/errors.yaml），
+// 绝不放原始 err.Error()：它可能含 WARP 本地代理地址、下一跳地址等内部信息。
+
+// rejectBadRequest 返回 400：请求本身格式错误（缺目标、端口非数字、无法解析的 URI），不属于 §7 的 502 类。
+// error 取 RFC 9209 的 http_request_error。
+func rejectBadRequest(w http.ResponseWriter) {
+	w.Header().Set("Proxy-Status", `aero; error=http_request_error; details="EDGE_BAD_REQUEST"`)
+	w.WriteHeader(http.StatusBadRequest)
+}
+
+// rejectDestinationProhibited 返回 403：目的地址或端口被 §5 拒绝；why 是固定的分类词（如 private、smtp）。
+func rejectDestinationProhibited(w http.ResponseWriter, why string) {
+	w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
+	w.WriteHeader(http.StatusForbidden)
+}
+
+// rejectLimitExceeded 返回 503：本节点的并发资源（连接、拨号、CONNECT-IP 会话）已达上限。
+func rejectLimitExceeded(w http.ResponseWriter) {
+	w.Header().Set("Proxy-Status", "aero; error=connection_limit_exceeded")
+	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
+// rejectDial 把拨号失败映射为 §7 的拒绝响应，用 sentinel 错误判定，不依赖错误文本：
+// 解析到被禁地址 403；本地并发上限 503；WARP 出口 fail-closed 与 DNS 解析失败、其他拨号失败 502。
+func rejectDial(w http.ResponseWriter, err error) {
+	var dnsErr *net.DNSError
+	switch {
+	case errors.Is(err, errBlockedTarget):
+		rejectDestinationProhibited(w, "EDGE_DEST_PROHIBITED")
+	case errors.Is(err, errDialTokenLimit), errors.Is(err, errDialQueueFull):
+		rejectLimitExceeded(w)
+	case errors.Is(err, errWarpFailClosed):
+		w.Header().Set("Proxy-Status", `aero; error=connection_refused; details="EGRESS_UNAVAILABLE"`)
+		w.WriteHeader(http.StatusBadGateway)
+	case errors.As(err, &dnsErr):
+		w.Header().Set("Proxy-Status", "aero; error=destination_ip_unroutable")
+		w.WriteHeader(http.StatusBadGateway)
+	default:
+		w.Header().Set("Proxy-Status", "aero; error=connection_refused")
+		w.WriteHeader(http.StatusBadGateway)
+	}
+}
+
+// parseTargetPort 取 host:port 的端口。端口必须是 1-65535 的纯数字：
+// net.Dial 还接受 "smtp" 之类的服务名，不限制会绕过端口策略。
+func parseTargetPort(target string) (uint16, bool) {
+	_, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return 0, false
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || p == 0 {
+		return 0, false
+	}
+	return uint16(p), true
+}
+
 var relayBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 16384)
@@ -1502,23 +1577,31 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	target = strings.TrimPrefix(target, "/")
 	target = strings.TrimPrefix(target, "/")
 	if target == "" {
-		w.Header().Set("Proxy-Status", "aero; error=destination_ip_unroutable")
-		w.WriteHeader(http.StatusBadRequest)
+		rejectBadRequest(w)
+		return
+	}
+	// 端口策略（C1 §5）：与 CONNECT-IP、connect-udp 同一套。端口必须是数字，
+	// 否则 net.Dial 会把 "smtp" 之类服务名解析成 25 而绕过策略。
+	port, ok := parseTargetPort(target)
+	if !ok {
+		rejectBadRequest(w)
+		return
+	}
+	if blocked, why := destinationPortBlocked(6, port); blocked {
+		rejectDestinationProhibited(w, why)
 		return
 	}
 
 	if !s.allowLoopbackForTest.Load() {
 		if blocked, why := IsBlockedTarget(target); blocked {
-			w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
-			w.WriteHeader(http.StatusForbidden)
+			rejectDestinationProhibited(w, why)
 			return
 		}
 	}
 
 	if s.connLimiter != nil {
 		if !s.connLimiter.TryAcquire(token) {
-			w.Header().Set("Proxy-Status", "aero; error=connection_limit_exceeded")
-			w.WriteHeader(http.StatusServiceUnavailable)
+			rejectLimitExceeded(w)
 			return
 		}
 		defer s.connLimiter.Release(token)
@@ -1529,7 +1612,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	if s.cfg != nil && s.cfg.Role == "ingress" && s.cfg.NextHopAddr != "" {
 		targetConn, err = s.dialNextHopTCP(s.cfg.NextHopAddr, target, s.cfg.HopCredential)
 	} else if s.dialGuard != nil {
-		targetConn, err = s.dialGuard.DialTimeout("tcp", target, 10*time.Second)
+		targetConn, err = s.dialGuard.DialTimeoutFor(token, "tcp", target, 10*time.Second)
 	} else {
 		tcpNet := "tcp4"
 		targetHost, _, _ := net.SplitHostPort(target)
@@ -1539,8 +1622,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 		targetConn, err = net.DialTimeout(tcpNet, target, 10*time.Second)
 	}
 	if err != nil {
-		w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
-		w.WriteHeader(http.StatusBadGateway)
+		rejectDial(w, err)
 		return
 	}
 	defer targetConn.Close()
@@ -1566,12 +1648,22 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 
 	relayCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	// aborted 表示因空闲超时而终止；此时还要取消流的发送方向，唤醒阻塞在 str.Write 的下行
+	// goroutine（客户端不读流时它不会自行返回）。普通出错不取消发送方向，避免丢弃已写入但尚未送达的数据。
+	var aborted atomic.Bool
+	abort := func() {
+		aborted.Store(true)
+		cancel()
+	}
 
 	// 任一方向出错或整体空闲时，关闭两端以唤醒阻塞的读写。
 	go func() {
 		<-relayCtx.Done()
 		_ = targetConn.Close()
 		str.CancelRead(quic.StreamErrorCode(0))
+		if aborted.Load() {
+			str.CancelWrite(quic.StreamErrorCode(0))
+		}
 	}()
 
 	var wg sync.WaitGroup
@@ -1599,8 +1691,12 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 				}
 			}
 			if err != nil {
-				if isTimeoutErr(err) && stillActive() {
-					continue
+				if isTimeoutErr(err) {
+					if stillActive() {
+						continue
+					}
+					abort() // 双向都空闲：唤醒可能阻塞在 str.Write 的另一方向
+					return
 				}
 				if errors.Is(err, io.EOF) {
 					closeWriteSide(targetConn)
@@ -1627,14 +1723,20 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 					s.bandwidthLimiter.Take(token, n)
 				}
 				usage.Add(0, int64(n))
+				// 写超时：客户端长时间不读流（流控窗口满）时 Write 会一直阻塞，用空闲上限兜底。
+				_ = str.SetWriteDeadline(time.Now().Add(idle))
 				if _, werr := str.Write(buf[:n]); werr != nil {
 					cancel()
 					return
 				}
 			}
 			if err != nil {
-				if isTimeoutErr(err) && stillActive() {
-					continue
+				if isTimeoutErr(err) {
+					if stillActive() {
+						continue
+					}
+					abort() // 双向都空闲：唤醒可能阻塞在 str.Write 的另一方向
+					return
 				}
 				if errors.Is(err, io.EOF) {
 					_ = str.Close()
@@ -1679,14 +1781,23 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 		proxyReq.Host = origHost
 	}
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		rejectBadRequest(w)
+		return
+	}
+	udpPort, ok := parseTargetPort(proxyReq.Target)
+	if !ok {
+		rejectBadRequest(w)
+		return
+	}
+	// 与 TCP、CONNECT-IP 同一套端口策略（C1 §5）；当前策略对 UDP 无端口限制。
+	if blocked, why := destinationPortBlocked(17, udpPort); blocked {
+		rejectDestinationProhibited(w, why)
 		return
 	}
 
 	if !s.allowLoopbackForTest.Load() {
 		if blocked, why := IsBlockedTarget(proxyReq.Target); blocked {
-			w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
-			w.WriteHeader(http.StatusForbidden)
+			rejectDestinationProhibited(w, why)
 			return
 		}
 	}
@@ -1702,15 +1813,14 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 	if s.cfg != nil && s.cfg.Role == "ingress" && s.cfg.NextHopAddr != "" {
 		uConn, err := s.dialNextHopUDP(s.cfg.NextHopAddr, proxyReq.Target, s.cfg.HopCredential)
 		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
+			rejectDial(w, err)
 			return
 		}
 		targetUDP = uConn
 	} else if s.udpDialFn.Load() == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(proxyReq.Target, 0) {
 		warpConn, err := s.dialGuard.DialUDPViaWARP(proxyReq.Target, 10*time.Second)
 		if err != nil {
-			w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
-			w.WriteHeader(http.StatusBadGateway)
+			rejectDial(w, err)
 			return
 		}
 		targetUDP = warpConn
@@ -1722,14 +1832,15 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 		}
 		dstAddr, err := s.resolveUDP(resolveNet, proxyReq.Target)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+			// 目标无法解析属于“目标不可达”（§7 的 502），不是请求格式错误。
+			w.Header().Set("Proxy-Status", "aero; error=destination_ip_unroutable")
+			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 
 		if !s.allowLoopbackForTest.Load() {
 			if blocked, why := IsBlockedIP(dstAddr.IP); blocked {
-				w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=destination_ip_prohibited; details=%q", why))
-				w.WriteHeader(http.StatusForbidden)
+				rejectDestinationProhibited(w, why)
 				return
 			}
 		}
@@ -1737,8 +1848,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 		if s.udpDialFn.Load() == nil && s.dialGuard != nil && s.dialGuard.ShouldRouteUDP(dstAddr.String(), dstAddr.Port) {
 			warpConn, err := s.dialGuard.DialUDPViaWARP(dstAddr.String(), 10*time.Second)
 			if err != nil {
-				w.Header().Set("Proxy-Status", fmt.Sprintf("aero; error=connection_refused; details=%q", err.Error()))
-				w.WriteHeader(http.StatusBadGateway)
+				rejectDial(w, err)
 				return
 			}
 			targetUDP = warpConn
@@ -1749,7 +1859,7 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 			}
 			uConn, err := s.dialUDP(udpNet, nil, dstAddr)
 			if err != nil {
-				w.WriteHeader(http.StatusBadGateway)
+				rejectDial(w, err)
 				return
 			}
 			targetUDP = uConn
@@ -1936,7 +2046,7 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	proxyReq, err := connectip.ParseProxyRequest(r, s.ipTempl)
 	r.Host = origHost
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		rejectBadRequest(w)
 		return
 	}
 
@@ -1949,11 +2059,26 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	// 地址租约键：签名 token 按 uid（token 每 24 小时轮换，地址保持不变，隧道内 TCP 不中断）；
 	// 旧的不透明 token 按 token 本身。
 	leaseKey := token
-	if qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn); qc != nil && s.connTracker != nil {
-		if uid := s.connTracker.UID(qc); uid != "" {
+	perKeyLimit := connectIPMaxSessionsOpaque
+	qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn)
+	if qc != nil && s.connTracker != nil {
+		if uid, maxDevices := s.connTracker.Limits(qc); uid != "" {
 			leaseKey = "uid:" + uid
+			if maxDevices > 0 {
+				perKeyLimit = maxDevices // 每个设备一条连接、一个会话
+			}
 		}
 	}
+
+	// 会话数上限（L0 §9.2）：每个会话占用地址、64KB 缓冲与多个 goroutine，
+	// 单 QUIC 连接最多可开 1000 个请求流，不加限制可被一个用户耗尽节点资源。
+	sess, ok := s.connectIPSessions.acquire(qc, leaseKey, perKeyLimit, s.connectIPGlobalLimit())
+	if !ok {
+		rejectLimitExceeded(w)
+		return
+	}
+	defer s.connectIPSessions.release(sess)
+
 	assignedPrefix, err := s.ipPool.AllocateFor(leaseKey)
 	if err != nil {
 		w.Header().Set("Proxy-Status", "aero; error=address_pool_exhausted; details=\"IP pool exhausted\"")
@@ -2000,7 +2125,12 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 同一份 binding 先登记到路由表（下行按目的地址查到它），再交给 reader（上行）。
-	binding := GlobalTunnelBinding{Token: token, IPv4: assignedPrefix.Addr(), Conn: conn, usage: s.usageCell(token)}
+	var packetConn IPPacketConn = conn
+	if s.bandwidthLimiter.Enabled() {
+		// 与 TCP/UDP 相同：按 token 限速，上下行都计入同一个令牌桶。
+		packetConn = &limitedIPConn{IPPacketConn: conn, ctx: r.Context(), token: token, limiter: s.bandwidthLimiter}
+	}
+	binding := GlobalTunnelBinding{Token: token, IPv4: assignedPrefix.Addr(), Conn: packetConn, usage: s.usageCell(token)}
 	if assignedIPv6.IsValid() {
 		binding.IPv6 = assignedIPv6.Addr()
 	}
@@ -2030,6 +2160,137 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
+// connectIPMaxSessionsOpaque 是不透明 token（没有 max_devices）与未设置设备数上限的签名 token 的
+// CONNECT-IP 并发会话上限。取 8：正常用户一台设备一个会话，8 覆盖多设备共用一个旧 token 的情形，
+// 又把单 token 可占用的地址与 goroutine 限制在很小的范围内（估算，待实测）。
+const connectIPMaxSessionsOpaque = 8
+
+// connectIPGlobalLimit 返回 CONNECT-IP 的全局会话上限：复用全局连接上限（ConnLimiter），
+// 没有配置限制器时用其默认值（DefaultMaxGlobal，远小于 /16 地址池的容量）。
+func (s *QUICServer) connectIPGlobalLimit() int {
+	if s.connLimiter != nil {
+		return int(s.connLimiter.MaxGlobal())
+	}
+	return DefaultMaxGlobal
+}
+
+// connectIPSession 是一个已登记的 CONNECT-IP 会话。
+type connectIPSession struct {
+	conn     *quic.Conn // 可为 nil（测试中没有 QUIC 连接）
+	key      string
+	released bool
+}
+
+// connectIPSessionTable 登记活动的 CONNECT-IP 会话并执行三层上限：
+// 每个 QUIC 连接 1 个、每个 uid/token（key）不超过 perKey、全局不超过 global。
+type connectIPSessionTable struct {
+	mu     sync.Mutex
+	byConn map[*quic.Conn]*connectIPSession
+	byKey  map[string]map[*connectIPSession]struct{}
+	total  int
+}
+
+// acquire 登记一个会话；任一上限已满返回 false。成功后调用方必须在 defer 中 release。
+func (t *connectIPSessionTable) acquire(conn *quic.Conn, key string, perKey, global int) (*connectIPSession, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.byConn == nil {
+		t.byConn = make(map[*quic.Conn]*connectIPSession)
+		t.byKey = make(map[string]map[*connectIPSession]struct{})
+	}
+	if conn != nil {
+		if _, busy := t.byConn[conn]; busy {
+			return nil, false
+		}
+	}
+	if global > 0 && t.total >= global {
+		return nil, false
+	}
+	set := t.byKey[key]
+	if perKey > 0 && len(set) >= perKey {
+		// 设备数上限替换旧连接时，旧连接的处理协程可能还没来得及退出：
+		// 先清掉连接已关闭的会话，避免把“换设备重连”误判为超限。
+		for other := range set {
+			if other.conn != nil && !connAlive(other.conn) {
+				t.removeLocked(other)
+			}
+		}
+		set = t.byKey[key]
+		if len(set) >= perKey {
+			return nil, false
+		}
+	}
+	sess := &connectIPSession{conn: conn, key: key}
+	if conn != nil {
+		t.byConn[conn] = sess
+	}
+	if t.byKey[key] == nil {
+		t.byKey[key] = make(map[*connectIPSession]struct{})
+	}
+	t.byKey[key][sess] = struct{}{}
+	t.total++
+	return sess, true
+}
+
+// release 释放会话；可重复调用。
+func (t *connectIPSessionTable) release(sess *connectIPSession) {
+	if sess == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.removeLocked(sess)
+}
+
+func (t *connectIPSessionTable) removeLocked(sess *connectIPSession) {
+	if sess.released {
+		return
+	}
+	sess.released = true
+	if sess.conn != nil && t.byConn[sess.conn] == sess {
+		delete(t.byConn, sess.conn)
+	}
+	if set := t.byKey[sess.key]; set != nil {
+		delete(set, sess)
+		if len(set) == 0 {
+			delete(t.byKey, sess.key)
+		}
+	}
+	t.total--
+}
+
+// active 返回当前登记的会话总数。
+func (t *connectIPSessionTable) active() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.total
+}
+
+// limitedIPConn 给 CONNECT-IP 会话套上 bandwidthLimiter（与 TCP/UDP 同一个按 token 的令牌桶）。
+// 上行在读到报文后扣减（拖慢后续读取，QUIC 流控向客户端反压），下行在写出前扣减；
+// 等待随会话上下文取消而结束，Close 之后不会卡住发送协程。
+type limitedIPConn struct {
+	IPPacketConn
+	ctx     context.Context
+	token   string
+	limiter *BandwidthLimiter
+}
+
+func (c *limitedIPConn) ReadPacket(b []byte) (int, error) {
+	n, err := c.IPPacketConn.ReadPacket(b)
+	if n > 0 {
+		_ = c.limiter.TakeContext(c.ctx, c.token, n)
+	}
+	return n, err
+}
+
+func (c *limitedIPConn) WritePacket(b []byte) ([]byte, error) {
+	if err := c.limiter.TakeContext(c.ctx, c.token, len(b)); err != nil {
+		return nil, net.ErrClosed // 会话已结束：与连接关闭同样处理，发送协程不记噪声日志
+	}
+	return c.IPPacketConn.WritePacket(b)
 }
 
 // maxDoHQueryBytes 是 DoH 请求体上限（PROJECT_RULES §7.3）。

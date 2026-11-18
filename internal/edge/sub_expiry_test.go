@@ -21,7 +21,7 @@ func newSubExpiryAdmin(t *testing.T) (*AdminHandler, *Validator) {
 	if err != nil {
 		t.Fatalf("NewSubStore: %v", err)
 	}
-	return NewAdminHandler("admin_key_expiry", v, ts, ss), v
+	return NewAdminHandler(testConsoleKey, v, ts, ss), v
 }
 
 func postSubs(t *testing.T, h *AdminHandler, body map[string]any) int {
@@ -31,7 +31,7 @@ func postSubs(t *testing.T, h *AdminHandler, body map[string]any) int {
 		t.Fatalf("marshal: %v", err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/admin/subs", bytes.NewReader(raw))
-	req.Header.Set("X-Aero-Admin-Key", "admin_key_expiry")
+	req.Header.Set("Authorization", "Bearer "+testConsoleKey)
 	rec := httptest.NewRecorder()
 	if !h.TryServe(rec, req) {
 		t.Fatal("admin handler did not serve /admin/subs")
