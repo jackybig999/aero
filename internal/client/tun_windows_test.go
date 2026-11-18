@@ -4,6 +4,7 @@ package client
 
 import (
 	"net"
+	"syscall"
 	"testing"
 )
 
@@ -29,5 +30,26 @@ func TestWindowsRoutesAndPhysicalGatewayFromAPI(t *testing.T) {
 	}
 	if _, name, err := DetectThirdPartyTUN(); err != nil {
 		t.Fatalf("DetectThirdPartyTUN: %v (%s)", err, name)
+	}
+}
+
+// IPv4 套接字用 IPPROTO_IP + 大端索引；IPv6 套接字必须用 IPPROTO_IPV6 + 主机字节序（小端）索引。
+func TestUnicastIfSockopt(t *testing.T) {
+	const idx = 0x01020304
+	cases := []struct {
+		network string
+		level   int
+		val     [4]byte
+	}{
+		{"udp4", syscall.IPPROTO_IP, [4]byte{1, 2, 3, 4}},
+		{"tcp4", syscall.IPPROTO_IP, [4]byte{1, 2, 3, 4}},
+		{"udp6", syscall.IPPROTO_IPV6, [4]byte{4, 3, 2, 1}},
+		{"tcp6", syscall.IPPROTO_IPV6, [4]byte{4, 3, 2, 1}},
+	}
+	for _, c := range cases {
+		level, opt, val := unicastIfSockopt(c.network, idx)
+		if level != c.level || opt != 31 || val != c.val {
+			t.Errorf("unicastIfSockopt(%q) = (%d, %d, %v), want (%d, 31, %v)", c.network, level, opt, val, c.level, c.val)
+		}
 	}
 }

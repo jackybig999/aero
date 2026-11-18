@@ -9,6 +9,7 @@ package client
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -59,6 +60,8 @@ type windowsDevice struct {
 	sessionOK atomic.Bool
 	readWg    sync.WaitGroup
 	writeMu   sync.Mutex
+	// dropped 记录因 wintun 环形缓冲区满而丢弃的下行包数。
+	dropped atomic.Uint64
 }
 
 var (
@@ -130,6 +133,12 @@ func (d *windowsDevice) Write(p []byte) (int, error) {
 
 	buf, err := sess.AllocateSendPacket(len(p))
 	if err != nil {
+		// 环形缓冲区满：丢弃该包，与 wireguard-go 的 Windows tun 一致；
+		// 若返回错误，数据泵会把它当作写失败而拆掉整条隧道，下行突发即可断线。
+		if errors.Is(err, windows.ERROR_BUFFER_OVERFLOW) {
+			d.dropped.Add(1)
+			return len(p), nil
+		}
 		return 0, err
 	}
 	copy(buf, p)
@@ -307,6 +316,44 @@ func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	return bestGW, bestIdx, nil
 }
 
+// 套接字选项常量。IPV6_UNICAST_IF 与 IP_UNICAST_IF 数值同为 31（ws2ipdef.h），
+// golang.org/x/sys/windows 未导出，这里定义本地常量。
+const (
+	sockoptIPUnicastIf   = 31 // IP_UNICAST_IF
+	sockoptIPv6UnicastIf = 31 // IPV6_UNICAST_IF
+)
+
+// unicastIfSockopt 按套接字网络类型（Control 回调收到的 "tcp4"/"udp6" 等）返回绑定出接口的选项参数。
+// IPv4 的 IP_UNICAST_IF 要求网络字节序（大端）索引；IPv6 的 IPV6_UNICAST_IF 要求主机字节序索引，
+// Windows 只运行在小端架构上，故用小端编码。
+func unicastIfSockopt(network string, ifIndex uint32) (level, opt int, val [4]byte) {
+	if strings.HasSuffix(network, "6") {
+		binary.LittleEndian.PutUint32(val[:], ifIndex)
+		return syscall.IPPROTO_IPV6, sockoptIPv6UnicastIf, val
+	}
+	binary.BigEndian.PutUint32(val[:], ifIndex)
+	return syscall.IPPROTO_IP, sockoptIPUnicastIf, val
+}
+
+// bindPhysicalControl 返回把套接字绑定到物理网卡并设置收发缓冲区的 Control 回调；
+// 拨号与监听共用，仅缓冲区大小不同。
+func bindPhysicalControl(ifIndex uint32, bufSize int) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		var opErr error
+		if err := c.Control(func(fd uintptr) {
+			level, opt, val := unicastIfSockopt(network, ifIndex)
+			opErr = syscall.Setsockopt(syscall.Handle(fd), int32(level), int32(opt), (*byte)(unsafe.Pointer(&val[0])), 4)
+			if opErr == nil {
+				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, bufSize)
+				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, bufSize)
+			}
+		}); err != nil {
+			return err
+		}
+		return opErr
+	}
+}
+
 // DialPhysicalDirect 绑定物理网卡发包
 func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, error) {
 	if hook := getPhysicalDialerHook(); hook != nil {
@@ -318,19 +365,7 @@ func DialPhysicalDirect(ctx context.Context, network, addr string) (net.Conn, er
 		_, idxStr, err := PhysicalDefaultGateway()
 		if err == nil && idxStr != "" {
 			if idx, err := strconv.Atoi(idxStr); err == nil && idx > 0 {
-				dialer.Control = func(netw, address string, c syscall.RawConn) error {
-					var opErr error
-					_ = c.Control(func(fd uintptr) {
-						var buf [4]byte
-						binary.BigEndian.PutUint32(buf[:], uint32(idx))
-						opErr = syscall.Setsockopt(syscall.Handle(fd), syscall.IPPROTO_IP, 31, (*byte)(unsafe.Pointer(&buf[0])), 4)
-						if opErr == nil {
-							_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 2*1024*1024)
-							_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 2*1024*1024)
-						}
-					})
-					return opErr
-				}
+				dialer.Control = bindPhysicalControl(uint32(idx), 2*1024*1024)
 			}
 		}
 	}
@@ -351,18 +386,6 @@ func ListenPhysicalPacket(ctx context.Context, network string) (net.PacketConn, 
 		return nil, fmt.Errorf("invalid physical interface index %q", idxStr)
 	}
 	var lc net.ListenConfig
-	lc.Control = func(netw, address string, c syscall.RawConn) error {
-		var opErr error
-		_ = c.Control(func(fd uintptr) {
-			var buf [4]byte
-			binary.BigEndian.PutUint32(buf[:], uint32(idx))
-			opErr = syscall.Setsockopt(syscall.Handle(fd), syscall.IPPROTO_IP, 31, (*byte)(unsafe.Pointer(&buf[0])), 4)
-			if opErr == nil {
-				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
-				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
-			}
-		})
-		return opErr
-	}
+	lc.Control = bindPhysicalControl(uint32(idx), 4*1024*1024)
 	return lc.ListenPacket(ctx, network, ":0")
 }

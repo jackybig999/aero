@@ -31,16 +31,12 @@ type debounceWatcher struct {
 	stopCh          chan struct{}
 	doneCh          chan struct{}
 	running         bool
-	started         bool
-	closeOnce       sync.Once
 	debounce        time.Duration
 }
 
 func newDebounceWatcher() *debounceWatcher {
 	return &debounceWatcher{
 		triggerCh: make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
 		debounce:  300 * time.Millisecond,
 	}
 }
@@ -52,16 +48,22 @@ func (w *debounceWatcher) start(onChange func(newGW, ifName string)) {
 		return
 	}
 	w.running = true
-	w.started = true
 	w.onChange = onChange
+	// 每次 start 重建退出通道：engine 会对同一个监控器反复 Start/Stop，
+	// 复用已关闭的通道会让新 loop 立即退出并重复 close(doneCh) 而 panic
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+	w.stopCh = stopCh
+	w.doneCh = doneCh
 
-	// 初始指纹采样，防止启动阶段无意义自触发
+	// 初始指纹采样，防止启动阶段无意义自触发；先失效缓存，避免以过期网关作基线
+	invalidateGatewayCache()
 	if gw, ifName, err := PhysicalDefaultGateway(); err == nil && gw != "" {
 		w.lastFingerprint = gw + "@" + ifName
 	}
 	w.mu.Unlock()
 
-	go w.loop()
+	go w.loop(stopCh, doneCh)
 }
 
 func (w *debounceWatcher) trigger() {
@@ -73,28 +75,26 @@ func (w *debounceWatcher) trigger() {
 
 func (w *debounceWatcher) stop() {
 	w.mu.Lock()
-	if !w.started {
+	if !w.running {
 		w.mu.Unlock()
 		return
 	}
 	w.running = false
+	stopCh, doneCh := w.stopCh, w.doneCh
 	w.mu.Unlock()
 
-	w.closeOnce.Do(func() {
-		close(w.stopCh)
-	})
-
-	<-w.doneCh
+	close(stopCh)
+	<-doneCh
 }
 
-func (w *debounceWatcher) loop() {
-	defer close(w.doneCh)
+func (w *debounceWatcher) loop(stopCh <-chan struct{}, doneCh chan<- struct{}) {
+	defer close(doneCh)
 	var timer *time.Timer
 	var timerCh <-chan time.Time
 
 	for {
 		select {
-		case <-w.stopCh:
+		case <-stopCh:
 			if timer != nil {
 				timer.Stop()
 			}
@@ -121,6 +121,9 @@ func (w *debounceWatcher) loop() {
 }
 
 func (w *debounceWatcher) evaluate() {
+	// PhysicalDefaultGateway 有 15 秒缓存；防抖后若恰在缓存期内会读到旧网关，
+	// 指纹不变且之后不再有事件，这次切换就永久漏检。读取前必须先失效缓存。
+	invalidateGatewayCache()
 	gw, ifName, err := PhysicalDefaultGateway()
 	if err != nil || gw == "" {
 		return
