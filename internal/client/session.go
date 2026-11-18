@@ -43,6 +43,26 @@ type Session struct {
 	closeOnce     sync.Once
 	tcpDialer     func(ctx context.Context, target string) (net.Conn, error)
 	onClose       func()
+	// authRejected：edge 已以 401 拒绝本会话的 token。之后的请求在本地直接返回该拒绝，不再发往 edge
+	// （否则每个应用连接都会再失败一次，触发 edge 的防爆破封禁）；token 更换后会新建会话。
+	authRejected  atomic.Pointer[EdgeRejectError]
+	onAuthFailure func()
+}
+
+// checkRejected 返回已记录的认证拒绝（本会话不再向 edge 发请求）。
+func (s *Session) checkRejected() error {
+	if r := s.authRejected.Load(); r != nil {
+		return r
+	}
+	return nil
+}
+
+// noteRejection 记录 edge 的拒绝；认证失败时标记会话并通知刷新 token（只通知一次）。
+func (s *Session) noteRejection(r *EdgeRejectError) error {
+	if r != nil && r.AuthFailure() && s.authRejected.CompareAndSwap(nil, r) && s.onAuthFailure != nil {
+		s.onAuthFailure()
+	}
+	return r
 }
 
 // NewSession creates a new Session from an existing Client connection.
@@ -120,6 +140,9 @@ func (s *Session) DialTCP(ctx context.Context, target string) (net.Conn, error) 
 		return s.tcpDialer(ctx, target)
 	}
 
+	if err := s.checkRejected(); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "//"+target, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create connect request: %w", err)
@@ -145,7 +168,7 @@ func (s *Session) DialTCP(ctx context.Context, target string) (net.Conn, error) 
 
 	if resp.StatusCode != http.StatusOK {
 		_ = str.Close()
-		return nil, fmt.Errorf("connect %s rejected: %d %s", target, resp.StatusCode, resp.Status)
+		return nil, s.noteRejection(rejectionFrom("connect", resp))
 	}
 
 	return newH3StreamConn(str, target), nil
@@ -157,6 +180,9 @@ func (s *Session) DialMASQUE(ctx context.Context, target string) (*masque.Conn, 
 		return nil, net.ErrClosed
 	}
 
+	if err := s.checkRejected(); err != nil {
+		return nil, err
+	}
 	tmpl := uritemplate.MustNew("https://" + s.sni + "/.well-known/masque/udp/{target_host}/{target_port}/")
 	mreq, err := masque.NewRequest(ctx, tmpl, target)
 	if err != nil {
@@ -166,11 +192,14 @@ func (s *Session) DialMASQUE(ctx context.Context, target string) (*masque.Conn, 
 
 	mconn, resp, err := s.masqueConn.Dial(mreq)
 	if err != nil {
+		if resp != nil && resp.StatusCode != http.StatusOK { // 库在非 2xx 时返回响应与错误：保留拒绝原因
+			return nil, s.noteRejection(rejectionFrom("connect-udp", resp))
+		}
 		return nil, fmt.Errorf("dial masque: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = mconn.Close()
-		return nil, fmt.Errorf("connect-udp %s rejected: %d %s", target, resp.StatusCode, resp.Status)
+		return nil, s.noteRejection(rejectionFrom("connect-udp", resp))
 	}
 
 	return mconn, nil
@@ -191,6 +220,9 @@ func (s *Session) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, 
 		return nil, nil, net.ErrClosed
 	}
 
+	if err := s.checkRejected(); err != nil {
+		return nil, nil, err
+	}
 	tmpl := uritemplate.MustNew("https://" + s.sni + "/.well-known/masque/ip/*/*/")
 	ipReq, err := connectip.NewRequest(ctx, tmpl)
 	if err != nil {
@@ -200,11 +232,14 @@ func (s *Session) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, 
 
 	ipConn, resp, err := s.connectIPConn.Dial(ipReq)
 	if err != nil {
+		if resp != nil && resp.StatusCode != http.StatusOK { // 库在非 2xx 时返回响应与错误：保留拒绝原因
+			return nil, nil, s.noteRejection(rejectionFrom("connect-ip", resp))
+		}
 		return nil, nil, fmt.Errorf("dial connect-ip: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = ipConn.Close()
-		return nil, nil, fmt.Errorf("connect-ip rejected: %d %s", resp.StatusCode, resp.Status)
+		return nil, nil, s.noteRejection(rejectionFrom("connect-ip", resp))
 	}
 
 	assignCtx, assignCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -322,6 +357,14 @@ type SessionManager struct {
 	dialHook         func(ctx context.Context) (*Session, error)
 	drainingMu       sync.Mutex
 	drainingSessions []*Session
+	authFailureHook  func() // edge 以 401 拒绝当前 token 时调用（引擎据此换 token）
+}
+
+// SetAuthFailureHook 设置认证失败回调，作用于之后采用的会话。
+func (m *SessionManager) SetAuthFailureHook(f func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.authFailureHook = f
 }
 
 // NewSessionManager creates a new SessionManager.
@@ -347,6 +390,9 @@ func (m *SessionManager) SetSession(s *Session) {
 	defer m.mu.Unlock()
 	if m.currentSession != nil && !m.currentSession.IsDraining() && m.currentSession != s {
 		_ = m.currentSession.Close()
+	}
+	if s != nil && s.onAuthFailure == nil {
+		s.onAuthFailure = m.authFailureHook
 	}
 	m.currentSession = s
 	if m.cond != nil {
@@ -455,6 +501,7 @@ func (m *SessionManager) GetSession(ctx context.Context) (*Session, error) {
 		if m.currentSession != nil && !m.currentSession.IsDraining() {
 			_ = m.currentSession.Close()
 		}
+		newSess.onAuthFailure = m.authFailureHook
 		m.currentSession = newSess
 	}
 	if m.cond != nil {

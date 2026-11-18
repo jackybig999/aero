@@ -145,7 +145,9 @@ type Engine struct {
 	daemonCtx         context.Context
 	daemonCancel      context.CancelFunc
 	tokenRefreshKick  chan struct{} // 订阅应用后通知 token 刷新协程（token_refresh.go）
-	tokenRefreshOnce  sync.Once     // 首次应用订阅时才启动刷新协程
+	authRefreshMu     sync.Mutex
+	lastAuthRefresh   time.Time // 上次因 401 强制刷新订阅的时间（至多每分钟一次）
+	tokenRefreshOnce  sync.Once // 首次应用订阅时才启动刷新协程
 
 	chainProxyMu  sync.RWMutex
 	chainProxyCfg ChainProxyConfig
@@ -191,6 +193,7 @@ func NewEngine() *Engine {
 	}
 	eng.daemonCtx, eng.daemonCancel = context.WithCancel(context.Background())
 	eng.tokenRefreshKick = make(chan struct{}, 1)
+	sessMgr.SetAuthFailureHook(eng.refreshAfterAuthFailure)
 	eng.sentinel = newNodeSentinel(eng)
 	SetPacketConnFactory(ListenPhysicalPacket)
 	eng.loadChainProxyConfig()
@@ -322,6 +325,27 @@ func (e *Engine) ClearStartPending(ticket uint64) {
 	if ticket != 0 && e.startEpoch == ticket {
 		e.startPending.Store(false)
 	}
+}
+
+// setRejection 把 edge 的拒绝反映到状态（UI 据错误码提示：token 失效、被限流、节点不可用）。
+func (e *Engine) setRejection(r *EdgeRejectError) {
+	code := "EDGE_REJECTED"
+	switch {
+	case strings.HasPrefix(r.Details, "EDGE_"):
+		code = r.Details
+	case r.AuthFailure():
+		code = "EDGE_AUTH_INVALID_TOKEN"
+	case r.Status == http.StatusTooManyRequests:
+		code = "EDGE_RATE_LIMITED"
+	case r.Code == "connect_ip_disabled":
+		code = "EDGE_CONNECT_IP_DISABLED"
+	case r.Code == "address_pool_exhausted":
+		code = "EDGE_POOL_EXHAUSTED"
+	}
+	e.lastErrMu.Lock()
+	e.lastErr = r.Error()
+	e.lastErrCode = code
+	e.lastErrMu.Unlock()
 }
 
 // SetLastError 设置最后错误信息

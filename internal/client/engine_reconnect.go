@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"net/http"
 	"net/netip"
 	"time"
 )
@@ -53,9 +54,12 @@ func (e *Engine) startReconnector(ctx context.Context, stack *StackEngine, host 
 				if ctx.Err() != nil || errors.Is(err, errReconnectAborted) {
 					return
 				}
-				log.Printf("[ENGINE] reconnect failed: %v; retry in ~%v", err, backoff)
 				// 抖动避免 edge 重启后大量客户端同时重连
 				wait := backoff/2 + rand.N(backoff/2+1)
+				if rej, ok := asRejection(err); ok {
+					wait = e.rejectionWait(rej, wait)
+				}
+				log.Printf("[ENGINE] reconnect failed: %v; retry in ~%v", err, wait)
 				select {
 				case <-ctx.Done():
 					return
@@ -98,4 +102,28 @@ func (e *Engine) reconnectOnce(ctx context.Context, stack *StackEngine, host tun
 		}
 	}
 	return p, stack.RestartWithConn(conn)
+}
+
+// 被 edge 明确拒绝时的重试节奏（C1 §5）：
+//   - 401：换 token（refreshAfterAuthFailure）；两次尝试至少间隔 authRetryMin，保证每分钟少于 5 次，
+//     不触发 edge 的防爆破封禁（5 次/分钟 → 封禁 15 分钟）；
+//   - 429：按 Retry-After 等待；
+//   - 节点不可用（关闭 CONNECT-IP、地址池耗尽、连接数满）：至少等待 nodeUnavailableRetry。
+const (
+	authRetryMin         = 15 * time.Second
+	nodeUnavailableRetry = time.Minute
+)
+
+func (e *Engine) rejectionWait(r *EdgeRejectError, wait time.Duration) time.Duration {
+	e.setRejection(r)
+	switch {
+	case r.AuthFailure():
+		e.refreshAfterAuthFailure()
+		return max(wait, authRetryMin)
+	case r.Status == http.StatusTooManyRequests:
+		return max(wait, r.RetryAfter, authRetryMin)
+	case r.NodeUnavailable():
+		return max(wait, nodeUnavailableRetry)
+	}
+	return wait
 }

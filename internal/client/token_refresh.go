@@ -16,7 +16,11 @@ var (
 	tokenRefreshMinRetry = 30 * time.Second
 	tokenRefreshMaxRetry = 10 * time.Minute
 	tokenRefreshIdle     = 10 * time.Minute // 没有签名 token 时的复查间隔
-	tokenRefreshNow      = time.Now
+	// tokenRefreshMaxWait：计时器按单调时钟计时，系统休眠期间不走；每次最多等这么久就按实际时间重新判断，
+	// 避免休眠一夜醒来后仍用过期 token。
+	tokenRefreshMaxWait    = 5 * time.Minute
+	authRefreshMinInterval = time.Minute // 因 401 强制刷新订阅的最小间隔
+	tokenRefreshNow        = time.Now
 )
 
 // tokenLifetime 读取 aero1 token 的签发与到期时间；非签名 token 或格式错误时 ok=false。
@@ -73,7 +77,7 @@ func (e *Engine) runTokenRefresher() {
 		wait := tokenRefreshIdle
 		at, signed := nextTokenRefresh(tok)
 		if signed && src != "" {
-			wait = max(at.Sub(tokenRefreshNow()), 0)
+			wait = min(max(at.Sub(tokenRefreshNow()), 0), tokenRefreshMaxWait)
 		}
 		timer := time.NewTimer(wait)
 		select {
@@ -86,8 +90,8 @@ func (e *Engine) runTokenRefresher() {
 			continue
 		case <-timer.C:
 		}
-		if !signed || src == "" {
-			continue
+		if !signed || src == "" || tokenRefreshNow().Before(at) {
+			continue // 尚未到刷新时刻（等待被截断为 tokenRefreshMaxWait）
 		}
 		if _, err := e.LoadAndApplySubscription(src); err != nil {
 			log.Printf("[TOKEN] refresh failed: %v; retry in %v", err, retry)
@@ -107,4 +111,38 @@ func (e *Engine) runTokenRefresher() {
 			}
 		}
 	}
+}
+
+// refreshAfterAuthFailure：edge 以 401 拒绝了当前 token（被吊销、过期、或订阅已更换）。立即重新拉取订阅换 token；
+// 至多每分钟一次。拿到不同的 token 后重置会话，以新 token 重建；token 未变则保持被拒状态，由重连节奏决定何时再试。
+func (e *Engine) refreshAfterAuthFailure() {
+	e.authRefreshMu.Lock()
+	if now := time.Now(); now.Sub(e.lastAuthRefresh) < authRefreshMinInterval {
+		e.authRefreshMu.Unlock()
+		return
+	} else {
+		e.lastAuthRefresh = now
+	}
+	e.authRefreshMu.Unlock()
+	e.mu.RLock()
+	src := e.savedSubURL
+	e.mu.RUnlock()
+	if src == "" {
+		return
+	}
+	go func() {
+		_, oldTok, _, _ := getActiveEdge()
+		if _, err := e.LoadAndApplySubscription(src); err != nil {
+			log.Printf("[TOKEN] refresh after authentication failure failed: %v", err)
+			return
+		}
+		if _, newTok, _, _ := getActiveEdge(); newTok != oldTok {
+			log.Printf("[TOKEN] edge rejected the token; switched to the token from the refreshed subscription")
+			if e.sessionMgr != nil {
+				e.sessionMgr.Reset()
+			}
+			return
+		}
+		log.Printf("[TOKEN] edge rejected the token and the subscription still carries it (revoked, expired or suspended subscription)")
+	}()
 }
