@@ -103,8 +103,9 @@ func (e *Engine) refreshTunRoutes(extra ...net.IP) {
 }
 
 // bringUpTunLocked 建立 CONNECT-IP、创建自有网卡并启动数据面。失败时已建立的部分全部释放。
-func (e *Engine) bringUpTunLocked(nodeIP net.IP) error {
-	dialCtx, cancel := context.WithTimeout(e.rootCtx, 8*time.Second)
+// startCtx 是本次启动的取消域：Stop/Close/BeginStop 取消它即可中断拨号，不必等持 lifecycleMu 的启动自然超时。
+func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error {
+	dialCtx, cancel := context.WithTimeout(startCtx, 8*time.Second)
 	ipConn, prefixStr, err := dialIPFn(dialCtx, e.sessionMgr)
 	cancel()
 	if err != nil {

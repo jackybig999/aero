@@ -46,8 +46,10 @@ const (
 
 var (
 	// ErrUDPUnavailable 标识 TUN 模式下 UDP/443 (QUIC/HTTP/3) 拨号失败，降级防御阻止整机伪装
-	ErrUDPUnavailable   = errors.New("UDP_UNAVAILABLE")
-	ErrStartAborted     = errors.New("start aborted by stop request")
+	ErrUDPUnavailable = errors.New("UDP_UNAVAILABLE")
+	ErrStartAborted   = errors.New("start aborted by stop request")
+	// ErrEngineClosed 引擎已 Close（进程退出路径）：一切建立数据面的入口都返回它，不再重新建网卡
+	ErrEngineClosed     = errors.New("engine closed")
 	subSingleFlight     singleflight.Group
 	detectThirdPartyTUN = DetectThirdPartyTUN
 	dialIPFn            = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
@@ -129,6 +131,7 @@ type Engine struct {
 	state             atomic.Int32
 	startEpoch        uint64
 	startPending      atomic.Bool
+	closed            atomic.Bool // Close 已调用；仅在 e.mu 下置位，建立数据面的入口在 e.mu 下检查
 	pendingMode       string
 	lifecycleMu       sync.Mutex
 	startCancel       context.CancelFunc
@@ -273,6 +276,10 @@ func (e *Engine) PrepareModeSwitch(targetMode string) (needRestart bool, ticket 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if e.closed.Load() {
+		// 引擎已关闭：不改模式、不签发票据
+		return false, 0
+	}
 	cur := e.state.Load()
 	if cur != stateRunning && cur != stateStarting {
 		// 已经停着：只改下次要启动的模式，不签发 ticket，不动 epoch
@@ -291,10 +298,19 @@ func (e *Engine) PrepareModeSwitch(targetMode string) (needRestart bool, ticket 
 	return true, e.startEpoch
 }
 
-// RequestStart 请求启动：递增票据并设置 startPending
+// IsClosed 报告引擎是否已 Close
+func (e *Engine) IsClosed() bool {
+	return e.closed.Load()
+}
+
+// RequestStart 请求启动：递增票据并设置 startPending。
+// 引擎已 Close 时不签发票据，返回 0（0 永远无效，StartWith(0) 返回 ErrEngineClosed）。
 func (e *Engine) RequestStart() uint64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.closed.Load() {
+		return 0
+	}
 	e.startEpoch++
 	e.startPending.Store(true)
 	e.pendingMode = ""
@@ -712,6 +728,10 @@ func (e *Engine) startLocked(ticket uint64) error {
 	var ip net.IP
 
 	e.mu.Lock()
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return ErrEngineClosed
+	}
 	if ticket == 0 || e.startEpoch != ticket || !e.startPending.Load() {
 		e.mu.Unlock()
 		return ErrStartAborted
@@ -778,8 +798,11 @@ func (e *Engine) startLocked(ticket uint64) error {
 		return err
 	}
 
+	// 只有停止流程（Stop/Restart/BeginStop/PrepareModeSwitch/Close）发起的取消才走 abort：
+	// 它们要么已把状态置为 stopping，要么取消了本次的 startCtx，并由停止流程负责收尾状态。
+	// 底层库自行返回的 context.Canceled 不属于此类，按普通失败回滚到 stopped 并清 startPending。
 	failStart := func(err error) error {
-		if errors.Is(err, context.Canceled) || e.state.Load() == stateStopping {
+		if e.state.Load() == stateStopping || startCtx.Err() != nil {
 			return e.abortStartLocked(startCancel, nm)
 		}
 		return rollbackLocked(ticket, startCancel, err)
@@ -1028,7 +1051,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	}
 
 	// 先建立 CONNECT-IP 取得地址，再创建自有网卡：网卡、地址、路由、DNS 防护一次就绪（ADR-0013）。
-	if err := e.bringUpTunLocked(nodeIP); err != nil {
+	if err := e.bringUpTunLocked(startCtx, nodeIP); err != nil {
 		if e.rootCancel != nil {
 			e.rootCancel()
 		}
@@ -1178,7 +1201,20 @@ func (e *Engine) getContext() context.Context {
 }
 
 // Close 优雅释放引擎全局资源与常驻代理端口 (进程退出时调用)
+// 幂等；Close 之后一切建立数据面的入口返回 ErrEngineClosed。
+// 锁顺序：先在 e.mu 下置位 closed、作废票据并取消在途启动（不持 lifecycleMu，与 BeginStop 一致），
+// 再走 Stop（取消后获取 lifecycleMu，等在途 StartWith 退出后清理），最后在 e.mu 下关闭常驻监听。
 func (e *Engine) Close() error {
+	e.mu.Lock()
+	e.closed.Store(true)
+	e.startEpoch++
+	e.startPending.Store(false)
+	e.pendingMode = ""
+	if e.startCancel != nil {
+		e.startCancel()
+	}
+	e.mu.Unlock()
+
 	_ = e.Stop()
 	if e.daemonCancel != nil {
 		e.daemonCancel()
@@ -1270,6 +1306,9 @@ func (e *Engine) stopLocked() error {
 
 // Restart 在同一把 lifecycleMu 锁内依次执行停止与使用特定票据重新启动
 func (e *Engine) Restart(ticket uint64) error {
+	if e.closed.Load() {
+		return ErrEngineClosed
+	}
 	invalidateGatewayCache()
 
 	e.mu.Lock()
@@ -1732,6 +1771,10 @@ func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 	if len(addr) > 0 && addr[0] != "" {
 		e.listenAddr = addr[0]
 	}
+	if e.closed.Load() {
+		e.mu.Unlock()
+		return ErrEngineClosed
+	}
 	targetAddr := e.listenAddr
 	if targetAddr == "" {
 		targetAddr = "127.0.0.1:55555"
@@ -1753,6 +1796,12 @@ func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 	}
 
 	e.mu.Lock()
+	if e.closed.Load() {
+		e.mixedStarting = false
+		e.mu.Unlock()
+		_ = ln.Close()
+		return ErrEngineClosed
+	}
 	if e.mixedListener != nil {
 		e.mixedStarting = false
 		e.mu.Unlock()
