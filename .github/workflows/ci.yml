@@ -137,7 +137,15 @@ jobs:
           tar.exe -xf wintun-test.zip
           Copy-Item wintun/bin/amd64/wintun.dll internal/client/wintun.dll
           go vet ./internal/client ./cmd/client ./internal/desk ./cmd/desk
-          go test -v -short -shuffle=on ./internal/client ./internal/desk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test -v -short -shuffle=on ./internal/client ./internal/desk *> test.log
+          $rc = $LASTEXITCODE
+          Get-Content test.log
+          # 失败详情写成注解（公开可读）
+          if ($rc -ne 0) {
+            Select-String -Path test.log -Pattern '--- FAIL|^FAIL|panic:|_test\.go:\d+:' | Select-Object -First 60 | ForEach-Object { Write-Output ("::error::" + $_.Line) }
+          }
+          exit $rc
 
       - name: Build Windows Client & Desk
         run: |
