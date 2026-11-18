@@ -32,3 +32,10 @@
 - 与用户指令冲突时，写出条款号，让人决定（§0.3、§14.8）。
 - 会话结束且可能换工具继续时，写交接报告（§14.8）。
 <!-- L0-CARD:END -->
+
+## AERO 专属约束（子代理 coder / coder-lite 同样遵守）
+- 不修改宿主系统：本机与任何 VPS 的系统配置、注册表、防火墙、sysctl 都不动；网络相关测试只在 `unshare` 命名空间里做。
+- 子代理不连接 VPS，不读 `/root/.git-credentials` 或任何密钥文件；日志不打印密钥。
+- 子代理不 `git commit`、不 `git push`、不新增依赖；提交由主会话审核后完成。
+- 全量门禁：`bash tmp/gate.sh`（gofmt、imports、版本、vet 四平台、`go test -race`），输出 `GATE PASS` 才算通过。
+- 代码注释用中文，与周围风格一致。
