@@ -43,13 +43,22 @@ func fakeAnswer(query []byte, rcode byte, answers int, tc bool) []byte {
 
 func startFakeDNS(t *testing.T) *fakeDNS {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	// UDP 与 TCP 需要同一端口号：随机取 UDP 端口后该 TCP 端口可能已被占用，重试直到两者都绑定成功
+	var pc net.PacketConn
+	var ln net.Listener
+	for i := 0; i < 20 && ln == nil; i++ {
+		p, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l, err := net.Listen("tcp", p.LocalAddr().String()); err == nil {
+			pc, ln = p, l
+		} else {
+			p.Close()
+		}
 	}
-	ln, err := net.Listen("tcp", pc.LocalAddr().String())
-	if err != nil {
-		t.Fatal(err)
+	if ln == nil {
+		t.Fatal("could not bind a UDP+TCP port pair")
 	}
 	t.Cleanup(func() { pc.Close(); ln.Close() })
 	f := &fakeDNS{addr: pc.LocalAddr().String()}
