@@ -143,14 +143,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Push-Location internal/client
           ./client.test.exe -test.v -test.short -test.shuffle=on *> ../../test.log
-          $rc = $LASTEXITCODE
+          $clientRc = $LASTEXITCODE
           Pop-Location
           go test -v -short -shuffle=on ./internal/desk *>> test.log
-          if ($rc -eq 0) { $rc = $LASTEXITCODE }
+          $deskRc = $LASTEXITCODE
+          $rc = if ($clientRc -ne 0) { $clientRc } else { $deskRc }
           Get-Content test.log
-          # 失败详情写成注解（公开可读）
+          # 失败详情写成注解（公开可读）：失败的测试行，以及日志末尾
           if ($rc -ne 0) {
+            Write-Output "::error::client tests exit=$clientRc, desk tests exit=$deskRc"
             Select-String -Path test.log -Pattern '--- FAIL|^FAIL|panic:|_test\.go:\d+:' | Select-Object -First 60 | ForEach-Object { Write-Output ("::error::" + $_.Line) }
+            Get-Content test.log -Tail 40 | ForEach-Object { Write-Output ("::error::tail: " + $_) }
           }
           exit $rc
 
