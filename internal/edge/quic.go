@@ -32,191 +32,7 @@ import (
 	"github.com/quic-go/quic-go/qlog"
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/yosida95/uritemplate/v3"
-	"golang.org/x/sync/singleflight"
 )
-
-// ==========================================
-// 1. DNS Short Stream Resolver (50 QPS, Singleflight, 300s/30s Cache)
-// ==========================================
-
-type dnsCacheEntry struct {
-	ip        net.IP
-	expiresAt time.Time
-}
-
-// DNSResolver resolves hostnames for tunnel DNS short streams (StreamType_CONTROL)
-type DNSResolver struct {
-	mu          sync.RWMutex
-	cache       map[string]dnsCacheEntry
-	group       singleflight.Group
-	rateMu      sync.Mutex
-	rateBuckets map[string]*rateTokenBucket // 50 QPS per token
-	lastCleanup time.Time
-	lookupFn    func(ctx context.Context, host string) ([]net.IP, error)
-}
-
-// NewDNSResolver creates a new DNSResolver
-func NewDNSResolver() *DNSResolver {
-	return &DNSResolver{
-		cache:       make(map[string]dnsCacheEntry),
-		rateBuckets: make(map[string]*rateTokenBucket),
-		lookupFn: func(ctx context.Context, host string) ([]net.IP, error) {
-			return net.DefaultResolver.LookupIP(ctx, "ip4", host)
-		},
-	}
-}
-
-// SetLookupFunc allows injecting a mock lookup function for testing
-func (r *DNSResolver) SetLookupFunc(fn func(ctx context.Context, host string) ([]net.IP, error)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.lookupFn = fn
-}
-
-// checkRateLimit checks 50 QPS rate limit per token
-func (r *DNSResolver) checkRateLimit(token string) bool {
-	if token == "" {
-		return false
-	}
-	r.rateMu.Lock()
-	defer r.rateMu.Unlock()
-
-	now := time.Now()
-	if len(r.rateBuckets) > 500 && now.Sub(r.lastCleanup) > time.Minute {
-		for k, v := range r.rateBuckets {
-			if now.Sub(v.lastTime) > 5*time.Minute {
-				delete(r.rateBuckets, k)
-			}
-		}
-		r.lastCleanup = now
-	}
-	b, ok := r.rateBuckets[token]
-	if !ok {
-		b = &rateTokenBucket{
-			tokens:   299,
-			lastTime: now,
-			rate:     100,
-			max:      300,
-		}
-		r.rateBuckets[token] = b
-		return true
-	}
-	elapsed := now.Sub(b.lastTime).Seconds()
-	b.tokens += elapsed * b.rate
-	if b.tokens > b.max {
-		b.tokens = b.max
-	}
-	b.lastTime = now
-	if b.tokens >= 1 {
-		b.tokens--
-		return true
-	}
-	return false
-}
-
-// Resolve resolves domain to 4-byte IPv4 payload
-func (r *DNSResolver) Resolve(token, host string) ([]byte, error) {
-	if !r.checkRateLimit(token) {
-		return nil, fmt.Errorf("dns rate limit exceeded")
-	}
-
-	host = strings.TrimSpace(strings.ToLower(host))
-	if host == "" {
-		return nil, fmt.Errorf("empty host")
-	}
-
-	// 1. Check Cache
-	now := time.Now()
-	r.mu.RLock()
-	entry, found := r.cache[host]
-	r.mu.RUnlock()
-
-	if found && now.Before(entry.expiresAt) {
-		if entry.ip != nil {
-			if ip4 := entry.ip.To4(); ip4 != nil {
-				return ip4, nil
-			}
-		}
-		return nil, fmt.Errorf("cached negative resolution")
-	}
-
-	// 2. Singleflight Resolution with 1.0s Timeout
-	res, err, _ := r.group.Do(host, func() (any, error) {
-		// Double check cache inside singleflight
-		r.mu.RLock()
-		e, ok := r.cache[host]
-		r.mu.RUnlock()
-		if ok && time.Now().Before(e.expiresAt) {
-			if e.ip != nil {
-				return e.ip.To4(), nil
-			}
-			return nil, fmt.Errorf("cached negative resolution")
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
-		defer cancel()
-
-		r.mu.RLock()
-		fn := r.lookupFn
-		r.mu.RUnlock()
-
-		ips, lookupErr := fn(ctx, host)
-		r.mu.Lock()
-		defer r.mu.Unlock()
-
-		if lookupErr != nil {
-			negTTL := 30 * time.Second
-			var netErr net.Error
-			if errors.Is(lookupErr, context.DeadlineExceeded) || (errors.As(lookupErr, &netErr) && netErr.Timeout()) {
-				negTTL = 5 * time.Second
-			}
-			r.cache[host] = dnsCacheEntry{
-				ip:        nil,
-				expiresAt: time.Now().Add(negTTL),
-			}
-			return nil, lookupErr
-		}
-		if len(ips) == 0 {
-			r.cache[host] = dnsCacheEntry{
-				ip:        nil,
-				expiresAt: time.Now().Add(30 * time.Second),
-			}
-			return nil, fmt.Errorf("no ipv4 found for %s", host)
-		}
-
-		var selected net.IP
-		for _, ip := range ips {
-			if ip4 := ip.To4(); ip4 != nil {
-				selected = ip4
-				break
-			}
-		}
-		if selected == nil {
-			r.cache[host] = dnsCacheEntry{
-				ip:        nil,
-				expiresAt: time.Now().Add(30 * time.Second),
-			}
-			return nil, fmt.Errorf("no ipv4 found")
-		}
-
-		// Positive cache: 300s
-		r.cache[host] = dnsCacheEntry{
-			ip:        selected,
-			expiresAt: time.Now().Add(300 * time.Second),
-		}
-		return selected, nil
-	})
-
-	if err != nil || res == nil {
-		return nil, err
-	}
-
-	ipBytes, ok := res.(net.IP)
-	if !ok || len(ipBytes.To4()) != 4 {
-		return nil, fmt.Errorf("invalid resolved ip")
-	}
-	return ipBytes.To4(), nil
-}
 
 // ==========================================
 // 2. IP Pool & Dynamic Allocation (10.88.0.0/16)
@@ -694,7 +510,7 @@ type QUICServer struct {
 	bandwidthLimiter  *BandwidthLimiter
 	dialGuard         *DialGuard
 	rateLimiter       *RateLimiter
-	dnsResolver       *DNSResolver
+	doh               *dohForwarder
 	connTracker       *ConnTracker
 	ipPool            *IPPool
 	ipv6Pool          *IPv6Pool
@@ -1168,7 +984,7 @@ func newQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		bandwidthLimiter: bl,
 		dialGuard:        dg,
 		rateLimiter:      rl,
-		dnsResolver:      NewDNSResolver(),
+		doh:              newDoHForwarder(),
 		connTracker:      NewConnTracker(),
 		ipPool:           ipPool,
 		ipv6Pool:         ipv6Pool,
@@ -1287,11 +1103,6 @@ func (s *QUICServer) Handler() http.Handler {
 	s.handlerMu.RLock()
 	defer s.handlerMu.RUnlock()
 	return s.handler
-}
-
-// DNSResolver returns the internal DNSResolver
-func (s *QUICServer) DNSResolver() *DNSResolver {
-	return s.dnsResolver
 }
 
 func (s *QUICServer) acquireUDPSlot(token string) bool {
@@ -2240,50 +2051,23 @@ func (s *QUICServer) serveDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	qname, qtype := extractDNSQuestionAndType(queryBytes)
-	if qname == "" {
+	qtype, ok := dnsQueryType(queryBytes)
+	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	if qtype == 0x001C { // AAAA -> Empty answer
-		resp := buildEmptyResponse(queryBytes, qname, qtype)
-		w.Header().Set("Content-Type", "application/dns-message")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(resp)
+	if !s.doh.allow(token) {
+		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
-
-	if qtype == 0x0001 { // A
-		if qname == "localhost" {
-			resp := buildAResponse(queryBytes, qname, net.IPv4(127, 0, 0, 1))
-			w.Header().Set("Content-Type", "application/dns-message")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(resp)
-			return
-		}
-
-		ip4, err := s.dnsResolver.Resolve(token, qname)
-		if err != nil {
-			if strings.Contains(err.Error(), "rate limit") {
-				w.WriteHeader(http.StatusTooManyRequests)
-				return
-			}
-			resp := buildEmptyResponse(queryBytes, qname, qtype)
-			w.Header().Set("Content-Type", "application/dns-message")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(resp)
-			return
-		}
-
-		resp := buildAResponse(queryBytes, qname, net.IP(ip4))
-		w.Header().Set("Content-Type", "application/dns-message")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(resp)
-		return
+	var resp []byte
+	if qtype == dnsTypeAAAA && s.ipv6Pool == nil {
+		resp = dnsReply(queryBytes, 0) // 节点没有 IPv6 出口：空应答，应用直接用 IPv4
+	} else if out, err := s.doh.exchange(r.Context(), queryBytes); err == nil {
+		resp = out
+	} else {
+		resp = dnsReply(queryBytes, 2) // SERVFAIL：上游不可用，不伪造“无记录”
 	}
-
-	resp := buildEmptyResponse(queryBytes, qname, qtype)
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(resp)
@@ -2305,93 +2089,4 @@ func calcChecksum(data []byte) uint16 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 	return ^uint16(sum)
-}
-
-func extractDNSQuestionAndType(pkt []byte) (string, uint16) {
-	if len(pkt) <= 12 {
-		return "", 0
-	}
-	offset := 12
-	var name []byte
-	for offset < len(pkt) {
-		length := int(pkt[offset])
-		if length == 0 {
-			offset++
-			break
-		}
-		if length > 63 || offset+1+length > len(pkt) {
-			return "", 0
-		}
-		if len(name) > 0 {
-			name = append(name, '.')
-		}
-		name = append(name, pkt[offset+1:offset+1+length]...)
-		offset += 1 + length
-	}
-	if offset+4 > len(pkt) {
-		return string(name), 0x0001
-	}
-	qtype := binary.BigEndian.Uint16(pkt[offset : offset+2])
-	return string(name), qtype
-}
-
-func buildAResponse(req []byte, host string, ip net.IP) []byte {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return nil
-	}
-	resp := []byte{
-		0x00, 0x00,
-		0x81, 0x80,
-		0x00, 0x01,
-		0x00, 0x01,
-		0x00, 0x00,
-		0x00, 0x00,
-	}
-	if len(req) >= 2 {
-		resp[0], resp[1] = req[0], req[1]
-	}
-	resp = append(resp, encodeDNSName(host)...)
-	resp = append(resp, 0x00, 0x01)
-	resp = append(resp, 0x00, 0x01)
-
-	resp = append(resp, 0xC0, 0x0C)
-	resp = append(resp, 0x00, 0x01)
-	resp = append(resp, 0x00, 0x01)
-	resp = append(resp, 0x00, 0x00, 0x01, 0x2C)
-	resp = append(resp, 0x00, 0x04)
-	resp = append(resp, ip4...)
-	return resp
-}
-
-func buildEmptyResponse(req []byte, host string, qtype uint16) []byte {
-	resp := []byte{
-		0x00, 0x00,
-		0x81, 0x80,
-		0x00, 0x01,
-		0x00, 0x00,
-		0x00, 0x00,
-		0x00, 0x00,
-	}
-	if len(req) >= 2 {
-		resp[0], resp[1] = req[0], req[1]
-	}
-	resp = append(resp, encodeDNSName(host)...)
-	resp = append(resp, byte(qtype>>8), byte(qtype))
-	resp = append(resp, 0x00, 0x01)
-	return resp
-}
-
-func encodeDNSName(domain string) []byte {
-	var buf []byte
-	parts := strings.Split(domain, ".")
-	for _, part := range parts {
-		if len(part) == 0 {
-			continue
-		}
-		buf = append(buf, byte(len(part)))
-		buf = append(buf, []byte(part)...)
-	}
-	buf = append(buf, 0x00)
-	return buf
 }

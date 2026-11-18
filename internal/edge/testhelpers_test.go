@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"strings"
 )
 
 // 仅供测试使用的构造器与辅助函数。生产代码只使用 NewQUICServerWithIPv6Prefix 等生产路径。
@@ -67,4 +68,18 @@ func buildRouterTestIPv4(src, dst netip.Addr) []byte {
 // atomically writes to filePath (.tmp -> Rename) if changed, and updates memory.
 func (h *GeoDataHandler) fetchAndUpdate() error {
 	return h.fetchAndUpdateWithContext(context.Background())
+}
+
+func encodeDNSName(domain string) []byte {
+	var buf []byte
+	parts := strings.Split(domain, ".")
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		buf = append(buf, byte(len(part)))
+		buf = append(buf, []byte(part)...)
+	}
+	buf = append(buf, 0x00)
+	return buf
 }
