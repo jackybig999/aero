@@ -7,6 +7,7 @@ package client
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -35,6 +36,7 @@ func (e *ErrConflictingTUN) Error() string {
 
 // ifaceSummary 抽象网卡特征（纯内存可测）
 type ifaceSummary struct {
+	Index       uint32 // 接口编号（路由条目按它关联网卡）
 	Name        string
 	Description string // 驱动描述，如 "Wintun Userspace Tunnel", "TAP-Windows Adapter V9"
 	IfType      uint32 // NDIS 接口类型：53 (虚拟), 131 (隧道), 6 (以太网), 71 (Wi-Fi), 23 (PPP)
@@ -115,8 +117,32 @@ func isLetter(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
-// evaluateThirdPartyTUN 纯函数判定
-func evaluateThirdPartyTUN(ifaces []ifaceSummary, routeTableText string) (bool, string) {
+// ipv4Route 是一条 IPv4 活动路由（Windows 经 GetIPForwardTable2 读取：与系统语言无关，不启动外部进程）。
+type ipv4Route struct {
+	Dest    netip.Prefix
+	NextHop netip.Addr // 无效或 0.0.0.0 表示“在链路上”（如 PPPoE）
+	IfIndex uint32     // 0 或不在网卡表中表示孤儿路由
+	Metric  uint32     // 路由跃点 + 接口跃点
+}
+
+var (
+	halfLow  = netip.MustParsePrefix("0.0.0.0/1")
+	halfHigh = netip.MustParsePrefix("128.0.0.0/1")
+	defRoute = netip.MustParsePrefix("0.0.0.0/0")
+)
+
+// ifaceIPv4 返回网卡的第一个 IPv4 地址字符串。
+func ifaceIPv4(ifi ifaceSummary) string {
+	for _, ip := range ifi.IPs {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String()
+		}
+	}
+	return ""
+}
+
+// evaluateThirdPartyTUN 纯函数判定：是否有第三方 TUN/VPN 正在接管流量。
+func evaluateThirdPartyTUN(ifaces []ifaceSummary, routes []ipv4Route) (bool, string) {
 	// 条件 1：扫描活跃网卡是否持有 198.18.0.0/15 (Clash / 透明代理 Fake-IP 保留段)
 	for _, ifi := range ifaces {
 		if !ifi.IsUp || ifi.IsLoopback || strings.EqualFold(ifi.Name, "aero0") {
@@ -133,158 +159,83 @@ func evaluateThirdPartyTUN(ifaces []ifaceSummary, routeTableText string) (bool, 
 			}
 		}
 	}
-
-	ipToIface := make(map[string]ifaceSummary)
+	byIndex := make(map[uint32]ifaceSummary, len(ifaces))
 	for _, ifi := range ifaces {
-		for _, ip := range ifi.IPs {
-			if ip4 := ip.To4(); ip4 != nil {
-				ipToIface[ip4.String()] = ifi
-			}
-		}
+		byIndex[ifi.Index] = ifi
 	}
 
-	lines := strings.Split(routeTableText, "\n")
-
-	// 截取 Active Routes 部分，遇到 Persistent Routes 立即中止
-	var activeLines []string
-	for _, line := range lines {
-		lower := strings.ToLower(line)
-		if strings.Contains(lower, "persistent routes") || strings.Contains(line, "永久路由") || strings.Contains(line, "持久路由") {
-			break
-		}
-		activeLines = append(activeLines, line)
-	}
-
-	// 条件 2a：任何非 aero0 的 0.0.0.0/1 或 128.0.0.0/1 路由
-	for _, line := range activeLines {
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
+	// 条件 2a：任何非 aero0 的 0.0.0.0/1 或 128.0.0.0/1 路由（孤儿路由同样拦截）
+	for _, r := range routes {
+		if r.Dest != halfLow && r.Dest != halfHigh {
 			continue
 		}
-		dest := fields[0]
-		mask := fields[1]
-		ifIP := fields[3]
-
-		if (dest == "0.0.0.0" && mask == "128.0.0.0") || (dest == "128.0.0.0" && mask == "128.0.0.0") {
-			if isAeroTunAddr(ifIP) {
-				continue
-			}
-			if ifi, ok := ipToIface[ifIP]; ok {
-				if strings.EqualFold(ifi.Name, "aero0") {
-					continue
-				}
-				name := ifi.Name
-				if name == "" {
-					name = "第三方 TUN"
-				}
-				return true, name
-			}
-			// 孤儿 /1 路由未映射到网卡表，同样绝不放行！
-			return true, ifIP
+		ifi, ok := byIndex[r.IfIndex]
+		if !ok || r.IfIndex == 0 {
+			return true, "未知网卡"
 		}
+		if strings.EqualFold(ifi.Name, "aero0") || isAeroTunAddr(ifaceIPv4(ifi)) {
+			continue
+		}
+		if ifi.Name != "" {
+			return true, ifi.Name
+		}
+		return true, "第三方 TUN"
 	}
 
-	// 条件 2b：0.0.0.0/0 默认路由若由虚拟网卡（isVirtualAdapter）持有，100% 判定为 VPN 接管
-	for _, line := range activeLines {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[0] == "0.0.0.0" && fields[1] == "0.0.0.0" {
-			ifIP := fields[3]
-			if isAeroTunAddr(ifIP) {
-				continue
+	// 条件 2b：0.0.0.0/0 默认路由若由虚拟网卡（isVirtualAdapter）持有，判定为 VPN 接管
+	for _, r := range routes {
+		if r.Dest != defRoute {
+			continue
+		}
+		ifi, ok := byIndex[r.IfIndex]
+		if !ok || r.IfIndex == 0 || isAeroTunAddr(ifaceIPv4(ifi)) {
+			continue // 孤儿 /0 忽略，防止 DHCP 换 IP 瞬间误伤
+		}
+		if isVirtualAdapter(ifi) {
+			if ifi.Name != "" {
+				return true, ifi.Name
 			}
-			ifi, ok := ipToIface[ifIP]
-			if !ok {
-				// 未在网卡表中找到的孤儿 /0 忽略，防止 DHCP 换 IP 瞬间误伤
-				continue
-			}
-			if isVirtualAdapter(ifi) {
-				name := ifi.Name
-				if name == "" {
-					name = ifIP
-				}
-				return true, name
-			}
+			return true, ifaceIPv4(ifi)
 		}
 	}
-
 	return false, ""
 }
 
-type ipv4Default struct {
-	gw      string
-	ifaceIP net.IP
-	metric  int
-}
-
-// physicalDefaultGatewayWithInput 纯函数支持内存桩回测与边界断言
-func physicalDefaultGatewayWithInput(summaries []ifaceSummary, routeText string, ifIndexGetter func(net.IP) string) (gw, ifIndex string, err error) {
-	ipToIface := make(map[string]ifaceSummary)
-	for _, ifi := range summaries {
-		for _, ip := range ifi.IPs {
-			if ip4 := ip.To4(); ip4 != nil {
-				ipToIface[ip4.String()] = ifi
-			}
-		}
+// physicalDefaultGateway 从路由条目中选出物理默认网关（排除虚拟/VPN 网卡、本程序与保留地址），取跃点最小者。
+// “在链路上”的默认路由（如 PPPoE）以网卡自身地址作为下一跳。返回下一跳与接口编号。
+func physicalDefaultGateway(ifaces []ifaceSummary, routes []ipv4Route) (gw, ifIndex string, err error) {
+	byIndex := make(map[uint32]ifaceSummary, len(ifaces))
+	for _, ifi := range ifaces {
+		byIndex[ifi.Index] = ifi
 	}
-
-	var best ipv4Default
-	bestIdx := ""
-	found := false
-	for _, line := range strings.Split(routeText, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 4 || fields[0] != "0.0.0.0" || fields[1] != "0.0.0.0" {
+	isBlacklisted := func(ipStr string) bool {
+		return strings.HasPrefix(ipStr, "198.18.") ||
+			strings.HasPrefix(ipStr, "198.19.") ||
+			strings.HasPrefix(ipStr, "10.88.") ||
+			strings.HasPrefix(ipStr, "127.") ||
+			strings.HasPrefix(ipStr, "169.254.")
+	}
+	var best ipv4Route
+	bestGW, found := "", false
+	for _, r := range routes {
+		ifi, ok := byIndex[r.IfIndex]
+		if r.Dest != defRoute || !ok || r.IfIndex == 0 || isVirtualAdapter(ifi) {
 			continue
 		}
-		cand := fields[2]
-		isOnLink := strings.EqualFold(cand, "on-link") || cand == "在链路上"
-		candIP := net.ParseIP(cand)
-		if candIP == nil && !isOnLink {
+		ifIP := ifaceIPv4(ifi)
+		cand := ifIP
+		if r.NextHop.IsValid() && !r.NextHop.IsUnspecified() {
+			cand = r.NextHop.String()
+		}
+		if ifIP == "" || isBlacklisted(cand) || isBlacklisted(ifIP) {
 			continue
 		}
-		ifIP := net.ParseIP(fields[3])
-		if ifIP == nil || ifIP.To4() == nil {
-			continue
-		}
-		// 若为点对点/在链路直连（如光猫 PPPoE 拨号），物理出口下一跳使用网卡自身 IP 充当
-		if isOnLink {
-			cand = ifIP.String()
-			candIP = ifIP
-		}
-		isBlacklisted := func(ipStr string) bool {
-			return strings.HasPrefix(ipStr, "198.18.") ||
-				strings.HasPrefix(ipStr, "198.19.") ||
-				strings.HasPrefix(ipStr, "10.88.") ||
-				strings.HasPrefix(ipStr, "127.") ||
-				strings.HasPrefix(ipStr, "169.254.")
-		}
-		if isBlacklisted(cand) || isBlacklisted(ifIP.String()) {
-			continue
-		}
-		// 关键防污染判定：持有该默认路由的接口若为虚拟/VPN 网卡，坚决排除！
-		if ifi, ok := ipToIface[ifIP.String()]; ok && isVirtualAdapter(ifi) {
-			continue
-		}
-		metric := 9999
-		if len(fields) >= 5 {
-			if n, err := strconv.Atoi(fields[4]); err == nil {
-				metric = n
-			}
-		}
-		idx := ""
-		if ifIndexGetter != nil {
-			idx = ifIndexGetter(ifIP.To4())
-		}
-		if idx == "" {
-			continue
-		}
-		if !found || metric < best.metric {
-			best = ipv4Default{gw: cand, ifaceIP: ifIP.To4(), metric: metric}
-			bestIdx = idx
-			found = true
+		if !found || r.Metric < best.Metric {
+			best, bestGW, found = r, cand, true
 		}
 	}
 	if !found {
 		return "", "", fmt.Errorf("no physical default gateway")
 	}
-	return best.gw, bestIdx, nil
+	return bestGW, strconv.FormatUint(uint64(best.IfIndex), 10), nil
 }

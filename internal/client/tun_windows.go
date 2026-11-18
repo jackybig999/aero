@@ -13,7 +13,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +24,8 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wintun"
+
+	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
 func ensureWintunDLL() error {
@@ -203,6 +204,7 @@ func getWindowsAdaptersSummary() ([]ifaceSummary, error) {
 					}
 				}
 				summaries = append(summaries, ifaceSummary{
+					Index:       curr.IfIndex,
 					Name:        name,
 					Description: desc,
 					IfType:      curr.IfType,
@@ -220,6 +222,29 @@ func getWindowsAdaptersSummary() ([]ifaceSummary, error) {
 	return nil, fmt.Errorf("GetAdaptersAddresses buffer overflow")
 }
 
+// readIPv4Routes 经 IP Helper API 读取 IPv4 活动路由（不解析随系统语言变化的 route print 文本，不启动进程）。
+// 有效跃点 = 路由跃点 + 接口跃点（与 Windows 选路一致）。
+func readIPv4Routes() ([]ipv4Route, error) {
+	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err != nil {
+		return nil, err
+	}
+	ifMetric := map[uint32]uint32{}
+	out := make([]ipv4Route, 0, len(rows))
+	for i := range rows {
+		r := &rows[i]
+		m, ok := ifMetric[r.InterfaceIndex]
+		if !ok {
+			if row, err := r.InterfaceLUID.IPInterface(windows.AF_INET); err == nil {
+				m = row.Metric
+			}
+			ifMetric[r.InterfaceIndex] = m
+		}
+		out = append(out, ipv4Route{Dest: r.DestinationPrefix.Prefix(), NextHop: r.NextHop.Addr(), IfIndex: r.InterfaceIndex, Metric: r.Metric + m})
+	}
+	return out, nil
+}
+
 // DetectThirdPartyTUN 检测宿主机是否存在其他正在运行 TUN 模式的 VPN
 func DetectThirdPartyTUN() (bool, string, error) {
 	summaries, err := getWindowsAdaptersSummary()
@@ -227,14 +252,11 @@ func DetectThirdPartyTUN() (bool, string, error) {
 		return false, "", fmt.Errorf("query adapters: %w", err)
 	}
 
-	prt := exec.Command("route", "print", "-4")
-	prt.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	out, err := prt.CombinedOutput()
+	routes, err := readIPv4Routes()
 	if err != nil {
-		return false, "", fmt.Errorf("route print failed: %w", err)
+		return false, "", fmt.Errorf("read routes: %w", err)
 	}
-
-	conflict, name := evaluateThirdPartyTUN(summaries, string(out))
+	conflict, name := evaluateThirdPartyTUN(summaries, routes)
 	return conflict, name, nil
 }
 
@@ -266,13 +288,11 @@ func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	gwCacheMu.RUnlock()
 
 	summaries, _ := getWindowsAdaptersSummary()
-	prt := exec.Command("route", "print", "-4")
-	prt.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	out, e := prt.CombinedOutput()
+	routes, e := readIPv4Routes()
 	if e != nil {
 		return "", "", e
 	}
-	bestGW, bestIdx, err := physicalDefaultGatewayWithInput(summaries, string(out), liveIfIndexForIPv4)
+	bestGW, bestIdx, err := physicalDefaultGateway(summaries, routes)
 	if err != nil {
 		return "", "", err
 	}
@@ -286,35 +306,6 @@ func PhysicalDefaultGateway() (gw, ifIndex string, err error) {
 	gwCacheMu.Unlock()
 
 	return bestGW, bestIdx, nil
-}
-
-func liveIfIndexForIPv4(ip net.IP) string {
-	if ip == nil {
-		return ""
-	}
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if strings.Contains(strings.ToLower(ifi.Name), "aero") {
-			continue
-		}
-		addrs, _ := ifi.Addrs()
-		for _, a := range addrs {
-			ipn, ok := a.(*net.IPNet)
-			if !ok || ipn.IP.To4() == nil {
-				continue
-			}
-			if ipn.IP.To4().Equal(ip) {
-				return strconv.Itoa(ifi.Index)
-			}
-		}
-	}
-	return ""
 }
 
 // DialPhysicalDirect 绑定物理网卡发包

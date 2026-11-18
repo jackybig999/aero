@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1183,7 +1184,7 @@ Network Destination        Netmask          Gateway       Interface  Metric
           0.0.0.0        128.0.0.0         10.9.0.1         10.9.0.2       1
 `,
 			wantConflict: true,
-			wantVPN:      "10.9.0.2",
+			wantVPN:      "未知网卡",
 		},
 		{
 			name: "用例 10: aero0 上次崩溃遗留的 10.88.0.2 /1 路由 (自身残留不报第三方)",
@@ -1339,7 +1340,8 @@ Network Destination        Netmask          Gateway       Interface  Metric
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotConflict, gotVPN := evaluateThirdPartyTUN(tt.ifaces, tt.routeText)
+			ifaces, routes := routesFromText(tt.ifaces, tt.routeText)
+			gotConflict, gotVPN := evaluateThirdPartyTUN(ifaces, routes)
 			if gotConflict != tt.wantConflict {
 				t.Fatalf("conflict mismatch: got %v, want %v", gotConflict, tt.wantConflict)
 			}
@@ -1347,16 +1349,11 @@ Network Destination        Netmask          Gateway       Interface  Metric
 				t.Fatalf("vpn name mismatch: got %s, want to contain %s", gotVPN, tt.wantVPN)
 			}
 			if strings.Contains(tt.name, "用例 4b") {
-				gw, idx, err := physicalDefaultGatewayWithInput(tt.ifaces, tt.routeText, func(ip net.IP) string {
-					if ip.Equal(net.ParseIP("100.65.1.2")) {
-						return "23"
-					}
-					return ""
-				})
+				gw, idx, err := physicalDefaultGateway(ifaces, routes)
 				if err != nil {
-					t.Fatalf("expected physicalDefaultGatewayWithInput success for on-link PPPoE, got err: %v", err)
+					t.Fatalf("expected physicalDefaultGateway success for on-link PPPoE, got err: %v", err)
 				}
-				if gw != "100.65.1.2" || idx != "23" {
+				if gw != "100.65.1.2" || idx != "1" {
 					t.Fatalf("expected gw 100.65.1.2 and idx 23, got gw=%s, idx=%s", gw, idx)
 				}
 			}
@@ -4387,4 +4384,45 @@ func TestResidentMixedProxyLifecycle(t *testing.T) {
 		_ = c3.Close()
 		t.Fatal("resident proxy port must be closed after eng.Close()")
 	}
+}
+
+// routesFromText 把 route print 文本（测试矩阵的可读写法）转换为 ipv4Route：按网卡 IP 关联接口编号（编号为
+// 网卡在列表中的序号 + 1；不在网卡表中的接口记为 0，即孤儿路由），“On-link/在链路上”为无下一跳，遇到持久路由段即停
+// （GetIPForwardTable2 只返回活动路由）。
+func routesFromText(ifaces []ifaceSummary, text string) ([]ifaceSummary, []ipv4Route) {
+	out := make([]ifaceSummary, len(ifaces))
+	idxByIP := map[string]uint32{}
+	for i, ifi := range ifaces {
+		ifi.Index = uint32(i + 1)
+		out[i] = ifi
+		for _, ip := range ifi.IPs {
+			idxByIP[ip.String()] = ifi.Index
+		}
+	}
+	var routes []ipv4Route
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(strings.ToLower(line), "persistent routes") {
+			break
+		}
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			continue
+		}
+		dst, mask := net.ParseIP(f[0]).To4(), net.ParseIP(f[1]).To4()
+		if dst == nil || mask == nil {
+			continue
+		}
+		ones, _ := net.IPMask(mask).Size()
+		r := ipv4Route{Dest: netip.PrefixFrom(netip.AddrFrom4([4]byte(dst)), ones), IfIndex: idxByIP[f[3]]}
+		if gw, err := netip.ParseAddr(f[2]); err == nil {
+			r.NextHop = gw
+		}
+		if len(f) >= 5 {
+			if m, err := strconv.Atoi(f[4]); err == nil {
+				r.Metric = uint32(m)
+			}
+		}
+		routes = append(routes, r)
+	}
+	return out, routes
 }
