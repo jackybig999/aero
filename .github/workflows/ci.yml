@@ -142,7 +142,8 @@ jobs:
           go test -c -o internal/client/client.test.exe ./internal/client
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Push-Location internal/client
-          ./client.test.exe -test.v -test.short -test.shuffle=on *> ../../test.log
+          # PowerShell 会把外部程序参数 -test.v 拆成 "-test" ".v"，参数须加引号
+          ./client.test.exe '-test.v' '-test.short' '-test.shuffle=on' *> ../../test.log
           $clientRc = $LASTEXITCODE
           Pop-Location
           go test -v -short -shuffle=on ./internal/desk *>> test.log
