@@ -53,7 +53,7 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
 |---|---|---|---|
 | 401 | `proxy_authorization_required` | token 无效、被吊销或过期（`details="EDGE_AUTH_TOKEN_EXPIRED"`） | 重新拉取订阅换 token；同一会话不再向 edge 发请求；两次尝试至少间隔 15 秒 |
 | 429 | —（带 `Retry-After`） | 来源 IP 因认证失败过多被暂时封禁（5 次/分钟 → 15 分钟） | 至少等待 `Retry-After` |
-| 503 | `connect_ip_disabled`、`address_pool_exhausted`、`connection_limit_exceeded`、`udp_slot_limit_exceeded` | 本节点暂不能提供该服务 | 至少 60 秒后重试（之后改为换节点） |
+| 503 | `connect_ip_disabled`、`address_pool_exhausted`、`connection_limit_exceeded`、`udp_slot_limit_exceeded` | 本节点暂不能提供该服务 | 该节点记入 10 分钟冷却名单，换到其他可达节点并立即重连；没有可换节点时至少 60 秒后重试 |
 | 403 | `destination_ip_prohibited` | 目的地址被 §5 拒绝 | 只影响该次请求，不影响会话 |
 | 502 | `connection_refused`、`destination_ip_unroutable` | 目标不可达 | 只影响该次请求 |
 
@@ -61,5 +61,4 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
 
 ## 8. 未定稿
 - 场景参数（`class=ai|browser|game`）与场景授权（C3 第 6 步）尚未实现。
-- 503 节点不可用时的自动换节点。
 - 多跳转发（edge `role=ingress|egress`、`Aero-Hop-Token`）存在于实现中但没有契约与测试，定稿前需决定保留或删除。

@@ -145,6 +145,8 @@ type Engine struct {
 	daemonCtx         context.Context
 	daemonCancel      context.CancelFunc
 	tokenRefreshKick  chan struct{} // 订阅应用后通知 token 刷新协程（token_refresh.go）
+	unavailableMu     sync.Mutex
+	unavailableNodes  map[string]time.Time // 返回“节点不可用”（503）的节点 → 截止时间；换节点时跳过
 	authRefreshMu     sync.Mutex
 	lastAuthRefresh   time.Time // 上次因 401 强制刷新订阅的时间（至多每分钟一次）
 	tokenRefreshOnce  sync.Once // 首次应用订阅时才启动刷新协程

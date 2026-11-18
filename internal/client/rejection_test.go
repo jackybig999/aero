@@ -1,6 +1,8 @@
 package client
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -52,23 +54,52 @@ func TestSessionFailsFastAfterAuthRejection(t *testing.T) {
 // 重连节奏：认证失败至少间隔 15 秒（每分钟少于 5 次，不触发 edge 封禁）；429 按 Retry-After；节点不可用至少 1 分钟。
 func TestRejectionWait(t *testing.T) {
 	e := &Engine{}
-	if w := e.rejectionWait(&EdgeRejectError{Status: 401}, time.Second); w < authRetryMin || 60*time.Second/w >= 5 {
+	if w := e.rejectionWait(context.Background(), &EdgeRejectError{Status: 401}, time.Second); w < authRetryMin || 60*time.Second/w >= 5 {
 		t.Fatalf("auth wait %v allows 5+ failures per minute", w)
 	}
-	if w := e.rejectionWait(&EdgeRejectError{Status: 429, RetryAfter: 900 * time.Second}, time.Second); w != 900*time.Second {
+	if w := e.rejectionWait(context.Background(), &EdgeRejectError{Status: 429, RetryAfter: 900 * time.Second}, time.Second); w != 900*time.Second {
 		t.Fatalf("429 wait %v", w)
 	}
-	if w := e.rejectionWait(&EdgeRejectError{Status: 503, Code: "address_pool_exhausted"}, time.Second); w != nodeUnavailableRetry {
+	if w := e.rejectionWait(context.Background(), &EdgeRejectError{Status: 503, Code: "address_pool_exhausted"}, time.Second); w != nodeUnavailableRetry {
 		t.Fatalf("node unavailable wait %v", w)
 	}
-	if w := e.rejectionWait(&EdgeRejectError{Status: 403, Code: "destination_ip_prohibited"}, 2*time.Second); w != 2*time.Second {
+	if w := e.rejectionWait(context.Background(), &EdgeRejectError{Status: 403, Code: "destination_ip_prohibited"}, 2*time.Second); w != 2*time.Second {
 		t.Fatalf("other rejection wait %v", w)
 	}
 	if e.lastErrCode != "EDGE_REJECTED" {
 		t.Fatalf("status code %q", e.lastErrCode)
 	}
-	_ = e.rejectionWait(&EdgeRejectError{Status: 401, Details: "EDGE_AUTH_TOKEN_EXPIRED"}, 0)
+	_ = e.rejectionWait(context.Background(), &EdgeRejectError{Status: 401, Details: "EDGE_AUTH_TOKEN_EXPIRED"}, 0)
 	if e.lastErrCode != "EDGE_AUTH_TOKEN_EXPIRED" {
 		t.Fatalf("status code %q", e.lastErrCode)
+	}
+}
+
+// 节点返回“不可用”（503）：记入冷却名单并换到其他可达节点，跳过仍在冷却中的节点；换成功则立即重连。
+func TestNodeUnavailableFailsOverSkippingCoolingNodes(t *testing.T) {
+	eng := NewEngine()
+	addrs := []string{"192.0.2.1:443", "192.0.2.2:443", "192.0.2.3:443"}
+	applied := &Applied{Tokens: map[string]string{}, SNIs: map[string]string{}}
+	for i, a := range addrs {
+		applied.Servers = append(applied.Servers, ServerConfig{Name: fmt.Sprintf("n%d", i+1), Address: a, Token: "tok", SNI: "n.example.com", IP: a[:len(a)-4]})
+		applied.Tokens[a], applied.SNIs[a] = "tok", "n.example.com"
+	}
+	if err := eng.Apply(applied); err != nil {
+		t.Fatal(err)
+	}
+	eng.sentinel.dialFn = func(ctx context.Context, cfg *TransportConfig) (*Client, error) { return &Client{}, nil }
+	eng.markNodeUnavailable(addrs[1]) // n2 刚报告过不可用
+
+	w := eng.rejectionWait(context.Background(), &EdgeRejectError{Status: 503, Code: "connect_ip_disabled"}, time.Second)
+	if eng.activeAddr != addrs[2] || w != reconnectMinBackoff {
+		t.Fatalf("active=%s wait=%v, want switch to %s and immediate reconnect", eng.activeAddr, w, addrs[2])
+	}
+	if !eng.nodeUnavailable(addrs[0]) || eng.lastErrCode != "EDGE_CONNECT_IP_DISABLED" {
+		t.Fatalf("rejected node not cooling (%v) or code %q", eng.nodeUnavailable(addrs[0]), eng.lastErrCode)
+	}
+	// 所有其他节点都在冷却：不切换，按节点不可用节奏等待
+	eng.markNodeUnavailable(addrs[0])
+	if w := eng.rejectionWait(context.Background(), &EdgeRejectError{Status: 503, Code: "address_pool_exhausted"}, time.Second); w != nodeUnavailableRetry || eng.activeAddr != addrs[2] {
+		t.Fatalf("all cooling: active=%s wait=%v", eng.activeAddr, w)
 	}
 }

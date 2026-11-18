@@ -232,7 +232,7 @@ func (s *nodeSentinel) failover(ctx context.Context) bool {
 
 	// 无锁探测各候选节点
 	for _, srv := range servers {
-		if srv.Address == "" || srv.Address == currentAddr {
+		if srv.Address == "" || srv.Address == currentAddr || s.engine.nodeUnavailable(srv.Address) {
 			continue
 		}
 

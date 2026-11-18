@@ -57,7 +57,7 @@ func (e *Engine) startReconnector(ctx context.Context, stack *StackEngine, host 
 				// 抖动避免 edge 重启后大量客户端同时重连
 				wait := backoff/2 + rand.N(backoff/2+1)
 				if rej, ok := asRejection(err); ok {
-					wait = e.rejectionWait(rej, wait)
+					wait = e.rejectionWait(ctx, rej, wait)
 				}
 				log.Printf("[ENGINE] reconnect failed: %v; retry in ~%v", err, wait)
 				select {
@@ -110,11 +110,38 @@ func (e *Engine) reconnectOnce(ctx context.Context, stack *StackEngine, host tun
 //   - 429：按 Retry-After 等待；
 //   - 节点不可用（关闭 CONNECT-IP、地址池耗尽、连接数满）：至少等待 nodeUnavailableRetry。
 const (
-	authRetryMin         = 15 * time.Second
-	nodeUnavailableRetry = time.Minute
+	authRetryMin           = 15 * time.Second
+	nodeUnavailableRetry   = time.Minute
+	nodeUnavailableCooling = 10 * time.Minute // 不可用节点在此期间不作为换节点的候选
 )
 
-func (e *Engine) rejectionWait(r *EdgeRejectError, wait time.Duration) time.Duration {
+// markNodeUnavailable 记录节点暂不可用；nodeUnavailable 报告是否仍在冷却期。
+func (e *Engine) markNodeUnavailable(addr string) {
+	if addr == "" {
+		return
+	}
+	e.unavailableMu.Lock()
+	defer e.unavailableMu.Unlock()
+	if e.unavailableNodes == nil {
+		e.unavailableNodes = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for a, until := range e.unavailableNodes {
+		if now.After(until) {
+			delete(e.unavailableNodes, a)
+		}
+	}
+	e.unavailableNodes[addr] = now.Add(nodeUnavailableCooling)
+}
+
+func (e *Engine) nodeUnavailable(addr string) bool {
+	e.unavailableMu.Lock()
+	defer e.unavailableMu.Unlock()
+	until, ok := e.unavailableNodes[addr]
+	return ok && time.Now().Before(until)
+}
+
+func (e *Engine) rejectionWait(ctx context.Context, r *EdgeRejectError, wait time.Duration) time.Duration {
 	e.setRejection(r)
 	switch {
 	case r.AuthFailure():
@@ -123,6 +150,14 @@ func (e *Engine) rejectionWait(r *EdgeRejectError, wait time.Duration) time.Dura
 	case r.Status == http.StatusTooManyRequests:
 		return max(wait, r.RetryAfter, authRetryMin)
 	case r.NodeUnavailable():
+		// 本节点不能提供服务：记入冷却名单并换到其他可达节点；换成功则立即重连
+		e.mu.RLock()
+		cur, sentinel := e.activeAddr, e.sentinel
+		e.mu.RUnlock()
+		e.markNodeUnavailable(cur)
+		if sentinel != nil && sentinel.failover(ctx) {
+			return reconnectMinBackoff
+		}
 		return max(wait, nodeUnavailableRetry)
 	}
 	return wait
