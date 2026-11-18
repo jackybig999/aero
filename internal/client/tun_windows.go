@@ -43,10 +43,9 @@ func ensureWintunDLL() error {
 		return nil
 	}
 
-	if _, err := os.Stat("wintun.dll"); err == nil {
-		return nil
-	}
-	return fmt.Errorf("wintun.dll not found in executable directory, System32, or current working directory")
+	// wintun 只从程序所在目录与 System32 加载（LOAD_LIBRARY_SEARCH_APPLICATION_DIR|SYSTEM32），不查工作目录：
+	// 此前这里也接受工作目录中的 DLL，检查通过后加载才失败，错误难以理解。
+	return fmt.Errorf("wintun.dll not found next to the program or in System32")
 }
 
 const errorNoMoreItems = syscall.Errno(259)

@@ -138,8 +138,15 @@ jobs:
           Copy-Item wintun/bin/amd64/wintun.dll internal/client/wintun.dll
           go vet ./internal/client ./cmd/client ./internal/desk ./cmd/desk
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go test -v -short -shuffle=on ./internal/client ./internal/desk *> test.log
+          # wintun.dll 只从程序目录或 System32 加载：把客户端测试编译到 DLL 所在目录再运行
+          go test -c -o internal/client/client.test.exe ./internal/client
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Push-Location internal/client
+          ./client.test.exe -test.v -test.short -test.shuffle=on *> ../../test.log
           $rc = $LASTEXITCODE
+          Pop-Location
+          go test -v -short -shuffle=on ./internal/desk *>> test.log
+          if ($rc -eq 0) { $rc = $LASTEXITCODE }
           Get-Content test.log
           # 失败详情写成注解（公开可读）
           if ($rc -ne 0) {
