@@ -126,7 +126,16 @@ jobs:
           cache: false
 
       - name: Vet & Test Client & Desk
+        env:
+          # 真实 wintun 网卡测试（runner 以管理员运行）；SAFE 只用文档保留网段的路由，不影响 runner 自身网络
+          AERO_HOST_TUN_TEST: "1"
+          AERO_HOST_TUN_SAFE: "1"
         run: |
+          curl.exe -fsSL "https://www.wintun.net/builds/wintun-0.14.1.zip" -o wintun-test.zip
+          $sum = (Get-FileHash wintun-test.zip -Algorithm SHA256).Hash.ToLower()
+          if ($sum -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") { throw "wintun checksum mismatch: $sum" }
+          tar.exe -xf wintun-test.zip
+          Copy-Item wintun/bin/amd64/wintun.dll internal/client/wintun.dll
           go vet ./internal/client ./cmd/client ./internal/desk ./cmd/desk
           go test -v -short -shuffle=on ./internal/client ./internal/desk
 

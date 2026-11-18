@@ -30,8 +30,15 @@ func requireHostTunTest(t *testing.T) {
 	}
 }
 
+// safeHostTun：AERO_HOST_TUN_SAFE=1（CI）时只使用文档保留网段的路由，不影响运行测试的机器自身的网络；
+// 路由规划本身由各平台的单元测试覆盖，这里只验证网卡、地址、MTU、路由增删、DNS 防护与清理。
+func safeHostTun() bool { return os.Getenv("AERO_HOST_TUN_SAFE") == "1" }
+
 func winTestPlan(t *testing.T) RoutePlan {
 	t.Helper()
+	if safeHostTun() {
+		return RoutePlan{IPv4: mustPrefixes("198.51.100.0/24"), IPv6: mustPrefixes("2001:db8::/32")}
+	}
 	plan, err := PlanTUNRoutes(RoutePlanInput{
 		Direct:  mustPrefixes("1.0.0.0/8"),
 		Bypass:  []netip.Addr{netip.MustParseAddr("9.9.9.9")},
@@ -76,8 +83,8 @@ func TestTunHostWindowsLifecycle(t *testing.T) {
 		if row, err := h.luid.IPInterface(windows.AF_INET6); err != nil || row.NLMTU != 1280 {
 			t.Fatalf("IPv6 MTU err %v; want 1280", err)
 		}
-		if !hasRoute(h.luid, "2000::/3") {
-			t.Error("IPv6 route 2000::/3 missing")
+		if v6 := cfg.Plan.IPv6; len(v6) > 0 && !hasRoute(h.luid, v6[0].String()) {
+			t.Errorf("IPv6 route %s missing", v6[0])
 		}
 	}
 	if dns, err := h.luid.DNS(); err != nil || len(dns) != 1 || dns[0] != netip.MustParseAddr("10.88.0.1") {
@@ -96,10 +103,14 @@ func TestTunHostWindowsLifecycle(t *testing.T) {
 		t.Error("bypass address 9.9.9.9 covered by the plan")
 	}
 
-	if err := h.ApplyRoutes(RoutePlan{IPv4: mustPrefixes("8.8.8.0/24")}); err != nil {
+	next, gone := "8.8.8.0/24", "8.0.0.0/8"
+	if safeHostTun() {
+		next, gone = "203.0.113.0/24", "198.51.100.0/24"
+	}
+	if err := h.ApplyRoutes(RoutePlan{IPv4: mustPrefixes(next)}); err != nil {
 		t.Fatalf("ApplyRoutes: %v", err)
 	}
-	if !hasRoute(h.luid, "8.8.8.0/24") || hasRoute(h.luid, "8.0.0.0/8") || !hasRoute(h.luid, "10.88.0.0/16") {
+	if !hasRoute(h.luid, next) || hasRoute(h.luid, gone) || !hasRoute(h.luid, "10.88.0.0/16") {
 		t.Fatal("incremental route update not applied")
 	}
 	if err := h.SetIPv4(netip.MustParsePrefix("10.88.5.9/16")); err != nil {
@@ -166,6 +177,9 @@ func TestTunHostWindowsNoResidueAfterKill(t *testing.T) {
 // 真实直连名单（约一万条路由）的下发与拆除耗时。需在 internal\client 目录下运行以读取 china_ip.txt。
 func TestTunHostWindowsChinaListTiming(t *testing.T) {
 	requireHostTunTest(t)
+	if safeHostTun() {
+		t.Skip("timing test routes nearly all traffic into the adapter; not run in safe mode")
+	}
 	b, err := os.ReadFile("china_ip.txt")
 	if err != nil {
 		t.Skipf("china_ip.txt not found (run from internal\\client): %v", err)
