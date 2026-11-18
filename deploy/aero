@@ -13,10 +13,13 @@ ACME_HOME=/root/.acme.sh
 ACME=$ACME_HOME/acme.sh
 WARP_STATE=$DATA/warp-installed-packages   # aero 安装 WARP 时新增的软件包（卸载时只移除这些）
 WARP_USERS=$DATA/warp-installed-users      # 同上，依赖包新建的系统用户与组（Debian 卸载软件包不删用户）
-ACME_STATE=$DATA/acme-before                # 安装 acme.sh 前的 .bashrc 备份与 crontab 状态
+ACME_STATE=$DATA/acme-before                # 安装 acme.sh 前的 .bashrc 备份与 crontab 状态（存在即表示 acme.sh 由 aero 安装）
+BASHRC=/root/.bashrc
 WARP_LIST=/etc/apt/sources.list.d/cloudflare-client.list
 WARP_KEY=/usr/share/keyrings/cloudflare-warp-archive-keyring.asc
 UNINSTALLER=/usr/local/lib/aero/edge-uninstall.sh
+# 邮箱：无空白、不以 '-' 开头，形如 local@domain.tld（域名各段为字母数字与连字符，且不以连字符开头结尾）
+EMAIL_RE='^[^[:space:]@-][^[:space:]@]*@[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'
 
 G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; N="\033[0m"
 ok()   { echo -e "${G}$*${N}"; }
@@ -37,11 +40,13 @@ check_and_restart() {
     return 1
   fi
   systemctl enable aero-edge >/dev/null 2>&1
-  local since i; since=$(date '+%Y-%m-%d %H:%M:%S')   # 只认本次重启之后的启动日志
+  local since i logs; since=$(date '+%Y-%m-%d %H:%M:%S')   # 只认本次重启之后的启动日志
   systemctl restart aero-edge
   for i in $(seq 1 20); do
-    if systemctl is-active --quiet aero-edge && journalctl -u aero-edge --since "$since" --no-pager 2>/dev/null | grep -q "Server started"; then
-      ok "服务已启动：$(journalctl -u aero-edge --since "$since" --no-pager | grep -o 'Server started on [^ ]*' | tail -1)"
+    # 先取到变量再 grep：pipefail 下 `cmd | grep -q` 会因 SIGPIPE 误判
+    logs=$(journalctl -u aero-edge --since "$since" --no-pager 2>/dev/null || true)
+    if systemctl is-active --quiet aero-edge && grep -q "Server started" <<<"$logs"; then
+      ok "服务已启动：$(grep -o 'Server started on [^ ]*' <<<"$logs" | tail -1)"
       return 0
     fi
     sleep 1
@@ -60,11 +65,13 @@ cmd_status() {
   ss -lntup 2>/dev/null | grep aero-edge | awk '{print " "$1, $5}' | sort -u || true
 }
 
+# cmd_domain [域名] [norestart]：单独执行时写入后检查并重启；setup 内部传 norestart，由 setup 最后统一重启。
 cmd_domain() {
   need_root
   local d="${1:-}"
   [[ -n "$d" ]] || d=$(ask "节点域名（已在 DNS 指向本机，Cloudflare 须灰云）: " AERO_DOMAIN)
   cfg_set domain "$d" && ok "域名已设置为 $(cfg_get domain)"
+  [[ "${2:-}" == norestart ]] || check_and_restart
 }
 
 # acme.sh 默认目录：ECC 证书在 /root/.acme.sh/<域名>_ecc/，edge 只读发现，续期后自动热加载。
@@ -72,22 +79,24 @@ cmd_cert() {
   need_root
   local d; d=$(cfg_get domain)
   [[ -n "$d" ]] || { err "先设置域名: aero domain <域名>"; return 1; }
-  if "$EDGE" check-cert -domain "$d" | grep -qx 'CERT_FOUND=yes'; then
-    ok "已有覆盖 $d 的有效证书："; "$EDGE" check-cert -domain "$d" | grep -E 'CERT_FILE|CERT_NOT_AFTER'
+  local cc; cc=$("$EDGE" check-cert -domain "$d" || true)
+  if grep -qx 'CERT_FOUND=yes' <<<"$cc"; then
+    ok "已有覆盖 $d 的有效证书："; grep -E 'CERT_FILE|CERT_NOT_AFTER' <<<"$cc" || true
     return 0
   fi
   warn "没有覆盖 $d 的有效证书。"
   if [[ ! -x "$ACME" ]]; then
     confirm "是否安装官方 acme.sh（https://get.acme.sh，会添加 acme.sh 自己的自动续期 cron）?" || { warn "已跳过。可自行签发到 acme.sh/certbot 默认目录后再执行 aero check"; return 1; }
     local email; email=$(ask "用于 Let's Encrypt 账户的邮箱: " AERO_EMAIL)
-    [[ "$email" == *@*.* ]] || { err "邮箱无效"; return 1; }
+    [[ "$email" =~ $EMAIL_RE ]] || { err "邮箱无效"; return 1; }
     mkdir -p "$ACME_STATE"
-    cp -p /root/.bashrc "$ACME_STATE/bashrc" 2>/dev/null || true
+    cp -p "$BASHRC" "$ACME_STATE/bashrc" 2>/dev/null || true
     crontab -l >/dev/null 2>&1 && touch "$ACME_STATE/had-crontab" || true
     curl -fsSL https://get.acme.sh | sh -s email="$email" || { err "acme.sh 安装失败"; return 1; }
   fi
   confirm "用 80 端口（standalone）为 $d 签发 Let's Encrypt 证书?" || return 1
-  if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ':80$'; then
+  local lst; lst=$(ss -lnt 2>/dev/null | awk '{print $4}' || true)
+  if grep -qE ':80$' <<<"$lst"; then
     err "80 端口已被其他程序占用，standalone 无法签发；AERO 不会停止其他服务。请改用 DNS 方式自行签发。"
     return 1
   fi
@@ -182,11 +191,30 @@ cmd_port() {
   local p="${1:-}"
   [[ -n "$p" ]] || read -r -p "主端口（默认 443；被占用时 edge 自动轮试候选端口）: " p </dev/tty
   cfg_set listen "${p:-443}" && ok "主端口: $(cfg_get listen)"
+  check_and_restart
 }
 
+# cmd_key [norestart]：生成新管理密钥。单独执行时必须检查通过并重启成功后才显示新密钥；
+# 失败则经 stdin 回滚到旧密钥（密钥不进命令行参数与日志）。setup 内部传 norestart，由 setup 最后统一重启。
 cmd_key() {
   need_root
-  local k; k=$(cfg_set admin_key random)
+  if [[ "${1:-}" == norestart ]]; then
+    local k; k=$(cfg_set admin_key random)
+    ok "新管理密钥（只显示这一次，请保存）："
+    echo "  $k"
+    warn "已登记该节点的中台需要同步新密钥。"
+    return 0
+  fi
+  local old k; old=$(cfg_get admin_key)
+  k=$(cfg_set admin_key random)
+  if ! check_and_restart; then
+    if [[ -n "$old" ]] && printf '%s' "$old" | cfg_set admin_key - >/dev/null; then
+      err "新管理密钥未生效（检查或启动失败），已回滚到旧密钥。修复上面的问题后重试 aero key。"
+    else
+      err "新管理密钥未生效，且回滚失败；请用 aero info 查看当前密钥，并修复后重试 aero key。"
+    fi
+    return 1
+  fi
   ok "新管理密钥（只显示这一次，请保存）："
   echo "  $k"
   warn "已登记该节点的中台需要同步新密钥。"
@@ -196,7 +224,7 @@ cmd_setup() {
   need_root
   echo -e "${C}== 1/5 域名${N}"
   local d; d=$(cfg_get domain)
-  if [[ -z "$d" || -n "${AERO_DOMAIN:-}" && "${AERO_DOMAIN:-}" != "$d" ]]; then cmd_domain; else ok "域名: $d（修改: aero domain <域名>）"; fi
+  if [[ -z "$d" || -n "${AERO_DOMAIN:-}" && "${AERO_DOMAIN:-}" != "$d" ]]; then cmd_domain "" norestart; else ok "域名: $d（修改: aero domain <域名>）"; fi
   echo -e "${C}== 2/5 证书${N}"
   cmd_cert || true
   echo -e "${C}== 3/5 WARP（可选）${N}"
@@ -209,7 +237,7 @@ cmd_setup() {
   echo " 主端口 $(cfg_get listen)（被其他程序占用时自动轮试 2083/2087/8443/...）"
   echo -e "${C}== 5/5 管理密钥${N}"
   local k; k=$(cfg_get admin_key)
-  if [[ ${#k} -lt 32 ]]; then cmd_key; else ok "已有管理密钥（${#k} 位）"; fi
+  if [[ ${#k} -lt 32 ]]; then cmd_key norestart; else ok "已有管理密钥（${#k} 位）"; fi
   check_and_restart
 }
 
@@ -219,7 +247,8 @@ cmd_info() {
   d=$(cfg_get domain); p=$(cfg_get listen); p=${p#:}; k=$(cfg_get admin_key)
   suffix=""; [[ -n "$p" && "$p" != 443 ]] && suffix=":$p"
   echo " 节点: https://${d:-<未设置域名>}${suffix}"
-  echo " Web 控制台: https://${d}${suffix}/console?key=${k}"
+  local cu; cu=$("$EDGE" console-url -config "$CONFIG" 2>&1) || true
+  echo " Web 控制台: ${cu}"
   echo " 管理员订阅: 在 Web 控制台查看"
 }
 
@@ -233,6 +262,13 @@ cmd_net() {
   fi
 }
 
+# verify_sum：SHA256SUMS 中必须有 edge-install.sh 一行且校验通过（先取到变量，避免 pipefail 下 grep -q 的 SIGPIPE）。
+verify_sum() {
+  local line; line=$(cd "$1" && awk '$2=="edge-install.sh"' SHA256SUMS)
+  [[ -n "$line" ]] || return 1
+  (cd "$1" && sha256sum -c --quiet - <<<"$line")
+}
+
 cmd_update() {
   need_root
   local v="${1:-}"
@@ -242,22 +278,39 @@ cmd_update() {
   local tmp; tmp=$(mktemp -d)
   local base="https://github.com/jackybig999/aero/releases/download/v$v"
   if ! curl -fsSL -o "$tmp/edge-install.sh" "$base/edge-install.sh" || ! curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" \
-     || ! (cd "$tmp" && awk '$2=="edge-install.sh"' SHA256SUMS | grep -q . && awk '$2=="edge-install.sh"' SHA256SUMS | sha256sum -c --quiet -); then
+     || ! verify_sum "$tmp"; then
     err "下载或校验 v$v 安装脚本失败"; rm -rf "$tmp"; return 1
   fi
-  AERO_VERSION="$v" bash "$tmp/edge-install.sh"; local rc=$?; rm -rf "$tmp"; return $rc
+  local rc=0
+  AERO_VERSION="$v" bash "$tmp/edge-install.sh" || rc=$?
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# acme.sh 只有由 aero 安装（安装时创建 $ACME_STATE）才可由 aero 卸载；
+# 非交互（AERO_YES=1）时还须显式 AERO_PURGE_ACME=1，证书不会被自动确认删除。
+acme_owned() { [[ -x "$ACME" && -d "$ACME_STATE" ]]; }
+acme_uninstall_allowed() {
+  acme_owned || return 1
+  [[ "${AERO_YES:-}" != 1 || "${AERO_PURGE_ACME:-}" == 1 ]]
 }
 
 cmd_uninstall() {
   need_root
   confirm "卸载 AERO Edge?" || return 0
   if command -v warp-cli >/dev/null && [[ -s "$WARP_STATE" ]] && confirm "同时卸载由 aero 安装的 WARP?"; then warp_uninstall || true; fi
-  if [[ -x "$ACME" ]] && confirm "同时卸载 acme.sh 及其证书（/root/.acme.sh）?"; then
-    "$ACME" --uninstall >/dev/null 2>&1 || true; rm -rf "$ACME_HOME"
-    # acme.sh 卸载后会留下空 crontab 与 .bashrc 末尾空行：只在与安装前状态精确对应时还原
-    if [[ ! -e "$ACME_STATE/had-crontab" && -z "$(crontab -l 2>/dev/null)" ]]; then crontab -r 2>/dev/null || true; fi
-    if [[ -f "$ACME_STATE/bashrc" ]] && cmp -s <(cat "$ACME_STATE/bashrc"; echo) /root/.bashrc; then cp -p "$ACME_STATE/bashrc" /root/.bashrc; fi
-    rm -rf "$ACME_STATE"
+  if [[ -x "$ACME" ]]; then
+    if ! acme_owned; then
+      warn "acme.sh 不是由 aero 安装，保留（含账户密钥与证书）。"
+    elif ! acme_uninstall_allowed; then
+      warn "非交互模式不自动删除 acme.sh 与证书，保留；需要删除请设置 AERO_PURGE_ACME=1。"
+    elif confirm "同时卸载 acme.sh 及其证书（$ACME_HOME）?"; then
+      "$ACME" --uninstall >/dev/null 2>&1 || true; rm -rf "$ACME_HOME"
+      # acme.sh 卸载后会留下空 crontab 与 .bashrc 末尾空行：只在与安装前状态精确对应时还原
+      if [[ ! -e "$ACME_STATE/had-crontab" && -z "$(crontab -l 2>/dev/null)" ]]; then crontab -r 2>/dev/null || true; fi
+      if [[ -f "$ACME_STATE/bashrc" ]] && cmp -s <(cat "$ACME_STATE/bashrc"; echo) "$BASHRC"; then cp -p "$ACME_STATE/bashrc" "$BASHRC"; fi
+      rm -rf "$ACME_STATE"
+    fi
   fi
   local purge=""; confirm "删除配置与数据（/etc/aero、/var/lib/aero）?" && purge=--purge
   bash "$UNINSTALLER" $purge
@@ -280,11 +333,12 @@ usage() {
   info               节点地址与 Web 控制台链接
   net                TUN 与转发规则状态
   update [版本]      升级服务端
-  uninstall          卸载（WARP、acme.sh 逐项询问）
+  uninstall          卸载（WARP、acme.sh 逐项询问；acme.sh 仅限 aero 安装的）
 修改配置后执行 aero restart（先检查，通过才重启）。
 EOF
 }
 
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0   # 被 source（测试）时只加载函数
 [[ -x "$EDGE" ]] || { err "未安装 aero-edge"; exit 1; }
 case "${1:-help}" in
   setup) cmd_setup ;;
