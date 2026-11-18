@@ -3721,7 +3721,7 @@ func TestPhase7Gate_MultiHopChaining(t *testing.T) {
 		}
 	}
 
-	// 2.5 验证生产环境下 Role == ingress 时 NextHopAddr 为空必须报错
+	// 2.5 生产环境的入口角色被拒绝（多跳重做完成前，见 errIngressDisabled）
 	prodIngressCfg := ServerConfig{
 		Listen:        ":443",
 		Domain:        "example.com",
@@ -3730,8 +3730,8 @@ func TestPhase7Gate_MultiHopChaining(t *testing.T) {
 		NextHopAddr:   "",
 	}
 	_, errProd := NewServer(prodIngressCfg)
-	if errProd == nil || !strings.Contains(errProd.Error(), "next hop address required") {
-		t.Fatalf("expected NewServer with role=ingress and empty next_hop_addr in production to fail, got: %v", errProd)
+	if !errors.Is(errProd, errIngressDisabled) { // 生产环境的入口角色在多跳重做完成前一律拒绝
+		t.Fatalf("expected production ingress to be refused, got: %v", errProd)
 	}
 
 	// 2.6 验证 SetNextHopDialerForTest 和 SetNextHopUDPDialerForTest 钩子工作正常

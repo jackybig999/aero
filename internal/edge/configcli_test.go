@@ -2,6 +2,7 @@ package edge
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -189,5 +190,25 @@ func TestConnectIPDisabledServerAndCheck(t *testing.T) {
 	}
 	if v, _ := ConfigGet(path, "connect_ip"); v != "true" {
 		t.Fatalf("connect_ip get = %q", v)
+	}
+}
+
+// 多跳入口在重做完成前禁止运行（否则 TUN 流量从入口出去、暴露入口 IP）：生产启动拒绝，check 报 FAIL。
+func TestIngressRoleRefusedInProduction(t *testing.T) {
+	listen, _ := findTestAddr()
+	_, err := NewServer(ServerConfig{Listen: listen, Domain: "n.example.com", DataDir: t.TempDir(), Role: "ingress", HopCredential: "hop", NextHopAddr: "egress.example.com:443"})
+	if !errors.Is(err, errIngressDisabled) {
+		t.Fatalf("ingress started in production: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "edge.json")
+	_ = os.WriteFile(path, []byte(`{"role":"ingress","domain":"n.example.com"}`), 0o600)
+	failed := false
+	for _, it := range CheckNode(path) {
+		if it.Name == "role" && it.Level == "FAIL" {
+			failed = true
+		}
+	}
+	if !failed {
+		t.Fatal("check does not flag the ingress role")
 	}
 }

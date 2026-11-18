@@ -168,6 +168,11 @@ func MaskToken(t string) string {
 	return t[:4] + "…" + t[len(t)-4:]
 }
 
+// errIngressDisabled：多跳入口尚未把 CONNECT-IP 与 DoH 转发给出口，TUN 模式的流量会直接从入口出去，
+// 用户以为的“出口 IP”实际是入口（静默泄露）。重做完成前拒绝以入口角色运行（fail closed）。
+var errIngressDisabled = errors.New("multi-hop role \"ingress\" is disabled: CONNECT-IP and DoH are not yet forwarded to the egress, " +
+	"so traffic would leave from the ingress and expose it as the exit; run as \"single\" until multi-hop is rebuilt")
+
 // NewServer creates a new Server instance from ServerConfig
 func NewServer(cfg ServerConfig) (*Server, error) {
 	// 0. Multi-hop Role 与跳间凭证校验 (P7 规范)
@@ -184,6 +189,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		if strings.TrimSpace(cfg.HopCredential) == "" {
 			return nil, fmt.Errorf("hop credential required: multi-hop role %s requires valid hop credential (hop credential must not be empty and is strictly distinct from user token)", role)
 		}
+	}
+	if role == "ingress" && !cfg.AllowSelfSignedCertForTest {
+		return nil, errIngressDisabled
 	}
 	if role == "ingress" {
 		if strings.TrimSpace(cfg.NextHopAddr) == "" && !cfg.AllowSelfSignedCertForTest {

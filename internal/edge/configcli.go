@@ -172,6 +172,9 @@ func CheckNode(path string) []CheckItem {
 		return out
 	}
 	add("OK", "config", "%s", path)
+	if strings.EqualFold(strings.TrimSpace(cfg.Role), "ingress") {
+		add("FAIL", "role", "%v", errIngressDisabled)
+	}
 
 	domain := normalizeCertDomain(cfg.Domain)
 	if !nodeDomainRe.MatchString(domain) {
