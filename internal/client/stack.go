@@ -165,10 +165,9 @@ func (e *StackEngine) Stop() {
 }
 
 func (e *StackEngine) SetKillSwitch(active bool) {
+	// 数据泵持有的就是 &e.killSwitch 同一个原子量（见 NewIPDataPump 调用处），
+	// 这里只写它即可；不读 e.pump，避免与 Stop/RestartWithConn 竞态。
 	e.killSwitch.Store(active)
-	if e.pump != nil && e.pump.killSwitch != nil {
-		e.pump.killSwitch.Store(active)
-	}
 }
 
 func (e *StackEngine) KillSwitch() bool {

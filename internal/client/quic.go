@@ -240,6 +240,24 @@ var (
 	quicDialHook   func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error)
 )
 
+var (
+	quicRaceDialHookMu sync.RWMutex
+	quicRaceDialHook   func(ctx context.Context, port int) (*quic.Conn, error)
+)
+
+// setQUICRaceDialHookForTest 注入多端口竞速（alt_ports）中单个端口的拨号逻辑，仅供测试。
+func setQUICRaceDialHookForTest(fn func(ctx context.Context, port int) (*quic.Conn, error)) {
+	quicRaceDialHookMu.Lock()
+	defer quicRaceDialHookMu.Unlock()
+	quicRaceDialHook = fn
+}
+
+func loadQUICRaceDialHook() func(ctx context.Context, port int) (*quic.Conn, error) {
+	quicRaceDialHookMu.RLock()
+	defer quicRaceDialHookMu.RUnlock()
+	return quicRaceDialHook
+}
+
 // SetQUICDialHook 允许单元测试注入自定义 QUIC 拨号逻辑 (如模拟 UDP 阻断)
 func SetQUICDialHook(fn func(ctx context.Context, pconn net.PacketConn, remoteAddr net.Addr, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error)) {
 	quicDialHookMu.Lock()
@@ -483,21 +501,33 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 				targetAddr := &net.UDPAddr{IP: udpAddr.IP, Port: port, Zone: udpAddr.Zone}
 				var c *quic.Conn
 				var dErr error
-				if cfg.Enable0RTT {
+				if raceHook := loadQUICRaceDialHook(); raceHook != nil {
+					c, dErr = raceHook(raceCtx, port)
+				} else if cfg.Enable0RTT {
 					c, dErr = tr.DialEarly(raceCtx, targetAddr, cfg.TLSConfig, quicConfig)
 				} else {
 					c, dErr = tr.Dial(raceCtx, targetAddr, cfg.TLSConfig, quicConfig)
 				}
+				// resCh 容量不小于候选端口数，发送永不阻塞；无论结果如何一律发送，
+				// 由赢家产生后的排空协程接收并关闭非赢家连接，避免 KeepAlive 让其泄漏。
 				if dErr == nil {
-					select {
-					case resCh <- dialRes{conn: c, port: port}:
-					case <-raceCtx.Done():
-						_ = c.CloseWithError(0, "race cancelled")
-					}
+					resCh <- dialRes{conn: c, port: port}
 				} else {
-					select {
-					case resCh <- dialRes{err: dErr, port: port}:
-					case <-raceCtx.Done():
+					resCh <- dialRes{err: dErr, port: port}
+				}
+			}()
+		}
+
+		// drainLosers 在竞速结束后接收尚未收取的结果，关闭所有成功但落选的连接。
+		// pending 是调用时已发起但结果尚未被主循环接收的拨号数；之后不会再发起新拨号。
+		drainLosers := func(pending int) {
+			if pending <= 0 {
+				return
+			}
+			go func() {
+				for i := 0; i < pending; i++ {
+					if r := <-resCh; r.conn != nil {
+						_ = r.conn.CloseWithError(0, "race lost")
 					}
 				}
 			}()
@@ -515,6 +545,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 			select {
 			case <-ctx.Done():
 				raceCancel()
+				drainLosers(launched - finished)
 				_ = tr.Close()
 				_ = pconn.Close()
 				return nil, ctx.Err()
@@ -531,6 +562,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 				finished++
 				if res.conn != nil {
 					raceCancel()
+					drainLosers(launched - finished)
 					conn = res.conn
 					actualPort = res.port
 					if res.port != udpAddr.Port {

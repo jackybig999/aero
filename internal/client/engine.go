@@ -122,6 +122,8 @@ type Engine struct {
 	mode          string
 	listenAddr    string
 	mixedListener net.Listener
+	// mixedHandshakeTimeout 为 0 时用默认 10 秒；仅测试注入更短的值（须在连接建立前设置）
+	mixedHandshakeTimeout time.Duration
 
 	currentISP  string
 	savedSubURL string
@@ -1536,6 +1538,12 @@ func (e *Engine) SetGeoDataURL(u string) {
 	e.geoDataURL = u
 }
 
+// geoDataMaxBytes 是 geodata 同步响应体的大小上限（16 MiB）
+const geoDataMaxBytes = 16 << 20
+
+// mixedHandshakeTimeoutDefault 是混合代理握手阶段的读超时
+const mixedHandshakeTimeoutDefault = 10 * time.Second
+
 // SyncGeoData 从云端同步最新中国直连域名与网段规则库
 // 规则：必须使用 DialPhysicalDirect 构建 HTTP Transport 防止 TUN 路由环路死锁，比对 If-None-Match ETag，200 则原子写入 GetDataDir()/geodata_direct.txt 并调用 e.splitEngine.ReloadRules
 func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
@@ -1629,9 +1637,13 @@ func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
 		return 0, false, fmt.Errorf("sync geodata unexpected HTTP status: %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// 限制响应体上限，超限直接报错，不落盘也不替换现有规则
+	body, err := io.ReadAll(io.LimitReader(resp.Body, geoDataMaxBytes+1))
 	if err != nil {
 		return 0, false, fmt.Errorf("read geodata body: %w", err)
+	}
+	if len(body) > geoDataMaxBytes {
+		return 0, false, fmt.Errorf("geodata body exceeds %d bytes limit", geoDataMaxBytes)
 	}
 
 	// 原子写入 GetDataDir()/geodata_direct.txt
@@ -1864,6 +1876,12 @@ func (c *trackedConn) Close() error {
 
 // StartResidentMixedProxy 启动 SOCKS5 + HTTP CONNECT 混合端口常驻守护监听 (Daemon 模式)
 func (e *Engine) StartResidentMixedProxy(addr ...string) error {
+	// 常驻混合代理只允许绑定回环地址；在写入 listenAddr 与 Listen 之前拒绝
+	if len(addr) > 0 && addr[0] != "" {
+		if err := requireLoopbackListenAddr(addr[0]); err != nil {
+			return err
+		}
+	}
 	e.mu.Lock()
 	if len(addr) > 0 && addr[0] != "" {
 		e.listenAddr = addr[0]
@@ -1882,6 +1900,14 @@ func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 	}
 	e.mixedStarting = true
 	e.mu.Unlock()
+
+	if err := requireLoopbackListenAddr(targetAddr); err != nil {
+		e.mu.Lock()
+		e.mixedStarting = false
+		e.mu.Unlock()
+		log.Printf("[PROXY] resident mixed proxy refused to listen: %v", err)
+		return err
+	}
 
 	ln, err := net.Listen("tcp", targetAddr)
 	if err != nil {
@@ -1945,7 +1971,34 @@ func (e *Engine) startMixedProxy() error {
 	return e.StartResidentMixedProxy()
 }
 
+// requireLoopbackListenAddr 校验监听地址的主机部分是回环地址（127.0.0.0/8、::1、localhost）。
+// 空主机（如 ":8080"）与通配地址（0.0.0.0、::）都会监听全部网卡，一律拒绝。
+func requireLoopbackListenAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid mixed proxy listen address %q: %w", addr, err)
+	}
+	h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if h == "localhost" {
+		return nil
+	}
+	if ip := net.ParseIP(strings.Trim(h, "[]")); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("mixed proxy listen address %q is not loopback: refusing to bind", addr)
+}
+
+// handshakeTimeout 返回混合代理握手阶段的读超时（测试可通过字段注入更短的值）。
+func (e *Engine) handshakeTimeout() time.Duration {
+	if e.mixedHandshakeTimeout > 0 {
+		return e.mixedHandshakeTimeout
+	}
+	return mixedHandshakeTimeoutDefault
+}
+
 func (e *Engine) serveMixedConn(conn net.Conn) {
+	// 握手阶段（首字节与请求头）设读 deadline，防止慢速连接长期占用；握手完成后由各处理函数清除
+	_ = conn.SetReadDeadline(time.Now().Add(e.handshakeTimeout()))
 	br := bufio.NewReader(conn)
 	peek, err := br.Peek(1)
 	if err != nil {
@@ -2042,6 +2095,7 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 	if err != nil {
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{}) // 握手完成，清除 deadline
 
 	if cmd == 0x03 { // UDP ASSOCIATE
 		e.handleSocks5UDPAssociate(conn, host, port)
@@ -2075,6 +2129,7 @@ func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
 	if err != nil {
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{}) // 请求头已读完，清除 deadline
 	if req.Method != http.MethodConnect {
 		return
 	}
