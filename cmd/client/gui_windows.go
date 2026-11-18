@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,11 +37,13 @@ const (
 	WM_TRAY_MSG         = WM_USER + 102
 	WM_AERO_UPDATE_TRAY = WM_USER + 103 // 新增：托盘异步更新专用安全消息
 
-	WM_CLOSE         = 0x0010
-	WM_DESTROY       = 0x0002
-	WM_LBUTTONUP     = 0x0202
-	WM_LBUTTONDBLCLK = 0x0203
-	WM_RBUTTONUP     = 0x0205
+	WM_CLOSE           = 0x0010
+	WM_QUERYENDSESSION = 0x0011
+	WM_ENDSESSION      = 0x0016
+	WM_DESTROY         = 0x0002
+	WM_LBUTTONUP       = 0x0202
+	WM_LBUTTONDBLCLK   = 0x0203
+	WM_RBUTTONUP       = 0x0205
 
 	SW_HIDE    = 0
 	SW_SHOW    = 5
@@ -100,6 +103,7 @@ var (
 	trayNID     notifyIconDataW
 	clientHWND  uintptr
 	clientWV    webview2.WebView
+	guiShutdown func() // 由 runClientWindow 在消息循环前设置，供 wndProc 访问
 
 	hIconBlue   uintptr
 	hIconGreen  uintptr
@@ -320,6 +324,22 @@ func wndProc(hwnd, msg, wParam, lParam uintptr) uintptr {
 		procShell_NotifyIconW.Call(uintptr(NIM_MODIFY), uintptr(unsafe.Pointer(&trayNID)))
 		return 0
 
+	case WM_QUERYENDSESSION:
+		// 允许系统关机/注销
+		return 1
+
+	case WM_ENDSESSION:
+		if wParam != 0 {
+			// 系统确定结束会话：Windows 在本消息返回后可能随时终止进程，
+			// 所以必须在返回前同步完成清理。耗时上限约为 eng.Close 耗时加
+			// apiServer.Shutdown 的 3 秒；shutdown 由 Once 保护，与托盘退出不会重复执行。
+			procShell_NotifyIconW.Call(uintptr(NIM_DELETE), uintptr(unsafe.Pointer(&trayNID)))
+			if sd := guiShutdown; sd != nil {
+				sd()
+			}
+		}
+		return 0
+
 	case WM_CLOSE:
 		procShowWindow.Call(hwnd, uintptr(SW_HIDE))
 		return 0
@@ -488,8 +508,11 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 	cleanOrphanWebViewData()
 	hideOwnConsole()
 	if !ensureSingleInstance() {
+		// 第二个实例：不会进入 shutdown，需自行清理本进程的 token 文件
+		removeOwnToken()
 		return
 	}
+	guiShutdown = shutdown
 
 	initDPIAwareness()
 
@@ -537,6 +560,26 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 	w.SetHtml(htmlUI)
 
 	setupSystemTray(w)
+
+	// Go 在 Windows 上把控制台关闭/注销/关机事件映射为 SIGTERM；
+	// 收到后复用托盘“退出”的流程：终止窗口循环，w.Run 返回后统一调用 shutdown。
+	// 先同步 shutdown 以抢在系统强制终止进程之前完成清理（Once 保证不重复）。
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	loopDone := make(chan struct{})
+	defer signal.Stop(sigCh)
+	defer close(loopDone)
+	go func() {
+		select {
+		case <-sigCh:
+		case <-loopDone:
+			return
+		}
+		log.Println("[UI] termination signal received, shutting down")
+		shutdown()
+		// PostQuitMessage 必须在 UI 线程调用，经 Dispatch 切回主线程
+		w.Dispatch(w.Terminate)
+	}()
 
 	log.Println("[UI] client window started, entering event loop...")
 	w.Run()

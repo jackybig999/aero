@@ -54,7 +54,7 @@ func main() {
 
 	runMode, err := client.NormalizeMode(*mode)
 	if err != nil {
-		log.Fatalf("[CLIENT] %v", err)
+		fatalf("[CLIENT] %v", err)
 	}
 	*mode = runMode
 
@@ -81,7 +81,7 @@ func main() {
 
 	uiFS, err := fs.Sub(uiEmbed, "ui")
 	if err != nil {
-		log.Fatalf("[CLIENT] failed to extract embedded ui: %v", err)
+		fatalf("[CLIENT] failed to extract embedded ui: %v", err)
 	}
 
 	tokenBytes := make([]byte, 16)
@@ -91,8 +91,11 @@ func main() {
 	// 将 sessionToken 写入系统标准临时/运行时目录，权限 0644 允许非 root 套壳 UI 读取鉴权
 	tokenDir := filepath.Join(os.TempDir(), "aeroprot")
 	_ = os.MkdirAll(tokenDir, 0755)
+	// 清理崩溃或被强杀进程遗留的 token 文件（仅删除 PID 已不存在的）
+	cleanOrphanTokens(tokenDir, os.Getpid(), isProcessAlive)
 	tokenPath := filepath.Join(tokenDir, fmt.Sprintf("session-%d.token", os.Getpid()))
 	_ = os.WriteFile(tokenPath, []byte(sessionToken), 0644)
+	setOwnTokenPath(tokenPath)
 
 	mux := http.NewServeMux()
 
@@ -274,10 +277,11 @@ func main() {
 			defer func() {
 				if rec := recover(); rec != nil {
 					log.Printf("[CLIENT] recover mode switch panic: %v", rec)
+					stopAfterPanic(eng)
 				}
 			}()
 			err := eng.Restart(ticket)
-			if err != nil && !errors.Is(err, client.ErrStartAborted) && !errors.Is(err, context.Canceled) {
+			if err != nil && !errors.Is(err, client.ErrStartAborted) && !errors.Is(err, context.Canceled) && !errors.Is(err, client.ErrEngineClosed) {
 				log.Printf("[CLIENT] mode switch failed: %v, rolling back to %s", err, prevMode)
 				eng.SetMode(prevMode)
 				t2 := eng.RequestStart()
@@ -321,6 +325,7 @@ func main() {
 			defer func() {
 				if r := recover(); r != nil {
 					log.Printf("[CLIENT] recover connect panic: %v", r)
+					stopAfterPanic(eng)
 				}
 			}()
 
@@ -336,7 +341,7 @@ func main() {
 				}
 			}
 
-			if err := eng.StartWith(ticket); err != nil && !errors.Is(err, client.ErrStartAborted) && !errors.Is(err, context.Canceled) {
+			if err := eng.StartWith(ticket); err != nil && !errors.Is(err, client.ErrStartAborted) && !errors.Is(err, context.Canceled) && !errors.Is(err, client.ErrEngineClosed) {
 				log.Printf("[CLIENT] background connect finished with err: %v", err)
 			}
 			curSt := eng.GetState()
@@ -582,19 +587,20 @@ func main() {
 	go func() {
 		log.Printf("[CLIENT] Web UI & API ready at http://%s", *apiAddr)
 		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[CLIENT] API server failed: %v", err)
+			fatalf("[CLIENT] API server failed: %v", err)
 		}
 	}()
 
-	shutdown := func() {
+	// 托盘退出、信号、系统关机消息都可能调用 shutdown，用 Once 保证只执行一次
+	shutdown := newOnceShutdown(func() {
 		log.Println("[CLIENT] stopping engine and api server...")
-		_ = os.Remove(tokenPath)
+		removeOwnToken()
 		_ = eng.Close()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = apiServer.Shutdown(shutdownCtx)
 		log.Println("[CLIENT] AERO client shutdown complete.")
-	}
+	})
 
 	htmlUI := getClientHTMLUI(uiFS)
 	if *headless {
@@ -688,4 +694,12 @@ func runHeadless(shutdown func()) {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	shutdown()
+}
+
+// stopAfterPanic 在启动类协程 panic 后停止引擎，避免引擎停在 Starting 且 TUN 已建。
+// Stop 幂等；其错误只能记录日志（此时已无调用方可上报）。
+func stopAfterPanic(eng *client.Engine) {
+	if err := eng.Stop(); err != nil {
+		log.Printf("[CLIENT] stop engine after panic failed: %v", err)
+	}
 }
