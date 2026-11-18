@@ -6,16 +6,22 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -164,6 +170,10 @@ type Subscription struct {
 	Servers           []ServerConfig `json:"servers" yaml:"nodes"`
 	CreatedAt         int64          `json:"createdAt,omitempty" yaml:"created_at"`
 	Opt               Optimization   `json:"optimization,omitempty" yaml:"optimization"`
+
+	// FromCache 为 true 表示本次拉取失败，结果取自本地缓存（上一次成功拉取的订阅）。
+	// 启动时可以用它连上节点；token 刷新与 401 刷新必须把它视为“拉取失败”（缓存里的 token 不是新签发的）。
+	FromCache bool `json:"-" yaml:"-"`
 }
 
 func (s *Subscription) UnmarshalJSON(data []byte) error {
@@ -220,49 +230,107 @@ func (s *Subscription) IsTrafficExceeded() bool {
 	return s.TrafficUsedBytes >= s.TrafficLimitBytes
 }
 
-// ValidateAndNormalize 强校验与主动安全兜底，杜绝遗漏字段与空值
+// subDefaultPort 是 C5 §3 规定的缺省端口（address 缺省或只有主机名时）。
+const subDefaultPort = 443
+
+// validPort 判断端口是否在 1-65535。
+func validPort(p int) bool { return p >= 1 && p <= 65535 }
+
+// normalizeNodeAddr 把节点地址规整为 host:port：只有主机名（或裸 IPv6）时补默认端口 443；端口必须是 1-65535 的十进制数。
+func normalizeNodeAddr(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("empty address")
+	}
+	if h, p, err := net.SplitHostPort(raw); err == nil {
+		if h == "" {
+			return "", fmt.Errorf("address %q has an empty host", raw)
+		}
+		n, perr := strconv.Atoi(p)
+		if perr != nil || !validPort(n) {
+			return "", fmt.Errorf("address %q has an invalid port (want 1-65535)", raw)
+		}
+		return net.JoinHostPort(h, strconv.Itoa(n)), nil
+	}
+	// 没有端口：只接受主机名或 IP 字面量（可带方括号的 IPv6）
+	h := strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")
+	if h == "" || strings.ContainsAny(h, " /\\?#@") {
+		return "", fmt.Errorf("address %q is not a valid host", raw)
+	}
+	if strings.Contains(h, ":") && net.ParseIP(h) == nil {
+		return "", fmt.Errorf("address %q is not a valid host:port", raw)
+	}
+	return net.JoinHostPort(h, strconv.Itoa(subDefaultPort)), nil
+}
+
+// normalizeServer 按 C5 §3 校验并规整单个节点；返回错误表示该节点非法。
+func normalizeServer(srv *ServerConfig) error {
+	srv.Name = strings.TrimSpace(srv.Name)
+	srv.Host = strings.TrimSpace(srv.Host)
+	srv.Address = strings.TrimSpace(srv.Address)
+	if srv.Address == "" && srv.Host == "" {
+		return errors.New("missing address and host")
+	}
+	if srv.Address == "" {
+		srv.Address = srv.Host
+	}
+	addr, err := normalizeNodeAddr(srv.Address)
+	if err != nil {
+		return err
+	}
+	srv.Address = addr
+	if srv.Host == "" {
+		srv.Host, _, _ = net.SplitHostPort(addr)
+	}
+	if srv.Name == "" {
+		srv.Name = srv.Address
+	}
+	if strings.TrimSpace(srv.Token) == "" {
+		return errors.New("missing token")
+	}
+	srv.SNI = strings.TrimSpace(srv.SNI)
+	if srv.SNI == "" {
+		return errors.New("missing sni")
+	}
+	if srv.Protocol != "connect-ip" {
+		return fmt.Errorf("unsupported protocol %q (want connect-ip)", srv.Protocol)
+	}
+	for _, cp := range srv.AltPorts {
+		if !validPort(cp) {
+			return fmt.Errorf("alt_ports contains invalid port %d (want 1-65535)", cp)
+		}
+	}
+	return nil
+}
+
+// ValidateAndNormalize 按 C5 §3 校验并规整订阅。契约没有规定单个节点非法时整份拒绝，
+// 所以非法节点被跳过并记录日志（不含 token）；一个有效节点都不剩时整份拒绝。
 func (s *Subscription) ValidateAndNormalize() error {
 	if s == nil || len(s.Servers) == 0 {
 		return fmt.Errorf("empty subscription: no servers configured")
 	}
+	valid := make([]ServerConfig, 0, len(s.Servers))
+	var firstErr error
 	for i := range s.Servers {
-		srv := &s.Servers[i]
-		if strings.TrimSpace(srv.Address) == "" && strings.TrimSpace(srv.Host) == "" {
-			return fmt.Errorf("server[%d] missing address and host", i)
-		}
-		if strings.TrimSpace(srv.Address) == "" && srv.Host != "" {
-			srv.Address = strings.TrimSpace(srv.Host)
-			if !strings.Contains(srv.Address, ":") {
-				srv.Address = net.JoinHostPort(srv.Address, "443")
+		srv := s.Servers[i]
+		if err := normalizeServer(&srv); err != nil {
+			log.Printf("[SUB] skipping invalid server[%d] (%q): %v", i, srv.Name, err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("server[%d] (%s): %w", i, srv.Name, err)
 			}
+			continue
 		}
-		if strings.TrimSpace(srv.Host) == "" && srv.Address != "" {
-			if h, _, err := net.SplitHostPort(strings.TrimSpace(srv.Address)); err == nil {
-				srv.Host = h
-			} else {
-				srv.Host = strings.TrimSpace(srv.Address)
-			}
-		}
-		if strings.TrimSpace(srv.Name) == "" {
-			srv.Name = srv.Address
-		}
-		if strings.TrimSpace(srv.Token) == "" {
-			return fmt.Errorf("server[%d] (%s) missing token", i, srv.Name)
-		}
-		// 若服务端未下发备用端口，主动注入高防备用端口池，保障自愈避障能力；同时过滤掉主端口与重复端口
 		var mainPort int
 		if _, pStr, err := net.SplitHostPort(srv.Address); err == nil {
 			mainPort, _ = strconv.Atoi(pStr)
 		}
-		if mainPort <= 0 {
-			mainPort = 443
-		}
+		// 若服务端未下发备用端口，主动注入高防备用端口池，保障自愈避障能力；同时过滤掉主端口与重复端口
 		if len(srv.AltPorts) == 0 {
 			candidates := StandardCandidatePorts
-			if mainPort == 443 {
+			if mainPort == subDefaultPort {
 				srv.AltPorts = append([]int(nil), candidates...)
 			} else {
-				srv.AltPorts = []int{443}
+				srv.AltPorts = []int{subDefaultPort}
 				for _, cp := range candidates {
 					if cp != mainPort {
 						srv.AltPorts = append(srv.AltPorts, cp)
@@ -273,27 +341,17 @@ func (s *Subscription) ValidateAndNormalize() error {
 			filtered := make([]int, 0, len(srv.AltPorts))
 			seen := make(map[int]bool)
 			for _, cp := range srv.AltPorts {
-				if cp > 0 && cp != mainPort && !seen[cp] {
+				if cp != mainPort && !seen[cp] {
 					seen[cp] = true
 					filtered = append(filtered, cp)
 				}
 			}
 			srv.AltPorts = filtered
 		}
-		// 若 IP 为空，尝试从 Host 或 Address 中提取有效 IPv4 自动补齐，杜绝空值
+		// 若 IP 为空，尝试从 Host 中提取有效 IPv4 自动补齐，杜绝空值
 		if srv.IP == "" {
-			hostCandidate := strings.TrimSpace(srv.Host)
-			if hostCandidate == "" && srv.Address != "" {
-				if h, _, err := net.SplitHostPort(strings.TrimSpace(srv.Address)); err == nil {
-					hostCandidate = h
-				} else {
-					hostCandidate = strings.TrimSpace(srv.Address)
-				}
-			}
-			if hostCandidate != "" {
-				if ip := net.ParseIP(hostCandidate); ip != nil && ip.To4() != nil {
-					srv.IP = ip.String()
-				}
+			if ip := net.ParseIP(srv.Host); ip != nil && ip.To4() != nil {
+				srv.IP = ip.String()
 			}
 		}
 		// 跨系统 ECH 与 ECHConfig 双向归一化，杜绝跨系统命名失配
@@ -302,7 +360,12 @@ func (s *Subscription) ValidateAndNormalize() error {
 		} else if srv.ECHConfig != "" && srv.ECH == "" {
 			srv.ECH = srv.ECHConfig
 		}
+		valid = append(valid, srv)
 	}
+	if len(valid) == 0 {
+		return fmt.Errorf("no valid servers in subscription: %w", firstErr)
+	}
+	s.Servers = valid
 	return nil
 }
 
@@ -328,6 +391,7 @@ type Applied struct {
 	ECHConfigs    map[string][]byte
 	IPs           map[string]string
 	AltPorts      map[string][]int
+	FromCache     bool // 订阅来自本地缓存而非本次成功拉取（见 Subscription.FromCache）
 }
 
 // ApplySubscription 将订阅转为拨号参数
@@ -344,6 +408,7 @@ func ApplySubscription(s *Subscription) (*Applied, error) {
 		ECHConfigs: make(map[string][]byte),
 		IPs:        make(map[string]string),
 		AltPorts:   make(map[string][]int),
+		FromCache:  s.FromCache,
 	}
 	var addrs []string
 	var validServers []ServerConfig
@@ -597,6 +662,7 @@ func probeCandidatePortsLadder(ctx context.Context, scheme, hostOnly, requestURI
 	defer staggerTicker.Stop()
 
 	var firstErr error
+	received := 0
 
 	for {
 		select {
@@ -612,6 +678,7 @@ func probeCandidatePortsLadder(ctx context.Context, scheme, hostOnly, requestURI
 			}
 
 		case res := <-resCh:
+			received++
 			if res.sub != nil {
 				return res.sub, res.body, res.port, nil
 			}
@@ -622,7 +689,9 @@ func probeCandidatePortsLadder(ctx context.Context, scheme, hostOnly, requestURI
 			if attemptIdx < len(candPorts) {
 				launchProbe(candPorts[attemptIdx])
 				attemptIdx++
-			} else if activeProbes.Load() == 0 {
+			} else if received >= attemptIdx {
+				// 每个已发射的探测恰好交回一个结果；不能用“活跃协程数为 0”判断——
+				// 协程在发出结果之后才递减计数，最后一个结果先到时会误判为还有探测在跑，白等到总超时。
 				if firstErr != nil {
 					return nil, nil, 0, fmt.Errorf("ladder probe exhausted across all candidate ports: %w", firstErr)
 				}
@@ -639,11 +708,15 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		return nil, errors.New("empty subscription URL")
 	}
 
-	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-		return nil, fmt.Errorf("invalid subscription URL scheme: %s (must be http:// or https://)", rawURL)
-	}
-
+	// C5 §1：只通过 https:// 获取订阅；错误信息不回显完整 URL（路径里含订阅标识）。
 	u, parseErr := url.Parse(rawURL)
+	if parseErr != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
+		scheme := "(none)"
+		if parseErr == nil && u.Scheme != "" {
+			scheme = u.Scheme + "://"
+		}
+		return nil, fmt.Errorf("invalid subscription URL: scheme %s is not allowed, only https:// with a host is accepted (C5 §1)", scheme)
+	}
 	isZeroPort := parseErr == nil && (u.Port() == "" || u.Port() == "443" || u.Port() == "80") && strings.HasPrefix(u.Path, "/sub/")
 
 	if isZeroPort {
@@ -664,7 +737,7 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 			cSub, cBody, cErr := fetchSingleSubURL(cachedCtx, cachedURL, opt)
 			cachedCancel()
 			if cErr == nil && cSub != nil && len(cSub.Servers) > 0 {
-				SaveLastBody(cBody)
+				SaveLastBody(rawURL, cBody)
 				return cSub, nil
 			}
 			// 缓存端口失效（可能服务端换端口），剔除该缓存项并继续正常探测
@@ -682,7 +755,7 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 
 		if err == nil && sub != nil && len(sub.Servers) > 0 {
 			SetCachedSubPort(hostOnly, 443)
-			SaveLastBody(body)
+			SaveLastBody(rawURL, body)
 			return sub, nil
 		}
 
@@ -690,26 +763,24 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		altSub, altBody, winPort, ladderErr := probeCandidatePortsLadder(ctx, scheme, hostOnly, u.RequestURI(), opt)
 		if ladderErr == nil && altSub != nil && len(altSub.Servers) > 0 {
 			SetCachedSubPort(hostOnly, winPort)
-			SaveLastBody(altBody)
+			SaveLastBody(rawURL, altBody)
 			return altSub, nil
 		}
 
 		// 4. 判定致命状态：403 明确拒绝（到期或超额）清理缓存
 		if err != nil && strings.Contains(err.Error(), "HTTP 403") {
-			ClearLastBody()
+			ClearLastBody(rawURL)
 			return nil, fmt.Errorf("subscription revoked or expired: %w", err)
 		}
 		if ladderErr != nil && strings.Contains(ladderErr.Error(), "HTTP 403") {
-			ClearLastBody()
+			ClearLastBody(rawURL)
 			return nil, fmt.Errorf("subscription revoked or expired: %w", ladderErr)
 		}
 
 		// 5. 尝试离线缓存兜底
 		if !opt.DisableCache {
-			if cached := LoadLastBody(); len(cached) > 0 {
-				if lastSub, perr := ParseSubscriptionBytes(cached); perr == nil && len(lastSub.Servers) > 0 {
-					return lastSub, nil
-				}
+			if lastSub := cachedSubscription(rawURL, ladderErr); lastSub != nil {
+				return lastSub, nil
 			}
 		}
 
@@ -722,23 +793,20 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 	// 显式非标端口订阅 URL：直接单目标请求，不触发阶梯并发探测
 	sub, body, err := fetchSingleSubURL(ctx, rawURL, opt)
 	if err == nil && sub != nil {
-		SaveLastBody(body)
+		SaveLastBody(rawURL, body)
 		return sub, nil
 	}
 
 	if err != nil && (strings.Contains(err.Error(), "HTTP 403") || strings.Contains(err.Error(), "HTTP 404")) {
-		ClearLastBody()
+		ClearLastBody(rawURL)
 		return nil, fmt.Errorf("subscription revoked or expired: %w", err)
 	}
 
 	// 主 URL 失败时，尝试故障漂移
 	if parseErr == nil && u.Path != "" && strings.HasPrefix(u.Path, "/sub/") {
-		if cached := LoadLastBody(); len(cached) > 0 {
+		if cached := LoadLastBody(rawURL); len(cached) > 0 {
 			if lastSub, perr := ParseSubscriptionBytes(cached); perr == nil && len(lastSub.Servers) > 0 {
-				scheme := u.Scheme
-				if scheme == "" {
-					scheme = "https"
-				}
+				scheme := "https"
 				for _, srv := range lastSub.Servers {
 					altAddr := srv.Address
 					if altAddr == "" || altAddr == u.Host {
@@ -746,7 +814,7 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 					}
 					altURL := fmt.Sprintf("%s://%s%s", scheme, altAddr, u.Path)
 					if altSub, altBody, altErr := fetchSingleSubURL(ctx, altURL, opt); altErr == nil && altSub != nil {
-						SaveLastBody(altBody)
+						SaveLastBody(rawURL, altBody)
 						return altSub, nil
 					}
 				}
@@ -755,20 +823,199 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 	}
 
 	if !opt.DisableCache {
-		if cached := LoadLastBody(); len(cached) > 0 {
-			if sub, perr := ParseSubscriptionBytes(cached); perr == nil {
-				return sub, nil
-			}
+		if lastSub := cachedSubscription(rawURL, err); lastSub != nil {
+			return lastSub, nil
 		}
 	}
 
 	return nil, fmt.Errorf("fetch subscription (all sources failed): %w", err)
 }
 
+// cachedSubscription 拉取失败后的离线兜底：读取该订阅 URL 自己的缓存，成功时返回带 FromCache 标记的订阅。
+// 调用方必须检查 FromCache（启动可用它连节点；token 刷新、401 刷新要把它视为失败）。
+func cachedSubscription(rawURL string, cause error) *Subscription {
+	cached := LoadLastBody(rawURL)
+	if len(cached) == 0 {
+		return nil
+	}
+	lastSub, err := ParseSubscriptionBytes(cached)
+	if err != nil || len(lastSub.Servers) == 0 {
+		return nil
+	}
+	lastSub.FromCache = true
+	log.Printf("[SUB] subscription fetch failed (%v); using the locally cached copy", cause)
+	return lastSub
+}
+
+// maxSubscriptionBodyBytes 订阅响应体上限（4 MiB）；超出报错且不写缓存。
+const maxSubscriptionBodyBytes = 4 << 20
+
+// maxSubRedirects 订阅拉取最多跟随的重定向次数。
+const maxSubRedirects = 3
+
+// 只给测试用的钩子（生产默认值即安全值）：
+//   - subAllowLoopbackForTest：放行回环地址（httptest 服务器在 127.0.0.1）；私网等其他地址仍然拒绝；
+//   - subRootCAsForTest：自签测试证书的根池；设置后仍做完整的证书与主机名校验，只是信任的根不同；
+//   - subLookupIPsForTest：替换主机名解析（测试 DNS 重绑定）。
+var (
+	subAllowLoopbackForTest atomic.Bool
+	subRootCAsForTest       atomic.Pointer[x509.CertPool]
+	subLookupIPsForTest     atomic.Pointer[func(ctx context.Context, host string) ([]net.IP, error)]
+)
+
+// subForbiddenIP 订阅请求不得到达的地址：回环、私网（10/8、172.16/12、192.168/16、fc00::/7）、
+// 链路本地、未指定、组播、CGNAT 100.64/10、0/8、基准测试段 198.18/15（TUN 的 fake-IP 池也在这里）。
+func subForbiddenIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() {
+		return !subAllowLoopbackForTest.Load()
+	}
+	if ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		switch {
+		case ip4[0] == 0:
+			return true
+		case ip4[0] == 100 && ip4[1]&0xC0 == 64: // 100.64.0.0/10
+			return true
+		case ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19): // 198.18.0.0/15
+			return true
+		}
+	}
+	return false
+}
+
+// subLookupIPs 解析订阅主机名：先走物理网卡的 DNS（避开 TUN 的 fake-IP），失败再退回系统解析器。
+func subLookupIPs(ctx context.Context, host string) ([]net.IP, error) {
+	if fn := subLookupIPsForTest.Load(); fn != nil {
+		return (*fn)(ctx, host)
+	}
+	if ip, err := resolvePhysicalIPv4(host); err == nil && ip != nil {
+		return []net.IP{ip}, nil
+	}
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	// IPv4 优先（物理拨号路径以 IPv4 为主）
+	var v4, v6 []net.IP
+	for _, a := range addrs {
+		if a.IP.To4() != nil {
+			v4 = append(v4, a.IP)
+		} else {
+			v6 = append(v6, a.IP)
+		}
+	}
+	return append(v4, v6...), nil
+}
+
+// subCheckRemote 连接建立后再核对对端地址（兜住 physicalDialerHook 等无法事先得知目标 IP 的路径）。
+func subCheckRemote(conn net.Conn) error {
+	if conn == nil {
+		return nil
+	}
+	var ip net.IP
+	switch a := conn.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		ip = a.IP
+	case *net.UDPAddr:
+		ip = a.IP
+	default:
+		return nil // 内存管道等没有 IP 的连接
+	}
+	if subForbiddenIP(ip) {
+		return fmt.Errorf("subscription to private or loopback IP %s is forbidden", ip)
+	}
+	return nil
+}
+
+func subDialChecked(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, err := DialPhysicalDirect(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	if cerr := subCheckRemote(conn); cerr != nil {
+		_ = conn.Close()
+		return nil, cerr
+	}
+	return conn, nil
+}
+
+// subDialContext 订阅拉取专用拨号：在解析之后、连接之前校验实际目标 IP，
+// 因此对重定向、DNS 重绑定同样有效；之后只拨已校验的 IP 字面量，不再让系统二次解析。
+func subDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("subscription dial: bad address %q: %w", addr, err)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if subForbiddenIP(ip) {
+			return nil, fmt.Errorf("subscription to private or loopback IP %s is forbidden", host)
+		}
+		return subDialChecked(ctx, network, addr)
+	}
+	if h := strings.TrimSuffix(strings.ToLower(host), "."); h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		if !subAllowLoopbackForTest.Load() {
+			return nil, fmt.Errorf("subscription to private or loopback host %s is forbidden", host)
+		}
+	}
+	if getPhysicalDialerHook() != nil {
+		// 钩子自己负责解析与连接；连接建立后核对对端地址
+		return subDialChecked(ctx, network, addr)
+	}
+	ips, err := subLookupIPs(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("subscription dial: resolve %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("subscription dial: resolve %s: no addresses", host)
+	}
+	// 任何一条记录落在禁区就整体拒绝：不给“公网+私网混合记录”留空子
+	for _, ip := range ips {
+		if subForbiddenIP(ip) {
+			return nil, fmt.Errorf("subscription host %s resolves to private or loopback IP %s: forbidden", host, ip)
+		}
+	}
+	const maxTries = 4
+	var lastErr error
+	for i, ip := range ips {
+		if i >= maxTries {
+			break
+		}
+		conn, derr := subDialChecked(ctx, network, net.JoinHostPort(ip.String(), port))
+		if derr == nil {
+			return conn, nil
+		}
+		lastErr = derr
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, lastErr
+}
+
+// subCheckRedirect 重定向只允许 https 目标、最多 maxSubRedirects 次。
+func subCheckRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > maxSubRedirects {
+		return fmt.Errorf("subscription redirected more than %d times", maxSubRedirects)
+	}
+	if !strings.EqualFold(req.URL.Scheme, "https") {
+		return fmt.Errorf("subscription redirect to non-https scheme %q is forbidden", req.URL.Scheme)
+	}
+	return nil
+}
+
 func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOptions) (*Subscription, []byte, error) {
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, nil, err
+	}
+	if !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
+		return nil, nil, errors.New("subscription URL must use https:// with a host (C5 §1)")
 	}
 
 	q := u.Query()
@@ -795,31 +1042,22 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 	req.Header.Set("User-Agent", "AeroClient/2.0")
 
 	tr := &http.Transport{
-		Proxy: nil,
-		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err == nil {
-				if parsedIP := net.ParseIP(host); parsedIP != nil {
-					if isLocalOrPrivateIP(host, parsedIP) {
-						return nil, fmt.Errorf("subscription to private or loopback IP %s is forbidden", host)
-					}
-				} else if getPhysicalDialerHook() == nil {
-					if ip, rerr := resolvePhysicalIPv4(host); rerr == nil && ip != nil {
-						addr = net.JoinHostPort(ip.String(), port)
-					}
-				}
-			}
-			return DialPhysicalDirect(c, network, addr)
-		},
+		Proxy:                 nil,
+		DialContext:           subDialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          10,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	if pool := subRootCAsForTest.Load(); pool != nil {
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool}
+	}
+	defer tr.CloseIdleConnections() // 每次拉取新建 Transport，结束时关闭空闲连接，避免泄漏
 	client := &http.Client{
-		Transport: tr,
-		Timeout:   timeout,
+		Transport:     tr,
+		Timeout:       timeout,
+		CheckRedirect: subCheckRedirect,
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -831,7 +1069,7 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 		var errBody struct {
 			Error string `json:"error"`
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&errBody)
 		if errBody.Error == "TIER1_AI_NODES_EXHAUSTED" {
 			return nil, nil, ErrTier1AIExhausted
 		}
@@ -848,9 +1086,12 @@ func fetchSingleSubURL(ctx context.Context, targetURL string, opt SubFetchOption
 		return nil, nil, fmt.Errorf("subscription HTTP status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBodyBytes+1))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read subscription body failed: %w", err)
+	}
+	if len(body) > maxSubscriptionBodyBytes {
+		return nil, nil, fmt.Errorf("subscription body exceeds %d bytes", maxSubscriptionBodyBytes)
 	}
 
 	sub, err := ParseSubscriptionBytes(body)
@@ -888,24 +1129,75 @@ func ParseSubscriptionBytes(data []byte) (*Subscription, error) {
 
 var lastBodyMu sync.RWMutex
 
-// SaveLastBody 本地保存最后一次成功拉取的有效订阅
-func SaveLastBody(body []byte) {
+// lastBodyPath 返回某个订阅 URL 的缓存文件路径：客户端数据目录下 .last-sub-<SHA-256 前 16 位十六进制>。
+// 文件名不含 URL/token 明文；不同订阅各用各的文件，换订阅不会回退到上一个订阅的节点。
+func lastBodyPath(subURL string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(subURL)))
+	dir := GetDataDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, ".last-sub-"+hex.EncodeToString(sum[:8]))
+}
+
+// writeFileAtomic 先写同目录临时文件再 rename 替换，崩溃时只会看到旧文件或新文件，不会是半个文件。
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".last-sub-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
+}
+
+// SaveLastBody 本地保存该订阅 URL 最后一次成功拉取的有效订阅（0600，原子替换）。写失败只记录日志，不影响本次使用。
+func SaveLastBody(subURL string, body []byte) {
 	if len(body) == 0 {
 		return
 	}
 	lastBodyMu.Lock()
 	defer lastBodyMu.Unlock()
-	p := lastBodyPath()
-	if p != "" {
-		_ = os.WriteFile(p, body, 0o600)
+	p := lastBodyPath(subURL)
+	if p == "" {
+		log.Printf("[SUB] cannot cache subscription: no data directory")
+		return
+	}
+	if err := writeFileAtomic(p, body); err != nil {
+		log.Printf("[SUB] cannot cache subscription to %s: %v", filepath.Dir(p), err)
 	}
 }
 
-// LoadLastBody 加载本地订阅缓存
-func LoadLastBody() []byte {
+// LoadLastBody 加载该订阅 URL 的本地缓存
+func LoadLastBody(subURL string) []byte {
 	lastBodyMu.RLock()
 	defer lastBodyMu.RUnlock()
-	p := lastBodyPath()
+	p := lastBodyPath(subURL)
 	if p == "" {
 		return nil
 	}
@@ -916,22 +1208,13 @@ func LoadLastBody() []byte {
 	return b
 }
 
-// ClearLastBody 清理本地订阅缓存
-func ClearLastBody() {
+// ClearLastBody 清理该订阅 URL 的本地缓存
+func ClearLastBody(subURL string) {
 	lastBodyMu.Lock()
 	defer lastBodyMu.Unlock()
-	p := lastBodyPath()
-	if p != "" {
-		_ = os.Remove(p)
+	if p := lastBodyPath(subURL); p != "" {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("[SUB] cannot remove cached subscription: %v", err)
+		}
 	}
-}
-
-func lastBodyPath() string {
-	if exe, err := os.Executable(); err == nil {
-		return filepath.Join(filepath.Dir(exe), ".last-sub-body")
-	}
-	if wd, err := os.Getwd(); err == nil {
-		return filepath.Join(wd, ".last-sub-body")
-	}
-	return ""
 }

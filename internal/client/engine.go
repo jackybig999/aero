@@ -144,6 +144,8 @@ type Engine struct {
 	mixedStarting     bool
 	killSwitch        atomic.Bool
 	sentinel          *nodeSentinel
+	nodeGen           uint64                            // 活动节点代数（e.mu 保护）：每次提交节点切换自增；锁外解析后据此判断状态是否被改过
+	resolveIPv4       func(host string) (net.IP, error) // 节点主机名解析；nil 时用 resolvePhysicalIPv4（测试可注入）
 	packetConnFactory PacketConnFactory
 	daemonCtx         context.Context
 	daemonCancel      context.CancelFunc
@@ -408,8 +410,14 @@ func (e *Engine) KillSwitch() bool {
 	return e.killSwitch.Load()
 }
 
+// errNodeSwitchSuperseded 表示锁外解析期间节点状态已被其他调用改动，本次切换结果被放弃。
+var errNodeSwitchSuperseded = errors.New("active node changed during resolve; switch abandoned")
+
 // Apply 应用已解析好的订阅配置
-// 核心规则：若首节点 host:port 与当前激活节点相同，短路返回，严禁调用 Reset()！
+// 规则：当前活动节点仍在新订阅中时，只就地刷新它的 token/SNI/IP/钉扎，不切换、不排空会话（订阅刷新
+// 不得打断隧道，也不得覆盖哨兵 failover 或用户手动选择的节点）；只有活动节点已不在订阅中（或尚无活动节点）
+// 才切换，且按订阅顺序优先选不在冷却名单中的节点。严禁调用 Reset()！
+// 调用 switchActiveNodeLocked 时可能临时释放并重新获取 e.mu（见该函数注释）。
 func (e *Engine) Apply(applied *Applied) error {
 	if applied == nil || len(applied.Servers) == 0 {
 		return fmt.Errorf("empty applied subscription")
@@ -425,29 +433,107 @@ func (e *Engine) Apply(applied *Applied) error {
 		AddPins(applied.AllPins...)
 	}
 
-	primary := applied.Servers[0]
-	SetActiveEdgePinSPKI(primary.PinSPKI)
 	defer e.kickTokenRefresh()
-	if e.activeAddr == primary.Address {
-		// 同一节点：只更新凭证（含刷新后的签名 token），下次启动与重连使用新值
-		e.activeToken, e.activeSNI = primary.Token, primary.SNI
-		// host:port 严格一致，短路返回，绝对不调用 Reset()！
-		var ech []byte
-		if applied.ECHConfigs != nil {
-			if c, ok := applied.ECHConfigs[primary.Address]; ok && len(c) > 0 {
-				ech = c
-			}
-		}
-		_, _, _, curIP := getActiveEdge()
-		if len(ech) > 0 {
-			SetActiveEdge(primary.Address, primary.Token, primary.SNI, curIP, ech)
-		} else {
-			SetActiveEdge(primary.Address, primary.Token, primary.SNI, curIP)
-		}
+	if cur, ok := findActiveServer(applied, e.activeAddr); ok {
+		e.refreshActiveNodeLocked(applied, cur)
 		return nil
 	}
 
-	return e.switchActiveNodeLocked(primary.Address, primary.Token, primary.SNI)
+	target := applied.Servers[0]
+	for _, srv := range applied.Servers {
+		if srv.Address != "" && !e.nodeUnavailable(srv.Address) {
+			target = srv
+			break
+		}
+	}
+	if err := e.switchActiveNodeLocked(target.Address, target.Token, target.SNI); err != nil && !errors.Is(err, errNodeSwitchSuperseded) {
+		return err
+	}
+	return nil
+}
+
+// findActiveServer 在订阅中查找当前活动节点：先按 host:port 精确匹配，再按主机名匹配
+// （多端口跳频后活动地址的端口可能与订阅里的不同）。
+func findActiveServer(applied *Applied, activeAddr string) (ServerConfig, bool) {
+	if activeAddr == "" {
+		return ServerConfig{}, false
+	}
+	for _, srv := range applied.Servers {
+		if srv.Address == activeAddr {
+			return srv, true
+		}
+	}
+	host, _, err := net.SplitHostPort(activeAddr)
+	if err != nil || host == "" {
+		return ServerConfig{}, false
+	}
+	for _, srv := range applied.Servers {
+		if h, _, _ := net.SplitHostPort(srv.Address); h == host {
+			return srv, true
+		}
+	}
+	return ServerConfig{}, false
+}
+
+// lookupAppliedIPLocked 从订阅的 IPs 取节点 IPv4（先精确地址，再同主机名）；没有则返回 nil，不做网络解析。
+func lookupAppliedIPLocked(applied *Applied, addr string) net.IP {
+	if applied == nil || applied.IPs == nil {
+		return nil
+	}
+	if ipStr, ok := applied.IPs[addr]; ok && ipStr != "" {
+		if parsed := net.ParseIP(ipStr); parsed != nil {
+			if ip4 := parsed.To4(); ip4 != nil {
+				return ip4
+			}
+		}
+	}
+	host, _, _ := net.SplitHostPort(addr)
+	for a, ipStr := range applied.IPs {
+		if h, _, _ := net.SplitHostPort(a); h == host && ipStr != "" {
+			if parsed := net.ParseIP(ipStr); parsed != nil {
+				return parsed.To4()
+			}
+		}
+	}
+	return nil
+}
+
+// refreshActiveNodeLocked 就地刷新活动节点的凭证（含刷新后的签名 token）与 IP；调用方持 e.mu 写锁。
+// 不切换、不排空：已有会话继续使用旧值，下次启动与重连使用新值。
+func (e *Engine) refreshActiveNodeLocked(applied *Applied, srv ServerConfig) {
+	addr := e.activeAddr
+	e.activeToken, e.activeSNI = srv.Token, srv.SNI
+	SetActiveEdgePinSPKI(srv.PinSPKI)
+
+	var ech []byte
+	if applied.ECHConfigs != nil {
+		if c, ok := applied.ECHConfigs[addr]; ok && len(c) > 0 {
+			ech = c
+		} else if c, ok := applied.ECHConfigs[srv.Address]; ok && len(c) > 0 {
+			ech = c
+		}
+	}
+	_, _, _, curIP := getActiveEdge()
+	newIP := curIP
+	if ip := lookupAppliedIPLocked(applied, addr); ip != nil {
+		newIP = ip
+	}
+	if len(ech) > 0 {
+		SetActiveEdge(addr, srv.Token, srv.SNI, newIP, ech)
+	} else {
+		SetActiveEdge(addr, srv.Token, srv.SNI, newIP)
+	}
+	if newIP != nil && !newIP.Equal(curIP) {
+		// 节点 IP 变化：新旧 IP 都需要走物理网卡（现有会话仍连旧 IP，直到断线重连用新 IP）。
+		// 不在 e.mu 内执行：refreshTunRoutes 自行加锁。
+		if host, _, err := net.SplitHostPort(addr); err == nil && e.dnsHandler != nil && host != "" {
+			e.dnsHandler.SetEdge(host, newIP)
+			e.dnsHandler.Flush()
+		}
+		if e.mode == "tun" && e.running.Load() {
+			go e.refreshTunRoutes(newIP, curIP)
+		}
+	}
 }
 
 // LoadAndApplySubscription 从远程 URL 加载并应用订阅，挂载 singleflight 阻断重入
@@ -595,6 +681,11 @@ func resolvePhysicalIPv4(host string) (net.IP, error) {
 	return nil, fmt.Errorf("no valid public IPv4 address found for %s", host)
 }
 
+// switchActiveNodeLocked 切换活动节点；调用方持 e.mu 写锁。
+// 节点 IP 只能经网络解析得到时（最坏阻塞约 6 秒），本函数会临时释放 e.mu，在锁外解析，再重新获取并复核
+// （节点代数、订阅、活动地址均未变）后提交；复核失败返回 errNodeSwitchSuperseded，放弃本次结果。
+// 因此调用方不得假定调用前后 e.mu 保护的状态不变，且调用后不能依赖调用前读到的值。
+// 锁顺序不变：lifecycleMu → e.mu；解析期间不持有任何引擎锁。
 func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err == nil && net.ParseIP(host) == nil && host != "" {
@@ -604,30 +695,32 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	_, _, _, oldIP := getActiveEdge()
 	newHost, _, _ := net.SplitHostPort(addr)
 
-	var newIP net.IP
-	if e.appliedSub != nil && e.appliedSub.IPs != nil {
-		if ipStr, ok := e.appliedSub.IPs[addr]; ok && ipStr != "" {
-			if parsed := net.ParseIP(ipStr); parsed != nil {
-				newIP = parsed.To4()
-			}
-		}
-		if newIP == nil {
-			for a, ipStr := range e.appliedSub.IPs {
-				if h, _, _ := net.SplitHostPort(a); h == newHost && ipStr != "" {
-					if parsed := net.ParseIP(ipStr); parsed != nil {
-						newIP = parsed.To4()
-						break
-					}
-				}
-			}
-		}
-	}
-	if newIP == nil && newHost != "" {
+	newIP := lookupAppliedIPLocked(e.appliedSub, addr)
+	if newIP == nil && net.ParseIP(newHost) != nil {
+		// IP 字面量无需网络，直接转换
 		ip, rerr := resolvePhysicalIPv4(newHost)
 		if rerr != nil {
 			return fmt.Errorf("resolve active node %s: %w", newHost, rerr)
 		}
 		newIP = ip
+	}
+	if newIP == nil && newHost != "" {
+		gen, sub, prevAddr := e.nodeGen, e.appliedSub, e.activeAddr
+		resolve := e.resolveIPv4
+		if resolve == nil {
+			resolve = resolvePhysicalIPv4
+		}
+		e.mu.Unlock()
+		ip, rerr := resolve(newHost)
+		e.mu.Lock()
+		if e.nodeGen != gen || e.appliedSub != sub || e.activeAddr != prevAddr || e.closed.Load() {
+			return errNodeSwitchSuperseded
+		}
+		if rerr != nil {
+			return fmt.Errorf("resolve active node %s: %w", newHost, rerr)
+		}
+		newIP = ip
+		_, _, _, oldIP = getActiveEdge()
 	}
 	if newIP != nil && e.mode == "tun" && e.running.Load() {
 		// 新旧节点都走物理网卡：旧会话在 20 秒排空期内仍在使用旧节点（见下方 Drain）。
@@ -661,6 +754,7 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 	}
 	SetActiveEdgePinSPKI(nodePins)
 
+	e.nodeGen++
 	e.activeAddr = addr
 	e.activeToken = tok
 	e.activeSNI = sni
@@ -685,6 +779,7 @@ func (e *Engine) switchActiveNodeLocked(addr, tok, sni string) error {
 
 	if e.dnsHandler != nil && newHost != "" && newIP != nil {
 		e.dnsHandler.SetEdge(newHost, newIP)
+		e.dnsHandler.Flush()
 	}
 
 	// 平滑软切线（Graceful Draining）：
@@ -909,6 +1004,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	}
 	if e.dnsHandler != nil {
 		e.dnsHandler.SetEdge(host, ip)
+		e.dnsHandler.Flush()
 	}
 
 	select {
@@ -1152,6 +1248,7 @@ func (e *Engine) onNetworkChange(newGW, ifName string) {
 	// 4. 更新物理 DNS (固定设为 223.5.5.5:53)
 	if e.dnsHandler != nil {
 		e.dnsHandler.SetPhysicalDNS("223.5.5.5:53")
+		e.dnsHandler.Flush()
 	}
 
 	// 5. 异步预热新网络接口上的 QUIC 拨号

@@ -294,9 +294,9 @@ func TestLoadAndApplySubscriptionWithISP(t *testing.T) {
 	subObj := &Subscription{
 		Version: "aero/3.0",
 		Servers: []ServerConfig{
-			{Name: "Node-CT", Address: "192.0.2.1:443", Token: "tok_ct", ISPAffinity: "CT"},
-			{Name: "Node-CU", Address: "192.0.2.2:443", Token: "tok_cu", ISPAffinity: "CU"},
-			{Name: "Node-CM", Address: "192.0.2.3:443", Token: "tok_cm", ISPAffinity: "CM"},
+			{Name: "Node-CT", Address: "192.0.2.1:443", Token: "tok_ct", SNI: "ct.example.com", Protocol: "connect-ip", ISPAffinity: "CT"},
+			{Name: "Node-CU", Address: "192.0.2.2:443", Token: "tok_cu", SNI: "cu.example.com", Protocol: "connect-ip", ISPAffinity: "CU"},
+			{Name: "Node-CM", Address: "192.0.2.3:443", Token: "tok_cm", SNI: "cm.example.com", Protocol: "connect-ip", ISPAffinity: "CM"},
 		},
 	}
 	b64, err := subObj.ToBase64()
@@ -308,11 +308,10 @@ func TestLoadAndApplySubscriptionWithISP(t *testing.T) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = fmt.Fprint(w, b64)
 	})
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
 	eng := NewEngine()
-	subURL := "http://sub.example.com/sub/superadmin"
+	subURL := "https://sub.example.com/sub/superadmin"
 	applied, err := eng.LoadAndApplySubscription(subURL)
 	if err != nil {
 		t.Fatalf("LoadAndApplySubscription failed: %v", err)

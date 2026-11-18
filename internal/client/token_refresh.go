@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,15 +14,27 @@ import (
 // 既有重连逻辑以新 token 重建 CONNECT-IP；edge 按 uid 租约分配地址，隧道地址不变。
 
 var (
-	tokenRefreshMinRetry = 30 * time.Second
-	tokenRefreshMaxRetry = 10 * time.Minute
-	tokenRefreshIdle     = 10 * time.Minute // 没有签名 token 时的复查间隔
+	tokenRefreshIdle = 10 * time.Minute // 没有签名 token 时的复查间隔
 	// tokenRefreshMaxWait：计时器按单调时钟计时，系统休眠期间不走；每次最多等这么久就按实际时间重新判断，
 	// 避免休眠一夜醒来后仍用过期 token。
 	tokenRefreshMaxWait    = 5 * time.Minute
 	authRefreshMinInterval = time.Minute // 因 401 强制刷新订阅的最小间隔
 	tokenRefreshNow        = time.Now
 )
+
+// 刷新失败后的退避下限与上限（纳秒）。用原子量，测试可在引擎协程运行时安全地缩短。
+var (
+	tokenRefreshMinRetryNs atomic.Int64
+	tokenRefreshMaxRetryNs atomic.Int64
+)
+
+func init() {
+	tokenRefreshMinRetryNs.Store(int64(30 * time.Second))
+	tokenRefreshMaxRetryNs.Store(int64(10 * time.Minute))
+}
+
+func tokenRefreshMinRetry() time.Duration { return time.Duration(tokenRefreshMinRetryNs.Load()) }
+func tokenRefreshMaxRetry() time.Duration { return time.Duration(tokenRefreshMaxRetryNs.Load()) }
 
 // tokenLifetime 读取 aero1 token 的签发与到期时间；非签名 token 或格式错误时 ok=false。
 func tokenLifetime(tok string) (iat, exp time.Time, ok bool) {
@@ -67,7 +80,7 @@ func (e *Engine) kickTokenRefresh() {
 
 // runTokenRefresher 随 daemonCtx 运行到引擎关闭。
 func (e *Engine) runTokenRefresher() {
-	retry := tokenRefreshMinRetry
+	retry := tokenRefreshMinRetry()
 	for {
 		_, tok, _, _ := getActiveEdge()
 		e.mu.RLock()
@@ -86,30 +99,57 @@ func (e *Engine) runTokenRefresher() {
 			return
 		case <-e.tokenRefreshKick:
 			timer.Stop()
-			retry = tokenRefreshMinRetry
+			retry = tokenRefreshMinRetry()
 			continue
 		case <-timer.C:
 		}
 		if !signed || src == "" || tokenRefreshNow().Before(at) {
 			continue // 尚未到刷新时刻（等待被截断为 tokenRefreshMaxWait）
 		}
-		if _, err := e.LoadAndApplySubscription(src); err != nil {
-			log.Printf("[TOKEN] refresh failed: %v; retry in %v", err, retry)
+		applied, err := e.LoadAndApplySubscription(src)
+		// Apply 会 kick 本协程；那是自己引起的，不是新订阅。不清掉的话下一轮会重置退避并立刻重拉（空转）。
+		e.drainTokenRefreshKick()
+		_, newTok, _, _ := getActiveEdge()
+		var failure string
+		switch {
+		case err != nil:
+			failure = err.Error()
+		case applied != nil && applied.FromCache:
+			failure = "subscription service unreachable, only the cached copy is available" // 缓存里的 token 不是新签发的
+		case newTok == tok:
+			failure = "subscription still carries the old token"
+		}
+		if failure != "" {
+			// 失败、来自缓存、token 未变都按退避重试，且不重置 retry；否则离线或订阅服务 5xx 时会空转。
+			log.Printf("[TOKEN] refresh failed: %s; retry in %v", failure, retry)
+			backoff := time.NewTimer(retry)
 			select {
 			case <-e.daemonCtx.Done():
+				backoff.Stop()
 				return
-			case <-time.After(retry):
+			case <-e.tokenRefreshKick:
+				// 退避期间有新的订阅被应用（自己的 kick 已在上面清掉）：重置退避，立即按新状态重试
+				backoff.Stop()
+				retry = tokenRefreshMinRetry()
+				continue
+			case <-backoff.C:
 			}
-			retry = min(retry*2, tokenRefreshMaxRetry)
+			retry = min(retry*2, tokenRefreshMaxRetry())
 			continue
 		}
-		retry = tokenRefreshMinRetry
-		if _, newTok, _, _ := getActiveEdge(); newTok != tok {
-			log.Printf("[TOKEN] refreshed; rotating session to the new token")
-			if e.sessionMgr != nil {
-				e.sessionMgr.Reset() // 先关旧连接再以新 token 重建，edge 按 uid 归还同一隧道地址
-			}
+		retry = tokenRefreshMinRetry()
+		log.Printf("[TOKEN] refreshed; rotating session to the new token")
+		if e.sessionMgr != nil {
+			e.sessionMgr.Reset() // 先关旧连接再以新 token 重建，edge 按 uid 归还同一隧道地址
 		}
+	}
+}
+
+// drainTokenRefreshKick 丢弃挂起的 kick（刷新协程自己的 Apply 产生的）。
+func (e *Engine) drainTokenRefreshKick() {
+	select {
+	case <-e.tokenRefreshKick:
+	default:
 	}
 }
 
@@ -132,8 +172,16 @@ func (e *Engine) refreshAfterAuthFailure() {
 	}
 	go func() {
 		_, oldTok, _, _ := getActiveEdge()
-		if _, err := e.LoadAndApplySubscription(src); err != nil {
+		applied, err := e.LoadAndApplySubscription(src)
+		if err != nil {
 			log.Printf("[TOKEN] refresh after authentication failure failed: %v", err)
+			return
+		}
+		if applied != nil && applied.FromCache {
+			// 拿到的是缓存（订阅服务不可达），不能据此判断 token 是否被吊销，也不是新签发的 token；
+			// 缓存的 Apply 产生的 kick 也不是新订阅，清掉以免刷新协程跳过退避立刻重拉。
+			e.drainTokenRefreshKick()
+			log.Printf("[TOKEN] refresh after authentication failure failed: subscription service unreachable, only the cached copy is available")
 			return
 		}
 		if _, newTok, _, _ := getActiveEdge(); newTok != oldTok {

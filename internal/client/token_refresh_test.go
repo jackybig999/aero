@@ -43,16 +43,15 @@ func TestTokenRefresherRotatesToNewToken(t *testing.T) {
 	var fetches atomic.Int32
 	ClearCachedSubPorts()
 	defer ClearCachedSubPorts()
-	SetPhysicalDialerHook(newInMemHTTPDialer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	useSubHTTPS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fetches.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"version":"aero/3.0","servers":[{"name":"n1","address":"198.51.100.7:443","ip":"198.51.100.7","token":%q,"sni":"n1.example.com","protocol":"connect-ip"}]}`, current.Load().(string))
-	})))
-	defer SetPhysicalDialerHook(nil)
+		fmt.Fprintf(w, `{"version":"aero/3.0","servers":[{"name":"n1","host":"198.51.100.7","address":"198.51.100.7:443","ip":"198.51.100.7","token":%q,"sni":"n1.example.com","protocol":"connect-ip"}]}`, current.Load().(string))
+	}))
 
 	eng := NewEngine()
 	defer eng.Close()
-	if _, err := eng.LoadAndApplySubscription("http://sub.aero.test/sub/x"); err != nil {
+	if _, err := eng.LoadAndApplySubscription("https://sub.aero.test/sub/x"); err != nil {
 		t.Fatalf("initial load: %v", err)
 	}
 	if _, tok, _, _ := getActiveEdge(); tok != oldTok {

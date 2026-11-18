@@ -348,11 +348,29 @@ func (s *Session) IsAlive() bool {
 
 const maxDrainingSessions = 2
 
+// sessionDialTimeout 是单次会话拨号的总时限。拨号与发起调用方的 ctx 解耦（调用方可能只有 DoH 的 2.5 秒），
+// 因此需要独立时限；取值需大于 DefaultTransportConfig 的握手超时（10 秒）并留出 alt_ports 阶梯的余量。
+const sessionDialTimeout = 15 * time.Second
+
+// errSessionDialAbandoned 表示在途拨号因 Reset 被放弃：其结果被丢弃并关闭，等待方得到该错误。
+var errSessionDialAbandoned = errors.New("session dial abandoned by reset")
+
+// sessionDial 是一次在途拨号。done 在拨号结束（或被 Reset/SetSession 放弃）时关闭；
+// sess/err/abandoned/finished 只在 SessionManager.mu 持有时写入，且都先于 close(done)，
+// 等待方在 <-done 之后读取 sess/err 是安全的。
+type sessionDial struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	sess      *Session
+	err       error
+	abandoned bool // 已被 Reset/SetSession 放弃：拨号协程返回后必须关闭其结果，不得采用
+	finished  bool // done 已关闭（保证只关闭一次）
+}
+
 // SessionManager manages active Session lifecycle, supporting dial, get, and reset.
 type SessionManager struct {
 	mu               sync.Mutex
-	cond             *sync.Cond
-	dialing          bool
+	dial             *sessionDial // 在途拨号（单飞）；nil 表示没有拨号
 	currentSession   *Session
 	dialHook         func(ctx context.Context) (*Session, error)
 	drainingMu       sync.Mutex
@@ -369,9 +387,7 @@ func (m *SessionManager) SetAuthFailureHook(f func()) {
 
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager() *SessionManager {
-	m := &SessionManager{}
-	m.cond = sync.NewCond(&m.mu)
-	return m
+	return &SessionManager{}
 }
 
 // SetDialHook sets a custom session dialer (primarily for testing).
@@ -381,7 +397,21 @@ func (m *SessionManager) SetDialHook(hook func(ctx context.Context) (*Session, e
 	m.dialHook = hook
 }
 
+// finishDialLocked 结束一次拨号并唤醒全部等待方；重复调用无副作用。调用方必须持有 m.mu。
+func (m *SessionManager) finishDialLocked(d *sessionDial, sess *Session, err error) {
+	if d.finished {
+		return
+	}
+	d.finished = true
+	d.sess, d.err = sess, err
+	if m.dial == d {
+		m.dial = nil
+	}
+	close(d.done)
+}
+
 // SetSession injects an active session directly into the SessionManager.
+// 若此时有在途拨号，注入的会话优先：拨号被放弃（结果会被关闭），等待方直接拿到注入的会话。
 func (m *SessionManager) SetSession(s *Session) {
 	if m == nil {
 		return
@@ -395,124 +425,166 @@ func (m *SessionManager) SetSession(s *Session) {
 		s.onAuthFailure = m.authFailureHook
 	}
 	m.currentSession = s
-	if m.cond != nil {
-		m.cond.Broadcast()
+	if s != nil && m.dial != nil {
+		d := m.dial
+		d.abandoned = true
+		d.cancel()
+		m.finishDialLocked(d, s, nil)
 	}
 }
 
 // GetSession returns the active session or creates a new one.
+//
+// 拨号单飞：同一时间只有一个拨号，由独立协程执行，使用与调用方无关的 ctx（见 sessionDialTimeout）。
+// 每个调用方（包括发起者）都只按自己的 ctx 等待拨号结束：ctx 取消立即返回 ctx.Err()，
+// 不影响拨号继续进行，也不影响其他等待方。
 func (m *SessionManager) GetSession(ctx context.Context) (*Session, error) {
 	m.mu.Lock()
-	for {
-		if m.currentSession != nil && m.currentSession.IsAlive() && !m.currentSession.IsDraining() {
-			sess := m.currentSession
-			m.mu.Unlock()
-			return sess, nil
-		}
-		if m.dialing {
-			if m.cond == nil {
-				m.cond = sync.NewCond(&m.mu)
-			}
-			m.cond.Wait()
-			continue
-		}
-		m.dialing = true
-		break
+	if m.currentSession != nil && m.currentSession.IsAlive() && !m.currentSession.IsDraining() {
+		sess := m.currentSession
+		m.mu.Unlock()
+		return sess, nil
 	}
-
-	if m.dialHook != nil {
-		hook := m.dialHook
+	if err := ctx.Err(); err != nil {
 		m.mu.Unlock()
-		sess, err := hook(ctx)
-		m.mu.Lock()
-		m.dialing = false
-		if err == nil {
-			if m.currentSession != nil && !m.currentSession.IsDraining() {
-				_ = m.currentSession.Close()
-			}
-			m.currentSession = sess
-		}
-		if m.cond != nil {
-			m.cond.Broadcast()
-		}
-		m.mu.Unlock()
-		return sess, err
+		return nil, err
+	}
+	d := m.dial
+	if d == nil {
+		d = m.startDialLocked(ctx)
 	}
 	m.mu.Unlock()
 
-	addr, tok, sni, ip := getActiveEdge()
-	var newSess *Session
-	var dialErr error
+	select {
+	case <-d.done:
+		return d.sess, d.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
-	if addr == "" {
-		dialErr = errors.New("no active edge address configured")
-	} else {
-		cfg := DefaultTransportConfig(addr, sni)
-		if ech := getActiveEdgeECH(); len(ech) > 0 {
-			cfg.ECHConfigList = ech
-		}
-		if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
-			cfg.AltPorts = altPorts
-		}
-		if pins := getActivePinSPKI(); len(pins) > 0 {
-			if cfg.TLSConfig == nil {
-				nodeHost := addr
-				if h, _, err := net.SplitHostPort(addr); err == nil {
-					nodeHost = h
-				}
-				cfg.TLSConfig = defaultTLSConfig(cfg.TLSServerName, nodeHost)
-			}
-			configureSPKIPinning(cfg.TLSConfig, pins)
-		}
-		port := 443
-		if _, portStr, err := net.SplitHostPort(addr); err == nil {
-			if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
-				port = p
-			}
-		}
-		if ip != nil {
-			cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
-		}
-
-		client, err := Dial(ctx, cfg)
-		if err != nil {
-			dialErr = fmt.Errorf("dial edge session: %w", err)
+// startDialLocked 启动拨号协程并登记为在途拨号。调用方必须持有 m.mu。
+// 拨号 ctx 保留调用方 ctx 的 value，但脱离其取消与截止时间；Reset 会取消它。
+func (m *SessionManager) startDialLocked(callerCtx context.Context) *sessionDial {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(callerCtx), sessionDialTimeout)
+	d := &sessionDial{done: make(chan struct{}), cancel: cancel}
+	m.dial = d
+	hook := m.dialHook
+	go func() {
+		defer cancel()
+		var (
+			sess    *Session
+			adopted func()
+			err     error
+		)
+		if hook != nil {
+			sess, err = hook(dctx)
 		} else {
-			if client.ActualPort() > 0 && client.ActualPort() != port {
-				h, _, _ := net.SplitHostPort(addr)
-				addr = net.JoinHostPort(h, strconv.Itoa(client.ActualPort()))
-				if len(cfg.ECHConfigList) > 0 {
-					SetActiveEdge(addr, tok, sni, ip, cfg.ECHConfigList)
-				} else {
-					SetActiveEdge(addr, tok, sni, ip)
-				}
-			}
-
-			newSess, dialErr = NewSession(client, tok, addr, sni)
-			if dialErr != nil {
-				_ = client.Close()
-			}
+			sess, adopted, err = dialActiveEdgeSession(dctx)
 		}
+		m.completeDial(d, sess, adopted, err)
+	}()
+	return d
+}
+
+// completeDial 在拨号协程内提交结果：已被放弃则关闭结果、不采用；否则替换当前会话。
+// adopted（可选）在结果被采用后调用，用于把拨号中发现的实际端口写回活动 edge。
+func (m *SessionManager) completeDial(d *sessionDial, sess *Session, adopted func(), err error) {
+	if err == nil && sess == nil {
+		err = errors.New("dial returned no session")
 	}
 
 	m.mu.Lock()
-	m.dialing = false
-	if dialErr == nil && newSess != nil {
-		if m.currentSession != nil && !m.currentSession.IsDraining() {
-			_ = m.currentSession.Close()
+	if d.abandoned {
+		// Reset/SetSession 已放弃本次拨号并唤醒了等待方；旧拨号的会话不得装回。
+		m.mu.Unlock()
+		if sess != nil {
+			_ = sess.Close()
 		}
-		newSess.onAuthFailure = m.authFailureHook
-		m.currentSession = newSess
+		return
 	}
-	if m.cond != nil {
-		m.cond.Broadcast()
+	var old *Session
+	if err == nil {
+		if m.currentSession != nil && !m.currentSession.IsDraining() && m.currentSession != sess {
+			old = m.currentSession
+		}
+		if sess.onAuthFailure == nil {
+			sess.onAuthFailure = m.authFailureHook
+		}
+		m.currentSession = sess
+	} else {
+		sess = nil
 	}
+	m.finishDialLocked(d, sess, err)
 	m.mu.Unlock()
 
-	if dialErr != nil {
-		return nil, dialErr
+	if old != nil {
+		_ = old.Close()
 	}
-	return newSess, nil
+	if err == nil && adopted != nil {
+		adopted()
+	}
+}
+
+// dialActiveEdgeSession 按当前活动 edge 配置建立新会话。返回的 adopted（可选）只应在会话被采用后调用。
+func dialActiveEdgeSession(ctx context.Context) (*Session, func(), error) {
+	addr, tok, sni, ip := getActiveEdge()
+	if addr == "" {
+		return nil, nil, errors.New("no active edge address configured")
+	}
+	cfg := DefaultTransportConfig(addr, sni)
+	if ech := getActiveEdgeECH(); len(ech) > 0 {
+		cfg.ECHConfigList = ech
+	}
+	if altPorts := getActiveEdgeAltPorts(); len(altPorts) > 0 {
+		cfg.AltPorts = altPorts
+	}
+	if pins := getActivePinSPKI(); len(pins) > 0 {
+		if cfg.TLSConfig == nil {
+			nodeHost := addr
+			if h, _, err := net.SplitHostPort(addr); err == nil {
+				nodeHost = h
+			}
+			cfg.TLSConfig = defaultTLSConfig(cfg.TLSServerName, nodeHost)
+		}
+		configureSPKIPinning(cfg.TLSConfig, pins)
+	}
+	port := 443
+	if _, portStr, err := net.SplitHostPort(addr); err == nil {
+		if p, perr := strconv.Atoi(portStr); perr == nil && p > 0 {
+			port = p
+		}
+	}
+	if ip != nil {
+		cfg.RemoteUDPAddr = &net.UDPAddr{IP: ip, Port: port}
+	}
+
+	client, err := Dial(ctx, cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial edge session: %w", err)
+	}
+	var adopted func()
+	if client.ActualPort() > 0 && client.ActualPort() != port {
+		h, _, _ := net.SplitHostPort(addr)
+		newAddr := net.JoinHostPort(h, strconv.Itoa(client.ActualPort()))
+		addr = newAddr
+		ech := cfg.ECHConfigList
+		// 实际端口写回活动 edge 放在会话被采用之后：被 Reset 放弃的旧拨号不得覆盖新的活动 edge。
+		adopted = func() {
+			if len(ech) > 0 {
+				SetActiveEdge(newAddr, tok, sni, ip, ech)
+			} else {
+				SetActiveEdge(newAddr, tok, sni, ip)
+			}
+		}
+	}
+
+	sess, err := NewSession(client, tok, addr, sni)
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, err
+	}
+	return sess, adopted, nil
 }
 
 // DialTCP dials an outbound TCP stream using the active session.
@@ -560,9 +632,16 @@ func (m *SessionManager) Ping(ctx context.Context) (time.Duration, error) {
 	return sess.Ping(ctx)
 }
 
-// Reset clears and closes the active session and all draining sessions.
+// Reset clears and closes the active session and all draining sessions, and abandons any in-flight dial.
 func (m *SessionManager) Reset() {
 	m.mu.Lock()
+	// 在途拨号被放弃：取消其 ctx，立即唤醒等待方并给出错误；拨号协程返回后会关闭其结果、不采用。
+	// 登记同时清除，之后的 GetSession 会发起全新的拨号，不必等旧拨号收尾。
+	if d := m.dial; d != nil {
+		d.abandoned = true
+		d.cancel()
+		m.finishDialLocked(d, nil, errSessionDialAbandoned)
+	}
 	if m.currentSession != nil {
 		_ = m.currentSession.Close()
 		m.currentSession = nil

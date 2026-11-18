@@ -136,12 +136,11 @@ func TestLoadAndApplySubscriptionSingleflight(t *testing.T) {
 		fmt.Fprintf(w, `{
 			"version": "aero/3.0",
 			"servers": [
-				{"name": "Node-1", "address": "198.51.100.1:443", "token": "tok_abc"}
+				{"name": "Node-1", "address": "198.51.100.1:443", "token": "tok_abc", "sni": "n1.example.com", "protocol": "connect-ip"}
 			]
 		}`)
 	})
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
 	eng := NewEngine()
 
@@ -154,7 +153,7 @@ func TestLoadAndApplySubscriptionSingleflight(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, errs[idx] = eng.LoadAndApplySubscription("http://singleflight.example.com/sub/superadmin")
+			_, errs[idx] = eng.LoadAndApplySubscription("https://singleflight.example.com/sub/superadmin")
 		}()
 	}
 	wg.Wait()
@@ -446,6 +445,7 @@ func TestNativeAeroSubParsing(t *testing.T) {
 				"name": "Tokyo Edge 01",
 				"address": "tokyo.aero.net:443",
 				"token": "tok_abcdef",
+				"sni": "tokyo.aero.net",
 				"protocol": "connect-ip",
 				"pin_spki": ["abc123spki=="]
 			}
@@ -488,17 +488,16 @@ func TestSubPhysicalDial(t *testing.T) {
 		fmt.Fprintf(w, `{
 			"version": "aero/3.0",
 			"servers": [
-				{"name": "DirectNode", "address": "direct.example.com:443", "token": "tok_direct"}
+				{"name": "DirectNode", "address": "direct.example.com:443", "token": "tok_direct", "sni": "direct.example.com", "protocol": "connect-ip"}
 			]
 		}`)
 	})
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	sub, body, err := fetchSingleSubURL(ctx, "http://direct-sub.example.com/sub/test", SubFetchOptions{})
+	sub, body, err := fetchSingleSubURL(ctx, "https://direct-sub.example.com/sub/test", SubFetchOptions{})
 	if err != nil {
 		t.Fatalf("fetchSingleSubURL with DialPhysicalDirect failed: %v", err)
 	}
@@ -3389,6 +3388,7 @@ func TestWireContract_Strict(t *testing.T) {
 				"ip": "154.213.18.99",
 				"sni": "hk.aero-net.com",
 				"token": "tok_ct_123456",
+				"protocol": "connect-ip",
 				"line_type": "VIP",
 				"isp_affinity": "CT",
 				"alt_ports": [2083, 2087, 8443]
@@ -3398,6 +3398,7 @@ func TestWireContract_Strict(t *testing.T) {
 				"address": "154.213.19.100:2083",
 				"sni": "jp.aero-net.com",
 				"token": "tok_cu_654321",
+				"protocol": "connect-ip",
 				"lineType": "BGP",
 				"ispAffinity": "CU",
 				"altPorts": [443, 8443]
@@ -3507,6 +3508,7 @@ func TestMultiPortHopping_And_PortAlignment(t *testing.T) {
 				IP:          "154.213.18.99",
 				Token:       "tok_test_hop",
 				SNI:         "myconsun.de5.net",
+				Protocol:    "connect-ip",
 				AltPorts:    []int{2083, 2087, 8443},
 				LineType:    "direct",
 				ISPAffinity: "BGP",
@@ -3876,31 +3878,21 @@ func TestDNSVirtualGatewayInterception(t *testing.T) {
 	requireServFail(t, dnsPayload, "virtual gateway reply without DoH")
 }
 
-// 验证 Type 65 (HTTPS RR) 与非 A 查询返回纯净空应答，绝不塞入 Fake-IP Type A 造成报文畸变
+// 验证 Type 65 (HTTPS RR) 与非 A 查询经 DoH 原样转发（api/dataplane.md §6）；
+// 没有 DoH 上游时返回 SERVFAIL，绝不塞入 Fake-IP Type A 造成报文畸变
 func TestDNS_Type65_And_NonA_CleanResponse(t *testing.T) {
 	split := NewSplitEngine()
 	dnsHandler := NewDNSHandler(split)
 
-	// 1. 境外域名 Type 65 (0x0041) 查询：必须返回标准空应答 (NOERROR, 0 答案)
+	// 1. 境外域名 Type 65 (0x0041) 查询、无 DoH 上游：SERVFAIL，不是空应答也不是假 A 记录
 	reqType65 := buildDNSQuery("google.com", 0x0041)
 	respType65 := dnsHandler.HandleQuery(reqType65, net.ParseIP("10.88.0.2"), 53)
-	if respType65 == nil {
-		t.Fatalf("expected non-nil response for Type 65 query")
-	}
-	if ansCount := binary.BigEndian.Uint16(respType65[6:8]); ansCount != 0 {
-		t.Fatalf("expected 0 answers for Type 65 query, got %d", ansCount)
-	}
-	// RCODE 必须是 0 (NOERROR)
-	if respType65[3]&0x0F != 0 {
-		t.Fatalf("expected RCODE 0 for Type 65 query, got %d", respType65[3]&0x0F)
-	}
+	requireServFail(t, respType65, "google.com Type 65 without DoH")
 
-	// 2. 境外域名 TXT (0x0010) 查询：必须返回标准空应答
+	// 2. 境外域名 TXT (0x0010) 查询、无 DoH 上游：同样 SERVFAIL
 	reqTXT := buildDNSQuery("google.com", 0x0010)
 	respTXT := dnsHandler.HandleQuery(reqTXT, net.ParseIP("10.88.0.2"), 53)
-	if respTXT == nil || binary.BigEndian.Uint16(respTXT[6:8]) != 0 {
-		t.Fatalf("expected empty answer for TXT query")
-	}
+	requireServFail(t, respTXT, "google.com TXT without DoH")
 
 	// 3. 境外域名 Type A (0x0001) 查询、无 DoH 上游：SERVFAIL，不返回 198.18 假 IP
 	reqA := buildDNSQuery("google.com", 0x0001)
@@ -4322,7 +4314,7 @@ func TestFetchSubscription_PortFallbackWhen443Occupied(t *testing.T) {
 				"version": "aero/3.0",
 				"userId": "admin",
 				"servers": [
-					{"name": "us-edge", "address": "us.mock.net:2083", "token": "tok_fallback_2083"}
+					{"name": "us-edge", "address": "us.mock.net:2083", "token": "tok_fallback_2083", "sni": "us.mock.net", "protocol": "connect-ip"}
 				]
 			}`)
 			return
@@ -4333,11 +4325,10 @@ func TestFetchSubscription_PortFallbackWhen443Occupied(t *testing.T) {
 		fmt.Fprintf(w, "<!DOCTYPE html><html><title>Error 404 (Not Found)</title>The requested URL was not found on this server.</html>")
 	})
 
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
-	// 请求不带端口的标准订阅 URL (默认 80/443，在测试中使用 http 匹配 newInMemHTTPDialer)
-	sub, err := FetchSubscription(context.Background(), "http://us.mock.net/sub/superadmin", SubFetchOptions{DisableCache: true})
+	// 请求不带端口的标准订阅 URL（默认 443；C5 §1 只允许 https，测试经内存 TLS 服务与测试根证书）
+	sub, err := FetchSubscription(context.Background(), "https://us.mock.net/sub/superadmin", SubFetchOptions{DisableCache: true})
 	if err != nil {
 		t.Fatalf("expected FetchSubscription to automatically probe and recover via 2083, got error: %v", err)
 	}

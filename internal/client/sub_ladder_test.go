@@ -40,15 +40,14 @@ func TestFetchSubscription_Ladder_443NormalPath(t *testing.T) {
 			"version": "aero/3.0",
 			"userId": "admin",
 			"servers": [
-				{"name": "primary-node", "address": "primary.aero.test:443", "token": "tok_primary"}
+				{"name": "primary-node", "address": "primary.aero.test:443", "token": "tok_primary", "sni": "primary.aero.test", "protocol": "connect-ip"}
 			]
 		}`)
 	})
 
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
-	sub, err := FetchSubscription(context.Background(), "http://primary.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
+	sub, err := FetchSubscription(context.Background(), "https://primary.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
 	if err != nil {
 		t.Fatalf("expected successful 443 fetch, got: %v", err)
 	}
@@ -81,7 +80,7 @@ func TestFetchSubscription_Ladder_CandidatePortFallback_Tier1(t *testing.T) {
 				"version": "aero/3.0",
 				"userId": "admin",
 				"servers": [
-					{"name": "tier1-node", "address": "fallback-tier1.aero.test:8443", "token": "tok_8443"}
+					{"name": "tier1-node", "address": "fallback-tier1.aero.test:8443", "token": "tok_8443", "sni": "fallback-tier1.aero.test", "protocol": "connect-ip"}
 				]
 			}`)
 			return
@@ -92,10 +91,9 @@ func TestFetchSubscription_Ladder_CandidatePortFallback_Tier1(t *testing.T) {
 		fmt.Fprintf(w, "<html>404 Not Found</html>")
 	})
 
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
-	sub, err := FetchSubscription(context.Background(), "http://fallback-tier1.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
+	sub, err := FetchSubscription(context.Background(), "https://fallback-tier1.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
 	if err != nil {
 		t.Fatalf("expected fallback to port 8443 to succeed, got: %v", err)
 	}
@@ -121,7 +119,7 @@ func TestFetchSubscription_Ladder_CandidatePortFallback_Tier2(t *testing.T) {
 				"version": "aero/3.0",
 				"userId": "admin",
 				"servers": [
-					{"name": "tier2-node", "address": "fallback-tier2.aero.test:24443", "token": "tok_24443"}
+					{"name": "tier2-node", "address": "fallback-tier2.aero.test:24443", "token": "tok_24443", "sni": "fallback-tier2.aero.test", "protocol": "connect-ip"}
 				]
 			}`)
 			return
@@ -130,11 +128,10 @@ func TestFetchSubscription_Ladder_CandidatePortFallback_Tier2(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
 	start := time.Now()
-	sub, err := FetchSubscription(context.Background(), "http://fallback-tier2.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
+	sub, err := FetchSubscription(context.Background(), "https://fallback-tier2.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
 	duration := time.Since(start)
 
 	if err != nil {
@@ -176,7 +173,7 @@ func TestFetchSubscription_Ladder_InMemoryCacheReuseAndEviction(t *testing.T) {
 			calls8443.Add(1)
 			if activePort.Load() == 8443 {
 				w.Header().Set("Content-Type", "application/json")
-				fmt.Fprintf(w, `{"version":"aero/3.0","userId":"u1","servers":[{"name":"n8443","address":"cache.aero.test:8443","token":"tok_8443"}]}`)
+				fmt.Fprintf(w, `{"version":"aero/3.0","userId":"u1","servers":[{"name":"n8443","address":"cache.aero.test:8443","token":"tok_8443", "sni": "cache.aero.test", "protocol": "connect-ip"}]}`)
 				return
 			}
 			w.WriteHeader(http.StatusBadGateway)
@@ -186,7 +183,7 @@ func TestFetchSubscription_Ladder_InMemoryCacheReuseAndEviction(t *testing.T) {
 			calls2083.Add(1)
 			if activePort.Load() == 2083 {
 				w.Header().Set("Content-Type", "application/json")
-				fmt.Fprintf(w, `{"version":"aero/3.0","userId":"u1","servers":[{"name":"n2083","address":"cache.aero.test:2083","token":"tok_2083"}]}`)
+				fmt.Fprintf(w, `{"version":"aero/3.0","userId":"u1","servers":[{"name":"n2083","address":"cache.aero.test:2083","token":"tok_2083", "sni": "cache.aero.test", "protocol": "connect-ip"}]}`)
 				return
 			}
 			w.WriteHeader(http.StatusBadGateway)
@@ -195,11 +192,10 @@ func TestFetchSubscription_Ladder_InMemoryCacheReuseAndEviction(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
 	// Step 1: Initial fetch discovers 8443
-	sub1, err := FetchSubscription(context.Background(), "http://cache.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
+	sub1, err := FetchSubscription(context.Background(), "https://cache.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
 	if err != nil {
 		t.Fatalf("first fetch failed: %v", err)
 	}
@@ -213,7 +209,7 @@ func TestFetchSubscription_Ladder_InMemoryCacheReuseAndEviction(t *testing.T) {
 
 	// Step 2: Second fetch hits 8443 directly via fast path (zero 443 calls)
 	init443Calls := calls443.Load()
-	sub2, err := FetchSubscription(context.Background(), "http://cache.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
+	sub2, err := FetchSubscription(context.Background(), "https://cache.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
 	if err != nil {
 		t.Fatalf("second fetch failed: %v", err)
 	}
@@ -226,7 +222,7 @@ func TestFetchSubscription_Ladder_InMemoryCacheReuseAndEviction(t *testing.T) {
 
 	// Step 3: Server relocates port to 2083. Cached 8443 fails -> evicted -> ladder probe discovers 2083
 	activePort.Store(2083)
-	sub3, err := FetchSubscription(context.Background(), "http://cache.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
+	sub3, err := FetchSubscription(context.Background(), "https://cache.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
 	if err != nil {
 		t.Fatalf("third fetch (port migration) failed: %v", err)
 	}
@@ -247,11 +243,10 @@ func TestFetchSubscription_Ladder_AllPortsBlocked(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
 	start := time.Now()
-	sub, err := FetchSubscription(context.Background(), "http://blocked.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
+	sub, err := FetchSubscription(context.Background(), "https://blocked.aero.test/sub/admin", SubFetchOptions{DisableCache: true})
 	duration := time.Since(start)
 
 	if err == nil {
@@ -273,14 +268,13 @@ func TestFetchSubscription_Ladder_RaceAndGoroutineLeak(t *testing.T) {
 		host := r.Host
 		if strings.Contains(host, ":2083") {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"version":"aero/3.0","userId":"u","servers":[{"name":"s","address":"%s","token":"tok_race"}]}`, host)
+			fmt.Fprintf(w, `{"version":"aero/3.0","userId":"u","servers":[{"name":"s","address":"%s","token":"tok_race", "sni": "%s", "protocol": "connect-ip"}]}`, host, strings.Split(host, ":")[0])
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	})
 
-	SetPhysicalDialerHook(newInMemHTTPDialer(handler))
-	defer SetPhysicalDialerHook(nil)
+	useSubHTTPS(t, handler)
 
 	const concurrency = 20
 	var wg sync.WaitGroup
@@ -289,7 +283,7 @@ func TestFetchSubscription_Ladder_RaceAndGoroutineLeak(t *testing.T) {
 	for i := 0; i < concurrency; i++ {
 		go func(id int) {
 			defer wg.Done()
-			urlStr := fmt.Sprintf("http://host-%d.aero.test/sub/user%d", id, id)
+			urlStr := fmt.Sprintf("https://host-%d.aero.test/sub/user%d", id, id)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			sub, err := FetchSubscription(ctx, urlStr, SubFetchOptions{DisableCache: true})
@@ -541,10 +535,10 @@ func TestFetchSubscription_PrivateIPBlocked(t *testing.T) {
 	defer cancel()
 
 	privateURLs := []string{
-		"http://127.0.0.1:8080/sub",
-		"http://192.168.1.1/sub",
-		"http://10.0.0.1:80/sub",
-		"http://169.254.169.254/latest/meta-data",
+		"https://127.0.0.1:8080/sub",
+		"https://192.168.1.1/sub",
+		"https://10.0.0.1:80/sub",
+		"https://169.254.169.254/latest/meta-data",
 	}
 
 	for _, u := range privateURLs {

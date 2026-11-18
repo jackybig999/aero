@@ -32,7 +32,16 @@ type nodeSentinel struct {
 	checkInterval    time.Duration
 	backoffDurations []time.Duration
 	lastRTT          atomic.Int64
+
+	// failoverMu 串行化故障转移：哨兵与重连协程（engine_reconnect.go）都会调用 failover，
+	// 同时对同一活动节点做切换会互相覆盖。
+	failoverMu sync.Mutex
+	// unreachableMsg 是哨兵写入引擎 lastErr 的文案（受 mu 保护）；空表示哨兵没有设置错误。
+	unreachableMsg string
 }
+
+// unreachableErrText 全部候选节点不可用时展示的错误；数据面保持，由重连协程负责恢复会话。
+const unreachableErrText = "no reachable node: all candidates failed, retrying with backoff"
 
 // LastRTT 获取最近一次探活 RTT
 func (s *nodeSentinel) LastRTT() time.Duration {
@@ -89,30 +98,38 @@ func (s *nodeSentinel) run(ctx context.Context) {
 			return
 		}
 
-		s.mu.Lock()
-		nextDuration := interval
-		if s.backoffIdx > 0 {
-			durations := s.backoffDurations
-			if len(durations) == 0 {
-				durations = backoffDurations
-			}
-			idx := s.backoffIdx
-			if idx >= len(durations) {
-				idx = len(durations) - 1
-			}
-			nextDuration = durations[idx]
-		}
-		s.mu.Unlock()
+		nextDuration := s.nextInterval(interval)
 		ticker.Reset(nextDuration)
 	}
 }
 
+// nextInterval 返回下一次探活的间隔：没有退避时用 base，否则取 backoffDurations[backoffIdx]（封顶于最后一档）。
+func (s *nodeSentinel) nextInterval(base time.Duration) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.backoffIdx <= 0 {
+		return base
+	}
+	durations := s.backoffDurations
+	if len(durations) == 0 {
+		durations = backoffDurations
+	}
+	idx := s.backoffIdx
+	if idx >= len(durations) {
+		idx = len(durations) - 1
+	}
+	return durations[idx]
+}
+
+// check 执行一轮健康检查。返回 false 仅表示 ctx 已取消（哨兵应退出）；
+// 全部候选节点不可用时不停止引擎：数据面与 TUN 保持，记录可见错误并按 backoffDurations 退避后重试。
 func (s *nodeSentinel) check(ctx context.Context) bool {
 	if s.isCurrentNodeHealthy(ctx) {
 		s.mu.Lock()
 		s.failureCount = 0
 		s.backoffIdx = 0
 		s.mu.Unlock()
+		s.clearUnreachable()
 		return true
 	}
 
@@ -124,13 +141,51 @@ func (s *nodeSentinel) check(ctx context.Context) bool {
 	log.Printf("[SENTINEL] Current node health check failed (%d/3)", count)
 
 	if count >= 3 {
-		if !s.failover(ctx) {
-			log.Printf("[SENTINEL] all candidate nodes failed, stopping data plane")
-			_ = s.engine.Stop()
-			return false
+		if s.failover(ctx) {
+			s.clearUnreachable()
+		} else {
+			if ctx.Err() != nil {
+				return false
+			}
+			log.Printf("[SENTINEL] all candidate nodes failed, keeping data plane and retrying with backoff")
+			s.reportUnreachable(ctx)
 		}
 	}
-	return true
+	return ctx.Err() == nil
+}
+
+// reportUnreachable 把“无可用节点”写入引擎状态（UI 可见）；引擎未运行或已停止时不写，避免覆盖 Stop 清空的状态。
+func (s *nodeSentinel) reportUnreachable(ctx context.Context) {
+	e := s.engine
+	if !e.running.Load() {
+		return
+	}
+	e.SetLastError(unreachableErrText)
+	s.mu.Lock()
+	s.unreachableMsg = unreachableErrText
+	s.mu.Unlock()
+	// 与 stopLocked 竞争：若期间已停止，撤销刚写入的错误
+	if ctx.Err() != nil || !e.running.Load() {
+		s.clearUnreachable()
+	}
+}
+
+// clearUnreachable 清除哨兵自己写入的错误；别处（如重连协程的 edge 拒绝）写入的错误不动。
+func (s *nodeSentinel) clearUnreachable() {
+	s.mu.Lock()
+	msg := s.unreachableMsg
+	s.unreachableMsg = ""
+	s.mu.Unlock()
+	if msg == "" {
+		return
+	}
+	e := s.engine
+	e.lastErrMu.Lock()
+	if e.lastErr == msg && e.lastErrCode == "CONNECT_ERROR" {
+		e.lastErr = ""
+		e.lastErrCode = ""
+	}
+	e.lastErrMu.Unlock()
 }
 
 // isPassiveHealthy 检查当前连接是否被动健康（连接正常且最后活跃在 15s 内）
@@ -211,7 +266,18 @@ func (s *nodeSentinel) isCurrentNodeHealthy(ctx context.Context) bool {
 }
 
 // failover 触发故障转移：浅拷贝 servers 快照并立即释放读锁，无锁探测各候选节点
+//
+// 分工：哨兵只负责“选哪个节点”（探测并 SwitchActiveNode），重连协程只负责“在当前节点上恢复会话”；
+// 两者都可能调用 failover，故用 failoverMu 串行化，且等锁期间若活动节点已被对方切走则直接返回，
+// 不再二次切换。
 func (s *nodeSentinel) failover(ctx context.Context) bool {
+	s.engine.mu.RLock()
+	entryAddr := s.engine.activeAddr
+	s.engine.mu.RUnlock()
+
+	s.failoverMu.Lock()
+	defer s.failoverMu.Unlock()
+
 	s.engine.mu.RLock()
 	currentAddr := s.engine.activeAddr
 	var servers []ServerConfig
@@ -219,6 +285,11 @@ func (s *nodeSentinel) failover(ctx context.Context) bool {
 		servers = append(servers, s.engine.appliedSub.Servers...)
 	}
 	s.engine.mu.RUnlock()
+
+	if currentAddr != entryAddr {
+		// 等锁期间另一方已完成切换
+		return true
+	}
 
 	if len(servers) == 0 {
 		s.enterBackoff()
