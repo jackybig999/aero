@@ -234,3 +234,64 @@ func TestEgressPerTokenLimitsRelaxedForSharedHopCredential(t *testing.T) {
 		t.Fatal("single role must keep the per-token conn cap below the global cap")
 	}
 }
+
+// 失败日志限频：间隔内只放行第一条，间隔过后报告被压掉的条数。
+func TestLogThrottle(t *testing.T) {
+	var l logThrottle
+	base := time.Unix(1000, 0)
+	if ok, n := l.allow(base, 10*time.Second); !ok || n != 0 {
+		t.Fatalf("first: ok=%v n=%d", ok, n)
+	}
+	for i := 0; i < 5; i++ {
+		if ok, _ := l.allow(base.Add(time.Duration(i+1)*time.Second), 10*time.Second); ok {
+			t.Fatalf("第 %d 条应被压掉", i+1)
+		}
+	}
+	if ok, n := l.allow(base.Add(11*time.Second), 10*time.Second); !ok || n != 5 {
+		t.Fatalf("after interval: ok=%v n=%d, want true/5", ok, n)
+	}
+}
+
+// 出口认证封禁按 /64 计：入口所在地址（或同一 /64 的其他租户）被封时，持有正确跳间凭证的入口
+// 仍可转发（否则多跳整体中断）；凭证错误的请求在被封地址上仍得到 429。
+func TestEgressHopCredentialBypassesAuthBan(t *testing.T) {
+	egressUp, ingressUp := startFakeDNS(t), startFakeDNS(t)
+	egress, ingress := startHopPair(t, egressUp, ingressUp, hopTestCred)
+
+	jail := egress.quicServer.AuthJail()
+	for i := 0; i < 5; i++ {
+		jail.RecordFailure("127.0.0.1") // 入口到出口的来源地址
+	}
+	if !jail.IsBanned("127.0.0.1") {
+		t.Fatal("前置条件：入口的来源地址应已被出口封禁")
+	}
+
+	// 凭证正确的入口：转发成功（TXT 应答 1 条，来自出口的上游）。
+	code, resp := postDoHH3(t, ingress.Addr(), dnsQuery(0x4001, "txt", 16))
+	if code != http.StatusOK || len(resp) < 12 {
+		t.Fatalf("http %d len %d", code, len(resp))
+	}
+	if rc, an := rcodeAndAnswers(resp); rc != 0 || an != 1 {
+		t.Fatalf("被封地址上的正确凭证应转发成功: rcode=%d answers=%d", rc, an)
+	}
+
+	// 凭证错误：仍然 429。
+	tr := &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}}
+	defer tr.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+egress.Addr()+"/dns-query", bytes.NewReader(dnsQuery(0x4002, "txt", 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Aero-Hop-Token", "wrong-credential")
+	r, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("被封地址上的错误凭证: http %d, want 429", r.StatusCode)
+	}
+}

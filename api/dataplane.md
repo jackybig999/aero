@@ -52,7 +52,7 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
 | 状态 | `error` | 含义 | 客户端处理 |
 |---|---|---|---|
 | 401 | `proxy_authorization_required` | token 无效、被吊销或过期（`details="EDGE_AUTH_TOKEN_EXPIRED"`） | 重新拉取订阅换 token；同一会话不再向 edge 发请求；两次尝试至少间隔 15 秒 |
-| 429 | —（带 `Retry-After`） | 来源 IP 因认证失败过多被暂时封禁（5 次/分钟 → 15 分钟） | 至少等待 `Retry-After` |
+| 429 | —（带 `Retry-After`） | 来源 IP 因认证失败过多被暂时封禁（5 次/分钟 → 15 分钟）；IPv6 按 /64 计（同一 /64 内换地址不能绕过），IPv4 按单个地址 | 至少等待 `Retry-After` |
 | 503 | `connect_ip_disabled`、`address_pool_exhausted`、`connection_limit_exceeded`、`udp_slot_limit_exceeded` | 本节点暂不能提供该服务 | 该节点记入 10 分钟冷却名单，换到其他可达节点并立即重连；没有可换节点时至少 60 秒后重试 |
 | 403 | `destination_ip_prohibited` | 目的地址被 §5 拒绝 | 只影响该次请求，不影响会话 |
 | 502 | `connection_refused`、`destination_ip_unroutable` | 目标不可达 | 只影响该次请求 |
@@ -85,9 +85,10 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
     - 隔离单位是用户 token，不是 uid：同一用户的多个 token（多设备、刷新后新旧并存）各占一条连接，旧 token 的连接空闲 60 秒后回收。回退的独立连接受入口全局并发上限（`max_conn`，默认 4096）与每 token 上限约束；是否改按 uid 分池待 C4（uid 随签名 token 下发）后决定。
     - 每条连接最多 1000 个并发流（`MaxIncomingStreams`）；流满时新请求 10 秒后失败（入口表现为 502），不会另开连接。单个请求从取连接、开流到读到出口响应头最长约 10 秒（拨号失败后重试一次的最坏情况可达约 30 秒）。
   - DoH 另有自己的一条复用连接（所有用户共用；DoH 报文小、单次应答不超过 64 KiB，不存在长期占窗口的流）。
-  - UDP `connect-udp` 仍然每个请求向出口新建一条 QUIC 连接（复用留待第 2 步 b）。出口按来源 IP 限制新连接速率（`rate_ip`，默认每秒 200），所有入口流量来自入口的同一个 IP，所以在 UDP 复用之前，入口整体每秒最多向出口新建约 200 条 UDP 连接；超出的请求在入口表现为 502。UDP 量大时需调高出口的 `rate_ip`。
+  - UDP `connect-udp` 仍然每个请求向出口新建一条 QUIC 连接（复用留待第 2 步 b）。出口按来源 IP 限制新连接速率（`rate_ip`，默认每秒 200；IPv6 按 /64 共用一个额度），所有入口流量来自入口的同一个 IP，所以在 UDP 复用之前，入口整体每秒最多向出口新建约 200 条 UDP 连接；超出的请求在入口表现为 502。UDP 量大时需调高出口的 `rate_ip`。
   - 入口的 `hop_credential` 配错时，出口会把入口的 IP 记入认证失败封禁表（最长 900 秒）；改对凭证后需等解封，或重启出口。
-  - 出口宕机时，入口每个失败的 DoH 查询打印一行 `[HOP]` 日志，日志量与查询量相当；日志限频留待第 2 步。
+  - 出口先比对跳间凭证、再查封禁：持有正确凭证的入口不受封禁影响。封禁按 IPv6 /64 计，若出口与其他租户共用一个 /64，对方对出口认证失败不会连带封掉凭证正确的入口；凭证错误的请求在被封地址上仍得到 429。
+  - 出口宕机时，入口的 DoH 失败日志（`[HOP] DoH forward … failed`）每 10 秒最多打印一条，并附带期间被压掉的条数。
 
 ## 9. 未定稿
 - CONNECT-IP 经入口中继到出口（入口不建 TUN，转发 IP 数据报；涉及地址分配、源地址校验与两跳 MTU）与 UDP 的 QUIC 连接复用：多跳第 2 步（b、c）。

@@ -42,6 +42,7 @@ func (j *AuthFailureJail) RecordFailure(ip string) bool {
 	if ip == "" {
 		return false
 	}
+	ip = ipBucketKey(ip)
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -100,6 +101,7 @@ func (j *AuthFailureJail) IsBanned(ip string) bool {
 	if ip == "" {
 		return false
 	}
+	ip = ipBucketKey(ip)
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 

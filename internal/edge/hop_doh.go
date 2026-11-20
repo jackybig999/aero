@@ -129,3 +129,28 @@ func (s *QUICServer) forwardDoHToNextHop(ctx context.Context, query []byte) ([]b
 	}
 	return out, nil
 }
+
+// hopLogEvery 是入口到出口失败日志的最小间隔。
+const hopLogEvery = 10 * time.Second
+
+// logThrottle 对重复日志限频：每个间隔放行一条，并报告期间被压掉的条数。
+type logThrottle struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+// allow 返回是否应该打印这一条，以及自上次打印以来被压掉的条数（仅在返回 true 时有意义）。
+// 压制期之后若再没有失败，被压掉的条数不会再报出（可接受：下一次失败才会带上）。
+func (l *logThrottle) allow(now time.Time, every time.Duration) (bool, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.last.IsZero() && now.Sub(l.last) < every {
+		l.suppressed++
+		return false, 0
+	}
+	n := l.suppressed
+	l.suppressed = 0
+	l.last = now
+	return true, n
+}

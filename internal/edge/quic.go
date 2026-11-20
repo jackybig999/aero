@@ -543,6 +543,7 @@ type QUICServer struct {
 	doh               *dohForwarder
 	hopDoHc           hopDoHClient // 入口到出口的 DoH 复用连接（role=ingress）
 	hopPool           hopConnPool  // 入口到出口的 TCP CONNECT 共享 QUIC 连接，每用户一条（role=ingress）
+	hopDoHLog         logThrottle  // 入口 DoH 转发失败日志限频（TCP 失败日志若要限频应另设一个，不共用窗口）
 	hopDials          atomic.Int64 // 入口向出口新建 QUIC 连接的次数（测试断言复用用）
 	connTracker       *ConnTracker
 	ipPool            *IPPool
@@ -1429,6 +1430,23 @@ func (s *QUICServer) ServeDefault(w http.ResponseWriter, r *http.Request) {
 
 func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
 	remoteIP := ClientIP(r)
+
+	// 出口：先比对跳间凭证。持有正确凭证的入口不受认证封禁限制——封禁按 IPv6 /64 计，
+	// 同一 /64 里的其他租户对出口认证失败，不能让入口被一起封掉而使多跳整体中断（§11.6）。
+	// 凭证错误的请求仍先过封禁检查，行为不变。
+	var egressHopOK bool
+	if s.cfg != nil && s.cfg.Role == "egress" {
+		expected := []byte(s.cfg.HopCredential)
+		matches := func(v string) bool {
+			return v != "" && len(expected) > 0 && subtle.ConstantTimeCompare([]byte(v), expected) == 1
+		}
+		bearer, _ := bearerToken(r)
+		egressHopOK = matches(strings.TrimSpace(r.Header.Get("Aero-Hop-Token"))) || matches(bearer)
+		if egressHopOK {
+			return s.cfg.HopCredential, true
+		}
+	}
+
 	if s.authJail != nil && s.authJail.IsBanned(remoteIP) {
 		w.Header().Set("Retry-After", "900")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -1436,14 +1454,6 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 	}
 
 	if s.cfg != nil && s.cfg.Role == "egress" {
-		expected := []byte(s.cfg.HopCredential)
-		matches := func(v string) bool {
-			return v != "" && len(expected) > 0 && subtle.ConstantTimeCompare([]byte(v), expected) == 1
-		}
-		bearer, _ := bearerToken(r)
-		if matches(strings.TrimSpace(r.Header.Get("Aero-Hop-Token"))) || matches(bearer) {
-			return s.cfg.HopCredential, true
-		}
 		s.rejectAuth(w, remoteIP, "invalid hop credential")
 		return "", false
 	}
@@ -2391,7 +2401,10 @@ func (s *QUICServer) serveDoH(w http.ResponseWriter, r *http.Request) {
 		if out, err := s.forwardDoHToNextHop(r.Context(), queryBytes); err == nil {
 			resp = out
 		} else {
-			log.Printf("[HOP] DoH forward to next hop failed: %v", err)
+			// 出口宕机时每个查询都会失败：限频，避免日志量与查询量相当（被动放大磁盘占用）。
+			if ok, suppressed := s.hopDoHLog.allow(time.Now(), hopLogEvery); ok {
+				log.Printf("[HOP] DoH forward to next hop failed: %v (%d similar suppressed)", err, suppressed)
+			}
 			resp = dnsReply(queryBytes, 2)
 		}
 	} else if qtype == dnsTypeAAAA && s.ipv6Pool == nil {

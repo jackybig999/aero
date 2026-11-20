@@ -1180,6 +1180,25 @@ func NewRateLimiter(maxConnsPerIPPerSec int) *RateLimiter {
 	}
 }
 
+// ipBucketKey 把客户端地址归并成限速/封禁用的键：IPv4（含 v4-mapped）按单个地址，IPv6 按 /64。
+// 一个 /64 有 2^64 个地址，按完整地址计数时攻击者换地址即可绕过封禁并把记录表填满。
+// 解析失败（非 IP 字符串）原样返回。
+func ipBucketKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	p, err := addr.Prefix(64)
+	if err != nil {
+		return ip
+	}
+	return p.String()
+}
+
 // ClientIP extracts IP from HTTP request using physical RemoteAddr
 func ClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -1191,6 +1210,7 @@ func ClientIP(r *http.Request) string {
 
 // Allow returns true if IP is allowed to connect
 func (l *RateLimiter) Allow(ip string) bool {
+	ip = ipBucketKey(ip)
 	nowUnix := time.Now().Unix()
 	// 锁外无锁检查：若距上次清理不足 120 秒，绝不进锁全量清扫！ (NEW-04)
 	if nowUnix-l.lastSweepUnix.Load() > 120 {
@@ -1238,6 +1258,7 @@ func (l *RateLimiter) Allow(ip string) bool {
 
 // RecordFail increments failure count and bans IP if threshold exceeded
 func (l *RateLimiter) RecordFail(ip string) bool {
+	ip = ipBucketKey(ip)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.fails[ip]++
@@ -1251,6 +1272,7 @@ func (l *RateLimiter) RecordFail(ip string) bool {
 
 // IsBanned returns true if IP is currently banned
 func (l *RateLimiter) IsBanned(ip string) bool {
+	ip = ipBucketKey(ip)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	until, ok := l.bans[ip]
