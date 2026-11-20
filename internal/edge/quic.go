@@ -542,6 +542,8 @@ type QUICServer struct {
 	rateLimiter       *RateLimiter
 	doh               *dohForwarder
 	hopDoHc           hopDoHClient // 入口到出口的 DoH 复用连接（role=ingress）
+	hopPool           hopConnPool  // 入口到出口的 TCP CONNECT 共享 QUIC 连接，每用户一条（role=ingress）
+	hopDials          atomic.Int64 // 入口向出口新建 QUIC 连接的次数（测试断言复用用）
 	connTracker       *ConnTracker
 	ipPool            *IPPool
 	ipv6Pool          *IPv6Pool
@@ -761,6 +763,8 @@ func (s *QUICServer) dialUDP(network string, laddr, raddr *net.UDPAddr) (*net.UD
 type quicStreamConn struct {
 	stream *http3.RequestStream
 	qConn  *quic.Conn
+	shared bool      // qConn 是入口到出口的共享连接：Close 只结束这一个流，不关连接
+	lease  *hopLease // 共享连接的租约，Close 时归还
 }
 
 func (c *quicStreamConn) Read(b []byte) (int, error) {
@@ -774,9 +778,16 @@ func (c *quicStreamConn) Write(b []byte) (int, error) {
 func (c *quicStreamConn) Close() error {
 	var err1, err2 error
 	if c.stream != nil {
+		if c.shared {
+			// 共享连接上不会再有人读这个流：取消读方向，避免对端继续发送占着流量窗口。
+			c.stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		}
 		err1 = c.stream.Close()
 	}
-	if c.qConn != nil {
+	if c.lease != nil {
+		c.lease.release()
+	}
+	if c.qConn != nil && !c.shared {
 		err2 = c.qConn.CloseWithError(0, "normal")
 	}
 	if err1 != nil {
@@ -822,72 +833,116 @@ func (c *quicStreamConn) SetWriteDeadline(t time.Time) error {
 
 var _ net.Conn = (*quicStreamConn)(nil)
 
-func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred string) (net.Conn, error) {
+// dialNextHopTCP 经出口建立到 target 的 TCP 隧道。userKey 是入口认证出的用户 token：
+// 同一用户的请求共用一条到出口的 QUIC 连接（每请求一个流），不同用户互不共用，
+// 这样一个用户的慢流只占自己连接的流控窗口，不会拖住其他用户（队头阻塞隔离）。
+// 连接池满且无空闲连接可回收时，本次请求用一条独立连接（Close 时一并关闭）。
+func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred, userKey string) (net.Conn, error) {
 	if fn := s.nextHopDialer.Load(); fn != nil {
 		return (*fn)(nextHopAddr, target, hopCred)
 	}
-
-	sni := dialSNI(s.cfg, nextHopAddr)
-
-	tlsConf := &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: s.allowLoopbackForTest.Load(),
-		NextProtos:         []string{"h3"},
-	}
-	quicConf := DefaultQUICConfig()
-
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer dialCancel()
-
-	qConn, err := quic.DialAddr(dialCtx, nextHopAddr, tlsConf, quicConf)
-	if err != nil {
-		// 故意用 %v 而不是 %w，原因见 dialNextHopUDP。
-		return nil, fmt.Errorf("dial next hop %s over quic: %v", nextHopAddr, err)
-	}
-
-	tr := &http3.Transport{EnableDatagrams: true}
-	h3Conn := tr.NewClientConn(qConn)
 
 	targetHost := strings.TrimPrefix(target, "//")
 	targetHost = strings.TrimPrefix(targetHost, "/")
 	targetHost = strings.TrimPrefix(targetHost, "/")
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, "//"+targetHost, nil)
 	if err != nil {
-		_ = qConn.CloseWithError(0, "failed to create request")
 		return nil, fmt.Errorf("create next hop connect request: %w", err)
 	}
 	req.Proto = "HTTP/1.1"
 	req.Header.Set("Aero-Hop-Token", hopCred)
 
-	reqStr, err := h3Conn.OpenRequestStream(dialCtx)
-	if err != nil {
-		_ = qConn.CloseWithError(0, "failed to open stream")
-		return nil, fmt.Errorf("open next hop request stream: %w", err)
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
+
+	// 取得连接与流。共享连接可能刚被对端关闭（空闲超时、出口重启）：开流失败且连接已死时换新连接重试一次。
+	var (
+		lease  *hopLease // 共享连接的租约；独立连接时为 nil
+		pc     *hopPooledConn
+		reqStr *http3.RequestStream
+	)
+	for attempt := 0; ; attempt++ {
+		lease, err = s.hopPool.get(dialCtx, userKey, func() (*hopPooledConn, error) { return s.dialHopConn(nextHopAddr) })
+		switch {
+		case err == nil:
+			pc = lease.conn
+		case errors.Is(err, errHopPoolFull):
+			if pc, err = s.dialHopConn(nextHopAddr); err != nil {
+				return nil, err
+			}
+			lease = nil
+		default:
+			return nil, err
+		}
+		reqStr, err = pc.h3.OpenRequestStream(dialCtx)
+		if err == nil {
+			break
+		}
+		if lease == nil {
+			_ = pc.q.CloseWithError(0, "failed to open stream")
+			return nil, fmt.Errorf("open next hop request stream: %w", err)
+		}
+		if pc.alive() || attempt >= 1 {
+			// 连接还活着（多半是流数量到上限或超时）：不动共享连接，只让本次请求失败。
+			lease.release()
+			return nil, fmt.Errorf("open next hop request stream: %w", err)
+		}
+		s.hopPool.invalidate(lease)
+		lease.release()
 	}
 
+	// abort 在流建立之后的失败路径上释放流与租约（独立连接则关闭整条连接）。
+	abort := func() {
+		reqStr.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		reqStr.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		switch {
+		case lease == nil:
+			_ = pc.q.CloseWithError(0, "next hop request failed")
+		case !pc.alive():
+			s.hopPool.invalidate(lease)
+			lease.release()
+		default:
+			lease.release()
+		}
+	}
 	if err := reqStr.SendRequestHeader(req); err != nil {
-		_ = reqStr.Close()
-		_ = qConn.CloseWithError(0, "failed to send header")
+		abort()
 		return nil, fmt.Errorf("send next hop request header: %w", err)
 	}
-
+	// 出口不应答时不能一直占着流（§8.1）：响应头读取加超时，之后清除，数据传输阶段由中继自己的空闲超时管理。
+	_ = reqStr.SetReadDeadline(time.Now().Add(10 * time.Second))
 	resp, err := reqStr.ReadResponse()
+	_ = reqStr.SetReadDeadline(time.Time{})
 	if err != nil {
-		_ = reqStr.Close()
-		_ = qConn.CloseWithError(0, "failed to read response")
+		abort()
 		return nil, fmt.Errorf("read next hop response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		proxyStatus := resp.Header.Get("Proxy-Status")
-		_ = reqStr.Close()
-		_ = qConn.CloseWithError(0, "next hop rejected")
+		abort()
 		return nil, fmt.Errorf("next hop connect rejected with status %d (Proxy-Status: %s)", resp.StatusCode, proxyStatus)
 	}
 
-	return &quicStreamConn{
-		stream: reqStr,
-		qConn:  qConn,
-	}, nil
+	return &quicStreamConn{stream: reqStr, qConn: pc.q, shared: lease != nil, lease: lease}, nil
+}
+
+// dialHopConn 建立到出口的 QUIC 连接并包成 HTTP/3 客户端连接（只在连接池里没有可用连接时调用）。
+func (s *QUICServer) dialHopConn(nextHopAddr string) (*hopPooledConn, error) {
+	s.hopDials.Add(1)
+	tlsConf := &tls.Config{
+		ServerName:         dialSNI(s.cfg, nextHopAddr),
+		InsecureSkipVerify: s.allowLoopbackForTest.Load(),
+		NextProtos:         []string{"h3"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	qConn, err := quic.DialAddr(ctx, nextHopAddr, tlsConf, DefaultQUICConfig())
+	if err != nil {
+		// 故意用 %v 而不是 %w，原因见 dialNextHopUDP。
+		return nil, fmt.Errorf("dial next hop %s over quic: %v", nextHopAddr, err)
+	}
+	tr := &http3.Transport{EnableDatagrams: true}
+	return &hopPooledConn{q: qConn, h3: tr.NewClientConn(qConn)}, nil
 }
 
 func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Conn, error) {
@@ -1041,6 +1096,7 @@ func (s *QUICServer) AuthJail() *AuthFailureJail {
 // Close closes the QUICServer and its background components
 func (s *QUICServer) Close() {
 	s.closeHopDoH()
+	s.hopPool.close()
 	s.closeOnce.Do(func() {
 		if s.stopCh != nil {
 			close(s.stopCh)
@@ -1599,7 +1655,7 @@ func (s *QUICServer) serveStandardConnect(w http.ResponseWriter, r *http.Request
 	var targetConn net.Conn
 	var err error
 	if s.cfg != nil && s.cfg.Role == "ingress" && s.cfg.NextHopAddr != "" {
-		targetConn, err = s.dialNextHopTCP(s.cfg.NextHopAddr, target, s.cfg.HopCredential)
+		targetConn, err = s.dialNextHopTCP(s.cfg.NextHopAddr, target, s.cfg.HopCredential, token)
 	} else if s.dialGuard != nil {
 		targetConn, err = s.dialGuard.DialTimeoutFor(token, "tcp", target, 10*time.Second)
 	} else {

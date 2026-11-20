@@ -3742,7 +3742,7 @@ func TestPhase7Gate_MultiHopChaining(t *testing.T) {
 		hookCalled.Store(true)
 		return nil, errors.New("mock dialer error")
 	})
-	c, errDial := ingressSrv.quicServer.dialNextHopTCP("127.0.0.1:1234", "target:80", "cred")
+	c, errDial := ingressSrv.quicServer.dialNextHopTCP("127.0.0.1:1234", "target:80", "cred", "user")
 	if errDial == nil || !hookCalled.Load() {
 		if c != nil {
 			_ = c.Close()
