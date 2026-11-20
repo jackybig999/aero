@@ -49,7 +49,7 @@
       </nav>
 
       <div class="sidebar-footer">
-        <span class="port-badge">PORT 127.0.0.1:55555</span>
+        <span class="port-badge">PORT <span id="sideListen">127.0.0.1:55555</span></span>
         <button class="btn btn-outline" style="padding:4px 8px" onclick="alert('AERO OS: 全平台桌面工作台已激活')">⚙️</button>
       </div>
     </aside>
@@ -70,10 +70,16 @@
             <div id="stState" class="pill off">就绪</div>
           </div>
 
+          <!-- 降级提示：虚拟网卡不可用时，只有本地代理端口可用，必须明确告知 -->
+          <div id="degradedNotice" hidden style="border:1px solid #b45309;background:#1f1708;color:#fbbf24;border-radius:10px;padding:10px 12px;margin-bottom:10px;font-size:12px;line-height:1.5">
+            <b>虚拟网卡不可用，已降级为仅本地代理</b>
+            <div id="degradedDesc" style="color:#d6b66a;font-size:11px;margin-top:4px"></div>
+          </div>
+
           <!-- 常驻端口徽章：专供指纹浏览器/应用一键复制使用 -->
-          <button type="button" id="btnDesktop" class="desktop-badge-btn" onclick="navigator.clipboard.writeText('127.0.0.1:55555');alert('已复制本地指纹专线地址：127.0.0.1:55555');">
+          <button type="button" id="btnDesktop" class="desktop-badge-btn" >
             <span>指纹专线</span>
-            <b>127.0.0.1:55555</b>
+            <b id="listenBadge">127.0.0.1:55555</b>
             <span class="copy">复制</span>
           </button>
 
@@ -88,23 +94,6 @@
               <button type="button" id="btnPasteSub" class="btn btn-sm" onclick="navigator.clipboard.readText().then(t=>{if(t)$('subInput').value=t.trim()})">📋 粘贴</button>
               <button type="button" id="btnApplySub" class="btn btn-sm btn-blue" style="margin-left:auto">载入</button>
             </div>
-          </div>
-
-          <!-- 工作模式选择 -->
-          <div class="card" style="padding:10px 12px;margin-bottom:0">
-            <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-              <span style="font-weight:700;color:var(--text);font-size:12px">工作模式</span>
-              <span style="font-size:10px;color:var(--muted)">127.0.0.1:55555 本地常驻</span>
-            </div>
-            <div class="mode-row" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-              <div class="mode-radio" data-mode="tun" id="radioTun" style="padding:10px 8px;border:1px solid var(--line);border-radius:8px;text-align:center;cursor:pointer;background:#0a0f18">
-                <b style="font-size:12px;display:block">TUN 全局模式</b>
-              </div>
-              <div class="mode-radio selected" data-mode="sysproxy" id="radioSysproxy" style="padding:10px 8px;border:1px solid var(--blue);border-radius:8px;text-align:center;cursor:pointer;background:#10203a">
-                <b style="font-size:12px;display:block;color:#93c5fd">系统代理</b>
-              </div>
-            </div>
-            <p id="modeTip" style="color:var(--muted);font-size:11px;margin-top:8px">全局虚拟网卡接管，和其他 TUN 互斥</p>
           </div>
 
           <!-- 节点指标与国内分流卡片 (与客户端 100% 对齐) -->
@@ -128,10 +117,11 @@
               <div style="display:flex;align-items:center;gap:6px">
                 <span>🛡️</span>
                 <span style="color:var(--muted);font-size:12px">国内直连</span>
-                <span class="tag tag-green" style="font-size:11px;font-weight:700">2,898 条 (已就绪)</span>
+                <span id="geoRuleCount" class="tag tag-green" style="font-size:11px;font-weight:700">—</span>
               </div>
-              <button type="button" class="btn btn-sm btn-blue" style="padding:2px 8px;font-size:11px" onclick="alert('国内分流规则库已是最优状态 (2,898 条)');">🔄 同步</button>
+              <button type="button" id="btnSyncGeo" class="btn btn-sm btn-blue" style="padding:2px 8px;font-size:11px">🔄 同步</button>
             </div>
+            <div id="geoStatusLine" style="font-size:11px;color:var(--muted);margin-top:6px"></div>
           </div>
         </div>
       </section>
@@ -456,7 +446,7 @@
         <header class="panel-header">
           <div>
             <h2>AI 开发者加速套件</h2>
-            <p style="color:var(--muted);font-size:12px;margin-top:2px">自动注入 AERO OS 环回代理 (HTTP_PROXY / ALL_PROXY: 127.0.0.1:55555)</p>
+            <p style="color:var(--muted);font-size:12px;margin-top:2px">自动注入 AERO OS 环回代理 (HTTP_PROXY / ALL_PROXY: <span id="aiProxyAddr">127.0.0.1:55555</span>)</p>
           </div>
         </header>
         <div class="card-grid" id="aiToolsGrid"></div>
@@ -520,8 +510,8 @@
           </select>
         </div>
         <div>
-          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">出站网络代理 (留空则默认走 AERO 55555)</label>
-          <input type="text" id="profProxy" class="input-text" style="width:100%" placeholder="socks5://127.0.0.1:55555 或留空" />
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">出站网络代理 (留空则默认走 AERO 本地代理)</label>
+          <input type="text" id="profProxy" class="input-text" style="width:100%" placeholder="socks5://主机:端口 或留空（默认走 AERO 本地代理）" />
         </div>
       </div>
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px">

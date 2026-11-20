@@ -507,7 +507,7 @@ func createKernelHTTPClient(useProxy bool) *http.Client {
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	if useProxy {
-		if pURL, err := url.Parse("http://" + DefaultMixedProxy); err == nil {
+		if pURL, err := url.Parse("http://" + MixedProxyAddr()); err == nil {
 			transport.Proxy = http.ProxyURL(pURL)
 		}
 	} else {
@@ -581,7 +581,7 @@ func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, prog
 		resp, err := client.Do(req)
 		if err != nil {
 			if !useProxy {
-				log.Printf("[KERNEL-FETCH] 直连官方源超时或失败 (%v)，自动切换至本地代理 %s 进行境内网络重试...", err, DefaultMixedProxy)
+				log.Printf("[KERNEL-FETCH] 直连官方源超时或失败 (%v)，自动切换至本地代理 %s 进行境内网络重试...", err, MixedProxyAddr())
 				useProxy = true
 			} else {
 				log.Printf("[KERNEL-FETCH] 本地代理重试官方内核源失败 (第 %d/%d 次): %v", attempt+1, maxRetries, err)
@@ -601,7 +601,7 @@ func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, prog
 				break
 			}
 			if !useProxy {
-				log.Printf("[KERNEL-FETCH] 官方源返回异常状态码 %d，自动切换本地代理 %s 进行重试...", resp.StatusCode, DefaultMixedProxy)
+				log.Printf("[KERNEL-FETCH] 官方源返回异常状态码 %d，自动切换本地代理 %s 进行重试...", resp.StatusCode, MixedProxyAddr())
 				useProxy = true
 				lastErr = fmt.Errorf("下载官方内核返回异常状态码: %d", resp.StatusCode)
 				select {
@@ -677,7 +677,7 @@ func DownloadAndExtractKernel(ctx context.Context, dlURL, targetDir string, prog
 			break
 		}
 		if !useProxy {
-			log.Printf("[KERNEL-FETCH] 官方源网络流中断 (%v)，自动切换至本地代理 %s 重试...", readErr, DefaultMixedProxy)
+			log.Printf("[KERNEL-FETCH] 官方源网络流中断 (%v)，自动切换至本地代理 %s 重试...", readErr, MixedProxyAddr())
 			useProxy = true
 		}
 		lastErr = fmt.Errorf("网络流中断: %w (已自动保持断点，准备重试)", readErr)

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,12 +36,51 @@ type NetStatus struct {
 	Protocol    string `json:"protocol"`
 	ISP         string `json:"isp"`
 	SNI         string `json:"sni"`
+
+	// 国内直连规则：引擎内规则总数、最近一次成功获取的 Unix 秒（0=尚未下载，仅内置规则）、最近一次失败原因
+	GeoRuleCount int    `json:"geo_rule_count"`
+	GeoUpdatedAt int64  `json:"geo_updated_at"`
+	GeoError     string `json:"geo_error"`
+
+	// 本地常驻代理是否在监听（Listen 是它的真实地址：默认端口不可用时是备用端口）；
+	// Degraded 表示请求的是 TUN 但虚拟网卡不可用，当前仅本地代理可用。
+	ResidentListening bool   `json:"resident_listening"`
+	Degraded          bool   `json:"degraded"`
+	DegradedReason    string `json:"degraded_reason"`
 }
+
+// MixedProxyAddr 返回桌面端当前应使用的本地代理地址（客户端常驻代理的真实监听地址）。
+// 默认 55555 在 Windows 上可能落在系统端口排除段而被客户端换到别的端口，所以不能写死：
+// 启动时由 main 指向 ClientBridge.ListenAddr；未接线（例如测试）时退回默认值。
+var MixedProxyAddr = func() string { return DefaultMixedProxy }
 
 // ClientBridge manages HTTP communication with local aero-client daemon
 type ClientBridge struct {
 	endpoint string
 	client   *http.Client
+	listen   atomic.Pointer[string] // 最近一次从客户端状态读到的真实监听地址
+}
+
+// cachedListen 只读缓存，不发请求：状态读取失败的错误分支用它，避免客户端不可达时再多等一次超时。
+func (b *ClientBridge) cachedListen() string {
+	if p := b.listen.Load(); p != nil && *p != "" {
+		return *p
+	}
+	return DefaultMixedProxy
+}
+
+// ListenAddr 返回客户端常驻代理的真实监听地址。读不到时（还没轮询过、客户端未启动）先尝试取一次状态，
+// 仍不行则退回默认地址。
+func (b *ClientBridge) ListenAddr() string {
+	if p := b.listen.Load(); p != nil && *p != "" {
+		return *p
+	}
+	if _, err := b.GetStatus(false); err == nil {
+		if p := b.listen.Load(); p != nil && *p != "" {
+			return *p
+		}
+	}
+	return DefaultMixedProxy
 }
 
 // NewClientBridge creates a bridge connected to Client REST API
@@ -101,7 +141,29 @@ func (b *ClientBridge) GetStatus(probe bool) (*NetStatus, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		return nil, fmt.Errorf("decode status failed: %w", err)
 	}
+	if st.Listen != "" {
+		listen := st.Listen
+		b.listen.Store(&listen)
+	}
 	return &st, nil
+}
+
+// SyncGeoData 让客户端立即从节点同步国内直连规则。返回客户端的应答
+// （status=ok 时含 updated、count、total；status=error 时含 error）。
+func (b *ClientBridge) SyncGeoData() (map[string]interface{}, error) {
+	// 同步最多尝试多个节点，耗时可能超过普通请求的超时，单独放宽
+	c := *b.client
+	c.Timeout = 170 * time.Second // 需大于客户端同步接口的 150 秒上限
+	resp, err := c.Post(b.endpoint+"/api/v1/geodata/sync", "application/json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("geodata sync request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	var out map[string]interface{}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode geodata sync response: %w", err)
+	}
+	return out, nil
 }
 
 // Connect triggers network proxy/VPN connection

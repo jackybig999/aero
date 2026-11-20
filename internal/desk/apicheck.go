@@ -155,7 +155,21 @@ func (v *APIVault) saveLocked() {
 type Tester struct {
 	vault     *APIVault
 	proxyAddr string
+	proxyFn   func() string
 	client    *http.Client
+}
+
+// SetProxyProvider 指定实时取代理地址的函数（客户端可能因端口被占用而回退到备用端口）。
+func (t *Tester) SetProxyProvider(fn func() string) { t.proxyFn = fn }
+
+// currentProxy 返回当前应使用的代理地址；没有提供函数时用构造时给定的固定地址。
+func (t *Tester) currentProxy() string {
+	if t.proxyFn != nil {
+		if a := t.proxyFn(); a != "" {
+			return a
+		}
+	}
+	return t.proxyAddr
 }
 
 func NewTester(vault *APIVault, proxyAddr string) *Tester {
@@ -200,8 +214,8 @@ func (t *Tester) TestProvider(id string) (string, int64, error) {
 			}).DialContext,
 		}
 
-		if t.proxyAddr != "" {
-			if proxyURL, err := url.Parse("http://" + t.proxyAddr); err == nil {
+		if addr := t.currentProxy(); addr != "" {
+			if proxyURL, err := url.Parse("http://" + addr); err == nil {
 				transport.Proxy = http.ProxyURL(proxyURL)
 			}
 		}

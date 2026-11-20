@@ -95,15 +95,35 @@ function initNetworkCenter() {
     });
   }
 
-  document.querySelectorAll('.mode-radio').forEach((radio) => {
-    radio.addEventListener('click', async () => {
-      const mode = radio.getAttribute('data-mode');
-      if (typeof window.goSetNetMode === 'function') {
-        await window.goSetNetMode(mode);
-      }
-      refreshNetStatus();
+  const desktopBtn = $('btnDesktop');
+  if (desktopBtn) {
+    desktopBtn.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(currentListen); } catch {}
+      alert('已复制本地指纹专线地址：' + currentListen);
     });
-  });
+  }
+
+  const syncGeoBtn = $('btnSyncGeo');
+  if (syncGeoBtn) {
+    syncGeoBtn.addEventListener('click', async () => {
+      if (typeof window.goSyncGeoData !== 'function') return;
+      syncGeoBtn.disabled = true;
+      syncGeoBtn.textContent = '同步中…';
+      try {
+        const res = await window.goSyncGeoData();
+        if (res && res.status === 'ok') {
+          setGeoNotice(res.updated ? `已更新，共 ${(res.count || 0).toLocaleString()} 条下发规则` : '规则已是最新', false);
+        } else {
+          setGeoNotice(`同步失败：${geoErrText((res && res.error) || '')}`, true);
+        }
+      } catch (e) {
+        setGeoNotice(`同步失败：${geoErrText(e.message || String(e))}`, true);
+      }
+      syncGeoBtn.disabled = false;
+      syncGeoBtn.textContent = '🔄 同步';
+      setTimeout(refreshNetStatus, 800);
+    });
+  }
 
   const applyBtn = $('btnApplySub');
   if (applyBtn) {
@@ -311,6 +331,83 @@ async function selectNodeSmooth(addr) {
   }
 }
 
+// 国内直连卡片：规则条数、最近更新、失败原因（数据来自客户端状态，不写死）
+function geoAgoText(sec) {
+  if (sec < 60) return '刚刚';
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
+  return `${Math.floor(sec / 86400)} 天前`;
+}
+
+function geoErrText(raw) {
+  if (!raw) return '';
+  if (raw.includes('no geodata source')) return '订阅里还没有可用节点';
+  if (raw.includes('already in progress')) return '正在同步，请稍候';
+  return raw.length > 90 ? raw.slice(0, 90) + '…' : raw;
+}
+
+// 本地常驻代理地址：以客户端真实监听的为准（默认 55555 可能因系统端口排除段被换成备用端口）
+let currentListen = '127.0.0.1:55555';
+
+function reasonText(raw) {
+  if (!raw) return '';
+  if (raw.includes('wintun.dll')) return '缺少 wintun.dll 或无法加载：请把官方 64 位 wintun.dll 放在客户端同一目录。';
+  if (raw.includes('not elevated')) return '需要管理员权限：请右键客户端选择「以管理员身份运行」。';
+  if (raw.includes('create wintun adapter')) return '虚拟网卡创建失败：请以管理员身份运行、退出其他 VPN/加速器、在设备管理器删除残留 Wintun 设备，或重启电脑。';
+  return raw.length > 120 ? raw.slice(0, 120) + '…' : raw;
+}
+
+function paintListenAndDegraded(st) {
+  if (st.resident_listening === false) {
+    for (const id of ['listenBadge', 'sideListen']) { const el = $(id); if (el) el.textContent = '未启动（端口被占用）'; }
+  } else {
+    if (st.listen) currentListen = st.listen;
+    for (const id of ['listenBadge', 'sideListen', 'aiProxyAddr']) { const el = $(id); if (el) el.textContent = currentListen; }
+  }
+  const box = $('degradedNotice');
+  if (box) {
+    const on = !!(st.connected && st.degraded);
+    box.hidden = !on;
+    if (on) {
+      const reason = reasonText(st.degraded_reason || '');
+      $('degradedDesc').textContent = `隧道已连上，但只有把代理设为 ${currentListen} 的浏览器/应用才会走隧道，其他程序不受影响。` + (reason ? ' 原因：' + reason : '');
+    }
+  }
+}
+
+// 同步按钮的结果保留几秒，避免被定时状态刷新立刻覆盖
+let geoNotice = null;
+function setGeoNotice(text, isErr) {
+  geoNotice = { text, isErr, until: Date.now() + 6000 };
+  paintGeoLine(geoNotice.text, geoNotice.isErr);
+}
+
+function paintGeoLine(text, isErr) {
+  const line = $('geoStatusLine');
+  if (!line) return;
+  line.textContent = text;
+  line.style.color = isErr ? '#fca5a5' : '';
+}
+
+function paintGeo(st) {
+  const cnt = $('geoRuleCount');
+  if (cnt) cnt.textContent = st.geo_rule_count ? `${st.geo_rule_count.toLocaleString()} 条` : '—';
+  if (!$('geoStatusLine')) return;
+  if (geoNotice && Date.now() < geoNotice.until) return;
+  const noNode = !!st.geo_error && st.geo_error.includes('no geodata source');
+  const err = noNode ? '' : geoErrText(st.geo_error);
+  let text;
+  if (noNode && !st.geo_updated_at) {
+    text = '仅内置规则（载入订阅后自动下载）';
+  } else if (st.geo_updated_at) {
+    const ago = geoAgoText(Math.max(0, Math.floor(Date.now() / 1000) - st.geo_updated_at));
+    text = `已更新 · ${ago}` + (err ? ` · 同步失败：${err}` : '');
+  } else {
+    text = err ? `同步失败：${err}` : '仅内置规则（尚未从节点下载）';
+  }
+  paintGeoLine(text, !!err);
+}
+
 async function refreshNetStatus() {
   try {
     if (typeof window.goGetNetStatus !== 'function') return;
@@ -333,21 +430,20 @@ async function refreshNetStatus() {
     const statePill = $('stState');
     if (statePill) {
       statePill.className = 'pill' + (st.connected ? ' on' : '');
-      statePill.textContent = st.connected ? '已加速' : (st.ready ? '就绪' : '离线');
+      statePill.textContent = st.connected ? (st.degraded ? '已连接 · 仅本地代理' : '已加速') : (st.ready ? '就绪' : '离线');
     }
 
     if ($('netNode')) $('netNode').textContent = st.node || '—';
     if ($('netRtt')) $('netRtt').textContent = st.rtt_ms ? `${st.rtt_ms} ms` : '—';
-    if ($('netMode')) $('netMode').textContent = st.mode === 'tun' ? 'TUN 虚拟网卡' : '系统代理 (SysProxy)';
+    if ($('netMode')) $('netMode').textContent = (st.mode === 'sysproxy' || st.degraded) ? '仅本地代理' : 'TUN 虚拟网卡';
     if ($('netProto')) $('netProto').textContent = st.protocol || 'AERO ECH 2.0';
+    paintGeo(st);
+    paintListenAndDegraded(st);
 
     if (st.sub_url_mask && $('subInput') && !$('subInput').value) {
       $('subInput').placeholder = st.sub_url_mask;
     }
 
-    document.querySelectorAll('.mode-radio').forEach((r) => {
-      r.classList.toggle('selected', r.getAttribute('data-mode') === (st.mode || 'sysproxy'));
-    });
   } catch (err) {
     console.warn('refreshNetStatus error', err);
   }

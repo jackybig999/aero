@@ -77,7 +77,22 @@ func (s *ToolStore) save() {
 
 type Executor struct {
 	scanner *Scanner
-	proxy   string // e.g. "127.0.0.1:55555"
+	proxy   string // 固定地址（兜底），例如 "127.0.0.1:55555"
+
+	proxyFn func() string // 非空时优先使用：实时取客户端常驻代理的真实地址
+}
+
+// SetProxyProvider 指定实时取代理地址的函数（客户端可能因端口被占用而回退到备用端口）。
+func (e *Executor) SetProxyProvider(fn func() string) { e.proxyFn = fn }
+
+// currentProxy 返回当前应注入的代理地址。
+func (e *Executor) currentProxy() string {
+	if e.proxyFn != nil {
+		if a := e.proxyFn(); a != "" {
+			return a
+		}
+	}
+	return e.proxy
 }
 
 func NewExecutor(scanner *Scanner, proxyAddr string) *Executor {
@@ -105,8 +120,9 @@ func (e *Executor) BuildProxyEnv() []string {
 		filtered = append(filtered, kv)
 	}
 
-	httpProxy := fmt.Sprintf("http://%s", e.proxy)
-	socksProxy := fmt.Sprintf("socks5://%s", e.proxy)
+	proxy := e.currentProxy()
+	httpProxy := fmt.Sprintf("http://%s", proxy)
+	socksProxy := fmt.Sprintf("socks5://%s", proxy)
 
 	filtered = append(filtered,
 		"HTTP_PROXY="+httpProxy,
@@ -141,7 +157,7 @@ func (e *Executor) Launch(toolKey, cwdOverride string) (string, error) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		if toolKey == "claude" || toolKey == "terminal" {
-			title := strings.ToUpper(toolKey[:1]) + toolKey[1:] + " [AERO OS Proxy: 55555]"
+			title := strings.ToUpper(toolKey[:1]) + toolKey[1:] + " [AERO OS Proxy: " + e.currentProxy() + "]"
 			args := []string{"/c", "start", title, "cmd", "/k", "title " + title}
 			if toolKey == "claude" {
 				args = append(args, "&&", path)

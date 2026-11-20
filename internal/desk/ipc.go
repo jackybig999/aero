@@ -404,7 +404,7 @@ func RegisterNetHandlers(w IPCBinder, bridge *ClientBridge, daemon *ClientDaemon
 			return map[string]interface{}{
 				"connected": false,
 				"error":     err.Error(),
-				"listen":    DefaultMixedProxy,
+				"listen":    bridge.cachedListen(),
 				"ready":     false,
 			}
 		}
@@ -420,6 +420,14 @@ func RegisterNetHandlers(w IPCBinder, bridge *ClientBridge, daemon *ClientDaemon
 			"protocol":     st.Protocol,
 			"isp":          st.ISP,
 			"ready":        true,
+
+			"geo_rule_count": st.GeoRuleCount,
+			"geo_updated_at": st.GeoUpdatedAt,
+			"geo_error":      st.GeoError,
+
+			"resident_listening": st.ResidentListening,
+			"degraded":           st.Degraded,
+			"degraded_reason":    st.DegradedReason,
 		}
 		if st.ProbeOK != nil {
 			res["probe_ok"] = *st.ProbeOK
@@ -458,6 +466,14 @@ func RegisterNetHandlers(w IPCBinder, bridge *ClientBridge, daemon *ClientDaemon
 			return map[string]interface{}{"status": "error", "error": err.Error()}
 		}
 		return map[string]interface{}{"status": "ok"}
+	})
+
+	w.Bind("goSyncGeoData", func() map[string]interface{} {
+		res, err := bridge.SyncGeoData()
+		if err != nil {
+			return map[string]interface{}{"status": "error", "error": err.Error()}
+		}
+		return res
 	})
 
 	w.Bind("goProbeNet", func() map[string]interface{} {

@@ -92,6 +92,8 @@ func main() {
 	appService := desk.InitAppService(appDB, detector, dataDir, 0)
 
 	netBridge := desk.NewClientBridge(desk.DefaultAPIEndpoint)
+	// 本地代理端口以客户端实际监听的为准（默认 55555 可能因系统端口排除段被换成备用端口）
+	desk.MixedProxyAddr = netBridge.ListenAddr
 	netDaemon := desk.NewClientDaemon(netBridge)
 	go func() {
 		_ = netDaemon.EnsureRunning()
@@ -100,9 +102,11 @@ func main() {
 	aiStore := desk.NewToolStore(dataDir)
 	aiScanner := desk.NewScanner(aiStore)
 	aiExecutor := desk.NewExecutor(aiScanner, "127.0.0.1:55555")
+	aiExecutor.SetProxyProvider(netBridge.ListenAddr)
 
 	apiVault := desk.NewAPIVault(dataDir)
 	apiTester := desk.NewTester(apiVault, "127.0.0.1:55555")
+	apiTester.SetProxyProvider(netBridge.ListenAddr)
 
 	historyStore := desk.NewHistoryStore(dataDir)
 
