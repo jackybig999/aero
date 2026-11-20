@@ -35,18 +35,31 @@ func ensureWintunDLL() error {
 		exeDir := filepath.Dir(exe)
 		target := filepath.Join(exeDir, "wintun.dll")
 		if _, err := os.Stat(target); err == nil {
-			return nil
+			return checkWintunLoadable()
 		}
 	}
 
 	sys32 := filepath.Join(os.Getenv("SystemRoot"), "System32", "wintun.dll")
 	if _, err := os.Stat(sys32); err == nil {
-		return nil
+		return checkWintunLoadable()
 	}
 
 	// wintun 只从程序所在目录与 System32 加载（LOAD_LIBRARY_SEARCH_APPLICATION_DIR|SYSTEM32），不查工作目录：
 	// 此前这里也接受工作目录中的 DLL，检查通过后加载才失败，错误难以理解。
 	return fmt.Errorf("wintun.dll not found next to the program or in System32")
+}
+
+// checkWintunLoadable 确认 wintun.dll 不只是存在，而且能被加载（位数不符、文件损坏都会失败）。
+// wintun 库在 DLL 无法加载时会 panic 而不是返回错误，所以必须在调用它之前检查。
+// 搜索范围与 wintun 库一致：程序所在目录与系统目录。
+func checkWintunLoadable() error {
+	const searchFlags = 0x00000200 | 0x00000800 // LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32
+	h, err := windows.LoadLibraryEx("wintun.dll", 0, searchFlags)
+	if err != nil {
+		return fmt.Errorf("wintun.dll exists but cannot be loaded (wrong architecture or corrupted? use the official amd64 build): %w", err)
+	}
+	_ = windows.FreeLibrary(h)
+	return nil
 }
 
 const errorNoMoreItems = syscall.Errno(259)

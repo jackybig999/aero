@@ -52,12 +52,21 @@ func main() {
 		return
 	}
 
+	// 日志文件（脱敏）。失败只告警，不影响客户端运行。
+	if closeLog, err := setupLogFile(client.GetDataDir(), *headless); err != nil {
+		log.Printf("[CLIENT] log file unavailable: %v", err)
+	} else {
+		defer closeLog()
+	}
+
 	runMode, err := client.NormalizeMode(*mode)
 	if err != nil {
 		fatalf("[CLIENT] %v", err)
 	}
 	*mode = runMode
 
+	// 排查“换了一台机器/一个环境就不行”所需的基本信息：系统版本、是否提权（创建虚拟网卡需要管理员）
+	log.Printf("[CLIENT] host: %s, elevated=%v", client.HostDescription(), client.ProcessElevated())
 	log.Printf("[CLIENT] initializing AERO client v%s (api=%s, listen=%s, mode=%s)...", client.ClientVersion, *apiAddr, *listenAddr, *mode)
 
 	eng := client.NewEngine()
@@ -70,6 +79,9 @@ func main() {
 	} else {
 		log.Printf("[CLIENT] resident mixed proxy listening on %s (permanent daemon)", eng.GetListenAddr())
 	}
+
+	// 国内直连规则：先加载上次下载的副本，再在后台从节点自动同步（订阅载入后开始，每 24h 刷新）
+	eng.StartGeoDataAutoSync()
 
 	if *subURL != "" {
 		if _, err := eng.LoadAndApplySubscription(*subURL); err != nil {
@@ -133,6 +145,12 @@ func main() {
 			"probe_ok":       st.ProbeOk,
 			"probe_ms":       st.ProbeMs,
 			"geo_rule_count": st.GeoRuleCount,
+			"geo_updated_at": st.GeoUpdatedAt,
+			"geo_error":      st.GeoError,
+
+			"resident_listening": st.ResidentListening,
+			"degraded":           st.Degraded,
+			"degraded_reason":    st.DegradedReason,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -437,7 +455,7 @@ func main() {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second) // 与单次下载上限匹配（慢链路）
 		defer cancel()
 
 		count, updated, err := eng.SyncGeoData(ctx)
@@ -448,7 +466,8 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":  "ok",
 			"updated": updated,
-			"count":   count,
+			"count":   count,                       // 本次生效的下发规则条数
+			"total":   eng.GetState().GeoRuleCount, // 引擎内全部直连规则（含内置）
 		})
 	})
 

@@ -8,11 +8,13 @@ import (
 	"context"
 	_ "embed"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -94,6 +96,13 @@ func (m *ChinaIPMatcher) init(data string) {
 		ranges = append(ranges, ipRange{start: start, end: end})
 	}
 
+	m.ranges = ranges
+	m.normalize()
+}
+
+// normalize 按起点排序并合并相邻或重叠的区间。
+func (m *ChinaIPMatcher) normalize() {
+	ranges := m.ranges
 	sort.Slice(ranges, func(i, j int) bool {
 		return ranges[i].start < ranges[j].start
 	})
@@ -102,7 +111,8 @@ func (m *ChinaIPMatcher) init(data string) {
 		merged := make([]ipRange, 0, len(ranges))
 		curr := ranges[0]
 		for i := 1; i < len(ranges); i++ {
-			if ranges[i].start <= curr.end+1 {
+			// 用 64 位比较：curr.end 为 255.255.255.255 时 +1 会在 32 位里回绕成 0
+			if uint64(ranges[i].start) <= uint64(curr.end)+1 {
 				if ranges[i].end > curr.end {
 					curr.end = ranges[i].end
 				}
@@ -194,6 +204,97 @@ type SplitEngine struct {
 	cacheMu         sync.RWMutex
 	cacheSize       int
 	defaultStrategy Strategy
+
+	// direct 是服务端下发的直连规则索引（域名哈希、IPv4 二分）。整体原子替换：
+	// Match 只读取指针，ReloadRules 构建好新索引后一次性换入，匹配期间无需加锁拷贝。
+	direct atomic.Pointer[directIndex]
+}
+
+// directIndex 是下发直连规则的只读索引，构建后不再修改。
+type directIndex struct {
+	suffix   map[string]struct{} // domain: 或无前缀：域名本身及全部子域
+	full     map[string]struct{} // full: 仅精确匹配
+	keywords []string            // keyword: 子串匹配
+	v4       *ChinaIPMatcher     // IPv4 网段（合并后二分）
+	v6       []*net.IPNet        // IPv6 网段（数量少，线性）
+	count    int                 // 有效规则条数（界面显示用，去重前）
+	rejected string              // 非空表示整份数据因异常被拒绝（此时 count=0），内容为原因
+}
+
+// matchDomain 判定 host（已小写、无端口、无尾点）是否命中：先精确，再逐级去掉最左一段查后缀，最后查关键字。
+func (d *directIndex) matchDomain(host string) bool {
+	if _, ok := d.full[host]; ok {
+		return true
+	}
+	for h := host; ; {
+		if _, ok := d.suffix[h]; ok {
+			return true
+		}
+		i := strings.IndexByte(h, '.')
+		if i < 0 {
+			break
+		}
+		h = h[i+1:]
+	}
+	for _, k := range d.keywords {
+		if strings.Contains(host, k) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *directIndex) matchIP(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		return d.v4 != nil && d.v4.Contains(ip4)
+	}
+	for _, n := range d.v6 {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// validDirectDomain 只接受由字母、数字、连字符、点与下划线组成的域名，拒绝带路径、端口、通配符等异常行。
+func validDirectDomain(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return s[0] != '.' && s[len(s)-1] != '.'
+}
+
+// 下发规则的校验边界。数据来自服务端，但服务端又取自第三方上游，所以客户端仍要独立设防：
+// 一行 0.0.0.0/0 或 com 就足以让大部分流量绕过隧道。取值参考真实数据（cn.txt 最宽 IPv4 /10、IPv6 /19，
+// IPv4 约 6200 条、覆盖约 8% 地址空间），并留出余量。
+const (
+	maxDirectRules      = 600000  // 单次热加载接受的规则条数上限，防止异常数据撑爆内存
+	minDirectV4Prefix   = 8       // 拒绝比 /8 更宽的 IPv4 网段
+	minDirectV6Prefix   = 16      // 拒绝比 /16 更宽的 IPv6 网段
+	maxDirectV4Lines    = 20000   // IPv4 网段行数上限；加内置快照与旁路仍远低于 maxTUNRoutes
+	maxDirectV6Lines    = 20000   // IPv6 网段为线性扫描，需限数
+	maxDirectKeywords   = 1000    // 关键字为线性子串扫描，需限数
+	minDirectKeywordLen = 4       // 过短的关键字会命中大半域名
+	maxDirectV4Coverage = 1 << 30 // IPv4 合并后覆盖超过 25% 地址空间：整份视为异常
+)
+
+// genericTLDs 是常见的通用顶级域。无前缀的单段条目会按“后缀”匹配该域下全部域名。
+// 真实名单里的单段条目只有：cn、品牌词（baidu、alipay…）、中文 gTLD（wang、yun…）与 xn-- 开头的中文顶级域；
+// 两位字母的国家/地区顶级域只放行 cn（见 addDomain），通用顶级域出现在名单里只可能是错误或投毒。
+var genericTLDs = map[string]struct{}{
+	"com": {}, "net": {}, "org": {}, "edu": {}, "gov": {}, "mil": {}, "int": {}, "info": {}, "biz": {},
+	"name": {}, "pro": {}, "xyz": {}, "top": {}, "app": {}, "dev": {}, "site": {}, "online": {},
+	"shop": {}, "vip": {}, "club": {}, "store": {}, "tech": {}, "link": {}, "asia": {}, "mobi": {},
+	"cloud": {}, "live": {}, "news": {}, "blog": {}, "life": {}, "world": {}, "fun": {}, "icu": {},
+	"work": {}, "ltd": {}, "win": {}, "bid": {}, "men": {}, "red": {}, "ren": {}, "xin": {},
+	"mom": {}, "page": {}, "click": {},
 }
 
 // NewSplitEngine 创建分流引擎
@@ -259,6 +360,20 @@ func (e *SplitEngine) Match(host string, ip net.IP) Strategy {
 		if matchSplitRule(rule, hostOnly, ip) {
 			e.setCache(host, rule.Strategy)
 			return rule.Strategy
+		}
+	}
+
+	// 服务端下发的直连规则：排在内置规则（含 AI）之后，AI 域名不会被直连名单覆盖
+	if d := e.direct.Load(); d != nil {
+		hit := false
+		if ip != nil {
+			hit = d.matchIP(ip)
+		} else {
+			hit = d.matchDomain(strings.TrimSuffix(strings.ToLower(hostOnly), "."))
+		}
+		if hit {
+			e.setCache(host, DIRECT)
+			return DIRECT
 		}
 	}
 
@@ -359,64 +474,199 @@ func (e *SplitEngine) ClearCache() {
 	e.cache = make(map[string]Strategy)
 }
 
-// ReloadRules 动态热加载直连分流规则库
+// ReloadRules 热加载服务端下发的直连规则库，返回有效规则条数。
+//
+// 每行一条，取第一个空白前的字段（丢弃 "@cn" 之类属性）：
+//   - IPv4/IPv6 的 CIDR 或单个 IP → 网段；
+//   - full:域名 → 仅精确匹配；keyword:词 → 子串匹配；regexp:… → 不支持，跳过；
+//   - domain:域名 或无前缀的域名 → 该域名及全部子域。
+//
+// 新索引完整构建后一次性替换旧索引；同时清空匹配缓存。
 func (e *SplitEngine) ReloadRules(data []byte) (int, error) {
-	lines := strings.Split(string(data), "\n")
-	var newDomains []string
-	var newIPRanges []string
-
-	for _, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	idx := buildDirectIndex(data)
+	if idx.count == 0 {
+		// 空数据或被判定异常的数据不安装，保持现有规则不变（否则会悄悄清空已有规则）
+		if idx.rejected != "" {
+			return 0, fmt.Errorf("direct rules rejected: %s", idx.rejected)
 		}
-		if _, _, err := net.ParseCIDR(line); err == nil {
-			newIPRanges = append(newIPRanges, line)
-		} else if ip := net.ParseIP(line); ip != nil {
-			if ip.To4() != nil {
-				newIPRanges = append(newIPRanges, line+"/32")
-			} else {
-				newIPRanges = append(newIPRanges, line+"/128")
-			}
-		} else {
-			clean := strings.TrimPrefix(line, "domain:")
-			clean = strings.TrimPrefix(clean, "full:")
-			clean = strings.TrimSpace(clean)
-			if clean != "" {
-				newDomains = append(newDomains, clean)
-			}
-		}
+		return 0, errNoDirectRules
 	}
+	e.installDirect(idx)
+	return idx.count, nil
+}
 
-	newRule := Rule{
-		Name:           "China Direct (Dynamic)",
-		Strategy:       DIRECT,
-		DomainSuffixes: newDomains,
-		IPRanges:       newIPRanges,
+var errNoDirectRules = errors.New("direct rules contain no valid entry")
+
+// BuiltinChinaCIDRs 返回仅含内置 APNIC 快照的直连网段（不含服务端下发的）。
+func (e *SplitEngine) BuiltinChinaCIDRs() []string {
+	if e == nil || e.chinaMatcher == nil {
+		return nil
 	}
+	return e.chinaMatcher.ExportCIDRs()
+}
 
+// hasDirectV4 报告是否有服务端下发的 IPv4 网段。
+func (e *SplitEngine) hasDirectV4() bool {
+	if e == nil {
+		return false
+	}
+	d := e.direct.Load()
+	return d != nil && d.v4 != nil && len(d.v4.ranges) > 0
+}
+
+// HasDirectRules 报告当前是否已有服务端下发的直连规则。
+func (e *SplitEngine) HasDirectRules() bool {
+	return e != nil && e.direct.Load() != nil
+}
+
+// DirectRuleCount 返回当前下发直连规则的条数（不含内置规则）。
+func (e *SplitEngine) DirectRuleCount() int {
+	if e == nil {
+		return 0
+	}
+	if d := e.direct.Load(); d != nil {
+		return d.count
+	}
+	return 0
+}
+
+// installDirect 用构建好的索引替换当前下发规则，并清空匹配缓存。
+func (e *SplitEngine) installDirect(idx *directIndex) {
 	e.mu.Lock()
-	newRule.parsedIPNets = make([]*net.IPNet, 0, len(newRule.IPRanges))
-	for _, cidr := range newRule.IPRanges {
-		if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
-			newRule.parsedIPNets = append(newRule.parsedIPNets, ipNet)
-		}
-	}
-
-	filtered := make([]Rule, 0, len(e.rules)+1)
+	// 旧版本把下发规则放在 rules 里（名为 China Direct (Dynamic)）：若残留则移除
+	filtered := e.rules[:0:0]
 	for _, r := range e.rules {
-		if r.Name == "China Direct" || r.Name == "China Direct (Dynamic)" {
-			continue
+		if r.Name != "China Direct (Dynamic)" {
+			filtered = append(filtered, r)
 		}
-		filtered = append(filtered, r)
 	}
-	filtered = append(filtered, newRule)
 	e.rules = filtered
+	e.direct.Store(idx)
 	e.mu.Unlock()
 
 	e.ClearCache()
+}
 
-	return len(newDomains) + len(newIPRanges), nil
+// buildDirectIndex 解析下发的规则文本，构建只读索引（不修改任何引擎状态）。
+func buildDirectIndex(data []byte) *directIndex {
+	idx := &directIndex{
+		suffix: make(map[string]struct{}),
+		full:   make(map[string]struct{}),
+	}
+	var v4 []string
+	addDomain := func(m map[string]struct{}, d string, isSuffix bool) {
+		d = strings.TrimSuffix(strings.ToLower(d), ".")
+		if !validDirectDomain(d) {
+			return
+		}
+		if isSuffix && !strings.Contains(d, ".") {
+			if _, generic := genericTLDs[d]; generic {
+				return
+			}
+			if len(d) == 2 && d != "cn" { // 其余国家/地区顶级域（tw、hk、ca、au…）不得整域直连
+				return
+			}
+		}
+		m[d] = struct{}{}
+		idx.count++
+	}
+	reject := func(reason string) *directIndex {
+		return &directIndex{suffix: map[string]struct{}{}, full: map[string]struct{}{}, rejected: reason}
+	}
+
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		if idx.count >= maxDirectRules {
+			break
+		}
+		fields := strings.Fields(rawLine)
+		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		line := fields[0]
+
+		if _, ipNet, err := net.ParseCIDR(line); err == nil {
+			ones, _ := ipNet.Mask.Size()
+			if ipNet.IP.To4() != nil {
+				if ones < minDirectV4Prefix { // 过宽（如 0.0.0.0/0）：跳过该行
+					continue
+				}
+				if len(v4) >= maxDirectV4Lines {
+					return reject(fmt.Sprintf("too many IPv4 ranges (> %d)", maxDirectV4Lines))
+				}
+				v4 = append(v4, ipNet.String())
+			} else {
+				if ones < minDirectV6Prefix {
+					continue
+				}
+				if len(idx.v6) >= maxDirectV6Lines {
+					return reject(fmt.Sprintf("too many IPv6 ranges (> %d)", maxDirectV6Lines))
+				}
+				idx.v6 = append(idx.v6, ipNet)
+			}
+			idx.count++
+			continue
+		}
+		if ip := net.ParseIP(line); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				if len(v4) >= maxDirectV4Lines {
+					return reject(fmt.Sprintf("too many IPv4 ranges (> %d)", maxDirectV4Lines))
+				}
+				v4 = append(v4, ip4.String()+"/32")
+			} else {
+				if len(idx.v6) >= maxDirectV6Lines {
+					return reject(fmt.Sprintf("too many IPv6 ranges (> %d)", maxDirectV6Lines))
+				}
+				idx.v6 = append(idx.v6, &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)})
+			}
+			idx.count++
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line, "regexp:"):
+			// 正则规则不支持：直接跳过，不当作域名
+		case strings.HasPrefix(line, "full:"):
+			addDomain(idx.full, strings.TrimPrefix(line, "full:"), false)
+		case strings.HasPrefix(line, "keyword:"):
+			k := strings.ToLower(strings.TrimPrefix(line, "keyword:"))
+			// 不得含点：形如 e.com 的“关键字”会命中大量无关站点
+			if validDirectDomain(k) && !strings.Contains(k, ".") && len(k) >= minDirectKeywordLen && len(idx.keywords) < maxDirectKeywords {
+				idx.keywords = append(idx.keywords, k)
+				idx.count++
+			}
+		default:
+			addDomain(idx.suffix, strings.TrimPrefix(line, "domain:"), true)
+		}
+	}
+	if len(v4) > 0 {
+		m := &ChinaIPMatcher{}
+		m.init(strings.Join(v4, "\n"))
+		var covered uint64
+		for _, r := range m.ranges {
+			covered += uint64(r.end) - uint64(r.start) + 1
+		}
+		if covered > maxDirectV4Coverage { // 覆盖面异常大：很可能是投毒或错误数据，整份拒绝
+			return reject(fmt.Sprintf("IPv4 ranges cover %.0f%% of the address space", float64(covered)*100/float64(1<<32)))
+		}
+		idx.v4 = m
+	}
+	return idx
+}
+
+// ChinaCIDRs 返回直连网段（内置 APNIC 快照 ∪ 服务端下发的 IPv4 网段）的合并 CIDR 列表，供 TUN 路由规划使用。
+func (e *SplitEngine) ChinaCIDRs() []string {
+	if e == nil {
+		return nil
+	}
+	merged := &ChinaIPMatcher{}
+	if e.chinaMatcher != nil {
+		merged.ranges = append(merged.ranges, e.chinaMatcher.ranges...)
+	}
+	if d := e.direct.Load(); d != nil && d.v4 != nil {
+		merged.ranges = append(merged.ranges, d.v4.ranges...)
+	}
+	merged.normalize()
+	return merged.ExportCIDRs()
 }
 
 // TotalRules 统计 APNIC 范围与所有 rules 的域名与 IP 范围总和
@@ -427,6 +677,9 @@ func (e *SplitEngine) TotalRules() int {
 	total := 0
 	if e.chinaMatcher != nil {
 		total += e.chinaMatcher.TotalRanges()
+	}
+	if d := e.direct.Load(); d != nil {
+		total += d.count
 	}
 	for _, r := range e.rules {
 		total += len(r.DomainSuffixes)

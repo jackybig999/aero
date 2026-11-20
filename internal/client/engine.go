@@ -7,11 +7,8 @@ package client
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
-	"crypto/tls"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +17,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,7 +45,10 @@ var (
 	ErrUDPUnavailable = errors.New("UDP_UNAVAILABLE")
 	ErrStartAborted   = errors.New("start aborted by stop request")
 	// ErrEngineClosed 引擎已 Close（进程退出路径）：一切建立数据面的入口都返回它，不再重新建网卡
-	ErrEngineClosed     = errors.New("engine closed")
+	ErrEngineClosed = errors.New("engine closed")
+	// ErrTunUnavailable 表示虚拟网卡无法创建/配置（缺驱动或 DLL、没有管理员权限、驱动启动失败等）。
+	// 这类失败不是网络问题，引擎据此降级为“仅本地代理”而不是让整个连接失败。
+	ErrTunUnavailable   = errors.New("virtual network adapter unavailable")
 	subSingleFlight     singleflight.Group
 	detectThirdPartyTUN = DetectThirdPartyTUN
 	dialIPFn            = func(ctx context.Context, m *SessionManager) (IPPacketConn, string, error) {
@@ -102,6 +101,17 @@ type AppState struct {
 	ProbeOk      bool   `json:"probe_ok"`
 	ProbeMs      int64  `json:"probe_ms"`
 	GeoRuleCount int    `json:"geo_rule_count"`
+	// GeoUpdatedAt 是最近一次成功获取（含“已是最新”）直连规则的 Unix 秒；0 表示尚未获取，仅用内置规则。
+	GeoUpdatedAt int64 `json:"geo_updated_at"`
+	// GeoError 是最近一次同步失败的简要原因；成功后清空。
+	GeoError string `json:"geo_error,omitempty"`
+	// ResidentListening 表示常驻混合代理（本地 SOCKS5/HTTP 端口）当前是否真的在监听；
+	// Listen 是它实际使用的地址（默认端口不可用时可能是备用端口）。
+	ResidentListening bool `json:"resident_listening"`
+	// Degraded 为真表示请求的是 TUN 但虚拟网卡不可用，当前仅本地代理可用（此时 Mode 为 sysproxy）；
+	// DegradedReason 是原因（引擎原始错误文本，界面再翻译）。
+	Degraded       bool   `json:"degraded"`
+	DegradedReason string `json:"degraded_reason,omitempty"`
 }
 
 // Engine 客户端核心引擎
@@ -128,6 +138,18 @@ type Engine struct {
 	currentISP  string
 	savedSubURL string
 	geoDataURL  string
+
+	// degraded 为真表示请求的是 TUN，但虚拟网卡不可用，当前以“仅本地代理”运行（隧道已连上，只有走本地端口的流量经隧道）。
+	degraded       atomic.Bool
+	degradedReason atomic.Pointer[string]
+
+	geoSyncOnce sync.Once
+	geoSyncSem  chan struct{} // 容量 1 的同步信号量（界面按钮与后台自动同步不并发）
+	geoStatMu   sync.Mutex
+	geoUpdated  time.Time
+	geoLastErr  string
+	geoAutoOnce sync.Once
+	geoLoopDone chan struct{} // 后台同步协程退出时关闭（测试等待用）
 
 	running           atomic.Bool
 	state             atomic.Int32
@@ -904,6 +926,8 @@ func (e *Engine) startLocked(ticket uint64) error {
 		}
 		return rollbackLocked(ticket, startCancel, err)
 	}
+	e.degraded.Store(false)
+	e.degradedReason.Store(nil)
 
 	e.mu.RLock()
 	activeAddr := e.activeAddr
@@ -1120,7 +1144,9 @@ func (e *Engine) startLocked(ticket uint64) error {
 		SetGlobalMobileDNSHandler(e.dnsHandler)
 	}
 
-	if mode == "sysproxy" {
+	// 本地代理数据面：只启动哨兵、网络监控与本地混合代理，不碰宿主网络。
+	// 命令行/无头的 sysproxy 模式走这里；TUN 虚拟网卡不可用时降级也走这里。
+	runLocalProxyPlane := func(desc string) error {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -1144,12 +1170,25 @@ func (e *Engine) startLocked(ticket uint64) error {
 		e.startPending.Store(false)
 		e.startCancel = nil
 		e.mu.Unlock()
-		log.Printf("[ENGINE] data plane started in local sysproxy mode (mixed proxy %s)", e.listenAddr)
+		log.Printf("[ENGINE] data plane started in %s (mixed proxy %s)", desc, e.listenAddr)
 		return nil
+	}
+
+	if mode == "sysproxy" {
+		return runLocalProxyPlane("local sysproxy mode")
 	}
 
 	// 先建立 CONNECT-IP 取得地址，再创建自有网卡：网卡、地址、路由、DNS 防护一次就绪（ADR-0013）。
 	if err := e.bringUpTunLocked(startCtx, nodeIP); err != nil {
+		// 虚拟网卡本身不可用（不是拨号/网络失败、也不是第三方 TUN 冲突）：隧道已能连上，
+		// 降级为“仅本地代理”，并在状态里明确标出，而不是让用户面对一个完全不能用的“连接失败”。
+		if errors.Is(err, ErrTunUnavailable) && startCtx.Err() == nil {
+			reason := err.Error()
+			e.degraded.Store(true)
+			e.degradedReason.Store(&reason)
+			log.Printf("[ENGINE] TUN unavailable, degrading to local proxy only: %v", err)
+			return runLocalProxyPlane("degraded local proxy mode (TUN unavailable)")
+		}
 		if e.rootCancel != nil {
 			e.rootCancel()
 		}
@@ -1397,6 +1436,8 @@ func (e *Engine) stopLocked() error {
 	e.mu.Lock()
 	e.state.Store(stateStopped)
 	e.running.Store(false)
+	e.degraded.Store(false)
+	e.degradedReason.Store(nil)
 	e.mu.Unlock()
 
 	log.Printf("[ENGINE] data plane stopped")
@@ -1450,6 +1491,19 @@ func (e *Engine) GetState() AppState {
 		geoCount = e.splitEngine.TotalRules()
 	}
 
+	geoUpdated, geoErr := e.geoStatus()
+
+	// 降级时对外报告实际运行的模式（sysproxy），界面据此显示“仅本地代理”
+	mode := e.mode
+	degraded := e.degraded.Load()
+	degradedReason := ""
+	if p := e.degradedReason.Load(); p != nil {
+		degradedReason = *p
+	}
+	if degraded {
+		mode = "sysproxy"
+	}
+
 	subURL := e.savedSubURL
 	isp := e.currentISP
 	if isp == "" {
@@ -1475,7 +1529,7 @@ func (e *Engine) GetState() AppState {
 		LastError:    lastErr,
 		ErrorCode:    lastCode,
 		ConflictVPN:  conflictVPN,
-		Mode:         e.mode,
+		Mode:         mode,
 		Listen:       e.listenAddr,
 		ActiveNode:   e.activeAddr,
 		ActiveSNI:    e.activeSNI,
@@ -1491,6 +1545,12 @@ func (e *Engine) GetState() AppState {
 		ProbeOk:      probeOk,
 		ProbeMs:      rttMs,
 		GeoRuleCount: geoCount,
+		GeoUpdatedAt: geoUpdated,
+		GeoError:     geoErr,
+
+		ResidentListening: e.mixedListener != nil,
+		Degraded:          degraded,
+		DegradedReason:    degradedReason,
 	}
 }
 
@@ -1543,173 +1603,6 @@ const geoDataMaxBytes = 16 << 20
 
 // mixedHandshakeTimeoutDefault 是混合代理握手阶段的读超时
 const mixedHandshakeTimeoutDefault = 10 * time.Second
-
-// SyncGeoData 从云端同步最新中国直连域名与网段规则库
-// 规则：必须使用 DialPhysicalDirect 构建 HTTP Transport 防止 TUN 路由环路死锁，比对 If-None-Match ETag，200 则原子写入 GetDataDir()/geodata_direct.txt 并调用 e.splitEngine.ReloadRules
-func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
-	e.mu.RLock()
-	targetURL := e.geoDataURL
-	subURL := e.savedSubURL
-	e.mu.RUnlock()
-
-	if targetURL == "" {
-		if subURL != "" {
-			if u, err := url.Parse(subURL); err == nil && u.Host != "" {
-				scheme := u.Scheme
-				if scheme == "" {
-					scheme = "https"
-				}
-				hostOnly := u.Hostname()
-				port := u.Port()
-				if port == "" || port == "443" || port == "80" {
-					if cachedPort, ok := GetCachedSubPort(hostOnly); ok && cachedPort > 0 {
-						port = strconv.Itoa(cachedPort)
-					}
-				}
-				if port != "" && port != "443" && port != "80" {
-					targetURL = fmt.Sprintf("%s://%s:%s/api/v1/geodata/direct", scheme, hostOnly, port)
-				} else {
-					targetURL = fmt.Sprintf("%s://%s/api/v1/geodata/direct", scheme, hostOnly)
-				}
-			}
-		}
-	}
-	if targetURL == "" {
-		targetURL = "https://rules.aero-protocol.com/geodata_direct.txt"
-	}
-
-	dataDir := GetDataDir()
-	filePath := filepath.Join(dataDir, "geodata_direct.txt")
-	etagPath := filepath.Join(dataDir, "geodata_direct.etag")
-
-	var currentETag string
-	if b, err := os.ReadFile(etagPath); err == nil {
-		currentETag = strings.TrimSpace(string(b))
-	} else if existing, err := os.ReadFile(filePath); err == nil && len(existing) > 0 {
-		sum := sha256.Sum256(existing)
-		currentETag = `"` + hex.EncodeToString(sum[:]) + `"`
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		return 0, false, fmt.Errorf("create geodata request: %w", err)
-	}
-	req.Header.Set("User-Agent", "AeroClient/2.0")
-	if currentETag != "" {
-		req.Header.Set("If-None-Match", currentETag)
-	}
-
-	tr := &http.Transport{
-		Proxy: nil,
-		DialContext: func(c context.Context, network, addr string) (net.Conn, error) {
-			return DialPhysicalDirect(c, network, addr)
-		},
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS13,
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          10,
-		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 8 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	client := &http.Client{
-		Transport: tr,
-		Timeout:   15 * time.Second,
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, false, fmt.Errorf("sync geodata network error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotModified {
-		count := 0
-		if e.splitEngine != nil {
-			count = e.splitEngine.TotalRules()
-		}
-		return count, false, nil
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, false, fmt.Errorf("sync geodata unexpected HTTP status: %d", resp.StatusCode)
-	}
-
-	// 限制响应体上限，超限直接报错，不落盘也不替换现有规则
-	body, err := io.ReadAll(io.LimitReader(resp.Body, geoDataMaxBytes+1))
-	if err != nil {
-		return 0, false, fmt.Errorf("read geodata body: %w", err)
-	}
-	if len(body) > geoDataMaxBytes {
-		return 0, false, fmt.Errorf("geodata body exceeds %d bytes limit", geoDataMaxBytes)
-	}
-
-	// 原子写入 GetDataDir()/geodata_direct.txt
-	tmpFile, err := os.CreateTemp(dataDir, "geodata_direct.*.tmp")
-	if err != nil {
-		return 0, false, fmt.Errorf("create geodata temp file: %w", err)
-	}
-	tmpName := tmpFile.Name()
-
-	var renameSuccess bool
-	defer func() {
-		if !renameSuccess {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmpFile.Write(body); err != nil {
-		_ = tmpFile.Close()
-		return 0, false, fmt.Errorf("write geodata temp file: %w", err)
-	}
-	if err := tmpFile.Sync(); err != nil {
-		_ = tmpFile.Close()
-		return 0, false, fmt.Errorf("sync geodata temp file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return 0, false, fmt.Errorf("close geodata temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpName, filePath); err == nil {
-		renameSuccess = true
-	} else {
-		bakPath := filePath + ".bak"
-		_ = os.Remove(bakPath)
-		if renBakErr := os.Rename(filePath, bakPath); renBakErr == nil {
-			if renTmpErr := os.Rename(tmpName, filePath); renTmpErr == nil {
-				renameSuccess = true
-				_ = os.Remove(bakPath)
-			} else {
-				_ = os.Rename(bakPath, filePath) // 立即回滚恢复原文件
-				return 0, false, fmt.Errorf("rename geodata fallback failed: %w", renTmpErr)
-			}
-		} else {
-			if werr := os.WriteFile(filePath, body, 0644); werr != nil {
-				return 0, false, fmt.Errorf("write geodata direct fallback: %w", werr)
-			}
-			renameSuccess = true
-		}
-	}
-
-	newETag := resp.Header.Get("ETag")
-	if newETag == "" {
-		sum := sha256.Sum256(body)
-		newETag = `"` + hex.EncodeToString(sum[:]) + `"`
-	}
-	_ = os.WriteFile(etagPath, []byte(newETag), 0644)
-
-	if e.splitEngine == nil {
-		return 0, true, fmt.Errorf("split engine not initialized")
-	}
-	count, err := e.splitEngine.ReloadRules(body)
-	if err != nil {
-		return 0, true, fmt.Errorf("reload rules failed: %w", err)
-	}
-
-	return count, true, nil
-}
 
 // SetMode 设置工作模式
 // NormalizeMode 把用户输入的模式规范为 "tun" 或 "sysproxy"（"socks"、"proxy" 为 sysproxy 的别名）。
@@ -1874,6 +1767,48 @@ func (c *trackedConn) Close() error {
 	return c.Conn.Close()
 }
 
+// 常驻混合代理的默认地址与备用端口。Windows 会把一批端口划为“排除段”（Hyper-V、WSL、Docker 等占用，
+// 重启后还会变），或被其他软件独占，绑定默认端口会报“访问权限不允许”。换一台机器、换一个网络环境，
+// 可用端口都不同，所以回退顺序是：上次成功的备用端口（保持稳定）→ 固定备用端口 → 最后让系统分配一个，
+// 保证常驻代理总能起来。真实地址写回 listenAddr，状态接口与界面据此显示。
+// 固定备用端口选在 8000–11000 之间，避开常见软件占用的端口（8080、8888、9090、9050、10808/10809 等）。
+// 只有使用默认地址时才回退；用户显式指定的地址失败就如实报错。
+const (
+	defaultMixedListen = "127.0.0.1:55555"
+	residentPortFile   = "resident_port" // 记住上次成功的备用端口，让浏览器里填的端口尽量保持不变
+)
+
+var mixedFallbackPorts = []string{"8731", "9457", "10231"}
+
+// residentFallbackAddrs 返回回退时依次尝试的地址（去重）。
+func residentFallbackAddrs() []string {
+	var out []string
+	seen := map[string]bool{defaultMixedListen: true}
+	add := func(a string) {
+		if !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(GetDataDir(), residentPortFile)); err == nil {
+		if p, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && p >= 1024 && p <= 65535 {
+			add(net.JoinHostPort("127.0.0.1", strconv.Itoa(p)))
+		}
+	}
+	for _, p := range mixedFallbackPorts {
+		add(net.JoinHostPort("127.0.0.1", p))
+	}
+	add("127.0.0.1:0") // 最后一招：交给系统分配
+	return out
+}
+
+// rememberResidentPort 记录成功回退到的端口；失败不影响运行。
+func rememberResidentPort(addr net.Addr) {
+	if ta, ok := addr.(*net.TCPAddr); ok {
+		_ = os.WriteFile(filepath.Join(GetDataDir(), residentPortFile), []byte(strconv.Itoa(ta.Port)), 0o600)
+	}
+}
+
 // StartResidentMixedProxy 启动 SOCKS5 + HTTP CONNECT 混合端口常驻守护监听 (Daemon 模式)
 func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 	// 常驻混合代理只允许绑定回环地址；在写入 listenAddr 与 Listen 之前拒绝
@@ -1910,6 +1845,18 @@ func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 	}
 
 	ln, err := net.Listen("tcp", targetAddr)
+	moved := false
+	if err != nil && targetAddr == defaultMixedListen {
+		firstErr := err
+		for _, alt := range residentFallbackAddrs() {
+			if l2, e2 := net.Listen("tcp", alt); e2 == nil {
+				log.Printf("[PROXY] %s unavailable (%v); resident mixed proxy moved to %s", targetAddr, firstErr, l2.Addr())
+				ln, err, targetAddr, moved = l2, nil, l2.Addr().String(), true
+				rememberResidentPort(l2.Addr())
+				break
+			}
+		}
+	}
 	if err != nil {
 		e.mu.Lock()
 		e.mixedStarting = false
@@ -1933,7 +1880,7 @@ func (e *Engine) StartResidentMixedProxy(addr ...string) error {
 	}
 	e.mixedListener = ln
 	e.mixedStarting = false
-	if strings.HasSuffix(targetAddr, ":0") {
+	if moved || strings.HasSuffix(targetAddr, ":0") {
 		e.listenAddr = ln.Addr().String()
 	}
 	actualAddr := e.listenAddr

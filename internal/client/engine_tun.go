@@ -46,11 +46,16 @@ func tunGateway(p netip.Prefix) netip.Addr {
 // 订阅中全部节点地址与当前活跃节点都放入 Bypass，切换到订阅内节点无需改路由。
 func (e *Engine) tunPlanInputLocked(extra ...net.IP) RoutePlanInput {
 	var in RoutePlanInput
-	if GlobalDefaultChinaMatcher != nil {
-		for _, s := range GlobalDefaultChinaMatcher.ExportCIDRs() {
-			if p, err := netip.ParsePrefix(s); err == nil {
-				in.Direct = append(in.Direct, p)
-			}
+	// 直连网段 = 内置 APNIC 快照 ∪ 服务端下发的 IPv4 网段；分流引擎尚未创建时退回内置快照
+	var cidrs []string
+	if e.splitEngine != nil {
+		cidrs = e.splitEngine.ChinaCIDRs()
+	} else if GlobalDefaultChinaMatcher != nil {
+		cidrs = GlobalDefaultChinaMatcher.ExportCIDRs()
+	}
+	for _, s := range cidrs {
+		if p, err := netip.ParsePrefix(s); err == nil {
+			in.Direct = append(in.Direct, p)
 		}
 	}
 	addBypass := func(ip net.IP) {
@@ -75,6 +80,27 @@ func (e *Engine) tunPlanInputLocked(extra ...net.IP) RoutePlanInput {
 		log.Printf("[ENGINE] read system DNS servers: %v", err)
 	}
 	in.Capture = dns
+	return e.withinRouteBudget(in)
+}
+
+// withinRouteBudget 保证路由规划不超过 maxTUNRoutes。挂到 TUN 上的是“全集减去直连”的补集，
+// 下发的 IPv4 网段若很稀疏（大量互不相邻的小网段），每段空隙都会被拆成多条前缀，条数远超网段数，
+// 行数上限与覆盖率总闸都挡不住。此时丢弃下发网段、只用内置快照，保证 TUN 能起来。
+func (e *Engine) withinRouteBudget(in RoutePlanInput) RoutePlanInput {
+	if !e.splitEngine.hasDirectV4() {
+		return in
+	}
+	_, err := PlanTUNRoutes(in)
+	if err == nil {
+		return in
+	}
+	log.Printf("[ENGINE] downloaded direct ranges exceed the TUN route budget, using built-in ranges only: %v", err)
+	in.Direct = in.Direct[:0:0]
+	for _, s := range e.splitEngine.BuiltinChinaCIDRs() {
+		if p, err := netip.ParsePrefix(s); err == nil {
+			in.Direct = append(in.Direct, p)
+		}
+	}
 	return in
 }
 
@@ -128,7 +154,7 @@ func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error
 	}
 	host, err := openTunHostFn(tunHostConfig{Name: tunName, MTU: tunMTU, IPv4: prefix, DNS: tunGateway(prefix), Plan: plan})
 	if err != nil {
-		return errors.Join(fmt.Errorf("open TUN: %w", err), ipConn.Close())
+		return errors.Join(fmt.Errorf("%w: open TUN: %w", ErrTunUnavailable, err), ipConn.Close())
 	}
 	e.mu.Lock() // refreshTunRoutes 在 e.mu 下读取 tunHost
 	e.tunHost = host

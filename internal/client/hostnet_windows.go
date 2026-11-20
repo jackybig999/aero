@@ -60,6 +60,16 @@ func openTunHost(cfg tunHostConfig) (tunHost, error) {
 	return h, nil
 }
 
+// createWintunAdapter 调用 wintun.CreateAdapter，并把库内的 panic 兜底成错误，避免后台协程崩溃整个进程。
+func createWintunAdapter(name string, guid *windows.GUID) (adapter *wintun.Adapter, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			adapter, err = nil, fmt.Errorf("wintun panic: %v", r)
+		}
+	}()
+	return wintun.CreateAdapter(name, wintunTunnelType, guid)
+}
+
 // createWintunDevice 新建自有网卡；同名网卡已存在（另一实例正在运行）时报错，不接管。
 func createWintunDevice(name string) (*windowsDevice, error) {
 	wintunLifecycleMu.Lock()
@@ -70,9 +80,13 @@ func createWintunDevice(name string) (*windowsDevice, error) {
 		}
 	}
 	guid := aeroTunGUID
-	adapter, err := wintun.CreateAdapter(name, wintunTunnelType, &guid)
+	adapter, err := createWintunAdapter(name, &guid)
 	if err != nil {
-		return nil, fmt.Errorf("create wintun adapter %s (another instance running?): %w", name, err)
+		hint := ""
+		if !ProcessElevated() { // 创建网卡需要管理员权限：没提权时在错误里明确写出，界面据此给出对应提示
+			hint = " [process is not elevated: run as Administrator]"
+		}
+		return nil, fmt.Errorf("create wintun adapter %s%s: %w", name, hint, err)
 	}
 	session, err := adapter.StartSession(wintunRingCapacity)
 	if err != nil {
