@@ -1,4 +1,6 @@
 const DEFAULT_LISTEN = '127.0.0.1:55555'
+let currentListen = DEFAULT_LISTEN   // 引擎实际监听的地址（默认端口不可用时会是备用端口）
+let effectiveMode = 'tun'            // 引擎实际运行的模式（TUN 不可用而降级时是 sysproxy）
 const LANG_KEY = 'aero-lang'
 const MODE_KEY = 'aero-mode'
 const SUB_KEY = 'aero-sub'
@@ -31,7 +33,7 @@ function applyI18n() {
   })
   const lb = $('btnLang')
   if (lb) lb.textContent = t('langName')
-  paintModeCards()
+  updateChainSummary()
   if (typeof filterAndRenderNodes === 'function') {
     filterAndRenderNodes()
   }
@@ -48,32 +50,9 @@ function modeLabel(mode) {
   return t('modeTun')
 }
 
+// 客户端界面统一 TUN（本地 55555 常驻代理在 TUN 下同样可用）；sysproxy 只在命令行/无头模式出现
 function selectedMode() {
-  const el = document.querySelector('input[name="mode"]:checked')
-  return productMode(el ? el.value : 'tun')
-}
-
-function paintModeCards() {
-  const cur = selectedMode()
-  document.querySelectorAll('.mode').forEach((lab) => {
-    lab.classList.toggle('selected', lab.getAttribute('data-mode') === cur)
-  })
-  const tip = $('modeTip')
-  if (!tip) return
-  if (cur === 'tun') tip.textContent = t('tipTun')
-  else if (cur === 'sysproxy') tip.textContent = t('tipSys')
-}
-
-function setModeUI(mode) {
-  mode = productMode(mode)
-  document.querySelectorAll('input[name="mode"]').forEach((inp) => {
-    inp.checked = inp.value === mode
-  })
-  try {
-    localStorage.setItem(MODE_KEY, mode)
-  } catch {}
-  paintModeCards()
-  if ($('stMode')) $('stMode').textContent = modeLabel(mode)
+  return 'tun'
 }
 
 function msg(text, kind) {
@@ -162,7 +141,6 @@ async function refreshStatus() {
   try {
     const st = await api('GET', '/api/v1/status')
     const on = !!st.connected
-    if (on && st.mode && !busy) setModeUI(st.mode)
     const shown = on && st.mode ? productMode(st.mode) : selectedMode()
     setState(on ? 'on' : 'off', on ? t('connected') + ' · ' + modeLabel(shown) : t('ready'))
     if ($('stMode')) $('stMode').textContent = modeLabel(shown)
@@ -175,16 +153,18 @@ async function refreshStatus() {
     if ($('stISP')) $('stISP').textContent = getLocalIspName(st.isp)
     if ($('stSNI')) $('stSNI').textContent = st.sni || '—'
     if ($('stListen')) $('stListen').textContent = st.listen || DEFAULT_LISTEN
+    paintListen(st)
+    effectiveMode = productMode(st.mode || 'tun')
+    paintDegraded(st)
     let rtt = st.rtt_ms
     if (!rtt && st.nodes && st.nodes.length) {
       const n = st.nodes.find((x) => x.active) || st.nodes.find((x) => x.reachable)
       if (n && n.rtt_ms) rtt = n.rtt_ms
     }
     if ($('stRtt')) $('stRtt').textContent = rtt ? rtt + ' ms' : on ? '…' : '—'
-    if ($('geoRuleCount') && st.geo_rule_count) {
-      $('geoRuleCount').textContent = t('rulesReady', { count: st.geo_rule_count.toLocaleString() })
-    }
+    paintGeo(st)
     if (st.sub_url && !$('subUrl').value) $('subUrl').value = st.sub_url
+    updateOnboard(st)
     if (st.probe_ok === true || st.probe_ok === false) {
       applyProbe({ ok: st.probe_ok, ms: st.probe_ms })
     }
@@ -209,6 +189,77 @@ async function refreshStatus() {
   }
 }
 
+// 本地常驻端口徽章：显示引擎真实监听的地址；没在监听（端口被占用/被系统禁止）时明确提示，而不是仍显示一个不可用的端口
+function paintListen(st) {
+  const badge = $('listenBadge')
+  if (!badge) return
+  if (st.resident_listening === false) {
+    badge.textContent = t('residentDown')
+    badge.classList.add('warn')
+    return
+  }
+  badge.classList.remove('warn')
+  if (st.listen) currentListen = st.listen
+  badge.textContent = currentListen
+}
+
+// 降级提示：请求的是 TUN 但虚拟网卡不可用，隧道已连上，只有走本地代理端口的流量经过隧道。
+function paintDegraded(st) {
+  const box = $('degradedNotice')
+  if (!box) return
+  const on = !!(st.connected && st.degraded)
+  box.hidden = !on
+  if (!on) return
+  const reason = friendlyConnectError(st.degraded_reason || '')
+  $('degradedDesc').textContent = t('degradedDesc', { listen: st.listen || currentListen }) + (reason ? ' ' + t('degradedReason', { reason }) : '')
+}
+
+// 把引擎的英文错误翻成用户能照着做的说明；其余错误原样显示
+function friendlyConnectError(raw) {
+  if (!raw) return raw
+  if (raw.includes('wintun.dll')) return t('errNoWintunDll') // 缺少或无法加载 wintun.dll
+  if (raw.includes('not elevated')) return t('errNeedAdmin') // 没有管理员权限
+  if (raw.includes('create wintun adapter')) return t('errTunCreate') // 驱动层创建失败
+  return raw
+}
+
+// 国内直连卡片：规则条数、最近一次更新时间、失败原因
+function agoText(sec) {
+  if (sec < 60) return t('agoJustNow')
+  if (sec < 3600) return t('agoMin', { n: Math.floor(sec / 60) })
+  if (sec < 86400) return t('agoHour', { n: Math.floor(sec / 3600) })
+  return t('agoDay', { n: Math.floor(sec / 86400) })
+}
+
+function geoErrText(raw) {
+  if (!raw) return ''
+  if (raw.includes('no geodata source')) return t('geoNoNode')
+  if (raw.includes('already in progress')) return t('geoBusy')
+  return raw.length > 90 ? raw.slice(0, 90) + '…' : raw
+}
+
+function paintGeo(st) {
+  if ($('geoRuleCount')) {
+    $('geoRuleCount').textContent = st.geo_rule_count ? t('rulesCount', { count: st.geo_rule_count.toLocaleString() }) : '—'
+  }
+  const line = $('geoStatusLine')
+  if (!line) return
+  // “订阅里还没有节点”不是故障：全新安装时显示中性提示，载入订阅后自动下载
+  const noNode = !!st.geo_error && st.geo_error.includes('no geodata source')
+  const err = noNode ? '' : geoErrText(st.geo_error)
+  let text
+  if (noNode && !st.geo_updated_at) {
+    text = t('geoWaitSub')
+  } else if (st.geo_updated_at) {
+    text = t('geoUpdatedAgo', { ago: agoText(Math.max(0, Math.floor(Date.now() / 1000) - st.geo_updated_at)) })
+    if (err) text += ' · ' + t('geoSyncFailed', { err })
+  } else {
+    text = err ? t('geoSyncFailed', { err }) : t('geoBuiltinOnly')
+  }
+  line.textContent = text
+  line.classList.toggle('err', !!err)
+}
+
 async function checkUpfrontTUNConflict() {
   try {
     const res = await api('GET', '/api/v1/tun/status')
@@ -221,39 +272,22 @@ async function checkUpfrontTUNConflict() {
   return null
 }
 
-function showTunConflictModal(vpnName, onProceed) {
+// 第三方 TUN 冲突：只警告，请用户先退出对方的 TUN；不提供“忽略并继续”（两个 TUN 无法同时工作）
+function showTunConflictModal(vpnName) {
   const modal = $('tunConflictModal')
-  if (!modal) {
-    if (onProceed) onProceed()
-    return
-  }
+  if (!modal) return
   const desc = $('tunConflictModalDesc')
   if (desc) {
     desc.textContent = t('tunConflictDesc', { name: vpnName || t('thirdPartyVPN') })
   }
   modal.hidden = false
-
-  $('btnTunConflictSysproxy').onclick = async () => {
-    modal.hidden = true
-    hideConflictBox()
-    setModeUI('sysproxy')
-    await api('POST', '/api/v1/mode', { mode: 'sysproxy' }).catch(() => null)
-    const sub = ($('subUrl').value || '').trim()
-    if (sub) {
-      await proceedConnect(sub)
-    } else if (onProceed) {
-      onProceed()
+  const ok = $('btnTunConflictOk')
+  if (ok) {
+    ok.onclick = () => {
+      modal.hidden = true
+      msg(t('closeThirdPartyTunHint'), 'info')
     }
-  }
-
-  $('btnTunConflictIgnore').onclick = () => {
-    modal.hidden = true
-    if (onProceed) onProceed()
-  }
-
-  $('btnTunConflictCancel').onclick = () => {
-    modal.hidden = true
-    msg(t('tunConflictCancel'), 'info')
+    ok.focus()
   }
 }
 
@@ -277,17 +311,7 @@ async function ensureImported(strict = false) {
       return
     }
 
-    if (strict && selectedMode() === 'tun') {
-      const vpn = await checkUpfrontTUNConflict()
-      if (vpn) {
-        showTunConflictModal(vpn, () => {
-          doActualImport(sub)
-        })
-        return
-      }
-    }
-
-    await doActualImport(sub)
+    await doActualImport(sub)   // 导入订阅不碰网卡，不受 TUN 冲突影响
   } finally {
     isImporting = false
   }
@@ -335,12 +359,15 @@ async function onConnect() {
   const sub = ($('subUrl').value || '').trim()
   if (!sub) {
     msg(t('needSub'), 'err')
+    switchTab('settings')
+    $('tabSubManual')?.click()
+    $('subUrl')?.focus()
     return
   }
   if (selectedMode() === 'tun') {
     const vpn = await checkUpfrontTUNConflict()
     if (vpn) {
-      showTunConflictModal(vpn, () => proceedConnect(sub))
+      showTunConflictModal(vpn)
       return
     }
   }
@@ -364,7 +391,6 @@ async function proceedConnect(sub) {
     const mode = selectedMode()
     const md = await api('POST', '/api/v1/mode', { mode })
     if (md && md.code === 'CONFLICT_TUN') {
-      setModeUI(md.mode || 'sysproxy')
       handleTUNConflict(md.vpn || '')
       return
     }
@@ -399,11 +425,10 @@ async function proceedConnect(sub) {
     }
 
     // 4. 已连通
-    hideConflictBox()
     doProbe()
     await refreshStatus()
     setState('on', t('connected'))
-    msg(t('connectedAs') + ' · ' + modeLabel(mode), 'ok')
+    msg(t('connectedAs') + ' · ' + modeLabel(effectiveMode), 'ok')
   } catch (e) {
     if (e.code === 'CONFLICT_TUN') {
       handleTUNConflict(e.vpn || '')
@@ -412,7 +437,7 @@ async function proceedConnect(sub) {
     } else {
       setState('err', t('ready'))
       const em = e.message || String(e)
-      msg(em === 'connect' ? t('connFailed') : em, 'err')
+      msg(em === 'connect' ? t('connFailed') : friendlyConnectError(em), 'err')
     }
   } finally {
     busy = false
@@ -439,11 +464,10 @@ async function pollConnectStatus() {
     if (!st) continue
 
     if (st.connected) {
-      hideConflictBox()
       doProbe()
       await refreshStatus()
       setState('on', t('connected'))
-      msg(t('connectedAs') + ' · ' + modeLabel(mode), 'ok')
+      msg(t('connectedAs') + ' · ' + modeLabel(effectiveMode), 'ok')
       return
     }
 
@@ -459,7 +483,7 @@ async function pollConnectStatus() {
 
     if (!st.starting && !st.stopping && st.last_error) {
       setState('err', t('ready'))
-      msg(st.last_error, 'err')
+      msg(friendlyConnectError(st.last_error), 'err')
       return
     }
 
@@ -474,7 +498,7 @@ async function pollConnectStatus() {
         await api('POST', '/api/v1/cancel')
       } catch {}
       setState('err', t('ready'))
-      const detail = st && st.last_error ? ` (${st.last_error})` : ''
+      const detail = st && st.last_error ? ` (${friendlyConnectError(st.last_error)})` : ''
       msg((t('connTimeout') || '连接超时，请重试') + detail, 'err')
       return
     }
@@ -482,7 +506,6 @@ async function pollConnectStatus() {
 }
 
 async function onDisconnect() {
-  hideConflictBox()
   busy = true
   setState('wait', t('disconnecting'))
   msg(t('disconnecting'))
@@ -508,23 +531,8 @@ function handleTUNConflict(vpnName) {
   busy = false
   msg('') // 彻底清空「连接中…」残留
   setState('off', t('ready'))
-  const box = $('conflictBox')
-  if (box) {
-    box.hidden = false
-    const desc = $('conflictDesc')
-    if (desc) {
-      desc.textContent = t('conflictDesc', { name: vpnName || t('thirdPartyVPN') })
-    }
-  }
-  const sub = ($('subUrl').value || '').trim()
-  showTunConflictModal(vpnName, () => {
-    if (sub) proceedConnect(sub)
-  })
-}
-
-function hideConflictBox() {
-  const box = $('conflictBox')
-  if (box) box.hidden = true
+  switchTab('home')
+  showTunConflictModal(vpnName)
 }
 
 async function pasteSub() {
@@ -546,9 +554,9 @@ async function pasteSub() {
 }
 
 function copyDesktop() {
-  const text = DEFAULT_LISTEN
+  const text = currentListen
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => msg(t('copied'), 'ok')).catch(() => copyDesktopFallback(text))
+    navigator.clipboard.writeText(text).then(() => msg(t('copied', { addr: text }), 'ok')).catch(() => copyDesktopFallback(text))
   } else {
     copyDesktopFallback(text)
   }
@@ -563,7 +571,7 @@ function copyDesktopFallback(text) {
   ta.select()
   try {
     document.execCommand('copy')
-    msg(t('copied'), 'ok')
+    msg(t('copied', { addr: text }), 'ok')
   } catch {
     msg(text)
   }
@@ -714,6 +722,8 @@ async function doClientLogin() {
     } catch {}
     renderLoggedInUser(server, u)
     msg(t('loginOk'), 'ok')
+    updateOnboard(null)
+    switchTab('home')
   } catch (e) {
     msg(t('loginFail', { err: e.message }), 'err')
   }
@@ -882,7 +892,7 @@ function renderNodes(nodes) {
   const badge = $('nodesCountBadge')
   if (!container) return
   if (!nodes || nodes.length === 0) {
-    container.innerHTML = '<div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;">' + (currentNodes.length > 0 ? t('noMatchNodes') : t('emptyNodes')) + '</div>'
+    container.innerHTML = '<div class="empty-nodes">' + (currentNodes.length > 0 ? t('noMatchNodes') : t('emptyNodes')) + '</div>'
     if (badge) badge.textContent = t('nodesCount', { count: currentNodes ? currentNodes.length : 0 })
     return
   }
@@ -1045,6 +1055,39 @@ async function probeAllNodes() {
   }
 }
 
+// 视图切换：home | nodes | settings
+function switchTab(name) {
+  const id = 'view' + name.charAt(0).toUpperCase() + name.slice(1)
+  document.querySelectorAll('.view').forEach((v) => v.classList.toggle('active', v.id === id))
+  document.querySelectorAll('.tabbar-btn').forEach((b) => b.classList.toggle('active', b.getAttribute('data-tab') === name))
+  const views = document.querySelector('.views')
+  if (views) views.scrollTop = 0
+}
+
+// 链式代理的详细配置在“线路”页；主页的开关行与未配置时的开关都跳到这里
+function openChainConfig() {
+  switchTab('nodes')
+  const card = $('chainProxyCard')
+  if (card) card.scrollIntoView({ block: 'start' })
+}
+
+// 首次使用引导：没有订阅（无链接、无节点、未连接）时，主页顶部显示提示卡；连接按钮始终可见
+function updateOnboard(st) {
+  const subEl = $('subUrl')
+  const has = !!((st && (st.sub_url || st.connected)) || (subEl && subEl.value.trim()) || currentNodes.length > 0)
+  if ($('onboard')) $('onboard').hidden = has
+}
+
+// 主页“链式代理”行的摘要：未配置 / 协议 主机:端口
+function updateChainSummary() {
+  const el = $('chainSummary')
+  if (!el) return
+  const host = ($('chainHostInput') && $('chainHostInput').value || '').trim()
+  const port = ($('chainPortInput') && $('chainPortInput').value || '').trim()
+  const proto = $('chainProtoSelect') ? $('chainProtoSelect').value : 'socks5'
+  el.textContent = host && port ? proto + ' ' + host + ':' + port : t('chainNotSet')
+}
+
 function init() {
   try {
     lang = localStorage.getItem(LANG_KEY) || 'zh-CN'
@@ -1064,6 +1107,21 @@ function init() {
     $('tabSubManual')?.classList.remove('active')
     $('paneAuthLogin').style.display = 'block'
     $('paneSubManual').style.display = 'none'
+  })
+
+  // 底部标签栏与首次引导按钮
+  document.querySelectorAll('.tabbar-btn').forEach((b) => {
+    b.addEventListener('click', () => switchTab(b.getAttribute('data-tab')))
+  })
+  $('btnOnboardSub')?.addEventListener('click', () => {
+    switchTab('settings')
+    $('tabSubManual')?.click()
+    $('subUrl')?.focus()
+  })
+  $('btnOnboardLogin')?.addEventListener('click', () => {
+    switchTab('settings')
+    $('tabAuthLogin')?.click()
+    $('loginUsername')?.focus()
   })
 
   // 2. 账号登录操作
@@ -1088,6 +1146,8 @@ function init() {
       await ensureImported(true)
       await refreshStatus()
       msg(t('subLoadedOk'), 'ok')
+      updateOnboard(null)
+      switchTab('home')
     } catch (e) {
       msg(e.message, 'err')
     } finally {
@@ -1140,77 +1200,8 @@ function init() {
     }
   } catch {}
 
-  // 默认模式读取 (存盘的 socks 按 sysproxy 读)
-  try {
-    let saved = localStorage.getItem(MODE_KEY) || 'tun'
-    if (saved === 'socks') saved = 'sysproxy'
-    setModeUI(saved)
-  } catch {
-    setModeUI('tun')
-  }
-
-  // 模式切换与点击（即时高亮、即时生效）
-  document.querySelectorAll('.mode').forEach((lab) => {
-    lab.addEventListener('click', async (e) => {
-      e.preventDefault()
-      e.stopPropagation()
-      if (busy) return
-      const targetMode = lab.getAttribute('data-mode')
-      const cur = selectedMode()
-      if (cur === targetMode) return // 重复点击当前单选卡，直接保持，绝不跳变！
-
-      const prevMode = cur
-      if (targetMode === 'tun') {
-        const vpn = await checkUpfrontTUNConflict()
-        if (vpn) {
-          showTunConflictModal(vpn, () => switchModeNow(targetMode, prevMode))
-          return
-        }
-      }
-      await switchModeNow(targetMode, prevMode)
-    })
-  })
-
-  async function switchModeNow(targetMode, prevMode) {
-    setModeUI(targetMode)
-    if (!$('btnPower').classList.contains('on')) {
-      // 未连接时立即同步模式到底层引擎，防止启动时二义性
-      api('POST', '/api/v1/mode', { mode: targetMode }).catch(() => null)
-      return
-    }
-    busy = true // 置 busy，阻断 2 秒轮询将乐观选择盖掉
-    msg(t('connecting'))
-    try {
-      const r = await api('POST', '/api/v1/mode', { mode: targetMode })
-        if (r && r.code === 'CONFLICT_TUN') {
-          setModeUI(r.mode || prevMode)
-          handleTUNConflict(r.vpn || '')
-          return
-        }
-        if (r && (r.status === 'error' || r.error)) {
-          setModeUI(r.mode || prevMode)
-          msg(r.error || 'mode switch failed', 'err')
-          await refreshStatus()
-          return
-        }
-        if (r && r.status === 'switching') {
-          busy = true
-          await pollConnectStatus()
-          return
-        }
-        if (r && r.status === 'ok') {
-          await refreshStatus()
-          return
-        }
-        await refreshStatus()
-      } catch (err) {
-        setModeUI(prevMode)
-        msg(err.message || String(err), 'err')
-        await refreshStatus()
-      } finally {
-        busy = false
-      }
-    }
+  // 旧版本保存过模式选择：已取消，清掉
+  try { localStorage.removeItem(MODE_KEY) } catch {}
 
   $('btnPower').onclick = onPower
   $('btnPaste').onclick = pasteSub
@@ -1249,33 +1240,16 @@ function init() {
       try {
         const res = await api('POST', '/api/v1/geodata/sync')
         if (res && res.status === 'ok') {
-          if ($('geoRuleCount')) $('geoRuleCount').textContent = t('rulesSynced', { count: res.count.toLocaleString() })
+          msg(res.updated ? t('geoUpdatedNow', { count: (res.count || 0).toLocaleString() }) : t('geoUpToDate'), 'ok')
+        } else {
+          msg(t('geoSyncFailed', { err: geoErrText((res && res.error) || '') }), 'err')
         }
-      } catch {}
+      } catch (e) {
+        msg(t('geoSyncFailed', { err: geoErrText(e.message || String(e)) }), 'err')
+      }
       $('btnSyncGeo').disabled = false
       $('btnSyncGeo').textContent = t('sync')
-    }
-  }
-
-  if ($('btnSwitchSysproxy')) {
-    $('btnSwitchSysproxy').onclick = async () => {
-      hideConflictBox()
-      setModeUI('sysproxy')
-      const sub = ($('subUrl').value || '').trim()
-      await api('POST', '/api/v1/mode', { mode: 'sysproxy' }).catch(() => null)
-      if (sub) {
-        await proceedConnect(sub)
-      } else {
-        await onConnect()
-      }
-    }
-  }
-
-  if ($('btnDismissConflict')) {
-    $('btnDismissConflict').onclick = () => {
-      hideConflictBox()
-      setState('off', t('ready'))
-      msg(t('closeThirdPartyTunHint'), 'info')
+      refreshStatus()
     }
   }
 
@@ -1300,31 +1274,8 @@ function init() {
     }
   })
 
-  // 链式代理折叠展开与配置处理
-  const chainToggle = $('chainProxyToggleHeader')
-  const chainBody = $('chainProxyBody')
-  const chainIcon = $('chainToggleIcon')
-  if (chainToggle && chainBody) {
-    chainToggle.onclick = () => {
-      const isHidden = chainBody.style.display === 'none'
-      chainBody.style.display = isHidden ? 'block' : 'none'
-      if (chainIcon) chainIcon.textContent = isHidden ? '▲' : '▼'
-    }
-  }
-
-  function updateChainBadge(enabled) {
-    const b = $('chainStatusBadge')
-    if (!b) return
-    if (enabled) {
-      b.className = 'tag-sm tag-blue'
-      b.textContent = t('chainEnabled')
-    } else {
-      b.className = 'tag-sm'
-      b.style.background = '#21262d'
-      b.style.color = '#8b949e'
-      b.textContent = t('chainDisabled')
-    }
-  }
+  // 链式代理：主页只放开关，详细配置在“线路”页
+  document.querySelectorAll('.js-chain-open').forEach((el) => el.addEventListener('click', openChainConfig))
 
   async function loadChainProxyUI() {
     try {
@@ -1337,33 +1288,55 @@ function init() {
         if ($('chainPortInput')) $('chainPortInput').value = c.port ? String(c.port) : ''
         if ($('chainUserInput')) $('chainUserInput').value = c.username || ''
         if ($('chainPassInput')) $('chainPassInput').value = c.password || ''
-        updateChainBadge(!!c.enabled)
+        updateChainSummary()
       }
     } catch {}
   }
 
-  if ($('btnSaveChainProxy')) {
-    $('btnSaveChainProxy').onclick = async () => {
-      const payload = {
-        enabled: $('chainEnableToggle') ? $('chainEnableToggle').checked : false,
-        protocol: $('chainProtoSelect') ? $('chainProtoSelect').value : 'socks5',
-        host: $('chainHostInput') ? $('chainHostInput').value.trim() : '',
-        port: $('chainPortInput') ? parseInt($('chainPortInput').value.trim(), 10) || 0 : 0,
-        username: $('chainUserInput') ? $('chainUserInput').value.trim() : '',
-        password: $('chainPassInput') ? $('chainPassInput').value : ''
-      }
-      try {
-        const res = await api('POST', '/api/v1/chain/config', payload)
-        if (res && res.status === 'ok') {
-          updateChainBadge(payload.enabled)
-          msg(t('chainSaveOk'), 'ok')
-        } else {
-          msg(res.error || 'save failed', 'err')
-        }
-      } catch (e) {
-        msg(e.message || String(e), 'err')
-      }
+  // 按表单当前值保存链式配置；enabled 由开关决定。成功返回 true。
+  async function saveChain(enabled) {
+    const payload = {
+      enabled,
+      protocol: $('chainProtoSelect') ? $('chainProtoSelect').value : 'socks5',
+      host: $('chainHostInput') ? $('chainHostInput').value.trim() : '',
+      port: $('chainPortInput') ? parseInt($('chainPortInput').value.trim(), 10) || 0 : 0,
+      username: $('chainUserInput') ? $('chainUserInput').value.trim() : '',
+      password: $('chainPassInput') ? $('chainPassInput').value : ''
     }
+    try {
+      const res = await api('POST', '/api/v1/chain/config', payload)
+      if (res && res.status === 'ok') {
+        updateChainSummary()
+        msg(t('chainSaveOk'), 'ok')
+        return true
+      }
+      msg((res && res.error) || 'save failed', 'err')
+    } catch (e) {
+      msg(e.message || String(e), 'err')
+    }
+    return false
+  }
+
+  if ($('btnSaveChainProxy')) {
+    $('btnSaveChainProxy').onclick = () => saveChain($('chainEnableToggle') ? $('chainEnableToggle').checked : false)
+  }
+
+  // 主页开关：开启前必须已填地址与端口（服务端不校验），否则回弹并跳到线路页的配置卡；保存失败也回弹
+  if ($('chainEnableToggle')) {
+    $('chainEnableToggle').addEventListener('change', async () => {
+      const sw = $('chainEnableToggle')
+      const want = sw.checked
+      const host = ($('chainHostInput').value || '').trim()
+      const port = parseInt(($('chainPortInput').value || '').trim(), 10) || 0
+      if (want && (!host || port <= 0 || port > 65535)) {
+        sw.checked = false
+        msg(t('chainNeedConfig'), 'err')
+        openChainConfig()
+        $('chainHostInput')?.focus()
+        return
+      }
+      if (!(await saveChain(want))) sw.checked = !want
+    })
   }
 
   loadChainProxyUI()

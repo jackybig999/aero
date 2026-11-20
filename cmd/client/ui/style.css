@@ -36,12 +36,18 @@ html, body {
   background: #3b82f6;
 }
 
+/* 整页固定为窗口高度：顶部栏与底部标签栏不动，只有中间视图区滚动 */
+html, body { height: 100%; }
 .app {
-  padding: 12px 16px 20px;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 12px 16px 0;
   width: 100%;
   max-width: 480px;
   margin: 0 auto;
 }
+header { flex-shrink: 0; }
 
 header {
   display: flex;
@@ -304,36 +310,6 @@ textarea {
   outline: none;
 }
 
-/* 双接管模式网格 (仅系统代理与 TUN) */
-.mode-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-.mode {
-  display: grid;
-  place-items: center;
-  padding: 6px 4px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  cursor: pointer;
-  background: #0a0f18;
-  text-align: center;
-  transition: all 0.2s ease;
-}
-.mode input {
-  position: absolute;
-  opacity: 0;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-}
-.mode.selected {
-  border-color: var(--blue);
-  background: #132033;
-}
-.mode b { font-size: 11px; font-weight: 700; }
-
 button.ghost {
   background: #1a2336;
   color: var(--text);
@@ -409,65 +385,7 @@ button.ghost:hover {
   font-weight: 700;
   font-family: ui-monospace, Consolas, monospace;
 }
-.geodata-row {
-  padding-top: 4px;
-  border-top: 1px dashed var(--line);
-}
-
-/* 第三方 TUN 冲突互斥卡片 */
-.conflict-card {
-  background: #201314;
-  border: 1px solid #7f1d1d;
-  border-radius: 8px;
-  padding: 10px;
-  margin-top: 8px;
-  margin-bottom: 6px;
-}
-.conflict-card[hidden] { display: none; }
-.conflict-hd {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: #f87171;
-  font-size: 11px;
-}
-.conflict-icon { font-size: 13px; }
-.conflict-desc {
-  margin: 6px 0 8px;
-  font-size: 11px;
-  line-height: 1.4;
-  color: #fca5a5;
-}
-.conflict-actions {
-  display: flex;
-  gap: 6px;
-}
-.btn-conflict-primary {
-  flex: 1;
-  background: #dc2626;
-  color: #fff;
-  border: none;
-  border-radius: 5px;
-  padding: 6px 8px;
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.btn-conflict-primary:hover { background: #b91c1c; }
-.btn-conflict-ghost {
-  flex: 1;
-  background: #2a1b1d;
-  color: #fca5a5;
-  border: 1px solid #7f1d1d;
-  border-radius: 5px;
-  padding: 6px 8px;
-  font-size: 11px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.btn-conflict-ghost:hover { background: #3b1f24; color: #fff; }
+.geodata-row { padding: 2px 0; }   /* 已移入设置页独立卡片，不再需要顶部分隔线 */
 
 .msg {
   margin: 2px 0 0;
@@ -542,3 +460,121 @@ button.ghost:hover {
   cursor: pointer;
   padding: 6px;
 }
+
+/* ===== 布局与表单工具类（原 index.html 内联样式提取；选择器带两级以保证不低于原内联优先级）===== */
+.flex-center { display: flex; align-items: center; gap: 6px; }
+.flex-between { display: flex; justify-content: space-between; align-items: center; }
+.clickable { cursor: pointer; }
+.strong { font-weight: 700; }
+.mb-6 { margin-bottom: 6px; }
+.mb-8 { margin-bottom: 8px; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.hint-sm { font-size: 10px; color: var(--muted); }
+.label-sm { font-size: 11px; color: var(--muted); }
+.field-label { font-size: 10px; color: var(--muted); }
+.ver-tag {
+  font-size: 10px; color: var(--blue); background: rgba(59, 130, 246, 0.15);
+  padding: 1px 5px; border-radius: 4px; font-weight: 600;
+}
+button.ghost.btn-load { color: var(--blue); margin-left: auto; }
+.btn-primary.btn-block { width: 100%; margin-top: 4px; }
+.tag-sm.tag-10 { font-size: 10px; }
+.tag-sm.tag-off { background: #21262d; color: #8b949e; }
+.badge-btn.badge-btn-lg { cursor: pointer; padding: 4px 8px; font-size: 11px; font-weight: 600; }
+.metric-item.metric-wide { width: 100%; justify-content: space-between; }
+.sub-picker-row { margin-top: 8px; }
+.sub-picker-hd { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+
+/* 节点列表与筛选 */
+.nodes-filter-bar { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+.node-isp-filters { display: flex; gap: 3px; flex-shrink: 0; }
+.tab-btn.node-isp-btn { padding: 2px 6px; font-size: 10px; }
+.node-search {
+  flex: 1; min-width: 0; background: #0a0f18; border: 1px solid var(--line);
+  border-radius: 4px; padding: 3px 6px; font-size: 11px; color: var(--text); outline: none;
+}
+.nodes-list {
+  margin-top: 8px; display: flex; flex-direction: column; gap: 6px;
+  max-height: 220px; overflow-y: auto; padding-right: 2px;
+}
+.empty-nodes { color: var(--muted); font-size: 11px; text-align: center; padding: 12px 0; }
+
+/* 链式代理 */
+.chain-tip { font-size: 10px; color: var(--muted); margin-bottom: 8px; }
+.input-sm {
+  width: 100%; background: #0a0f18; border: 1px solid var(--line); border-radius: 4px;
+  padding: 4px; font-size: 11px; color: var(--text); margin-top: 2px;
+}
+
+/* 弹窗 */
+.sheet-card.sheet-left { text-align: left; }
+.modal-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.modal-icon { font-size: 20px; }
+.sheet-card .modal-title { margin: 0; font-size: 14px; font-weight: 700; }
+.muted.modal-desc { font-size: 11px; line-height: 1.5; margin-bottom: 12px; }
+.modal-actions { display: flex; flex-direction: column; gap: 6px; }
+button.btn-modal { width: 100%; padding: 8px; font-size: 11px; }
+button.btn-modal.btn-modal-sm { padding: 6px; }
+
+/* ===== 三视图（主页 / 线路 / 设置）与底部标签栏 ===== */
+.views { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 8px; }
+.view { display: none; }
+.view.active { display: block; }
+.app > .msg { flex-shrink: 0; margin: 0; padding: 2px 0; }
+.tabbar {
+  flex-shrink: 0; display: flex; gap: 4px;
+  padding: 6px 0 10px; border-top: 1px solid var(--line);
+}
+.tabbar-btn {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  background: none; border: 0; border-radius: 8px; padding: 4px 0;
+  color: var(--muted); font-size: 11px; font-weight: 600; cursor: pointer;
+  transition: color 0.2s, background 0.2s;
+}
+.tabbar-btn:hover { color: var(--text); }
+.tabbar-btn.active { color: var(--blue); background: rgba(59, 130, 246, 0.12); }
+.tabbar-ic { font-size: 16px; line-height: 1; }
+.sec-title {
+  margin: 10px 2px 6px; font-size: 11px; font-weight: 700;
+  color: var(--muted); letter-spacing: 0.04em;
+}
+.sec-title:first-child { margin-top: 2px; }
+
+/* 首次使用引导 */
+.onboard { text-align: center; padding: 22px 14px; margin-top: 8px; }
+.onboard-ic { font-size: 30px; margin-bottom: 6px; }
+.onboard-title { display: block; font-size: 15px; margin-bottom: 4px; }
+.onboard-desc { font-size: 11px; line-height: 1.5; margin: 0 0 14px; }
+.onboard-actions { display: flex; gap: 8px; justify-content: center; }
+
+/* ===== 设置行（标题 + 摘要 + 开关 + ›）与二级页 ===== */
+.setting-row { display: flex; align-items: center; gap: 10px; }
+.setting-main {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  background: none; border: 0; padding: 2px 0; color: var(--text); font-size: 12px;
+  text-align: left; cursor: pointer;
+}
+.chev {
+  background: none; border: 0; color: var(--muted); font-size: 20px; line-height: 1;
+  padding: 0 2px; cursor: pointer;
+}
+.chev:hover { color: var(--text); }
+.switch { position: relative; display: inline-block; width: 38px; height: 22px; flex-shrink: 0; cursor: pointer; }
+.switch input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; z-index: 1; }
+.switch-ui { position: absolute; inset: 0; background: #2a3548; border-radius: 22px; transition: background 0.2s; }
+.switch-ui::after {
+  content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+  border-radius: 50%; background: #cbd5e1; transition: transform 0.2s, background 0.2s;
+}
+.switch input:checked + .switch-ui { background: var(--blue); }
+.switch input:checked + .switch-ui::after { transform: translateX(16px); background: #fff; }
+.switch input:focus-visible + .switch-ui { outline: 2px solid #93c5fd; outline-offset: 2px; }
+
+
+/* 国内直连状态行（最近更新 / 失败原因） */
+.geo-line { margin: 6px 0 0; }
+.card.degraded { border-color: #b45309; background: #1f1708; color: #fbbf24; }
+.card.degraded[hidden] { display: none; }
+.card.degraded .muted { color: #d6b66a; font-size: 11px; line-height: 1.5; margin-top: 4px; }
+#listenBadge.warn { color: #fbbf24; }
+.geo-line.err { color: #fca5a5; }

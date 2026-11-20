@@ -154,9 +154,9 @@
         <div class="brand">
           <span class="logo">A</span>
           <div>
-            <div style="display:flex;align-items:center;gap:6px">
+            <div class="flex-center">
               <h1>AERO</h1>
-              <span style="font-size:10px;color:var(--blue);background:rgba(59,130,246,0.15);padding:1px 5px;border-radius:4px;font-weight:600">v1.5.2</span>
+              <span class="ver-tag">v1.5.2</span>
             </div>
             <p class="hint" data-i18n="tagline">本地口已开</p>
           </div>
@@ -171,7 +171,27 @@
         </div>
       </header>
 
+      <main class="views">
+        <!-- 主页：连接与当前状态 -->
+        <div id="viewHome" class="view active">
+      <!-- 首次使用引导：没有订阅时代替连接区 -->
+      <section id="onboard" class="card onboard" hidden>
+        <div class="onboard-ic">🔗</div>
+        <b class="onboard-title" data-i18n="onboardTitle">先导入订阅</b>
+        <p class="muted onboard-desc" data-i18n="onboardDesc">导入订阅链接或登录中台账号后，才能连接和选择线路</p>
+        <div class="onboard-actions">
+          <button type="button" id="btnOnboardSub" class="btn-primary" data-i18n="onboardBtnSub">导入订阅链接</button>
+          <button type="button" id="btnOnboardLogin" class="btn-ghost" data-i18n="onboardBtnLogin">账号登录</button>
+        </div>
+      </section>
+
       <!-- 核心控制区：精巧 76px 状态呼吸旋钮 -->
+      <!-- 降级提示：虚拟网卡不可用时，只有本地代理端口可用，必须明确告知 -->
+      <section id="degradedNotice" class="card degraded" hidden>
+        <b data-i18n="degradedTitle">虚拟网卡不可用，已降级为仅本地代理</b>
+        <p id="degradedDesc" class="muted"></p>
+      </section>
+
       <div class="power-wrap">
         <button type="button" id="btnPower" class="power" aria-label="connect">
           <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true">
@@ -190,10 +210,111 @@
       <!-- 常驻端口徽章：专供指纹浏览器/应用一键复制使用 -->
       <button type="button" id="btnDesktop" class="desktop">
         <span data-i18n="desktop">指纹浏览器专线</span>
-        <b>127.0.0.1:55555</b>
+        <b id="listenBadge">127.0.0.1:55555</b>
         <span class="copy" data-i18n="copy">复制</span>
       </button>
 
+      <!-- 指标与规则条（高聚合精简） -->
+      <section class="metrics-ribbon">
+        <div class="metrics-row">
+          <div class="metric-item">
+            <span class="m-icon">🌐</span>
+            <span class="m-label" data-i18n="node">节点</span>
+            <b id="stNode" class="m-val">—</b>
+          </div>
+          <div class="metric-item">
+            <span class="m-icon">📶</span>
+            <span class="m-label" data-i18n="latency">延迟</span>
+            <b id="stRtt" class="m-val">—</b>
+            <button type="button" id="btnPing" class="badge-btn" data-i18n="speedTest">⚡ 测速</button>
+          </div>
+        </div>
+      </section>
+
+
+      <!-- 链式代理：主页只放开关，详细配置在“线路”页 -->
+      <section class="card" id="chainRowCard">
+        <div class="setting-row">
+          <button type="button" class="setting-main js-chain-open">
+            <span class="strong" data-i18n="chainTitle">链式代理 (住宅IP净化)</span>
+            <span id="chainSummary" class="hint-sm"></span>
+          </button>
+          <label class="switch" aria-label="chain proxy">
+            <input type="checkbox" id="chainEnableToggle" />
+            <span class="switch-ui"></span>
+          </label>
+          <button type="button" class="chev js-chain-open" aria-label="detail">›</button>
+        </div>
+      </section>
+
+
+        </div>
+
+        <!-- 线路：全部节点、搜索、测速 -->
+        <div id="viewNodes" class="view">
+      <!-- 供应商线路看板：展示所有节点、实时测速、点击切线 -->
+      <section class="card nodes-card" id="nodesCard">
+        <div class="card-hd flex-between">
+          <div class="flex-center">
+            <span class="strong" data-i18n="vendorNodes">供应商线路</span>
+            <span id="nodesCountBadge" class="tag-sm tag-blue tag-10">0 节点</span>
+          </div>
+          <button type="button" id="btnProbeAllNodes" class="badge-btn badge-btn-lg" data-i18n="probeAllNodes">⚡ 测速全部线路</button>
+        </div>
+        <!-- 节点搜索与 ISP 筛选工具栏 -->
+        <div class="nodes-filter-bar">
+          <input type="text" id="nodeSearchInput" data-i18n-placeholder="searchNodesPh" placeholder="🔍 搜索节点名/IP/域名..." class="node-search" />
+          <div class="node-isp-filters">
+            <button type="button" class="tab-btn active node-isp-btn" data-isp="ALL" data-i18n="ispAll">全部</button>
+            <button type="button" class="tab-btn node-isp-btn" data-isp="CT" data-i18n="ispCT">电信</button>
+            <button type="button" class="tab-btn node-isp-btn" data-isp="CU" data-i18n="ispCU">联通</button>
+            <button type="button" class="tab-btn node-isp-btn" data-isp="CM" data-i18n="ispCM">移动</button>
+          </div>
+        </div>
+        <div id="nodesList" class="nodes-list">
+          <div class="empty-nodes" data-i18n="emptyNodes">暂无线路数据，请先载入订阅</div>
+        </div>
+      </section>
+
+      <!-- 链式代理配置：静态住宅 IP 出口净化 (可选)；开关在主页 -->
+      <section class="card" id="chainProxyCard">
+        <div class="card-hd"><span class="strong" data-i18n="chainTitle">链式代理 (住宅IP净化)</span></div>
+        <p class="chain-tip" data-i18n="chainTip">通过 AERO 隧道级联上游住宅/数据中心代理，实现出口 IP 净化与抗封锁</p>
+        <div class="grid-2 mb-6">
+          <div>
+            <label class="field-label" data-i18n="chainProto">代理协议</label>
+            <select id="chainProtoSelect" class="input-sm">
+              <option value="socks5">SOCKS5</option>
+              <option value="http">HTTP (CONNECT)</option>
+            </select>
+          </div>
+          <div>
+            <label class="field-label" data-i18n="chainPort">端口</label>
+            <input type="number" id="chainPortInput" placeholder="1080" class="input-sm" />
+          </div>
+        </div>
+        <div class="mb-6">
+          <label class="field-label" data-i18n="chainHost">服务器地址 (IP或域名)</label>
+          <input type="text" id="chainHostInput" placeholder="例如 1.2.3.4 或 proxy.example.com" class="input-sm" />
+        </div>
+        <div class="grid-2 mb-8">
+          <div>
+            <label class="field-label" data-i18n="chainUser">用户名 (可选)</label>
+            <input type="text" id="chainUserInput" placeholder="用户名" class="input-sm" />
+          </div>
+          <div>
+            <label class="field-label" data-i18n="chainPass">密码 (可选)</label>
+            <input type="password" id="chainPassInput" placeholder="密码" class="input-sm" />
+          </div>
+        </div>
+        <button type="button" id="btnSaveChainProxy" class="btn-primary btn-block" data-i18n="chainSave">保存链式配置</button>
+      </section>
+
+        </div>
+
+        <!-- 设置：订阅与账号、规则 -->
+        <div id="viewSettings" class="view">
+      <h3 class="sec-title" data-i18n="secAccount">订阅与账号</h3>
       <!-- 订阅与账号中心：双通道切换 (专属订阅 / 中台账号登录) -->
       <section class="card" id="authCard">
         <div class="tab-hd">
@@ -204,10 +325,10 @@
         <!-- 通道 1: 专属订阅链接输入 -->
         <div id="paneSubManual" class="tab-pane">
           <textarea id="subUrl" rows="2" spellcheck="false" data-i18n-placeholder="subPh" placeholder="粘贴专属订阅链接 (https://.../sub/...)"></textarea>
-          <div class="row" style="margin-top:6px">
+          <div class="row">
             <button type="button" id="btnPaste" class="ghost" data-i18n="paste">📋 粘贴</button>
             <button type="button" id="btnScan" class="ghost" data-i18n="scan">📷 扫码</button>
-            <button type="button" id="btnApplyManualSub" class="ghost" style="color:var(--blue);margin-left:auto" data-i18n="load">载入</button>
+            <button type="button" id="btnApplyManualSub" class="ghost btn-load" data-i18n="load">载入</button>
           </div>
         </div>
 
@@ -226,24 +347,24 @@
               <span class="input-icon">🔒</span>
               <input type="password" id="loginPassword" data-i18n-placeholder="loginPasswordPh" placeholder="登录密码" />
             </div>
-            <button type="button" id="btnDoLogin" class="btn-primary" style="width:100%;margin-top:4px" data-i18n="btnLogin">登录并同步专属订阅</button>
+            <button type="button" id="btnDoLogin" class="btn-primary btn-block" data-i18n="btnLogin">登录并同步专属订阅</button>
           </div>
           <!-- 登录成功后的用户信息 -->
           <div id="loggedInWrap" style="display:none">
             <div class="user-info-row">
               <div class="user-badge" id="userAvatar">A</div>
               <div class="user-meta">
-                <div style="display:flex;align-items:center;gap:6px">
+                <div class="flex-center">
                   <b id="userDisplayName" data-i18n="userDefault">用户</b>
                   <span id="userPlanBadge" class="tag-sm tag-blue" data-i18n="userPlan">套餐</span>
                 </div>
-                <span id="userServerHost" style="font-size:10px;color:var(--muted)"></span>
+                <span id="userServerHost" class="hint-sm"></span>
               </div>
               <button type="button" id="btnClientLogout" class="btn-ghost" data-i18n="logout">退出</button>
             </div>
-            <div class="sub-picker-row" id="subPickerWrap" style="margin-top:8px">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
-                <label style="font-size:11px;color:var(--muted)" data-i18n="currentSub">当前专属订阅:</label>
+            <div class="sub-picker-row" id="subPickerWrap">
+              <div class="sub-picker-hd">
+                <label class="label-sm" data-i18n="currentSub">当前专属订阅:</label>
                 <span id="subCountBadge" class="tag-sm tag-blue">1 个可用</span>
               </div>
               <select id="userSubSelect" class="sub-select"></select>
@@ -252,150 +373,43 @@
         </div>
       </section>
 
-      <!-- 代理接管模式选择：仅提供 TUN 与系统代理两种接管选项；本地 55555 专线常驻 -->
+      <h3 class="sec-title" data-i18n="secRules">规则</h3>
       <section class="card">
-        <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;">
-          <span data-i18n="modeTakeover">接管模式</span>
-          <span style="font-size:10px;color:var(--muted)" data-i18n="localPortActive">127.0.0.1:55555 本地常驻</span>
-        </div>
-        <div class="mode-row">
-          <label class="mode selected" data-mode="tun">
-            <input type="radio" name="mode" value="tun" checked />
-            <b data-i18n="modeTun">TUN 全局模式</b>
-          </label>
-          <label class="mode" data-mode="sysproxy">
-            <input type="radio" name="mode" value="sysproxy" />
-            <b data-i18n="modeSys">本地专线代理 (127.0.0.1:55555)</b>
-          </label>
-        </div>
-        <p id="modeTip" class="muted" data-i18n="tipTun">TUN 虚拟网卡驱动接管全局流量 (零改动系统注册表)</p>
-      </section>
-
-      <!-- 指标与规则条（高聚合精简） -->
-      <section class="metrics-ribbon">
-        <div class="metrics-row">
-          <div class="metric-item">
-            <span class="m-icon">🌐</span>
-            <span class="m-label" data-i18n="node">节点</span>
-            <b id="stNode" class="m-val">—</b>
-          </div>
-          <div class="metric-item">
-            <span class="m-icon">📶</span>
-            <span class="m-label" data-i18n="latency">延迟</span>
-            <b id="stRtt" class="m-val">—</b>
-            <button type="button" id="btnPing" class="badge-btn" data-i18n="speedTest">⚡ 测速</button>
-          </div>
-        </div>
-        <div class="metrics-row geodata-row">
-          <div class="metric-item" style="width:100%;justify-content:space-between;">
-            <div style="display:flex;align-items:center;gap:6px;">
+        <div class="geodata-row">
+          <div class="metric-item metric-wide">
+            <div class="flex-center">
               <span class="m-icon">🛡️</span>
               <span class="m-label" data-i18n="directRules">国内直连</span>
-              <span id="geoRuleCount" class="geo-badge">8,420 条 (已就绪)</span>
+              <span id="geoRuleCount" class="geo-badge">—</span>
             </div>
             <button type="button" id="btnSyncGeo" class="badge-btn ghost" data-i18n="sync">🔄 同步</button>
           </div>
         </div>
+        <p id="geoStatusLine" class="hint-sm geo-line"></p>
       </section>
 
-      <!-- 供应商线路看板：展示所有节点、实时测速、点击切线 -->
-      <section class="card nodes-card" id="nodesCard">
-        <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;">
-          <div style="display:flex;align-items:center;gap:6px;">
-            <span style="font-weight:700;" data-i18n="vendorNodes">供应商线路</span>
-            <span id="nodesCountBadge" class="tag-sm tag-blue" style="font-size:10px;">0 节点</span>
-          </div>
-          <button type="button" id="btnProbeAllNodes" class="badge-btn" style="cursor:pointer;padding:4px 8px;font-size:11px;font-weight:600;" data-i18n="probeAllNodes">⚡ 测速全部线路</button>
         </div>
-        <!-- 节点搜索与 ISP 筛选工具栏 -->
-        <div class="nodes-filter-bar" style="display:flex;gap:6px;align-items:center;margin-top:6px;">
-          <input type="text" id="nodeSearchInput" data-i18n-placeholder="searchNodesPh" placeholder="🔍 搜索节点名/IP/域名..." style="flex:1;min-width:0;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:3px 6px;font-size:11px;color:var(--text);outline:none;" />
-          <div class="node-isp-filters" style="display:flex;gap:3px;flex-shrink:0;">
-            <button type="button" class="tab-btn active node-isp-btn" data-isp="ALL" style="padding:2px 6px;font-size:10px;" data-i18n="ispAll">全部</button>
-            <button type="button" class="tab-btn node-isp-btn" data-isp="CT" style="padding:2px 6px;font-size:10px;" data-i18n="ispCT">电信</button>
-            <button type="button" class="tab-btn node-isp-btn" data-isp="CU" style="padding:2px 6px;font-size:10px;" data-i18n="ispCU">联通</button>
-            <button type="button" class="tab-btn node-isp-btn" data-isp="CM" style="padding:2px 6px;font-size:10px;" data-i18n="ispCM">移动</button>
-          </div>
-        </div>
-        <div id="nodesList" class="nodes-list" style="margin-top:8px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow-y:auto;padding-right:2px;">
-          <div class="empty-nodes" style="color:var(--muted);font-size:11px;text-align:center;padding:12px 0;" data-i18n="emptyNodes">暂无线路数据，请先载入订阅</div>
-        </div>
-      </section>
 
-      <!-- 链式代理配置：静态住宅 IP 出口净化 (可选) -->
-      <section class="card" id="chainProxyCard">
-        <div class="card-hd" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;" id="chainProxyToggleHeader">
-          <div style="display:flex;align-items:center;gap:6px;">
-            <span style="font-weight:700;" data-i18n="chainTitle">链式代理 (住宅IP净化)</span>
-            <span id="chainStatusBadge" class="tag-sm" style="font-size:10px;background:#21262d;color:#8b949e;" data-i18n="chainDisabled">未开启</span>
-          </div>
-          <span id="chainToggleIcon" style="font-size:11px;color:var(--muted);">▼</span>
-        </div>
-        <div id="chainProxyBody" style="display:none;margin-top:8px;">
-          <p style="font-size:10px;color:var(--muted);margin-bottom:8px;" data-i18n="chainTip">通过 AERO 隧道级联上游住宅/数据中心代理，实现出口 IP 净化与抗封锁</p>
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-            <label style="font-size:11px;font-weight:600;" data-i18n="chainEnable">启用链式出口代理</label>
-            <input type="checkbox" id="chainEnableToggle" style="accent-color:var(--accent);cursor:pointer;" />
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px;">
-            <div>
-              <label style="font-size:10px;color:var(--muted);" data-i18n="chainProto">代理协议</label>
-              <select id="chainProtoSelect" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;">
-                <option value="socks5">SOCKS5</option>
-                <option value="http">HTTP (CONNECT)</option>
-              </select>
-            </div>
-            <div>
-              <label style="font-size:10px;color:var(--muted);" data-i18n="chainPort">端口</label>
-              <input type="number" id="chainPortInput" placeholder="1080" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
-            </div>
-          </div>
-          <div style="margin-bottom:6px;">
-            <label style="font-size:10px;color:var(--muted);" data-i18n="chainHost">服务器地址 (IP或域名)</label>
-            <input type="text" id="chainHostInput" placeholder="例如 1.2.3.4 或 proxy.example.com" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
-          </div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px;">
-            <div>
-              <label style="font-size:10px;color:var(--muted);" data-i18n="chainUser">用户名 (可选)</label>
-              <input type="text" id="chainUserInput" placeholder="用户名" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
-            </div>
-            <div>
-              <label style="font-size:10px;color:var(--muted);" data-i18n="chainPass">密码 (可选)</label>
-              <input type="password" id="chainPassInput" placeholder="密码" style="width:100%;background:#0a0f18;border:1px solid var(--line);border-radius:4px;padding:4px;font-size:11px;color:var(--text);margin-top:2px;" />
-            </div>
-          </div>
-          <button type="button" id="btnSaveChainProxy" class="btn-conflict-primary" style="width:100%;padding:6px;font-size:11px;" data-i18n="chainSave">保存链式配置</button>
-        </div>
-      </section>
-
-      <!-- 第三方 TUN 冲突交互卡片 (互斥提示与双动作引导) -->
-      <div id="conflictBox" class="conflict-card" hidden>
-        <div class="conflict-hd">
-          <span class="conflict-icon">⚠️</span>
-          <b id="conflictTitle" data-i18n="conflictTitle">检测到第三方 VPN 正在运行 TUN</b>
-        </div>
-        <p id="conflictDesc" class="conflict-desc"></p>
-        <div class="conflict-actions">
-          <button type="button" id="btnSwitchSysproxy" class="btn-conflict-primary" data-i18n="btnSwitchSysproxy">切到本地 55555 再连接</button>
-          <button type="button" id="btnDismissConflict" class="btn-conflict-ghost" data-i18n="btnDismissConflict">先关掉对方的 TUN</button>
-        </div>
-      </div>
+      </main>
 
       <p id="msg" class="msg"></p>
+      <nav class="tabbar" aria-label="main">
+        <button type="button" class="tabbar-btn active" data-tab="home"><span class="tabbar-ic">🏠</span><span data-i18n="tabHome">主页</span></button>
+        <button type="button" class="tabbar-btn" data-tab="nodes"><span class="tabbar-ic">🌐</span><span data-i18n="tabNodes">线路</span></button>
+        <button type="button" class="tabbar-btn" data-tab="settings"><span class="tabbar-ic">⚙️</span><span data-i18n="tabSettings">设置</span></button>
+      </nav>
     </div>
 
     <!-- 前置虚拟网卡 TUN 冲突提醒弹窗 -->
     <div id="tunConflictModal" class="sheet" hidden>
-      <div class="sheet-card" style="text-align:left;">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-          <span style="font-size:20px;">⚠️</span>
-          <h2 style="margin:0;font-size:14px;font-weight:700;" data-i18n="tunConflictTitle">虚拟网卡/TUN 占用冲突检测</h2>
+      <div class="sheet-card sheet-left">
+        <div class="modal-hd">
+          <span class="modal-icon">⚠️</span>
+          <h2 class="modal-title" data-i18n="tunConflictTitle">虚拟网卡/TUN 占用冲突检测</h2>
         </div>
-        <p id="tunConflictModalDesc" class="muted" style="font-size:11px;line-height:1.5;margin-bottom:12px;" data-i18n="tunConflictDesc">检测到宿主机已运行其他虚拟网卡或 TUN 模式。同时开启两款 TUN 可能会导致系统全局路由冲突或死锁。</p>
-        <div style="display:flex;flex-direction:column;gap:6px;">
-          <button type="button" id="btnTunConflictSysproxy" class="btn-conflict-primary" style="width:100%;padding:8px;font-size:11px;" data-i18n="tunConflictSysproxy">切换为本地专线代理 (127.0.0.1:55555) 载入 (推荐)</button>
-          <button type="button" id="btnTunConflictIgnore" class="sheet-btn" style="width:100%;padding:8px;font-size:11px;" data-i18n="tunConflictIgnore">忽略并继续当前操作</button>
-          <button type="button" id="btnTunConflictCancel" class="sheet-cancel" style="width:100%;padding:6px;font-size:11px;" data-i18n="tunConflictCancel">暂不载入 / 取消</button>
+        <p id="tunConflictModalDesc" class="muted modal-desc" data-i18n="tunConflictDesc">检测到宿主机已运行其他虚拟网卡或 TUN 模式。同时开启两款 TUN 可能会导致系统全局路由冲突或死锁。</p>
+        <div class="modal-actions">
+          <button type="button" id="btnTunConflictOk" class="btn-primary btn-block" data-i18n="tunConflictOk">我知道了</button>
         </div>
       </div>
     </div>
