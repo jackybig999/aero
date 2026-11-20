@@ -168,11 +168,6 @@ func MaskToken(t string) string {
 	return t[:4] + "…" + t[len(t)-4:]
 }
 
-// errIngressDisabled：多跳入口尚未把 CONNECT-IP 与 DoH 转发给出口，TUN 模式的流量会直接从入口出去，
-// 用户以为的“出口 IP”实际是入口（静默泄露）。重做完成前拒绝以入口角色运行（fail closed）。
-var errIngressDisabled = errors.New("multi-hop role \"ingress\" is disabled: CONNECT-IP and DoH are not yet forwarded to the egress, " +
-	"so traffic would leave from the ingress and expose it as the exit; run as \"single\" until multi-hop is rebuilt")
-
 // NewServer creates a new Server instance from ServerConfig
 func NewServer(cfg ServerConfig) (*Server, error) {
 	// 0. Multi-hop Role 与跳间凭证校验 (P7 规范)
@@ -190,13 +185,11 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			return nil, fmt.Errorf("hop credential required: multi-hop role %s requires valid hop credential (hop credential must not be empty and is strictly distinct from user token)", role)
 		}
 	}
-	if role == "ingress" && !cfg.AllowSelfSignedCertForTest {
-		return nil, errIngressDisabled
+	if (role == "ingress" || role == "egress") && cfg.Token != "" && strings.TrimSpace(cfg.HopCredential) == cfg.Token {
+		return nil, fmt.Errorf("hop credential must differ from the user token")
 	}
-	if role == "ingress" {
-		if strings.TrimSpace(cfg.NextHopAddr) == "" && !cfg.AllowSelfSignedCertForTest {
-			return nil, fmt.Errorf("next hop address required: ingress role requires valid next_hop_addr in production")
-		}
+	if role == "ingress" && strings.TrimSpace(cfg.NextHopAddr) == "" {
+		return nil, fmt.Errorf("next hop address required: ingress role requires valid next_hop_addr")
 	}
 
 	if cfg.Listen == "" {
@@ -385,9 +378,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if maxConnUser <= 0 {
 		maxConnUser = DefaultMaxPerTok
 	}
+	if role == "egress" {
+		// 出口收到的 token 都是同一个跳间凭证（所有用户共用）：按 token 计数等于整个入口共用一份名额，
+		// 一个用户就能占满。每 token 上限放宽到全局上限，只受全局上限约束；用户级限额在入口执行（api/dataplane.md §8）。
+		maxConnUser = maxConn
+	}
 	connLimit := NewConnLimiter(maxConn, maxConnUser)
 	bwLimit := NewBandwidthLimiter(cfg.BWUser)
 	dialGuard := NewDialGuard(256)
+	if role == "egress" {
+		dialGuard.perTokMax = 256 // 同上：共用凭证下按 token 的拨号上限放宽到并发总量
+	}
 	if cfg.AllowSelfSignedCertForTest {
 		dialGuard.AllowLocal = true
 	}
@@ -426,6 +427,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		}
 	}
 	quicServer := NewQUICServerWithIPv6Prefix(validator, connLimit, bwLimit, dialGuard, rateLimit, ipv6Prefix)
+	if role == "egress" {
+		quicServer.maxUDPPerToken = int(quicServer.maxGlobalUDP)
+	}
 	quicServer.SetServerConfig(&cfg)
 	if cfg.AuthSignedToken {
 		keys, err := parseTokenIssuers(cfg.TokenIssuers)
@@ -440,7 +444,12 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		quicServer.SetAllowLoopbackForTest(true)
 	}
 	tunDevice := strings.TrimSpace(cfg.GlobalTUNDevice)
-	if cfg.ConnectIP != nil && !*cfg.ConnectIP {
+	if role == "ingress" {
+		// 入口不出网：CONNECT-IP 暂不经入口中继（api/dataplane.md §8），否则 TUN 流量会从入口直接出去，暴露入口为出口。
+		tunDevice = ""
+		quicServer.connectIPDisabled = true
+		log.Printf("[EDGE] role=ingress: CONNECT-IP disabled (no TUN, host untouched); TCP/UDP/DoH are forwarded to %s", cfg.NextHopAddr)
+	} else if cfg.ConnectIP != nil && !*cfg.ConnectIP {
 		tunDevice = ""
 		quicServer.connectIPDisabled = true
 		log.Printf("[EDGE] CONNECT-IP disabled by config (connect_ip=false): no TUN, host untouched; TCP/UDP proxy and DoH only")

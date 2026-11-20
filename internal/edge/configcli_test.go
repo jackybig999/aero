@@ -193,23 +193,34 @@ func TestConnectIPDisabledServerAndCheck(t *testing.T) {
 	}
 }
 
-// 多跳入口在重做完成前禁止运行（否则 TUN 流量从入口出去、暴露入口 IP）：生产启动拒绝，check 报 FAIL。
-func TestIngressRoleRefusedInProduction(t *testing.T) {
+// 多跳入口：缺 next_hop_addr 或 hop_credential 时启动被拒、check 报 FAIL；配置齐全时 check 通过且说明 CONNECT-IP 关闭。
+func TestIngressRoleConfigChecks(t *testing.T) {
 	listen, _ := findTestAddr()
-	_, err := NewServer(ServerConfig{Listen: listen, Domain: "n.example.com", DataDir: t.TempDir(), Role: "ingress", HopCredential: "hop", NextHopAddr: "egress.example.com:443"})
-	if !errors.Is(err, errIngressDisabled) {
-		t.Fatalf("ingress started in production: %v", err)
+	_, err := NewServer(ServerConfig{Listen: listen, Domain: "n.example.com", DataDir: t.TempDir(), Role: "ingress", HopCredential: "hop"})
+	if err == nil || !strings.Contains(err.Error(), "next hop address required") {
+		t.Fatalf("ingress without next_hop_addr started: %v", err)
 	}
-	path := filepath.Join(t.TempDir(), "edge.json")
-	_ = os.WriteFile(path, []byte(`{"role":"ingress","domain":"n.example.com"}`), 0o600)
-	failed := false
-	for _, it := range CheckNode(path) {
-		if it.Name == "role" && it.Level == "FAIL" {
-			failed = true
+	level := func(content string) string {
+		path := filepath.Join(t.TempDir(), "edge.json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
 		}
+		got := ""
+		for _, it := range CheckNode(path) {
+			if it.Name == "role" {
+				got = it.Level
+			}
+		}
+		return got
 	}
-	if !failed {
-		t.Fatal("check does not flag the ingress role")
+	if got := level(`{"role":"ingress","domain":"n.example.com"}`); got != "FAIL" {
+		t.Fatalf("missing next_hop_addr: role check = %q, want FAIL", got)
+	}
+	if got := level(`{"role":"ingress","domain":"n.example.com","next_hop_addr":"e.example.com:443"}`); got != "FAIL" {
+		t.Fatalf("missing hop_credential: role check = %q, want FAIL", got)
+	}
+	if got := level(`{"role":"ingress","domain":"n.example.com","next_hop_addr":"e.example.com:443","hop_credential":"h"}`); got != "OK" {
+		t.Fatalf("complete ingress config: role check = %q, want OK", got)
 	}
 }
 

@@ -173,8 +173,15 @@ func CheckNode(path string) []CheckItem {
 		return out
 	}
 	add("OK", "config", "%s", path)
-	if strings.EqualFold(strings.TrimSpace(cfg.Role), "ingress") {
-		add("FAIL", "role", "%v", errIngressDisabled)
+	isIngress := strings.EqualFold(strings.TrimSpace(cfg.Role), "ingress")
+	if isIngress {
+		if strings.TrimSpace(cfg.NextHopAddr) == "" {
+			add("FAIL", "role", "ingress requires next_hop_addr (aero-edge config set next_hop_addr <出口地址:端口>)")
+		} else if strings.TrimSpace(cfg.HopCredential) == "" {
+			add("FAIL", "role", "ingress requires hop_credential")
+		} else {
+			add("OK", "role", "ingress -> %s (TCP/UDP/DoH forwarded; CONNECT-IP disabled)", cfg.NextHopAddr)
+		}
 	}
 
 	domain := normalizeCertDomain(cfg.Domain)
@@ -222,7 +229,9 @@ func CheckNode(path string) []CheckItem {
 		}
 	}
 
-	if cfg.ConnectIP != nil && !*cfg.ConnectIP {
+	if isIngress {
+		add("OK", "connect_ip", "disabled on ingress: no TUN, host untouched")
+	} else if cfg.ConnectIP != nil && !*cfg.ConnectIP {
 		add("OK", "connect_ip", "disabled by config: TCP/UDP proxy and DoH only, no TUN, host untouched")
 	} else {
 		if fw, err := firewallBackend(); err != nil {

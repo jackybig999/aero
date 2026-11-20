@@ -541,6 +541,7 @@ type QUICServer struct {
 	dialGuard         *DialGuard
 	rateLimiter       *RateLimiter
 	doh               *dohForwarder
+	hopDoHc           hopDoHClient // 入口到出口的 DoH 复用连接（role=ingress）
 	connTracker       *ConnTracker
 	ipPool            *IPPool
 	ipv6Pool          *IPv6Pool
@@ -563,6 +564,7 @@ type QUICServer struct {
 	tokenUDPCtx          map[string]int
 	globalUDPCtx         atomic.Int64
 	maxGlobalUDP         int64
+	maxUDPPerToken       int         // 每个 token 的 UDP 上下文上限；出口（role=egress）的 token 是共用的跳间凭证，放宽到全局上限
 	allowLoopbackForTest atomic.Bool // 测试钩子：服务运行后可能被设置，须并发安全
 	resolveUDPFn         atomic.Pointer[resolveUDPFunc]
 	udpDialFn            atomic.Pointer[udpDialFunc]
@@ -825,17 +827,7 @@ func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred string) (net.Co
 		return (*fn)(nextHopAddr, target, hopCred)
 	}
 
-	sni := ""
-	if s.cfg != nil && s.cfg.NextHopSNI != "" {
-		sni = s.cfg.NextHopSNI
-	} else {
-		host, _, err := net.SplitHostPort(nextHopAddr)
-		if err == nil && host != "" {
-			sni = host
-		} else {
-			sni = nextHopAddr
-		}
-	}
+	sni := dialSNI(s.cfg, nextHopAddr)
 
 	tlsConf := &tls.Config{
 		ServerName:         sni,
@@ -849,7 +841,8 @@ func (s *QUICServer) dialNextHopTCP(nextHopAddr, target, hopCred string) (net.Co
 
 	qConn, err := quic.DialAddr(dialCtx, nextHopAddr, tlsConf, quicConf)
 	if err != nil {
-		return nil, fmt.Errorf("dial next hop %s over quic: %w", nextHopAddr, err)
+		// 故意用 %v 而不是 %w，原因见 dialNextHopUDP。
+		return nil, fmt.Errorf("dial next hop %s over quic: %v", nextHopAddr, err)
 	}
 
 	tr := &http3.Transport{EnableDatagrams: true}
@@ -903,26 +896,20 @@ func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Co
 	}
 
 	// 生产真实链路：通过 MASQUE CONNECT-UDP 向上游下一跳中继建立隧道 (NEW-01)
-	sni := ""
-	if s.cfg != nil && s.cfg.NextHopSNI != "" {
-		sni = s.cfg.NextHopSNI
-	} else {
-		host, _, err := net.SplitHostPort(nextHopAddr)
-		if err == nil && host != "" {
-			sni = host
-		} else {
-			sni = nextHopAddr
-		}
-	}
+	sni := dialSNI(s.cfg, nextHopAddr)
 
 	tlsConf := &tls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: s.allowLoopbackForTest.Load(),
 		NextProtos:         []string{"h3"},
 	}
-	qConn, err := quic.DialAddr(context.Background(), nextHopAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
+	qConn, err := quic.DialAddr(dialCtx, nextHopAddr, tlsConf, &quic.Config{EnableDatagrams: true})
 	if err != nil {
-		return nil, fmt.Errorf("dial next hop quic: %w", err)
+		// 故意用 %v 而不是 %w：下一跳地址解析失败若被 rejectDial 识别成 DNS 错误，会返回
+		// destination_ip_unroutable，与契约“出口失败一律 502 connection_refused”不符（api/dataplane.md §8）。
+		return nil, fmt.Errorf("dial next hop quic: %v", err)
 	}
 
 	tr := &http3.Transport{EnableDatagrams: true}
@@ -1027,6 +1014,7 @@ func newQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *Dial
 		connectIPProxy:   &connectip.Proxy{},
 		tokenUDPCtx:      make(map[string]int),
 		maxGlobalUDP:     DefaultMaxGlobalUDP,
+		maxUDPPerToken:   MaxUDPContextsPerToken,
 		udpTempl:         uritemplate.MustNew("https://placeholder/.well-known/masque/udp/{target_host}/{target_port}/"),
 		ipTempl:          uritemplate.MustNew("https://placeholder/.well-known/masque/ip/*/*/"),
 		udpSessions:      make(map[*udpSessionTracker]struct{}),
@@ -1052,6 +1040,7 @@ func (s *QUICServer) AuthJail() *AuthFailureJail {
 
 // Close closes the QUICServer and its background components
 func (s *QUICServer) Close() {
+	s.closeHopDoH()
 	s.closeOnce.Do(func() {
 		if s.stopCh != nil {
 			close(s.stopCh)
@@ -1161,7 +1150,7 @@ func (s *QUICServer) acquireUDPSlot(token string) bool {
 	defer s.udpMu.Unlock()
 
 	n = s.tokenUDPCtx[token]
-	if n >= MaxUDPContextsPerToken {
+	if n >= s.maxUDPPerToken {
 		return false
 	}
 	s.tokenUDPCtx[token] = n + 1
@@ -2334,12 +2323,22 @@ func (s *QUICServer) serveDoH(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	if !s.doh.allow(token) {
+	// 出口（role=egress）收到的 token 是跳间凭证，所有用户共用；用户级限流已在入口完成，这里不再限流。
+	isEgress := s.cfg != nil && s.cfg.Role == "egress"
+	if !isEgress && !s.doh.allow(token) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
 	}
 	var resp []byte
-	if qtype == dnsTypeAAAA && s.ipv6Pool == nil {
+	if s.cfg != nil && s.cfg.Role == "ingress" {
+		// 入口不自行解析：一律交给出口（含 AAAA 是否有 IPv6 出口的判断），失败回 SERVFAIL。
+		if out, err := s.forwardDoHToNextHop(r.Context(), queryBytes); err == nil {
+			resp = out
+		} else {
+			log.Printf("[HOP] DoH forward to next hop failed: %v", err)
+			resp = dnsReply(queryBytes, 2)
+		}
+	} else if qtype == dnsTypeAAAA && s.ipv6Pool == nil {
 		resp = dnsReply(queryBytes, 0) // 节点没有 IPv6 出口：空应答，应用直接用 IPv4
 	} else if out, err := s.doh.exchange(r.Context(), queryBytes); err == nil {
 		resp = out

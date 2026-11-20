@@ -60,7 +60,31 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
 
 客户端把拒绝原因反映到状态的 `error_code`（取 `details` 中的 `EDGE_*` 错误码，或按上表映射，见 `api/errors.yaml`）。
 
-## 8. 未定稿
+## 8. 多跳转发（入口 ingress → 出口 egress）
+状态：第 1 步已实现并有测试（`internal/edge/hop_doh_test.go`、`TestPhase7Gate_MultiHopChaining`）。
+- 角色（edge 配置 `role`）：`single`（默认）、`ingress`、`egress`。客户端只连入口，不感知出口；订阅里只出现入口。
+- 入口配置：`next_hop_addr`（出口 `host:port`，必填）、`next_hop_sni`（可选，默认取 `next_hop_addr` 的主机名）、`hop_credential`（必填）。
+  出口配置：`hop_credential`（必填，与入口相同）。`aero-edge check` 在入口缺任一项时报 FAIL。
+- 认证：用户 token 只在入口校验。入口向出口发请求时带 `Aero-Hop-Token: <hop_credential>`；出口只接受跳间凭证（请求头 `Aero-Hop-Token` 或 `Authorization: Bearer`），
+  用户 token 直连出口一律 401（`details="invalid hop credential"`）。跳间凭证不得与配置的用户 token 相同（启动时拒绝）；出口不保存用户 token。
+- 入口到出口的连接按出口的证书与 SNI 严格校验（与客户端到入口相同，系统根证书）。
+- 各请求类型经入口的行为：
+
+| 请求 | 入口行为 |
+|---|---|
+| TCP `CONNECT`、UDP `connect-udp` | 校验用户 token 后经 HTTP/3 转给出口，由出口出网；入口不直接连目标。出口的任何拒绝（含 403 `destination_ip_prohibited`）在入口表现为 502 `connection_refused` |
+| DoH `POST /dns-query` | 校验用户 token、限流（每 token 每秒 50 次）后原样转给出口，应答原样返回（所有记录类型与 rcode 保持）；出口拒绝、不可达或应答 ID 不符时返回 SERVFAIL；入口不查自己的上游，也不替出口判断 AAAA 策略 |
+| CONNECT-IP | 暂不支持：入口强制按 `connect_ip=false` 运行（不建 TUN、不改宿主），返回 503 `connect_ip_disabled`，客户端按 §7 换节点。否则 TUN 流量会从入口直接出网，暴露入口为出口 |
+
+- 出口收到的 token 都是跳间凭证（所有用户共用），因此出口对 DoH 不再按 token 限流（用户级限流在入口）。
+- 出口的容量：出口收到的 token 都是同一个跳间凭证，因此出口的“每 token”并发上限（TCP 连接、拨号、UDP 上下文）放宽到全局上限，只受全局上限约束；用户级限额在入口执行。
+- 已知限制：
+  - 每个 TCP/UDP 请求都向出口新建一条 QUIC 连接（DoH 已复用连接）；连接池化留待第 2 步，在此之前入口到出口的握手开销随请求数线性增加。
+  - 出口按来源 IP 限制新连接速率（`rate_ip`，默认每秒 200）。所有入口流量来自入口的同一个 IP，所以在连接池化之前，入口整体每秒最多向出口新建约 200 条连接；超出的请求在入口表现为 502。出口负载较大时需调高出口的 `rate_ip`。
+  - 入口的 `hop_credential` 配错时，出口会把入口的 IP 记入认证失败封禁表（最长 900 秒）；改对凭证后需等解封，或重启出口。
+  - 出口宕机时，入口每个失败的 DoH 查询打印一行 `[HOP]` 日志，日志量与查询量相当；日志限频留待第 2 步。
+
+## 9. 未定稿
+- CONNECT-IP 经入口中继到出口（入口不建 TUN，转发 IP 数据报；涉及地址分配、源地址校验与两跳 MTU）与 TCP/UDP 的 QUIC 连接复用：多跳第 2 步。
 - 场景参数（`class=ai|browser|game`）与场景授权（C3 第 6 步）尚未实现。
-- 多跳转发（edge `role=ingress|egress`、`Aero-Hop-Token`）存在于实现中但没有契约与测试，定稿前需决定保留或删除。
 - token 吊销（C3 第 5 步，`EDGE_AUTH_TOKEN_REVOKED`）、按 uid 的配额 `quota_bytes` 与带宽 `bw_bps` 尚未在 edge 执行：依赖中台下发吊销名单（C4），随中台对接实现。在此之前，被吊销的 token 在过期（最长 7 天）前仍被接受。

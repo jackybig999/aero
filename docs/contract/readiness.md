@@ -2,7 +2,7 @@
 
 | 契约点 | 契约状态 | 后端状态 | 一致性校验（§4.3） | 对应 flag | flag 状态 | 备注 |
 |---|---|---|---|---|---|---|
-| C1 CONNECT-IP `class=default` | draft（api/dataplane.md） | 已实现：认证、地址分配、目的地址策略、拒绝原因（Proxy-Status）；客户端按拒绝类型处理重连（换 token、Retry-After、节点不可用） | tests/e2e：真实 TCP/UDP/CONNECT-IP（CI 必跑） | `class_default` | OFF | 场景参数、多跳转发待定（§8）；503 换节点已实现（10 分钟冷却）；出站 TCP 25 三条路径一致拦截；CONNECT-IP 每连接 1 个、每 token 不超过设备数、全局上限；token 吊销与配额待 C4（§8） |
+| C1 CONNECT-IP `class=default` | draft（api/dataplane.md） | 已实现：认证、地址分配、目的地址策略、拒绝原因（Proxy-Status）；客户端按拒绝类型处理重连（换 token、Retry-After、节点不可用） | tests/e2e：真实 TCP/UDP/CONNECT-IP（CI 必跑） | `class_default` | OFF | 场景参数待定（§9）；多跳第 1 步已实现（§8：入口转发 TCP/UDP/DoH，入口禁用 CONNECT-IP），CONNECT-IP 中继待第 2 步（§9）；503 换节点已实现（10 分钟冷却）；出站 TCP 25 三条路径一致拦截；CONNECT-IP 每连接 1 个、每 token 不超过设备数、全局上限；token 吊销与配额待 C4（§9） |
 | C1 `class=ai` | draft | 未开始 | 未执行 | `class_ai` | OFF | 依赖 C9 |
 | C1 `class=game` | draft | 未开始 | 未执行 | `class_game` | OFF | |
 | C1 `class=browser` | draft | 未开始 | 未执行 | `class_browser` | OFF | 依赖 C9、C10 |

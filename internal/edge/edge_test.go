@@ -1431,6 +1431,7 @@ func TestHopCredentialRequired(t *testing.T) {
 		DataDir:                    dataDir,
 		Role:                       "ingress",
 		HopCredential:              "secret-hop-credential-xyz",
+		NextHopAddr:                "127.0.0.1:1",
 		AllowSelfSignedCertForTest: true,
 	}
 	srv, errValid := NewServer(cfgValid)
@@ -3723,17 +3724,16 @@ func TestPhase7Gate_MultiHopChaining(t *testing.T) {
 		}
 	}
 
-	// 2.5 生产环境的入口角色被拒绝（多跳重做完成前，见 errIngressDisabled）
-	prodIngressCfg := ServerConfig{
+	// 2.5 入口角色必须配置 next_hop_addr（生产与测试一致）
+	_, errProd := NewServer(ServerConfig{
 		Listen:        ":443",
 		Domain:        "example.com",
 		Role:          "ingress",
 		HopCredential: "hop-secret-999",
 		NextHopAddr:   "",
-	}
-	_, errProd := NewServer(prodIngressCfg)
-	if !errors.Is(errProd, errIngressDisabled) { // 生产环境的入口角色在多跳重做完成前一律拒绝
-		t.Fatalf("expected production ingress to be refused, got: %v", errProd)
+	})
+	if errProd == nil || !strings.Contains(errProd.Error(), "next hop address required") {
+		t.Fatalf("expected ingress without next_hop_addr to be refused, got: %v", errProd)
 	}
 
 	// 2.6 验证 SetNextHopDialerForTest 和 SetNextHopUDPDialerForTest 钩子工作正常
