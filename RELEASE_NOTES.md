@@ -1,4 +1,25 @@
-## AERO 1.5.1
+## AERO 1.5.2
+
+这一版补全服务端多跳转发的第一阶段，并收紧认证封禁。默认配置（单节点）的数据面行为没有变化；客户端没有改动。
+
+### 服务端
+- **多跳转发（入口 ingress → 出口 egress）可用于生产**（此前入口角色在生产被锁定）：入口只校验用户 token，把 TCP `CONNECT`、UDP `connect-udp` 和 DoH 转给出口，由出口出网；入口不直接连目标，也不查自己的 DNS 上游。入口与出口之间用跳间凭证（`Aero-Hop-Token`）认证，用户 token 直连出口一律 401。契约见 `api/dataplane.md` §8。
+  - 入口强制关闭 CONNECT-IP（不建 TUN、不改宿主），CONNECT-IP 返回 503 `connect_ip_disabled`，客户端会换节点；否则 TUN 流量会从入口直接出网，暴露入口为出口。**CONNECT-IP 经入口中继尚未实现。**
+  - 入口到出口的 TCP 连接按用户复用（每用户一条 QUIC 连接、每请求一个流），用户之间互不影响；DoH 另有一条复用连接。UDP 仍每请求新建一条连接。
+  - `aero-edge check` 校验入口的 `next_hop_addr` 与 `hop_credential`。
+- **认证封禁与连接限速对 IPv6 按 /64 计**：此前攻击者在同一 /64 内换地址即可绕过封禁，并填满记录表使新来源的封禁失效。IPv4 不变。
+- 出口对共用的跳间凭证不再按“每 token”限额，只受全局上限约束（用户级限额在入口）。
+- 入口 DoH 失败日志限频（每 10 秒一条）。
+
+### 已知限制
+- 多跳：UDP 连接复用、CONNECT-IP 经入口中继尚未实现；出口 `rate_ip`（默认每秒 200）仍限制入口新建的 UDP 连接速率，UDP 量大时需调高。
+- token 吊销与按用户的配额、带宽限制仍待中台对接（契约 C4）。
+
+### 升级提示
+- 单节点用户：节点上执行 `aero update` 即可，无需改配置。
+- 要用多跳：入口配置 `role=ingress`、`next_hop_addr`、`hop_credential`；出口配置 `role=egress`、相同的 `hop_credential`（不得与任何用户 token 相同）。
+
+## AERO 1.5.1（上一版本）
 
 这一版是客户端与服务端的定稿前审查修复，没有新功能。
 
