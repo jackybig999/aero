@@ -85,5 +85,6 @@ if [[ $UPGRADE -eq 1 ]]; then
   fi
 else
   echo "已安装 AERO Edge v${VERSION}。服务尚未启动。"
-  echo "下一步：运行 aero setup（域名、证书、可选 WARP、端口、管理密钥），检查通过后自动启动服务。"
+  echo "下一步：输入 aero 打开功能菜单，选 1「配置向导」（域名、证书、可选 WARP、端口、管理密钥），检查通过后自动启动服务。"
+  echo "也可直接运行 aero setup；aero help 查看全部命令。"
 fi

@@ -316,9 +316,121 @@ cmd_uninstall() {
   bash "$UNINSTALLER" $purge
 }
 
+# ---- 功能菜单（直接输入 aero 进入）----
+# 每个菜单项都以子进程调用本脚本的同名命令，语义与命令行完全一致；失败只提示，不退出菜单。
+# 菜单进程捕获 Ctrl+C：只中断当前命令（如实时日志）并回到菜单。
+menu_item() { printf " ${G}%3s.${N} ${G}%s${N}\n" "$1" "$2"; }
+menu_title() { echo -e "${C}$*${N}"; }
+menu_pause() { local _; read -r -p "按回车返回菜单..." _ </dev/tty || true; }
+menu_run() {
+  local rc=0
+  echo
+  "$MENU_SELF" "$@" || rc=$?
+  [[ $rc -eq 0 ]] || warn "命令退出码 $rc"
+  echo; menu_pause
+}
+menu_state() { # $1=active 状态文本
+  if [[ "$1" == active ]]; then echo -e "${G}运行中${N}"; else echo -e "${R}${1:-未知}${N}"; fi
+}
+menu_header() {
+  local st d p tun w
+  st=$(systemctl is-active aero-edge 2>/dev/null || true)
+  d=$(cfg_get domain); p=$(cfg_get listen); p=${p#:}
+  tun=$(cfg_get connect_ip); w=$(cfg_get warp)
+  [[ -t 1 ]] && printf '\033[H\033[2J'
+  echo -e "${G}==============================================${N}"
+  echo -e "${G}  AERO Edge 节点管理   v$("$EDGE" -version 2>/dev/null | awk '{print $2}')${N}"
+  echo -e "${G}==============================================${N}"
+  echo -e " 服务: $(menu_state "$st")   域名: ${d:-${Y}未设置${N}}   端口: ${p:-443}"
+  echo -e " 全局隧道: $([[ "$tun" == false ]] && echo 关闭 || echo 开启)   WARP: ${w:-off}"
+  echo
+}
+menu_warp() {
+  local c
+  while true; do
+    echo; menu_title "== WARP（可选插件）"
+    warp_status
+    echo
+    menu_item 1 "安装 WARP（官方源，代理模式）"
+    menu_item 2 "edge 使用 WARP：仅 AI 场景"
+    menu_item 3 "edge 使用 WARP：全部流量"
+    menu_item 4 "edge 不使用 WARP"
+    menu_item 5 "卸载 WARP"
+    menu_item 0 "返回上级"
+    read -r -p "请选择 [0-5]: " c </dev/tty || return 0
+    case "$c" in
+      1) menu_run warp install ;;
+      2) menu_run warp ai ;;
+      3) menu_run warp all ;;
+      4) menu_run warp off ;;
+      5) menu_run warp uninstall ;;
+      0|q|"") return 0 ;;
+      *) warn "无效选择: $c" ;;
+    esac
+  done
+}
+cmd_menu() {
+  if [[ ! -t 0 || ! -t 1 ]]; then usage; return 0; fi   # 非交互（管道、自动化）只打印用法，不挂起等待输入
+  need_root
+  MENU_SELF=$(readlink -f "${BASH_SOURCE[0]}")
+  trap ':' INT
+  local c
+  while true; do
+    menu_header
+    menu_title "【快速开始】"
+    menu_item 1 "配置向导（域名、证书、WARP、端口、管理密钥，检查通过后启动）"
+    menu_title "【运行】"
+    menu_item 2 "服务状态与检查"
+    menu_item 3 "启动 / 重启（先检查）"
+    menu_item 4 "停止服务"
+    menu_item 5 "实时日志（Ctrl+C 返回菜单）"
+    menu_title "【配置】"
+    menu_item 6 "设置域名"
+    menu_item 7 "证书（检查 / 签发）"
+    menu_item 8 "修改主端口"
+    menu_item 9 "全局隧道开关（CONNECT-IP）"
+    menu_item 10 "WARP 管理"
+    menu_item 11 "重置管理密钥"
+    menu_title "【信息】"
+    menu_item 12 "节点地址与 Web 控制台链接"
+    menu_item 13 "TUN 与转发规则状态"
+    menu_title "【维护】"
+    menu_item 14 "升级服务端"
+    printf " ${R}%3s.${N} ${R}%s${N}\n" 15 "卸载 AERO Edge"
+    menu_item 0 "退出"
+    echo
+    read -r -p "请选择 [0-15]: " c </dev/tty || { echo; return 0; }
+    case "$c" in
+      1) menu_run setup ;;
+      2) menu_run status ;;
+      3) menu_run restart ;;
+      4) confirm "停止 aero-edge 服务（客户端将断开）?" && menu_run stop || true ;;
+      5) menu_run log ;;
+      6) menu_run domain ;;
+      7) menu_run cert ;;
+      8) menu_run port ;;
+      9) if [[ "$(cfg_get connect_ip)" == false ]]; then
+           confirm "开启全局隧道（会创建 TUN 并设置宿主转发规则）?" && menu_run tunnel on || true
+         else
+           confirm "关闭全局隧道（只保留 TCP/UDP 代理与 DoH）?" && menu_run tunnel off || true
+         fi ;;
+      10) menu_warp ;;
+      11) confirm "重置管理密钥（旧密钥立即失效，已登记该节点的中台需同步）?" && menu_run key || true ;;
+      12) menu_run info ;;
+      13) menu_run net ;;
+      14) menu_run update ;;
+      15) menu_run uninstall ;;
+      0|q|Q) return 0 ;;
+      "") ;;
+      *) warn "无效选择: $c"; sleep 1 ;;
+    esac
+  done
+}
+
 usage() {
   cat <<'EOF'
-用法: aero <命令>
+用法: aero [命令]        不带命令时进入功能菜单（需要终端）
+  menu               功能菜单
   setup              引导完成域名、证书、可选 WARP、端口、管理密钥，检查通过后启动服务
   status             服务状态与检查结果
   check              检查（全部通过才可重启）
@@ -340,7 +452,9 @@ EOF
 
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0   # 被 source（测试）时只加载函数
 [[ -x "$EDGE" ]] || { err "未安装 aero-edge"; exit 1; }
-case "${1:-help}" in
+case "${1:-menu}" in
+  menu) cmd_menu ;;
+  help|-h|--help) usage ;;
   setup) cmd_setup ;;
   status) cmd_status ;;
   check) "$EDGE" check -config "$CONFIG" ;;
