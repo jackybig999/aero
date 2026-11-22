@@ -1,5 +1,8 @@
 //go:build windows && (amd64 || arm64)
 
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
+
 package client
 
 // Windows DNS 防泄漏（ADR-0014）：在 WFP 动态会话（FWPM_SESSION_FLAG_DYNAMIC）中安装过滤规则，

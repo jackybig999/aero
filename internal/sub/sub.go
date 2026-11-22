@@ -1,4 +1,5 @@
-// Copyright 2026 AERO Protocol Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
 // AERO Native Subscription Builder, Edge Sync & SNI Matrix Subsystem
 // Enforces:
 // 1. Subscription format: /sub/{slug} (random per subscription; no fixed names)

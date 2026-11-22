@@ -1,4 +1,5 @@
-// Copyright 2026 AERO Protocol Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
 // Plan.md Phase 2: 平铺单包测试 — 用户 Slug 专属订阅、多节点聚合与 SNI 矩阵映射
 package sub
 

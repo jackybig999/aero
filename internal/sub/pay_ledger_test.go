@@ -1,4 +1,5 @@
-// Copyright 2026 AERO Protocol Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
 // Plan.md Phase 2: 平铺测试 — 纯 Go SQLite 双轨记账与并发事务测试
 package sub
 

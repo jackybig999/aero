@@ -35,6 +35,9 @@ jobs:
       - name: Version Consistency Gate
         run: bash tools/check-version.sh
 
+      - name: Dependency License Gate (L0 §7.6, ADR-0018)
+        run: bash tools/check-licenses.sh
+
       - name: Allow user namespaces for isolated network tests
         # Ubuntu 默认用 AppArmor 限制非特权用户命名空间；命名空间测试（宿主状态、TUN、端到端）需要它。只影响 CI 虚拟机。
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true

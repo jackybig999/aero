@@ -1,6 +1,5 @@
-// Copyright 2026 AERO Protocol Contributors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
 
 //go:build !windows
 

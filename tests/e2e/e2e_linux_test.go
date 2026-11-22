@@ -1,5 +1,8 @@
 //go:build linux
 
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
+
 // 黑盒端到端测试：编译真实的 cmd/edge 与 cmd/client，在隔离的用户 + 网络 + 挂载 + PID 命名空间中运行
 // （宿主不受影响），用真实 QUIC 验证数据面。不 import 任何 internal 包（组件隔离门禁）。
 //

@@ -1,4 +1,4 @@
-// AERO Protocol Contributors - Pure Vanilla JS User Console (Zero Runtime Dependencies)
+// Aero AI System - Pure Vanilla JS User Console (Zero Runtime Dependencies)
 (function () {
   'use strict';
 

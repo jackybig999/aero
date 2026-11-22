@@ -1,8 +1,7 @@
 //go:build ios
 
-// Copyright 2026 AERO Protocol Contributors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
 
 // 契约注释：
 // 1. fd 必须由 iOS 系统层 NEPacketTunnelProvider 创建并传递；

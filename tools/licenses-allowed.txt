@@ -1,0 +1,12 @@
+# 第三方依赖许可证白名单（L0 §7.6，机器可读；由 tools/check-licenses.sh 读取）
+#
+# 本项目自身为 AGPL-3.0-or-later（ADR-0018）。下列宽松许可证的依赖可以并入。
+# GPL、LGPL、AGPL、MPL 等 copyleft 许可证的依赖不得加入本列表，需单独评审并写 ADR。
+allow MIT
+allow Apache-2.0
+allow BSD-2-Clause
+allow BSD-3-Clause
+allow ISC
+
+# 脚本无法从许可证文本判定时，逐个人工核对后在此登记：
+# override <模块路径> <SPDX> <核对依据>

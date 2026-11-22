@@ -24,6 +24,10 @@
 
 先读 `engineering-profile.yaml`、`PROJECT_RULES.md`、`GLOBAL_ENGINEERING_RULES.md`。代理入口为 `AGENTS.md`；`CLAUDE.md` 只引用它。
 
+## 许可
+
+AGPL-3.0-or-later，个人免费使用；商业使用或不愿遵守 AGPL 的场景需另取商业授权。详见 `LICENSING.md`、`LICENSE`、ADR-0018。
+
 ## 验证
 
 ```bash

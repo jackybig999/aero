@@ -1,4 +1,5 @@
-// Copyright 2026 AERO Protocol Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2026 Aero AI System
 // AERO Platform Master Database (aero.db) - 100% Pure Go SQLite (Zero CGO)
 package sub
 
