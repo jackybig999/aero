@@ -1,6 +1,7 @@
 # ADR-0003 流量场景：每个场景一条 CONNECT-IP 会话，出口由内核策略路由决定
 
 状态：proposed（2026-11-10）
+关系：由 ADR-0017 细化（v1 只启用 `default` 与 `ai` 两类、会话承载分数据报与 DATAGRAM capsule、`class` 改用请求头、源地址由客户端复用层改写）；`browser`、`game` 仍为保留类别。
 
 ## 背景
 产品要求按 AI、浏览器、游戏、其他分流。CONNECT-IP 是三层隧道，edge 看不到域名；现有 WARP 只作用于 TCP CONNECT / CONNECT-UDP，主路径上不生效。
