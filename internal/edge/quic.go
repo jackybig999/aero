@@ -308,6 +308,27 @@ func (ct *ConnTracker) BindEvictOldest(c *quic.Conn, token, uid string, max int)
 	}
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
+	return ct.bindEvictOldestLocked(c, token, uid, max)
+}
+
+// BindOrVerify 在同一把锁内完成“首次绑定”或“核对已绑定的 token”（L0 §7.5：检查与登记原子）。
+// 连接尚未绑定：绑定并按设备数上限摘除最早的连接（返回它们，由调用方在锁外断开），ok 为真。
+// 连接已绑定：token 一致 ok 为真，不一致 ok 为假且不改动绑定。c 为 nil（测试）时 ok 为真。
+// 同一条新连接上并发的多个请求（两条类别会话、不同 token）因此只会有一个 token 绑定成功。
+func (ct *ConnTracker) BindOrVerify(c *quic.Conn, token, uid string, max int) (evicted []*quic.Conn, ok bool) {
+	if c == nil {
+		return nil, true
+	}
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if b, tracked := ct.conns[c]; tracked {
+		return nil, subtle.ConstantTimeCompare([]byte(b.token), []byte(token)) == 1
+	}
+	return ct.bindEvictOldestLocked(c, token, uid, max), true
+}
+
+// bindEvictOldestLocked 是 BindEvictOldest 的主体，调用方持 ct.mu。
+func (ct *ConnTracker) bindEvictOldestLocked(c *quic.Conn, token, uid string, max int) []*quic.Conn {
 	var evict []*quic.Conn
 	if uid != "" && max > 0 {
 		var same []*quic.Conn
@@ -1489,22 +1510,20 @@ func (s *QUICServer) authRequestClaims(w http.ResponseWriter, r *http.Request) (
 	}
 	// 同一 QUIC 连接上的请求必须使用首次请求绑定的 token；首次绑定时执行本节点设备数限制（C3 §3 第 7 步）。
 	if qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn); qc != nil && s.connTracker != nil {
-		if bound, tracked := s.connTracker.Get(qc); tracked {
-			if subtle.ConstantTimeCompare([]byte(bound), []byte(token)) != 1 {
-				s.rejectAuth(w, remoteIP, "token differs from the one bound to this connection")
-				return "", nil, false
+		uid, maxDevices := "", 0
+		if claims != nil {
+			uid, maxDevices = claims.UID, claims.MaxDevices
+		}
+		evicted, ok := s.connTracker.BindOrVerify(qc, token, uid, maxDevices)
+		if !ok {
+			s.rejectAuth(w, remoteIP, "token differs from the one bound to this connection")
+			return "", nil, false
+		}
+		if len(evicted) > 0 {
+			for _, old := range evicted {
+				closeEvictedConn(old)
 			}
-		} else {
-			uid, maxDevices := "", 0
-			if claims != nil {
-				uid, maxDevices = claims.UID, claims.MaxDevices
-			}
-			if evicted := s.connTracker.BindEvictOldest(qc, token, uid, maxDevices); len(evicted) > 0 {
-				for _, old := range evicted {
-					closeEvictedConn(old)
-				}
-				log.Printf("[AUTH] uid %s at device limit %d: closed %d oldest connection(s)", uid, maxDevices, len(evicted))
-			}
+			log.Printf("[AUTH] uid %s at device limit %d: closed %d oldest connection(s)", uid, maxDevices, len(evicted))
 		}
 	}
 	return token, claims, true
