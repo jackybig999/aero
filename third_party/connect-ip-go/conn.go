@@ -1,0 +1,812 @@
+package connectip
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/netip"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
+)
+
+type CloseError struct {
+	Remote bool
+}
+
+func (e *CloseError) Error() string        { return net.ErrClosed.Error() }
+func (e *CloseError) Is(target error) bool { return target == net.ErrClosed }
+
+const (
+	ipProtoICMP   = 1
+	ipProtoICMPv6 = 58
+)
+
+type http3Stream interface {
+	io.ReadWriteCloser
+	ReceiveDatagram(context.Context) ([]byte, error)
+	SendDatagram([]byte) error
+	CancelRead(quic.StreamErrorCode)
+	CancelWrite(quic.StreamErrorCode)
+	SetWriteDeadline(time.Time) error
+}
+
+var (
+	_ http3Stream = &http3.Stream{}
+	_ http3Stream = &http3.RequestStream{}
+)
+
+// If a packet is too large to fit into a QUIC datagram,
+// we send an ICMP Packet Too Big packet.
+// On IPv6, the minimum MTU of a link is 1280 bytes.
+const minMTU = 1280
+
+// Bound pending capsules in both directions. Queues only grow when the peer
+// falls behind reading the stream or the application falls behind receiving updates.
+const maxQueuedCapsules = 128
+
+type streamWrite struct {
+	Data []byte
+	Fin  bool
+}
+
+// Conn is a connection that proxies IP packets over HTTP/3.
+type Conn struct {
+	str         http3Stream
+	closeConn   func() error
+	writeNotify chan struct{}
+	writeDone   chan error
+
+	assignedAddressUpdates  chan []AssignedAddress
+	addressRequests         chan *addressRequestCapsule
+	availableRouteUpdates   chan []IPRoute
+	dnsConfigurationUpdates chan []DNSConfiguration
+	pref64Updates           chan []netip.Prefix
+
+	mu                   sync.Mutex
+	queuedWrites         []streamWrite
+	peerAddresses        []netip.Prefix // IP prefixes that we assigned to the peer
+	localRoutes          []IPRoute      // IP routes that we advertised to the peer
+	assignedAddresses    []netip.Prefix
+	lastAddressRequestID AddressRequestID
+
+	closeChan chan struct{}
+	closeErr  error
+
+	// AERO fork: data mode (see datamode.go). mode is immutable after construction.
+	mode            DataMode
+	dataPackets     chan []byte   // capsule mode: received packets waiting for ReadPacket
+	writeSpace      chan struct{} // capsule mode: signaled when the write queue shrinks
+	droppedMismatch atomic.Uint64 // datagram mode: data capsules dropped
+}
+
+func newProxiedConn(str http3Stream, closeConn func() error) *Conn {
+	return newProxiedConnMode(str, closeConn, DataModeDatagram)
+}
+
+func newProxiedConnMode(str http3Stream, closeConn func() error, mode DataMode) *Conn {
+	c := &Conn{
+		str:                     str,
+		closeConn:               closeConn,
+		writeNotify:             make(chan struct{}, 1),
+		writeDone:               make(chan error, 1),
+		assignedAddressUpdates:  make(chan []AssignedAddress, maxQueuedCapsules),
+		addressRequests:         make(chan *addressRequestCapsule, maxQueuedCapsules),
+		availableRouteUpdates:   make(chan []IPRoute, 1),
+		dnsConfigurationUpdates: make(chan []DNSConfiguration, 1),
+		pref64Updates:           make(chan []netip.Prefix, 1),
+		closeChan:               make(chan struct{}),
+		mode:                    mode,
+	}
+	if mode == DataModeCapsule {
+		c.dataPackets = make(chan []byte, maxQueuedDataReads)
+		c.writeSpace = make(chan struct{}, 1)
+	}
+	go func() {
+		err := c.readFromStream()
+		if err != nil {
+			log.Printf("handling stream failed: %v", err)
+		}
+		c.mu.Lock()
+		if c.closeErr == nil {
+			c.closeErr = &CloseError{Remote: true}
+			close(c.closeChan)
+			if err != nil {
+				// Abort without consuming the remaining capsule payload.
+				c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+				close(c.writeNotify)
+			} else {
+				_ = c.queueWrite(streamWrite{Fin: true})
+			}
+		}
+		c.mu.Unlock()
+	}()
+	go func() {
+		err := c.writeToStream()
+		if err != nil {
+			log.Printf("writing to stream failed: %v", err)
+			c.mu.Lock()
+			if c.closeErr == nil {
+				c.closeErr = &CloseError{Remote: true}
+				close(c.closeChan)
+				c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+			} else {
+				// A write can time out while graceful shutdown is pending.
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
+			}
+			c.mu.Unlock()
+		}
+		c.writeDone <- err
+		close(c.writeDone)
+	}()
+	return c
+}
+
+// AdvertiseRoute schedules an advertisement of the available routes to the peer.
+// It returns once the advertisement has been queued.
+func (c *Conn) AdvertiseRoute(routes []IPRoute) error {
+	for _, route := range routes {
+		if route.StartIP.Compare(route.EndIP) == 1 {
+			return fmt.Errorf("invalid route advertising start_ip: %s larger than %s", route.StartIP, route.EndIP)
+		}
+	}
+
+	c.mu.Lock()
+	if c.closeErr != nil {
+		err := c.closeErr
+		c.mu.Unlock()
+		return err
+	}
+	routes = slices.Clone(routes)
+	err := c.queueWrite(streamWrite{Data: (&routeAdvertisementCapsule{IPAddressRanges: routes}).append(nil)})
+	if err == nil {
+		c.localRoutes = routes
+	}
+	c.mu.Unlock()
+	if err != nil {
+		_ = c.Close()
+		return err
+	}
+	return nil
+}
+
+// RequestAddresses requests address prefixes from the peer and returns once the
+// request is queued. It allocates a unique, nonzero ID for each prefix in input order.
+// The IDs have no semantic meaning and can be used to correlate assignments
+// returned by [Conn.ReceiveAddressAssignment] with the requested prefixes.
+//
+// Prefixes must be valid, with all bits outside the prefix set to zero.
+// An unspecified address (0.0.0.0 or ::) requests any address of that family,
+// with the prefix length indicating the preferred size.
+func (c *Conn) RequestAddresses(prefixes []netip.Prefix) ([]AddressRequestID, error) {
+	if len(prefixes) == 0 {
+		return nil, errors.New("connect-ip: address request must contain at least one prefix")
+	}
+	for i, p := range prefixes {
+		if !p.IsValid() || p != p.Masked() {
+			return nil, fmt.Errorf("connect-ip: invalid requested prefix %d: %s", i, p)
+		}
+	}
+
+	c.mu.Lock()
+	if c.closeErr != nil {
+		err := c.closeErr
+		c.mu.Unlock()
+		return nil, err
+	}
+	ids := make([]AddressRequestID, len(prefixes))
+	for i := range ids {
+		ids[i] = c.lastAddressRequestID + AddressRequestID(i) + 1
+	}
+	capsule := &addressRequestCapsule{RequestIDs: ids, Prefixes: prefixes}
+	err := c.queueWrite(streamWrite{Data: capsule.append(nil)})
+	if err == nil {
+		c.lastAddressRequestID = ids[len(ids)-1]
+	}
+	c.mu.Unlock()
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	return ids, nil
+}
+
+// ReceiveAddressAssignment waits for the next complete address assignment,
+// Each assignment replaces the preceding one; request IDs only provide optional correlation.
+// Call this method in a loop from one goroutine.
+func (c *Conn) ReceiveAddressAssignment(ctx context.Context) ([]AssignedAddress, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case assignment := <-c.assignedAddressUpdates:
+		return assignment, nil
+	case <-c.closeChan:
+		// Deliver queued responses before reporting closure.
+		select {
+		case assignment := <-c.assignedAddressUpdates:
+			return assignment, nil
+		default:
+			return nil, c.closeErr
+		}
+	}
+}
+
+// ReceiveAddressRequest waits for the next address request from the peer.
+// This method should be called in a loop, and each request should be answered with [AddressRequest.Respond].
+func (c *Conn) ReceiveAddressRequest(ctx context.Context) (*AddressRequest, error) {
+	var requested *addressRequestCapsule
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case requested = <-c.addressRequests:
+	case <-c.closeChan:
+		select {
+		case requested = <-c.addressRequests:
+		default:
+			return nil, c.closeErr
+		}
+	}
+	return newAddressRequest(c, requested), nil
+}
+
+// AssignAddresses schedules an assignment of address prefixes to the peer.
+func (c *Conn) AssignAddresses(prefixes []netip.Prefix) error {
+	capsule := &addressAssignCapsule{}
+	if prefixes != nil {
+		capsule.AssignedAddresses = make([]AssignedAddress, len(prefixes))
+		for i, p := range prefixes {
+			capsule.AssignedAddresses[i] = AssignedAddress{IPPrefix: p}
+		}
+	}
+	return c.sendAddressAssignment(capsule)
+}
+
+func (c *Conn) sendAddressAssignment(capsule *addressAssignCapsule) error {
+	c.mu.Lock()
+	if c.closeErr != nil {
+		err := c.closeErr
+		c.mu.Unlock()
+		return err
+	}
+	if err := c.queueWrite(streamWrite{Data: capsule.append(nil)}); err != nil {
+		c.mu.Unlock()
+		_ = c.Close()
+		return err
+	}
+
+	var prefixes []netip.Prefix
+	// Preserve nil (no source restriction) versus an empty assignment.
+	if capsule.AssignedAddresses != nil {
+		prefixes = make([]netip.Prefix, 0, len(capsule.AssignedAddresses))
+	}
+	for _, assigned := range capsule.AssignedAddresses {
+		if !assigned.Rejected() {
+			prefixes = append(prefixes, assigned.IPPrefix)
+		}
+	}
+	c.peerAddresses = prefixes
+	c.mu.Unlock()
+	return nil
+}
+
+// SendDNSConfiguration schedules a DNS configuration update to the peer.
+// The update supersedes the DNS configuration previously sent on this connection.
+//
+// To avoid leaking DNS traffic outside the tunnel, the application is responsible
+// for advertising the corresponding routes before calling this method. See
+// [Section 5 of draft-ietf-masque-connect-ip-dns-06].
+//
+// [Section 5 of draft-ietf-masque-connect-ip-dns-06]: https://datatracker.ietf.org/doc/html/draft-ietf-masque-connect-ip-dns-06#section-5
+func (c *Conn) SendDNSConfiguration(configurations []DNSConfiguration) error {
+	for _, config := range configurations {
+		if err := config.validate(); err != nil {
+			return fmt.Errorf("invalid DNS configuration: %w", err)
+		}
+	}
+	return c.sendCapsule((&dnsAssignCapsule{DNSConfigurations: configurations}).append(nil))
+}
+
+// ReceiveDNSConfiguration waits for the next DNS configuration update from the peer.
+// Each update supersedes the preceding one.
+func (c *Conn) ReceiveDNSConfiguration(ctx context.Context) ([]DNSConfiguration, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closeChan:
+		return nil, c.closeErr
+	case configurations := <-c.dnsConfigurationUpdates:
+		return configurations, nil
+	}
+}
+
+// SendPREF64Configuration schedules an update of the NAT64 prefixes to use for
+// IPv6/IPv4 address synthesis. It returns once the update has been queued. An
+// empty slice clears the previously sent configuration.
+func (c *Conn) SendPREF64Configuration(prefixes []netip.Prefix) error {
+	for i, prefix := range prefixes {
+		if !prefix.IsValid() || !prefix.Addr().Is6() || prefix.Addr().Is4In6() {
+			return fmt.Errorf("invalid NAT64 prefix %d: not an IPv6 prefix", i)
+		}
+		switch prefix.Bits() {
+		case 32, 40, 48, 56, 64, 96:
+		default:
+			return fmt.Errorf("invalid NAT64 prefix %d: invalid prefix length %d", i, prefix.Bits())
+		}
+	}
+	return c.sendCapsule((&pref64Capsule{Prefixes: prefixes}).append(nil))
+}
+
+// ReceivePREF64Configuration waits for the next NAT64 prefix update from the
+// peer. An empty slice means that NAT64 prefixes are not available.
+func (c *Conn) ReceivePREF64Configuration(ctx context.Context) ([]netip.Prefix, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closeChan:
+		return nil, c.closeErr
+	case prefixes := <-c.pref64Updates:
+		return prefixes, nil
+	}
+}
+
+func (c *Conn) sendCapsule(capsuleData []byte) error {
+	c.mu.Lock()
+	if c.closeErr != nil {
+		err := c.closeErr
+		c.mu.Unlock()
+		return err
+	}
+	err := c.queueWrite(streamWrite{Data: capsuleData})
+	c.mu.Unlock()
+	if err != nil {
+		_ = c.Close()
+		return err
+	}
+	return nil
+}
+
+func (c *Conn) queueWrite(w streamWrite) error {
+	if w.Fin {
+		// Interrupt pending capsule writes so shutdown cannot stall.
+		_ = c.str.SetWriteDeadline(time.Now())
+	} else if len(c.queuedWrites) >= maxQueuedCapsules {
+		c.closeErr = &CloseError{Remote: false}
+		close(c.closeChan)
+		c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeExcessiveLoad))
+		close(c.writeNotify)
+		return errors.New("connect-ip: capsule queue full")
+	}
+
+	c.queuedWrites = append(c.queuedWrites, w)
+
+	select {
+	case c.writeNotify <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func queueLatest[T any](ch chan T, value T) {
+	for {
+		select {
+		case ch <- value:
+			return
+		case <-ch:
+		}
+	}
+}
+
+// Routes returns the routes that the peer currently advertised.
+// Note that at any point during the connection, the peer can change the advertised routes.
+// It is therefore recommended to call this function in a loop.
+func (c *Conn) Routes(ctx context.Context) ([]IPRoute, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.closeChan:
+		return nil, c.closeErr
+	case routes := <-c.availableRouteUpdates:
+		return routes, nil
+	}
+}
+
+func (c *Conn) readFromStream() error {
+	p := http3.NewCapsuleParser(c.str)
+	for {
+		t, cr, err := p.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch t {
+		case capsuleTypeAddressAssign:
+			capsule, err := parseAddressAssignCapsule(cr)
+			if err != nil {
+				return err
+			}
+			prefixes := make([]netip.Prefix, 0, len(capsule.AssignedAddresses))
+			for _, assigned := range capsule.AssignedAddresses {
+				if !assigned.Rejected() {
+					prefixes = append(prefixes, assigned.IPPrefix)
+				}
+			}
+			c.mu.Lock()
+			c.assignedAddresses = prefixes
+			c.mu.Unlock()
+			select {
+			case c.assignedAddressUpdates <- capsule.AssignedAddresses:
+			default:
+				return errors.New("connect-ip: address assignment queue full")
+			}
+		case capsuleTypeAddressRequest:
+			capsule, err := parseAddressRequestCapsule(cr)
+			if err != nil {
+				return err
+			}
+			select {
+			case c.addressRequests <- capsule:
+			default:
+				return errors.New("connect-ip: address request queue full")
+			}
+		case capsuleTypeRouteAdvertisement:
+			capsule, err := parseRouteAdvertisementCapsule(cr)
+			if err != nil {
+				return err
+			}
+			queueLatest(c.availableRouteUpdates, capsule.IPAddressRanges)
+		case capsuleTypeDNSAssign:
+			capsule, err := parseDNSAssignCapsule(cr)
+			if err != nil {
+				return err
+			}
+			queueLatest(c.dnsConfigurationUpdates, capsule.DNSConfigurations)
+		case capsuleTypePREF64:
+			capsule, err := parsePREF64Capsule(cr)
+			if err != nil {
+				return err
+			}
+			queueLatest(c.pref64Updates, capsule.Prefixes)
+		case capsuleTypeDatagram:
+			if err := c.handleDataCapsule(cr); err != nil {
+				return err
+			}
+		default:
+			if err := cr.Discard(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// handleDataCapsule processes a DATAGRAM capsule (RFC 9297 Section 3.5).
+// In datagram mode the peer is using a different mode: drop and count.
+// In capsule mode the payload (Context ID + IP packet) is queued for ReadPacket;
+// when the queue is full this blocks, which stops reading the stream (QUIC flow control back-pressure).
+// A returned error closes the Conn.
+func (c *Conn) handleDataCapsule(cr http3.CapsuleReader) error {
+	if c.mode != DataModeCapsule {
+		c.droppedMismatch.Add(1)
+		return cr.Discard()
+	}
+	if n := cr.Remaining(); n > maxDataCapsuleSize {
+		return fmt.Errorf("connect-ip: DATAGRAM capsule too large: %d bytes (maximum %d)", n, maxDataCapsuleSize)
+	}
+	payload := make([]byte, cr.Remaining())
+	if _, err := io.ReadFull(cr, payload); err != nil {
+		return err
+	}
+	contextID, packet, err := splitDataPayload(payload)
+	if err != nil {
+		return err
+	}
+	if contextID != 0 {
+		// Only IP payloads (Context ID 0) are supported, same as in datagram mode.
+		return nil
+	}
+	select {
+	case c.dataPackets <- packet:
+	case <-c.closeChan:
+	}
+	return nil
+}
+
+func (c *Conn) writeToStream() error {
+	for range c.writeNotify {
+		for {
+			c.mu.Lock()
+			if len(c.queuedWrites) == 0 {
+				c.mu.Unlock()
+				break
+			}
+			w := c.queuedWrites[0]
+			c.queuedWrites[0] = streamWrite{}
+			c.queuedWrites = c.queuedWrites[1:]
+			c.mu.Unlock()
+			if c.writeSpace != nil {
+				select {
+				case c.writeSpace <- struct{}{}:
+				default:
+				}
+			}
+
+			if w.Fin {
+				return c.str.Close()
+			}
+			if _, err := c.str.Write(w.Data); err != nil {
+				return err
+			}
+		}
+	}
+	return c.closeErr
+}
+
+func (c *Conn) ReadPacket(b []byte) (n int, err error) {
+	if c.mode == DataModeCapsule {
+		return c.readPacketCapsule(b)
+	}
+start:
+	data, err := c.str.ReceiveDatagram(context.Background())
+	if err != nil {
+		select {
+		case <-c.closeChan:
+			return 0, c.closeErr
+		default:
+			return 0, err
+		}
+	}
+	contextID, n, err := quicvarint.Parse(data)
+	if err != nil {
+		// TODO: close connection
+		return 0, fmt.Errorf("connect-ip: malformed datagram: %w", err)
+	}
+	if contextID != 0 {
+		// Drop this datagram. We currently only support proxying of IP payloads.
+		goto start
+	}
+	if err := c.handleIncomingProxiedPacket(data[n:]); err != nil {
+		log.Printf("dropping proxied packet: %s", err)
+		goto start
+	}
+	return copy(b, data[n:]), nil
+}
+
+func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("connect-ip: empty packet")
+	}
+	var src, dst netip.Addr
+	var ipProto uint8
+	switch v := ipVersion(data); v {
+	default:
+		return fmt.Errorf("connect-ip: unknown IP versions: %d", v)
+	case 4:
+		if len(data) < ipv4.HeaderLen {
+			return fmt.Errorf("connect-ip: malformed datagram: too short")
+		}
+		src = netip.AddrFrom4([4]byte(data[12:16]))
+		dst = netip.AddrFrom4([4]byte(data[16:20]))
+		ipProto = data[9]
+	case 6:
+		if len(data) < ipv6.HeaderLen {
+			return fmt.Errorf("connect-ip: malformed datagram: too short")
+		}
+		src = netip.AddrFrom16([16]byte(data[8:24]))
+		dst = netip.AddrFrom16([16]byte(data[24:40]))
+		ipProto = data[6]
+	}
+
+	c.mu.Lock()
+	assignedAddresses := c.assignedAddresses
+	localRoutes := c.localRoutes
+	peerAddresses := c.peerAddresses
+	c.mu.Unlock()
+
+	// We don't necessarily assign any addresses to the peer.
+	// For example, in the Remote Access VPN use case (RFC 9484, section 8.1),
+	// the client accepts incoming traffic from all IPs.
+	if peerAddresses != nil {
+		if !slices.ContainsFunc(peerAddresses, func(p netip.Prefix) bool { return p.Contains(src) }) {
+			// TODO: send ICMP
+			return fmt.Errorf("connect-ip: datagram source address not allowed: %s", src)
+		}
+	}
+
+	// The destination IP address is valid if it
+	// 1. is within one of the ranges assigned to us, or
+	// 2. is within one of the ranges that we advertised to the peer.
+	var isAllowedDst bool
+	if len(assignedAddresses) > 0 {
+		isAllowedDst = slices.ContainsFunc(assignedAddresses, func(p netip.Prefix) bool { return p.Contains(dst) })
+	}
+	if !isAllowedDst {
+		isAllowedDst = slices.ContainsFunc(localRoutes, func(r IPRoute) bool {
+			if r.StartIP.Compare(dst) > 0 || dst.Compare(r.EndIP) > 0 {
+				return false
+			}
+			// ICMP is always allowed
+			if (ipVersion(data) == 4 && ipProto == ipProtoICMP) || (ipVersion(data) == 6 && ipProto == ipProtoICMPv6) {
+				return true
+			}
+			// TODO: walk the chain of IPv6 extensions
+			// See section 4.8 of RFC 9484 for details.
+			return r.IPProtocol == 0 || r.IPProtocol == ipProto
+		})
+	}
+	if !isAllowedDst {
+		// TODO: send ICMP
+		return fmt.Errorf("connect-ip: datagram destination address / protocol not allowed: %s (protocol: %d)", dst, ipProto)
+	}
+	return nil
+}
+
+// WritePacket writes an IP packet to the stream.
+// If sending the packet fails, it might return an ICMP packet.
+// It is the caller's responsibility to send the ICMP packet to the sender.
+func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
+	if c.mode == DataModeCapsule {
+		return c.writePacketCapsule(b)
+	}
+	data, err := c.composeDatagram(b)
+	if err != nil {
+		log.Printf("dropping proxied packet (%d bytes) that can't be proxied: %s", len(b), err)
+		return nil, nil
+	}
+	if err := c.str.SendDatagram(data); err != nil {
+		if _, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
+			icmpPacket, err := composeICMPTooLargePacket(b, minMTU)
+			if err != nil {
+				log.Printf("failed to compose ICMP too large packet: %s", err)
+			}
+			return icmpPacket, nil
+		}
+		select {
+		case <-c.closeChan:
+			return nil, c.closeErr
+		default:
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
+	// TODO: implement src, dst and ipproto checks
+	if len(b) == 0 {
+		return nil, nil
+	}
+	switch v := ipVersion(b); v {
+	default:
+		return nil, fmt.Errorf("connect-ip: unknown IP versions: %d", v)
+	case 4:
+		if len(b) < ipv4.HeaderLen {
+			return nil, fmt.Errorf("connect-ip: IPv4 packet too short")
+		}
+		ttl := b[8]
+		if ttl <= 1 {
+			return nil, fmt.Errorf("connect-ip: datagram TTL too small: %d", ttl)
+		}
+		b[8]-- // decrement TTL
+		// recalculate the checksum
+		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(([ipv4.HeaderLen]byte)(b[:ipv4.HeaderLen])))
+	case 6:
+		if len(b) < ipv6.HeaderLen {
+			return nil, fmt.Errorf("connect-ip: IPv6 packet too short")
+		}
+		hopLimit := b[7]
+		if hopLimit <= 1 {
+			return nil, fmt.Errorf("connect-ip: datagram Hop Limit too small: %d", hopLimit)
+		}
+		b[7]-- // Decrement Hop Limit
+	}
+	data := make([]byte, 0, len(contextIDZero)+len(b))
+	data = append(data, contextIDZero...)
+	data = append(data, b...)
+	return data, nil
+}
+
+// readPacketCapsule is ReadPacket in capsule mode.
+func (c *Conn) readPacketCapsule(b []byte) (int, error) {
+	for {
+		var packet []byte
+		select {
+		case packet = <-c.dataPackets:
+		case <-c.closeChan:
+			// The peer closed cleanly (EOF) after sending: packets already queued were delivered
+			// reliably and must not be lost to select's random choice. After a local Close,
+			// queued packets are discarded.
+			var ce *CloseError
+			if !errors.As(c.closeErr, &ce) || !ce.Remote {
+				return 0, c.closeErr
+			}
+			select {
+			case packet = <-c.dataPackets:
+			default:
+				return 0, c.closeErr
+			}
+		}
+		if err := c.handleIncomingProxiedPacket(packet); err != nil {
+			log.Printf("dropping proxied packet: %s", err)
+			continue
+		}
+		return copy(b, packet), nil
+	}
+}
+
+// writePacketCapsule is WritePacket in capsule mode. It blocks while the write queue holds
+// maxQueuedDataWrites data capsules (the peer or the network is slower than the sender),
+// and never returns an ICMP packet: there is no datagram size limit on a stream.
+func (c *Conn) writePacketCapsule(b []byte) ([]byte, error) {
+	payload, err := c.composeDatagram(b)
+	if err != nil {
+		log.Printf("dropping proxied packet (%d bytes) that can't be proxied: %s", len(b), err)
+		return nil, nil
+	}
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	if len(payload) > maxDataCapsuleSize {
+		log.Printf("dropping proxied packet (%d bytes) that is too large", len(b))
+		return nil, nil
+	}
+	frame := appendDataCapsule(make([]byte, 0, len(payload)+8), payload)
+	for {
+		c.mu.Lock()
+		if c.closeErr != nil {
+			err := c.closeErr
+			c.mu.Unlock()
+			return nil, err
+		}
+		if len(c.queuedWrites) < maxQueuedDataWrites {
+			err := c.queueWrite(streamWrite{Data: frame})
+			c.mu.Unlock()
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			return nil, nil
+		}
+		c.mu.Unlock()
+		select {
+		case <-c.writeSpace:
+		case <-c.closeChan:
+			return nil, c.closeErr
+		}
+	}
+}
+
+func (c *Conn) Close() error {
+	c.mu.Lock()
+	if c.closeErr == nil {
+		c.closeErr = &CloseError{Remote: false}
+		close(c.closeChan)
+		_ = c.queueWrite(streamWrite{Fin: true})
+	}
+	closeConn := c.closeConn
+	c.closeConn = nil
+	c.mu.Unlock()
+	err := <-c.writeDone
+	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+	if closeConn != nil {
+		return errors.Join(err, closeConn())
+	}
+	return err
+}
+
+func ipVersion(b []byte) uint8 { return b[0] >> 4 }
