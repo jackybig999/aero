@@ -123,6 +123,9 @@ type SubServer struct {
 	ISPAffinity string   `json:"isp_affinity,omitempty"`
 	AltPorts    []int    `json:"alt_ports,omitempty"`
 	ECH         string   `json:"ech,omitempty" yaml:"ech"`
+	// Transports 是本节点支持的 CONNECT-IP 传输方式（C5 §3、C1 §4.1）。它由运行中的程序决定，
+	// 不写入 sub_meta.json，只在输出订阅时填入，升级后无需迁移。
+	Transports []string `json:"transports,omitempty"`
 }
 
 func (s *SubServer) UnmarshalJSON(data []byte) error {
@@ -414,8 +417,19 @@ func (s *SubStore) saveLocked() error {
 	return os.Rename(tmp, s.metaPath())
 }
 
+// withTransports 返回订阅文档的副本，每个节点都带上本程序支持的传输方式；不修改原文档。
+func (d SubDocument) withTransports() SubDocument {
+	servers := make([]SubServer, len(d.Servers))
+	copy(servers, d.Servers)
+	for i := range servers {
+		servers[i].Transports = supportedTransports()
+	}
+	d.Servers = servers
+	return d
+}
+
 func (s *SubStore) writeClientSubLocked() error {
-	data, err := json.MarshalIndent(s.meta.Document, "", "  ")
+	data, err := json.MarshalIndent(s.meta.Document.withTransports(), "", "  ")
 	if err != nil {
 		return err
 	}
@@ -481,7 +495,7 @@ func (s *SubStore) Dir() string { return s.dir }
 func (s *SubStore) DocumentJSON() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return json.Marshal(s.meta.Document)
+	return json.Marshal(s.meta.Document.withTransports())
 }
 
 // Document returns copy of default subscription document
@@ -582,7 +596,7 @@ func (s *SubStore) AdminDocument() SubDocument {
 	doc.ExpireAt = 0          // permanent validity
 	doc.TrafficLimitBytes = 0 // unlimited traffic
 	doc.TrafficUsedBytes = 0
-	return doc
+	return doc.withTransports()
 }
 
 // AdminDocumentJSON formats the admin subscription document into JSON
@@ -649,7 +663,7 @@ func (s *SubStore) UserDocumentJSON(sub UserSub) ([]byte, error) {
 		Servers:           servers,
 		CreatedAt:         sub.CreatedAt,
 	}
-	return json.Marshal(doc)
+	return json.Marshal(doc.withTransports())
 }
 
 func randomHexSecret(n int) (string, error) {
