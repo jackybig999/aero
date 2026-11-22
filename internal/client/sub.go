@@ -54,6 +54,9 @@ type ServerConfig struct {
 	Country     string   `json:"country,omitempty" yaml:"country"`
 	WarpActive  bool     `json:"warp_active,omitempty" yaml:"warp_active"`
 	Tags        []string `json:"tags,omitempty" yaml:"tags"`
+	// Transports 是节点支持的 CONNECT-IP 传输方式（C5 §3）：datagram、capsule。缺省表示只支持 datagram，
+	// 客户端不会在这样的节点上开 ai 会话（ADR-0017）。
+	Transports []string `json:"transports,omitempty" yaml:"transports"`
 }
 
 // UnmarshalJSON 兼容 snake_case 与 camelCase，杜绝跨系统命名失配导致的静默丢弃

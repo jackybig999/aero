@@ -109,7 +109,9 @@ func natDownlink(pkt []byte, aiAddr, tunAddr netip.Addr) bool {
 	if _, ok := setIPv4Addr(pkt, 16, tunAddr.As4()); !ok {
 		return false
 	}
-	if pkt[9] == 1 { // ICMP
+	// ICMP 差错报文的内嵌头只在未分片时改写：分片的 ICMP，非首片没有 ICMP 头，首片的校验和覆盖整个重组后的报文，
+	// 无法只用本片重算。不改的后果只是系统匹配不到对应的套接字而忽略这条差错，无害。
+	if pkt[9] == 1 && binary.BigEndian.Uint16(pkt[6:8])&0x3fff == 0 {
 		natICMPInner(pkt, ihl, aiAddr.As4(), tunAddr.As4())
 	}
 	return true

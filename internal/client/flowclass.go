@@ -271,14 +271,12 @@ func (c *flowClassifier) classify(pkt []byte) (class flowClass, newTCP bool) {
 		return flowDefault, false
 	}
 	dst := netip.AddrFrom4([4]byte(pkt[16:20]))
-	if binary.BigEndian.Uint16(pkt[6:8])&0x1fff != 0 {
-		// 非首片没有端口：只能按目的地址判断（极少见；同一目的地址在有效期内结果一致）。
-		if c.ai.Contains(dst) {
-			return flowAI, false
-		}
+	if binary.BigEndian.Uint16(pkt[6:8])&0x3fff != 0 {
+		// 任何分片（MF 置位或偏移非 0）一律 default 且不记录：非首片没有端口，首片若走 ai 而后续分片走 default，
+		// 同一个报文会被拆到两条会话上无法重组。分片的 TCP 极少见。
 		return flowDefault, false
 	}
-	if len(pkt) < ihl+14 {
+	if int(binary.BigEndian.Uint16(pkt[2:4])) < ihl+14 { // 总长度（ipv4Header 已保证不超过 len(pkt)）
 		return flowDefault, false
 	}
 	key := tcpFlowKey{dst: dst, sport: binary.BigEndian.Uint16(pkt[ihl : ihl+2]), dport: binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])}
@@ -292,13 +290,16 @@ func (c *flowClassifier) classify(pkt []byte) (class flowClass, newTCP bool) {
 			return cl, false
 		}
 	}
-	// 新连接（纯 SYN，也覆盖源端口复用）或表里没有这条流：按目的地址决定并记录。
+	if !syn {
+		// 表里没有这条流的中途包（用户刚打开通道、条目过期或被淘汰）：永远走 default，不记录。
+		// 只有纯 SYN 才能开始一条 ai 流；否则一条已经在 default 上的连接会因源地址突变而断流。
+		return flowDefault, false
+	}
+	// 新连接（纯 SYN，也覆盖源端口复用）：按目的地址决定并记录。
 	cl := flowDefault
 	if c.ai.Contains(dst) {
 		cl = flowAI
 	}
-	if flags&0x04 == 0 {
-		c.flows.set(key, cl)
-	}
-	return cl, syn
+	c.flows.set(key, cl)
+	return cl, true
 }

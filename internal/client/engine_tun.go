@@ -148,16 +148,21 @@ func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error
 		return errors.Join(fmt.Errorf("CONNECT-IP assigned prefix %q: %w", prefixStr, err), ipConn.Close())
 	}
 
+	// 节点声明了 capsule 时接入 ai 会话（失败不影响隧道，见 wrapAI）；否则 ipConn 原样使用。
+	// 放在路由下发之前：拨号最长 aiDialTimeout，期间不能让整机流量落进还没有数据面的 TUN。
+	ipConn = e.wrapAI(startCtx, ipConn, prefix)
+	closeConn := func() error { e.retireAIConn(ipConn); return ipConn.Close() }
+
 	e.mu.RLock()
 	in := e.tunPlanInputLocked(nodeIP)
 	e.mu.RUnlock()
 	plan, err := PlanTUNRoutes(in)
 	if err != nil {
-		return errors.Join(fmt.Errorf("plan TUN routes: %w", err), ipConn.Close())
+		return errors.Join(fmt.Errorf("plan TUN routes: %w", err), closeConn())
 	}
 	host, err := openTunHostFn(tunHostConfig{Name: tunName, MTU: tunMTU, IPv4: prefix, DNS: tunGateway(prefix), Plan: plan})
 	if err != nil {
-		return errors.Join(fmt.Errorf("%w: open TUN: %w", ErrTunUnavailable, err), ipConn.Close())
+		return errors.Join(fmt.Errorf("%w: open TUN: %w", ErrTunUnavailable, err), closeConn())
 	}
 	e.mu.Lock() // refreshTunRoutes 在 e.mu 下读取 tunHost
 	e.tunHost = host
@@ -180,6 +185,7 @@ func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error
 // releaseTunLocked 停止数据面并销毁自有网卡（其上的地址、路由、DNS 及防护规则随之清除）；幂等。
 // 调用方不得持有 e.mu（本函数在 e.mu 下摘下 tunHost，再在锁外关闭）。
 func (e *Engine) releaseTunLocked() {
+	e.resetAIState()
 	if e.stackEngine != nil {
 		e.stackEngine.SetWebRTCActive(false)
 		SetGlobalMobileWebRTCActive(false)

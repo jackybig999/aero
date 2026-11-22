@@ -271,6 +271,26 @@ func TestNATICMPInner(t *testing.T) {
 	}
 }
 
+// 分片的 ICMP：只改外层目的地址与 IP 头校验和，不碰载荷（非首片没有 ICMP 头，首片的 ICMP 校验和覆盖整个重组后的报文）。
+func TestNATFragmentedICMPOnlyRewritesOuterHeader(t *testing.T) {
+	sent := tcpWithFlags(natAI, natRemote, 50001, 443, fSYN, 0)
+	icmp := append([]byte{3, 4, 0, 0, 0, 0, 5, 0xdc}, sent[:28]...)
+	binary.BigEndian.PutUint16(icmp[2:4], onesComplementSum(icmp))
+	for _, frag := range []uint16{0x2000, 0x0001, 0x2001} { // 首片（MF）、非首片、中间片
+		pkt := buildIPv4(netip.MustParseAddr("198.51.100.1"), natAI, 1, nil, icmp, frag)
+		payload := append([]byte(nil), pkt[20:]...)
+		if !natDownlink(pkt, natAI, natTun) {
+			t.Fatalf("frag %#x: outer destination not rewritten", frag)
+		}
+		if netip.AddrFrom4([4]byte(pkt[16:20])) != natTun || !refIPHeaderValid(pkt) {
+			t.Fatalf("frag %#x: outer header wrong", frag)
+		}
+		if !bytes.Equal(payload, pkt[20:]) {
+			t.Fatalf("frag %#x: payload modified", frag)
+		}
+	}
+}
+
 func TestNATLeavesForeignAndBrokenPacketsAlone(t *testing.T) {
 	pkt := withL4Checksum(buildIPv4(netip.MustParseAddr("10.88.0.99"), natRemote, 6, nil, tcpSeg(10, rand.New(rand.NewSource(7))), 0), 16)
 	orig := append([]byte(nil), pkt...)

@@ -284,6 +284,7 @@ func TestMuxAIBackpressureNeverBlocksDefault(t *testing.T) {
 	if err := f.m.AttachAI(a, natAI); err != nil {
 		t.Fatal(err)
 	}
+	f.m.WritePacket(tcpWithFlags(natTun, aiHost, 50003, 443, fSYN, 0)) // 只有 SYN 才能开始一条 ai 流
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -415,6 +416,7 @@ func TestMuxCloseUnblocksReaderAndLeaksNoGoroutines(t *testing.T) {
 		a.blockWrite = make(chan struct{})
 		_ = m.AttachAI(a, natAI)
 		m.cls.ai.Add(aiHost, time.Hour)
+		m.WritePacket(tcpWithFlags(natTun, aiHost, 50007, 443, fSYN, 0))
 		for j := 0; j < 300; j++ {
 			m.WritePacket(tcpWithFlags(natTun, aiHost, 50007, 443, fACK, 100))
 		}

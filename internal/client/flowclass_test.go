@@ -276,12 +276,40 @@ func TestClassifyDisabledAndMalformed(t *testing.T) {
 			t.Fatalf("malformed packet %x classified as %d", bad, cl)
 		}
 	}
-	// 非首片的 TCP 片段没有端口：只按目的地址判断，且不记录状态。
-	frag := tcpPacket(natTun, aiHost, 1, 2, fACK)
-	binary.BigEndian.PutUint16(frag[6:8], 100)
+	// 任何分片（非首片、带 MF 的首片）一律 default，不记录状态；否则同一个报文会被拆到两条会话上。
 	before := c.flows.len()
-	if cl, _ := c.classify(frag); cl != flowAI || c.flows.len() != before {
-		t.Fatalf("non-first fragment: class=%d", cl)
+	for _, fragField := range []uint16{100, 0x2000, 0x2064} { // 非首片、首片(MF)、中间片
+		frag := tcpPacket(natTun, aiHost, 50300, 443, fSYN)
+		binary.BigEndian.PutUint16(frag[6:8], fragField)
+		if cl, syn := c.classify(frag); cl != flowDefault || syn || c.flows.len() != before {
+			t.Fatalf("fragment field %#x: class=%d syn=%v", fragField, cl, syn)
+		}
+	}
+}
+
+// 只有纯 SYN 才能开始一条 ai 流：没有流表项的中途包永远走 default 且不记录，
+// 否则一条已经在 default 上的连接会因源地址突变而断流（用户刚打开通道、条目过期或被淘汰时）。
+func TestClassifyMidFlowPacketsNeverJoinAI(t *testing.T) {
+	c, _ := newTestClassifier()
+	c.ai.Add(aiHost, time.Hour)
+	for _, flags := range []byte{fACK, fACK | 0x08, 0x01 | fACK, fRST} { // ACK、PSH+ACK、FIN+ACK、RST
+		before := c.flows.len()
+		if cl, syn := c.classify(tcpPacket(natTun, aiHost, 50400, 443, flags)); cl != flowDefault || syn {
+			t.Fatalf("flags %02x: class=%d syn=%v", flags, cl, syn)
+		}
+		if c.flows.len() != before {
+			t.Fatalf("flags %02x: a mid-flow packet created flow state", flags)
+		}
+	}
+	// 通道从关闭到打开：关闭期间建立的连接继续留在 default，新连接才走 ai。
+	c.enabled.Store(false)
+	c.classify(tcpPacket(natTun, aiHost, 50401, 443, fSYN))
+	c.enabled.Store(true)
+	if cl, _ := c.classify(tcpPacket(natTun, aiHost, 50401, 443, fACK)); cl != flowDefault {
+		t.Fatal("a connection that started while the channel was off moved to ai after enabling")
+	}
+	if cl, _ := c.classify(tcpPacket(natTun, aiHost, 50402, 443, fSYN)); cl != flowAI {
+		t.Fatal("a new connection after enabling should use ai")
 	}
 }
 

@@ -111,6 +111,11 @@ type AppState struct {
 	// DegradedReason 是原因（引擎原始错误文本，界面再翻译）。
 	Degraded       bool   `json:"degraded"`
 	DegradedReason string `json:"degraded_reason,omitempty"`
+	// AIChannel 是 AI 稳定通道状态（off、unsupported、connecting、up、unavailable，隧道未建立时为空），
+	// AIChannelReason 是 unavailable 时的原因码；AIChannelEnabled 是用户开关（ADR-0017）。
+	AIChannel        string `json:"ai_channel,omitempty"`
+	AIChannelReason  string `json:"ai_channel_reason,omitempty"`
+	AIChannelEnabled bool   `json:"ai_channel_enabled"`
 }
 
 // Engine 客户端核心引擎
@@ -188,6 +193,13 @@ type Engine struct {
 	lastErrConflictVPN string
 
 	socksAuthToken string
+
+	// AI 稳定通道（ADR-0017）：ai 是通道状态，aiCls 由 DNS 处理器登记 AI 地址、供复用层分类（跨重连保留）。
+	ai    aiChannel
+	aiCls *flowClassifier
+
+	// rootMu 保护 rootCtx 的跨协程读取（getContext）与 Start 的重写。
+	rootMu sync.RWMutex
 }
 
 // NewEngine 创建客户端引擎
@@ -221,6 +233,13 @@ func NewEngine() *Engine {
 		netMon:            NewNetworkMonitor(),
 		packetConnFactory: ListenPhysicalPacket,
 	}
+	eng.aiCls = newFlowClassifier()
+	eng.ai.enabled.Store(true)
+	dns.SetAIRecorder(func(addrs []netip.Addr, ttl time.Duration) {
+		for _, a := range addrs {
+			eng.aiCls.ai.Add(a, ttl)
+		}
+	})
 	eng.daemonCtx, eng.daemonCancel = context.WithCancel(context.Background())
 	eng.tokenRefreshKick = make(chan struct{}, 1)
 	sessMgr.SetAuthFailureHook(eng.refreshAfterAuthFailure)
@@ -1138,7 +1157,12 @@ func (e *Engine) startLocked(ticket uint64) error {
 	nm = e.netMon
 	e.mu.Unlock()
 
+	e.rootMu.Lock()
 	e.rootCtx, e.rootCancel = context.WithCancel(context.Background())
+	e.rootMu.Unlock()
+	// 本次启动的取消域：后面的协程必须用这个局部变量，不能在协程里再读 e.rootCtx——
+	// Stop 之后紧接着再 Start 会重写该字段，协程会读到下一轮的上下文（数据竞争，也让上一轮的哨兵停不下来）。
+	rootCtx := e.rootCtx
 	if e.dnsHandler != nil {
 		SetGlobalMobileDNSHandler(e.dnsHandler)
 	}
@@ -1152,7 +1176,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 					log.Printf("[SENTINEL] panic recovered: %v", r)
 				}
 			}()
-			sentinel.run(e.rootCtx)
+			sentinel.run(rootCtx)
 		}()
 		nm.Start(func(newGW, ifName string) {
 			e.onNetworkChange(newGW, ifName)
@@ -1200,7 +1224,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 				log.Printf("[SENTINEL] panic recovered: %v", r)
 			}
 		}()
-		sentinel.run(e.rootCtx)
+		sentinel.run(rootCtx)
 	}()
 
 	nm.Start(func(newGW, ifName string) {
@@ -1328,8 +1352,11 @@ func (e *Engine) closeActiveConns() {
 }
 
 func (e *Engine) getContext() context.Context {
-	if e.rootCtx != nil && e.rootCtx.Err() == nil {
-		return e.rootCtx
+	e.rootMu.RLock()
+	root := e.rootCtx
+	e.rootMu.RUnlock()
+	if root != nil && root.Err() == nil {
+		return root
 	}
 	if e.daemonCtx != nil && e.daemonCtx.Err() == nil {
 		return e.daemonCtx
@@ -1521,6 +1548,7 @@ func (e *Engine) GetState() AppState {
 	conflictVPN := e.lastErrConflictVPN
 	e.lastErrMu.RUnlock()
 
+	aiState, aiReasonText := e.ai.snapshot()
 	return AppState{
 		Connected:    e.state.Load() == stateRunning,
 		Starting:     e.state.Load() == stateStarting || e.startPending.Load(),
@@ -1550,6 +1578,10 @@ func (e *Engine) GetState() AppState {
 		ResidentListening: e.mixedListener != nil,
 		Degraded:          degraded,
 		DegradedReason:    degradedReason,
+
+		AIChannel:        aiState,
+		AIChannelReason:  aiReasonText,
+		AIChannelEnabled: e.ai.enabled.Load(),
 	}
 }
 

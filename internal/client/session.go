@@ -213,10 +213,35 @@ func (s *Session) DialUDP(ctx context.Context, target string) (net.Conn, error) 
 	return newMasqueNetConn(mconn, target), nil
 }
 
+// 场景类别与传输方式（ADR-0017、api/dataplane.md §4.1）。
+const (
+	classNameAI     = "ai"
+	headerClassName = "Aero-Class"
+	headerTransport = "Aero-Transport"
+)
+
+// ErrTransportMismatch 表示节点返回的 Aero-Transport 与请求的类别不符。按设计不降级、不按其他方式使用。
+var ErrTransportMismatch = errors.New("CLIENT_TRANSPORT_MISMATCH")
+
 // DialIP establishes a CONNECT-IP tunnel session using connect-ip-go.
 func (s *Session) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, error) {
+	return s.dialIPClass(ctx, "")
+}
+
+// DialIPClass 建立指定类别的 CONNECT-IP 会话："" 为 default（数据报），classNameAI 为 ai（DATAGRAM capsule）。
+func (s *Session) DialIPClass(ctx context.Context, class string) (*connectip.Conn, []netip.Prefix, error) {
+	return s.dialIPClass(ctx, class)
+}
+
+func (s *Session) dialIPClass(ctx context.Context, class string) (*connectip.Conn, []netip.Prefix, error) {
 	if s.closed.Load() {
 		return nil, nil, net.ErrClosed
+	}
+	mode, wantTransport := connectip.DataModeDatagram, "datagram"
+	if class == classNameAI {
+		mode, wantTransport = connectip.DataModeCapsule, "capsule"
+	} else if class != "" {
+		return nil, nil, fmt.Errorf("unsupported class %q", class)
 	}
 
 	if err := s.checkRejected(); err != nil {
@@ -228,8 +253,11 @@ func (s *Session) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, 
 		return nil, nil, fmt.Errorf("create connect-ip request: %w", err)
 	}
 	s.setAuthHeaders(ipReq.Header())
+	if class != "" {
+		ipReq.Header().Set(headerClassName, class)
+	}
 
-	ipConn, resp, err := s.connectIPConn.Dial(ipReq)
+	ipConn, resp, err := s.connectIPConn.DialWithMode(ipReq, mode)
 	if err != nil {
 		if resp != nil && resp.StatusCode != http.StatusOK { // 库在非 2xx 时返回响应与错误：保留拒绝原因
 			return nil, nil, s.noteRejection(rejectionFrom("connect-ip", resp))
@@ -239,6 +267,13 @@ func (s *Session) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, 
 	if resp.StatusCode != http.StatusOK {
 		_ = ipConn.Close()
 		return nil, nil, s.noteRejection(rejectionFrom("connect-ip", resp))
+	}
+	// 核对节点实际使用的传输方式：ai 必须是 capsule（旧节点不认识类别头，会回数据报且没有该头，也算不符）；
+	// default 对旧节点没有该头是正常的，但出现了就必须是 datagram。
+	got := resp.Header.Get(headerTransport)
+	if got != wantTransport && !(class == "" && got == "") {
+		_ = ipConn.Close()
+		return nil, nil, fmt.Errorf("%w: node answered %q, want %q", ErrTransportMismatch, got, wantTransport)
 	}
 
 	assignCtx, assignCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -602,6 +637,15 @@ func (m *SessionManager) DialUDP(ctx context.Context, target string) (net.Conn, 
 		return nil, err
 	}
 	return sess.DialUDP(ctx, target)
+}
+
+// DialIPClass establishes a CONNECT-IP session of the given class using the active session.
+func (m *SessionManager) DialIPClass(ctx context.Context, class string) (*connectip.Conn, []netip.Prefix, error) {
+	sess, err := m.GetSession(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sess.DialIPClass(ctx, class)
 }
 
 // DialIP establishes a CONNECT-IP tunnel using the active session.

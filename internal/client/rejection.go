@@ -45,6 +45,12 @@ func (e *EdgeRejectError) NodeUnavailable() bool {
 	return false
 }
 
+// ClassRejected 报告 edge 是否因类别拒绝了会话：类别无效或保留（400 unsupported_class），或 token 未授权（403 class_not_allowed）。
+// 这类拒绝重试没有意义，该类别的流量按 fail-closed 处理（ADR-0017 决定 8）。
+func (e *EdgeRejectError) ClassRejected() bool {
+	return e.Code == "unsupported_class" || e.Code == "class_not_allowed"
+}
+
 // rejectionFrom 由 edge 的响应构造拒绝错误；resp 为 nil 时返回 nil。
 func rejectionFrom(op string, resp *http.Response) *EdgeRejectError {
 	if resp == nil {

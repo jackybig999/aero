@@ -92,19 +92,29 @@ func (e *Engine) reconnectOnce(ctx context.Context, stack *StackEngine, host tun
 		return cur, fmt.Errorf("assigned prefix %q: %w", prefixStr, err)
 	}
 
+	// ai 会话在持锁之前建立（最长 aiDialTimeout），不阻塞 Stop；中止路径关闭的是复用层，两个会话一起关。
+	conn = e.wrapAI(ctx, conn, p)
+
 	e.lifecycleMu.Lock()
 	defer e.lifecycleMu.Unlock()
 	if ctx.Err() != nil || !e.running.Load() || e.stackEngine != stack {
+		e.retireAIConn(conn)
 		_ = conn.Close()
 		return cur, errReconnectAborted
 	}
 	if p != cur {
 		if err := host.SetIPv4(p); err != nil {
+			e.retireAIConn(conn)
 			_ = conn.Close()
 			return cur, fmt.Errorf("update TUN address to %s: %w", p, err)
 		}
 	}
-	return p, stack.RestartWithConn(conn)
+	if err := stack.RestartWithConn(conn); err != nil {
+		e.retireAIConn(conn) // RestartWithConn 失败时没有人接管 conn：关闭它（含 ai 会话），不留泄漏
+		_ = conn.Close()
+		return p, err
+	}
+	return p, nil
 }
 
 // 被 edge 明确拒绝时的重试节奏（C1 §5）：
