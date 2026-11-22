@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -300,6 +301,32 @@ type DNSHandler struct {
 
 	cacheMu sync.Mutex
 	cache   map[dnsCacheKey]dnsCacheEntry
+
+	// aiRecorder 在 AI 域名的 A 记录应答（含缓存命中）时被调用，登记地址与最小 TTL（ADR-0017 决定 4）。
+	aiRecorder atomic.Pointer[func([]netip.Addr, time.Duration)]
+}
+
+// SetAIRecorder 设置 AI 域名应答的登记回调；nil 取消。
+func (h *DNSHandler) SetAIRecorder(f func(addrs []netip.Addr, ttl time.Duration)) {
+	if f == nil {
+		h.aiRecorder.Store(nil)
+		return
+	}
+	h.aiRecorder.Store(&f)
+}
+
+// noteAIAnswer 把 AI 域名 A 记录应答里的地址交给登记回调；其他记录类型与无答案的应答忽略。
+func (h *DNSHandler) noteAIAnswer(qtype uint16, resp []byte) {
+	if qtype != dnsTypeA {
+		return
+	}
+	rec := h.aiRecorder.Load()
+	if rec == nil || *rec == nil {
+		return
+	}
+	if addrs, ttl, ok := dnsAnswerIPv4s(resp); ok {
+		(*rec)(addrs, ttl)
+	}
 }
 
 // dnsConfig 是 HandleQuery 入口取得的配置快照。
@@ -459,14 +486,21 @@ func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byt
 		return buildEmptyResponse(pkt, qname, qtype)
 	}
 
+	isAI := h.split != nil && h.split.Decide(qnameLower) == "ai"
+
 	// 命中本地 DNS 缓存：0ms 极速响应，消灭重复解析网络延迟（缓存的是 DoH 返回的完整应答）
 	if resp := h.cacheGet(qnameLower, qtype, pkt); resp != nil {
+		if isAI {
+			h.noteAIAnswer(qtype, resp) // 缓存命中也要续期登记：应用可能在 TTL 内反复使用同一地址
+		}
 		return resp
 	}
 
 	// 阶段一：AI 优先通道（走真·DoH 远程解析获取真实公网 IP，彻底消灭纯三层黑洞）
-	if h.split != nil && h.split.Decide(qnameLower) == "ai" {
-		return h.resolveViaDoH(cfg, pkt, qname, qnameLower, qtype)
+	if isAI {
+		resp := h.resolveViaDoH(cfg, pkt, qname, qnameLower, qtype)
+		h.noteAIAnswer(qtype, resp)
+		return resp
 	}
 
 	// 阶段二：.cn 顶级域或分流规则判定的纯国内直连域名走直连物理 DNS
