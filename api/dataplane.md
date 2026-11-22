@@ -5,7 +5,7 @@
 ## 1. 传输
 - 只用 HTTP/3（QUIC，ALPN `h3`，启用 HTTP Datagrams 与扩展 CONNECT）。**不降级到 TCP**：edge 的 TCP 端口只提供伪装站与控制台，对 CONNECT 返回 405。
 - 节点地址与端口来自订阅（C5 §3）：先连主端口，失败时按 `alt_ports` 依次尝试；证书按 `sni` 严格校验（系统根证书，可选 `pin_spki`）。
-- 一条 QUIC 连接承载一个会话；连接上的各请求共用同一个 token（C3）。
+- 一条 QUIC 连接上的各请求共用同一个 token（C3）。CONNECT-IP 每个类别最多一条会话、每条连接最多两条（§4.1）；其余请求类型不受此限。
 
 ## 2. 认证（所有请求）
 - `Authorization: Bearer <token>`（C3：`aero1.` 签名 token，或过渡期的不透明 token）。
@@ -21,12 +21,29 @@
 | DNS | `POST /dns-query`，`Content-Type: application/dns-message` | C2，见 §6 |
 
 ## 4. CONNECT-IP（全局隧道）
-- 地址分配：IPv4 `/32`，取自 `10.88.0.0/16`（`10.88.0.1` 为 edge 网关）；签名 token 按 uid 保持同一地址（token 轮换后隧道地址不变，C3）。
-  节点有公网 IPv6 前缀时另分配 IPv6；否则只有 IPv4。
+- 地址分配：IPv4 `/32`，取自 `10.88.0.0/16`（`10.88.0.1` 为 edge 网关），按类别取自子网（§4.1）；签名 token 按 uid 与类别保持同一地址（token 轮换后隧道地址不变，C3）。
+  节点有公网 IPv6 前缀时，`default` 会话另分配 IPv6；否则只有 IPv4。`ai` 会话只分配 IPv4。
 - 路由通告：`0.0.0.0/0` 与 `::/0`。
 - MTU：edge TUN 1360；客户端 TUN 1280（IPv6 最小值），IPv4 路由 MTU 1224。超过 1360 的内层 IPv6 报文由 edge 回 ICMPv6 Packet Too Big。
 - 源地址校验：客户端只能以分配给自己的地址发包，伪造源地址的报文丢弃。
 - 节点配置 `connect_ip=false` 时返回 503 `connect_ip_disabled`（该节点只提供 TCP/UDP 与 DoH）。
+
+### 4.1 场景会话（class）与传输方式（ADR-0017）
+同一条 QUIC 连接上可以有两条 CONNECT-IP 会话，各有自己的地址与传输方式：
+
+| `Aero-Class` | 传输方式（`Aero-Transport`） | IPv4 子网 | 说明 |
+|---|---|---|---|
+| `default`（缺省） | `datagram`：每个 IP 包放进一个 QUIC DATAGRAM（RFC 9484 §6） | `10.88.0.0/17` | 可能丢包、乱序；低延迟 |
+| `ai` | `capsule`：每个 IP 包放进一个 DATAGRAM capsule（RFC 9297 §3.5），在请求流上收发 | `10.88.128.0/17` | 流可靠有序；同会话内队头阻塞 |
+
+- 请求头 `Aero-Class: default|ai`。缺省等于 `default`，旧客户端不发该头，行为不变。值区分大小写；出现多个值、空值、其他取值一律 400。`browser`、`game` 为保留值，v1 同样返回 400（`unsupported_class`）。
+- 响应头 `Aero-Transport: datagram|capsule`，表示本会话的传输方式。客户端必须核对与预期一致，不一致即失败，不得按其他方式使用（客户端错误码 `CLIENT_TRANSPORT_MISMATCH`）。两端必须使用同一方式，方式不在线上协商。
+- 两种方式都要求 QUIC DATAGRAM 已协商。`capsule` 不是没有数据报时的降级路径：未协商 QUIC DATAGRAM 时两种会话都失败。
+- 授权：签名 token 的 `classes` 必须包含该类别，否则 403 `EDGE_CLASS_NOT_ALLOWED`。不透明 token（过渡期，C3 §8）视为授权全部已实现类别。
+- 同一条 QUIC 连接上，同一类别的第二条 CONNECT-IP 请求被拒绝（503 `connection_limit_exceeded`）。`maxDevices` 按不同 QUIC 连接数计，一个设备开两条会话仍算一台；全局会话上限按会话数计。
+- 地址租约键为 uid（或不透明 token）加类别；两个类别的地址互不相同。服务端沿用按会话的源地址校验。
+- 带宽与流量计量对同一 token 的两条会话合计。
+- 客户端复用层把 `ai` 会话的包源地址改写为该会话地址，下行改回 TUN 地址（客户端内部实现，不属于线上契约）。
 
 ## 5. 目的地址策略（TCP、UDP、CONNECT-IP 三条路径相同）
 拒绝（TCP/UDP 返回 403 `destination_ip_prohibited`，CONNECT-IP 静默丢包）：
@@ -57,6 +74,8 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
 | 403 | `destination_ip_prohibited` | 目的地址被 §5 拒绝 | 只影响该次请求，不影响会话 |
 | 502 | `connection_refused`、`destination_ip_unroutable` | 目标不可达 | 只影响该次请求 |
 | 400 | `http_request_error`（`details="EDGE_BAD_REQUEST"`） | 请求格式错误：缺少目标、端口不是 1-65535 的数字、URI 无法解析 | 只影响该次请求；属于客户端缺陷，不重试 |
+| 400 | `unsupported_class`（`details="EDGE_UNSUPPORTED_CLASS"`） | `Aero-Class` 取值无效或为保留值（`browser`、`game`） | 属于客户端缺陷，不重试；该类别的流量 fail-closed（ADR-0017） |
+| 403 | `class_not_allowed`（`details="EDGE_CLASS_NOT_ALLOWED"`） | token 未授权该类别 | 不重试；该类别的流量 fail-closed，刷新订阅后再试 |
 
 客户端把拒绝原因反映到状态的 `error_code`（取 `details` 中的 `EDGE_*` 错误码，或按上表映射，见 `api/errors.yaml`）。
 
@@ -92,5 +111,5 @@ edge 以 HTTP 状态 + `Proxy-Status`（RFC 9209，`aero; error=<token>; details
 
 ## 9. 未定稿
 - CONNECT-IP 经入口中继到出口（入口不建 TUN，转发 IP 数据报；涉及地址分配、源地址校验与两跳 MTU）与 UDP 的 QUIC 连接复用：多跳第 2 步（b、c）。
-- 场景参数（`class=ai|browser|game`）与场景授权（C3 第 6 步）尚未实现。
+- 场景 `browser`、`game`（保留值）的会话与出口：待 ADR-0006（出口模块）与 ADR-0017 后续步骤。`default`、`ai` 已按 §4.1 实现。
 - token 吊销（C3 第 5 步，`EDGE_AUTH_TOKEN_REVOKED`）、按 uid 的配额 `quota_bytes` 与带宽 `bw_bps` 尚未在 edge 执行：依赖中台下发吊销名单（C4），随中台对接实现。在此之前，被吊销的 token 在过期（最长 7 天）前仍被接受。

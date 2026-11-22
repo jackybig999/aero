@@ -35,6 +35,7 @@
 | `sni` | string | 是 | TLS SNI 与证书校验名，通常等于节点域名 |
 | `protocol` | string | 是 | `connect-ip`（HTTP/3 MASQUE；不降级到 TCP） |
 | `alt_ports` | int[] | 否 | 主端口不可用时的候选端口（ADR-0005） |
+| `transports` | string[] | 否 | 节点支持的 CONNECT-IP 传输方式：`datagram`、`capsule`（C1 §4.1）。缺省表示只支持 `datagram`；客户端不得在没有 `capsule` 的节点上开 `ai` 会话 |
 | `pin_spki` | string[] | 否 | 证书公钥固定（base64 SHA-256）；空表示只做常规校验 |
 | `line_type`、`isp_affinity` | string | 否 | 线路类型与运营商亲和，用于排序 |
 | `ech` | string | 否 | ECH 配置（base64）；`ech_config` 为同义旧名 |

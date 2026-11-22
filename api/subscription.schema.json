@@ -87,6 +87,16 @@
             "connect-ip"
           ]
         },
+        "transports": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "datagram",
+              "capsule"
+            ]
+          },
+          "uniqueItems": true
+        },
         "alt_ports": {
           "type": "array",
           "items": {

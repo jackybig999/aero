@@ -29,8 +29,8 @@
    - D：`class=default`，IP 包走 QUIC DATAGRAM（RFC 9484 默认方式）。
    - R：`class=ai`，IP 包走 DATAGRAM capsule（RFC 9297 §3.5，Payload = Context ID 0 + IP 包），由 QUIC 流保证不丢。
    `browser`、`game` 为保留类别：token 可携带，v1 服务端对其返回 400 `unsupported_class`，不静默映射。
-2. **类别信号用请求头，不用 URI 模板**。头 `Aero-Class: default|ai`；服务端在响应里回 `Aero-Transport: datagram|capsule`，客户端核对一致，不一致即失败（`EDGE_TRANSPORT_MISMATCH`），不得静默当作数据报使用。原因：库不支持模板变量；模板保持标准字面量 `ip/*/*/`。订阅 C5 增加能力字段 `transports`，旧节点不含则客户端不开 R。
-3. **地址与源地址改写**。每条会话从自己的类别池取一个地址：`default` 沿用 10.88.0.0/16，`ai` 用 10.89.0.0/16（ADR-0003 示例）。TUN 网卡只配 D 的地址。客户端复用层（`ipmux`）在上行把 R 会话的包源地址改写为 R 地址，下行把目的地址改回 TUN 地址，增量更新 IP、TCP、UDP 校验和，并改写 ICMP 差错报文内嵌的原包头。服务端沿用 `ValidateSource` 按会话校验源地址。v1 只处理 IPv4（客户端 TUN 对 IPv6 已黑洞，`stack.go` `SetIPv6Blackhole(true)`）。
+2. **类别信号用请求头，不用 URI 模板**。头 `Aero-Class: default|ai`；服务端在响应里回 `Aero-Transport: datagram|capsule`，客户端核对一致，不一致即失败（`CLIENT_TRANSPORT_MISMATCH`），不得静默当作数据报使用。原因：库不支持模板变量；模板保持标准字面量 `ip/*/*/`。订阅 C5 增加能力字段 `transports`，旧节点不含则客户端不开 R。
+3. **地址与源地址改写**。每条会话从自己的类别子网取一个地址。**两个子网都切自现有的 10.88.0.0/16**：`default` 用 10.88.0.0/17，`ai` 用 10.88.128.0/17（取代 ADR-0003 示例里的 10.89/16，2026-11-22 修订）。好处：服务端 NAT 规则、TUN 地址、`ConfigureGlobalTunnelDevice`、客户端 `tunPool` 都不变，没有新增宿主修改（ADR-0012）；按源子网做策略路由（ADR-0006）同样成立。每个子网容量约 3.2 万个地址，不足时再扩展，不影响本契约。TUN 网卡只配 D 的地址。客户端复用层（`ipmux`）在上行把 R 会话的包源地址改写为 R 地址，下行把目的地址改回 TUN 地址，增量更新 IP、TCP、UDP 校验和，并改写 ICMP 差错报文内嵌的原包头。服务端沿用 `ValidateSource` 按会话校验源地址。v1 只处理 IPv4（客户端 TUN 对 IPv6 已黑洞，`stack.go` `SetIPv6Blackhole(true)`）。
 4. **客户端分类（按流，建立时确定，不迁移）**。
    - UDP、ICMP → D。
    - TCP：目的 IP 在 AI 集合内 → R，否则 D。
@@ -40,7 +40,7 @@
    - 是否让“非 AI 的普通 TCP”也进 R：由 P5 的丢包测量决定；在数据出来之前不进 R。
 5. **客户端发送调度（针对 D）**。写入 `WritePacket` 之前分两级队列：小 UDP 包与 ICMP 优先，大流量限长度，满时尾部丢弃。目的：避免大流量占满 quic-go 的 32 帧数据报队列而阻塞游戏包。阈值与队列长度估算，待实测。
 6. **库**。fork `connect-ip-go v0.4.0` 到 `third_party/connect-ip-go`，用 `replace` 引入，保留 MIT 许可证与版权声明。改动限于：(a) 构造选项选择“数据走 capsule”；(b) 写路径发 DATAGRAM capsule；(c) `readFromStream` 解析 0x00 并交给 `ReadPacket`（有界队列，满时停止读流，借 QUIC 流控反压；控制类 capsule 与数据共用一条流，实现时必须验证不因此死锁，RFC 9297 §3.2）；(d) D 会话收到 0x00 capsule、R 会话收到 QUIC 数据报，均丢弃并计数。服务端与客户端使用同一补丁版。改动提交上游 PR 为可选项，不作为前提。
-7. **服务端会话表**。登记键由“连接”改为“连接 + 类别”：每个 QUIC 连接每个类别最多 1 条，共 2 条；`maxDevices` 按不同 QUIC 连接数计，而不是会话数；全局上限按会话数计；地址租约键为 `leaseKey + "/" + class`；带宽令牌桶仍按 token 共用（两条会话合计）。第二个地址池需同步：服务端 TUN 地址与路由、nftables 的 `ip saddr` 伪装规则按池列表生成，沿用 ADR-0012 的标签与三重回滚，不新增宿主修改类型。
+7. **服务端会话表**。登记键由“连接”改为“连接 + 类别”：每个 QUIC 连接每个类别最多 1 条，共 2 条；`maxDevices` 按不同 QUIC 连接数计，而不是会话数；全局上限按会话数计；地址租约键为 `leaseKey + "/" + class`；带宽令牌桶仍按 token 共用（两条会话合计）。两个子网都在原 /16 内，NAT、TUN、nftables/iptables 规则与宿主还原逻辑均不改。
 8. **严禁降级**。
    - 任何情况下不回落到 TCP/TLS/h2；R 是 H3 请求流，不属于降级。
    - 未协商出 QUIC DATAGRAM 时，D 与 R 都失败，不自动改用 capsule 顶替。
@@ -53,7 +53,7 @@
    - 永不采集：访问的域名与目的 IP、DNS 查询内容、流量内容、设备指纹、浏览历史。
    - 默认值（2026-11-22 定）：L1 始终开启；L2、L3 默认开启，首次启动时明示说明采集内容与不采集内容，设置里一键可关；关闭后 L1 仍生效，不影响连接。L4 永远由用户主动触发。工程剖面 `pii: true`，隐私声明与合规核对由项目所有者负责。
    - 对应契约（`api/qos.yaml`、C6/C13 增量）随 P6 提出，现在不改。
-10. **契约变更草案（不在本步生效）**。C1：请求头 `Aero-Class`、响应头 `Aero-Transport`、错误码 `unsupported_class`、`EDGE_TRANSPORT_MISMATCH`、`EDGE_CLASS_FORBIDDEN`（token 未授权该类别）；C5：`transports` 字段；C11：连接状态增加“AI 稳定通道”状态与错误码。随 P2 一并提出，经用户确认后修改 `api/` 文件（§4.1）。
+10. **契约变更草案（不在本步生效）**。C1：请求头 `Aero-Class`、响应头 `Aero-Transport`、`Proxy-Status` 错误 `unsupported_class`（400，`details="EDGE_UNSUPPORTED_CLASS"`）、复用 `errors.yaml` 已登记的 `EDGE_CLASS_NOT_ALLOWED`（403，token 未授权该类别）、客户端侧 `CLIENT_TRANSPORT_MISMATCH`；不透明 token（过渡期）视为授权全部类别；C5：`transports` 字段；C11：连接状态增加“AI 稳定通道”状态与错误码。随 P2 一并提出，经用户确认后修改 `api/` 文件（§4.1）。
 
 ## 后果
 - R 会话内所有 TCP 流共用一条请求流，一个包丢失会让同会话的流短暂等待（队头阻塞）；内层 TCP 也可能误判超时，与外层重传叠加。RFC 9484 §10 也说明标准更偏好数据报。因此 R 的收益必须由 P5 测量证明，否则只保留 R 的能力、不扩大使用范围。
@@ -67,7 +67,7 @@
 |---|---|---|
 | P0 | 本 ADR；ADR-0003 注明被细化 | docs/adr |
 | P1 | fork 库，加 capsule 数据模式、解析 0x00、单元与模糊测试；`go.mod` replace；依赖说明（§7.6） | third_party/connect-ip-go、go.mod |
-| P2 | 服务端：`Aero-Class`、两个地址池、会话表改键、`Aero-Transport`、nftables 与 TUN 多池；提出 C1/C5 契约修改 | internal/edge（quic.go、serve.go、nat_linux.go）、api/ |
+| P2 | 服务端：P2a 契约与 errors.yaml；P2b `Aero-Class`、两个类别子网、会话表改键、`Aero-Transport`、类别授权；P2c 订阅 `transports` 字段。不改 NAT/TUN/命令行入口 | api/、internal/edge（quic.go、新增 connectip_class.go、sub.go） |
 | P3 | 客户端复用层与源地址改写；`dialIPFn` 返回复用层；重连支持双会话 | internal/client（ipmux.go、ipnat.go、engine*.go） |
 | P4 | 分类器（DNS 登记 AI 集合、流表）与 D 的两级发送队列 | internal/client（dns.go、flowclass.go、tunnel_pump.go） |
 | P5 | 丢包测量：`unshare` + `tc netem`，丢包 0/1/3/5%、往返 50/150ms；AI 式流式响应、大文件、并行游戏式 UDP；指标：数据块到达延迟 p50/p95/p99、吞吐、卡顿、游戏 UDP 抖动；据此定“普通 TCP 是否进 R”。阈值先在 0% 基线标定，不预设数字 | tools/、tests/ |

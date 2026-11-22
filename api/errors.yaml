@@ -5,6 +5,7 @@ EDGE_AUTH_TOKEN_REVOKED:    {http: 401, desc: "token 已吊销"}
 EDGE_QUOTA_EXCEEDED:        {http: 403, desc: "流量配额用尽"}
 EDGE_DEVICE_LIMIT:          {http: 403, desc: "超过同时在线设备数"}
 EDGE_CLASS_NOT_ALLOWED:     {http: 403, desc: "token 未授权该流量场景"}
+EDGE_UNSUPPORTED_CLASS:     {http: 400, desc: "Aero-Class 取值无效或为保留值（browser、game）"}
 EDGE_DEST_PROHIBITED:       {http: 403, desc: "目的地址被 ACL 拒绝"}
 EDGE_POOL_EXHAUSTED:        {http: 503, desc: "地址池耗尽"}
 EDGE_CONNECT_IP_DISABLED:   {http: 503, desc: "本节点关闭了 CONNECT-IP（connect_ip=false，只提供 TCP/UDP 代理与 DoH）"}
@@ -19,6 +20,7 @@ EDGE_NOT_READY:             {http: 503, desc: "排空中或未就绪"}
 EGRESS_UNAVAILABLE:         {http: 502, desc: "场景出口不可用（fail-closed）；只影响该次请求，不是节点不可用"}
 EGRESS_REBOUND:             {http: 200, desc: "环境出口已重新绑定"}
 CLIENT_UDP_BLOCKED:         {desc: "当前网络封锁 UDP，按设计不降级"}
+CLIENT_TRANSPORT_MISMATCH:  {desc: "节点返回的 Aero-Transport 与请求的类别不符，按设计不降级、不按其他方式使用"}
 CLIENT_ECH_REJECTED:        {desc: "ECH 被拒或干扰，已切换混淆节点组"}
 CLIENT_ALL_PORTS_FAILED:    {desc: "全部候选端口不可达"}
 CLIENT_TUN_CONFLICT:        {desc: "检测到第三方 TUN"}
