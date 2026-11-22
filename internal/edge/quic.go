@@ -546,6 +546,7 @@ type QUICServer struct {
 	hopDials          atomic.Int64 // 入口向出口新建 QUIC 连接的次数（测试断言复用用）
 	connTracker       *ConnTracker
 	ipPool            *IPPool
+	aiPool            *IPPool // ai 类别会话的地址池（10.88.128.0/17）；nil 表示不提供该类别
 	ipv6Pool          *IPv6Pool
 	globalRouter      *GlobalTunnelRouter
 	globalReaderMu    sync.Mutex
@@ -1023,12 +1024,15 @@ func (c *nextHopUDPRelayConn) SetWriteDeadline(t time.Time) error { return nil }
 // NewQUICServerWithIPv6Prefix creates a production QUICServer. An empty prefix
 // deliberately disables IPv6 allocation until a routed public prefix is proven.
 func NewQUICServerWithIPv6Prefix(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter, ipv6CIDR string) *QUICServer {
-	ipPool, _ := NewIPPool("10.88.0.0/16")
+	ipPool, _ := NewIPPool(edgeDefaultPoolCIDR)
+	aiPool, _ := NewIPPool(edgeAIPoolCIDR)
 	var ipv6Pool *IPv6Pool
 	if strings.TrimSpace(ipv6CIDR) != "" {
 		ipv6Pool, _ = newRoutedIPv6Pool(ipv6CIDR)
 	}
-	return newQUICServer(v, cl, bl, dg, rl, ipPool, ipv6Pool)
+	qs := newQUICServer(v, cl, bl, dg, rl, ipPool, ipv6Pool)
+	qs.aiPool = aiPool
+	return qs
 }
 
 func newRoutedIPv6Pool(cidrStr string) (*IPv6Pool, error) {
@@ -1428,6 +1432,14 @@ func (s *QUICServer) ServeDefault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
+	token, _, ok := s.authRequestClaims(w, r)
+	return token, ok
+}
+
+// authRequestClaims 与 authRequest 相同，并返回本次请求验签得到的 token 载荷。
+// 不透明 token 与出口跳间凭证没有载荷，返回 nil。调用方应直接用返回的载荷做授权判定，
+// 不要依赖连接绑定表：绑定发生在验签之后的另一步，其间别的请求可能读到尚未写完的状态。
+func (s *QUICServer) authRequestClaims(w http.ResponseWriter, r *http.Request) (string, *TokenClaims, bool) {
 	remoteIP := ClientIP(r)
 
 	// 出口：先比对跳间凭证。持有正确凭证的入口不受认证封禁限制——封禁按 IPv6 /64 计，
@@ -1442,26 +1454,26 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 		bearer, _ := bearerToken(r)
 		egressHopOK = matches(strings.TrimSpace(r.Header.Get("Aero-Hop-Token"))) || matches(bearer)
 		if egressHopOK {
-			return s.cfg.HopCredential, true
+			return s.cfg.HopCredential, nil, true
 		}
 	}
 
 	if s.authJail != nil && s.authJail.IsBanned(remoteIP) {
 		w.Header().Set("Retry-After", "900")
 		w.WriteHeader(http.StatusTooManyRequests)
-		return "", false
+		return "", nil, false
 	}
 
 	if s.cfg != nil && s.cfg.Role == "egress" {
 		s.rejectAuth(w, remoteIP, "invalid hop credential")
-		return "", false
+		return "", nil, false
 	}
 
 	// 只校验 token；Aero-Timestamp / Aero-Nonce 已废弃并被忽略（C3 §5）。
 	token, ok := bearerToken(r)
 	if !ok {
 		s.rejectAuth(w, remoteIP, "")
-		return "", false
+		return "", nil, false
 	}
 	claims, err := s.checkToken(token)
 	if errors.Is(err, ErrTokenExpired) {
@@ -1469,18 +1481,18 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 		w.Header().Set("WWW-Authenticate", `Bearer realm="aero", error="invalid_token"`)
 		w.Header().Set("Proxy-Status", `aero; error=proxy_authorization_required; details="EDGE_AUTH_TOKEN_EXPIRED"`)
 		w.WriteHeader(http.StatusUnauthorized)
-		return "", false
+		return "", nil, false
 	}
 	if err != nil {
 		s.rejectAuth(w, remoteIP, err.Error())
-		return "", false
+		return "", nil, false
 	}
 	// 同一 QUIC 连接上的请求必须使用首次请求绑定的 token；首次绑定时执行本节点设备数限制（C3 §3 第 7 步）。
 	if qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn); qc != nil && s.connTracker != nil {
 		if bound, tracked := s.connTracker.Get(qc); tracked {
 			if subtle.ConstantTimeCompare([]byte(bound), []byte(token)) != 1 {
 				s.rejectAuth(w, remoteIP, "token differs from the one bound to this connection")
-				return "", false
+				return "", nil, false
 			}
 		} else {
 			uid, maxDevices := "", 0
@@ -1495,7 +1507,7 @@ func (s *QUICServer) authRequest(w http.ResponseWriter, r *http.Request) (string
 			}
 		}
 	}
-	return token, true
+	return token, claims, true
 }
 
 // checkToken 校验 token（C3 §3 第 1–4 步）。aero1 签名 token 只在 auth_signed_token 开启时接受；
@@ -2085,13 +2097,24 @@ func (s *QUICServer) serveConnectUDP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
-	token, ok := s.authRequest(w, r)
+	token, claims, ok := s.authRequestClaims(w, r)
 	if !ok {
 		return
 	}
 	if s.connectIPDisabled {
 		w.Header().Set("Proxy-Status", `aero; error=connect_ip_disabled; details="CONNECT-IP is disabled on this node"`)
 		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	// 场景类别（ADR-0017）：缺省 default；无效或保留值 400；token 未授权 403。
+	class, ok := parseConnectIPClass(w, r)
+	if !ok {
+		return
+	}
+	qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn)
+	if !classAllowedByClaims(claims, class.name) {
+		rejectClassNotAllowed(w)
 		return
 	}
 
@@ -2104,7 +2127,8 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.ipPool == nil {
+	pool := s.poolForClass(class.name)
+	if pool == nil {
 		w.Header().Set("Proxy-Status", `aero; error=address_pool_exhausted; details="IP pool not configured"`)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -2114,7 +2138,6 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	// 旧的不透明 token 按 token 本身。
 	leaseKey := token
 	perKeyLimit := connectIPMaxSessionsOpaque
-	qc, _ := r.Context().Value(quicConnKey{}).(*quic.Conn)
 	if qc != nil && s.connTracker != nil {
 		if uid, maxDevices := s.connTracker.Limits(qc); uid != "" {
 			leaseKey = "uid:" + uid
@@ -2126,30 +2149,37 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 
 	// 会话数上限（L0 §9.2）：每个会话占用地址、64KB 缓冲与多个 goroutine，
 	// 单 QUIC 连接最多可开 1000 个请求流，不加限制可被一个用户耗尽节点资源。
-	sess, ok := s.connectIPSessions.acquire(qc, leaseKey, perKeyLimit, s.connectIPGlobalLimit())
+	sess, ok := s.connectIPSessions.acquireClass(qc, leaseKey, class.name, perKeyLimit, s.connectIPGlobalLimit())
 	if !ok {
 		rejectLimitExceeded(w)
 		return
 	}
 	defer s.connectIPSessions.release(sess)
 
-	assignedPrefix, err := s.ipPool.AllocateFor(leaseKey)
+	// 地址租约键：default 保持原键（升级后行为不变），其他类别加类别后缀，两个类别的地址互不相同。
+	addrKey := leaseKey
+	if class.name != classDefault {
+		addrKey += "/" + class.name
+	}
+	assignedPrefix, err := pool.AllocateFor(addrKey)
 	if err != nil {
 		w.Header().Set("Proxy-Status", "aero; error=address_pool_exhausted; details=\"IP pool exhausted\"")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	defer s.ipPool.ReleaseFor(leaseKey, assignedPrefix)
+	defer pool.ReleaseFor(addrKey, assignedPrefix)
 
+	// v1：只有 default 会话分配 IPv6（客户端 TUN 对 IPv6 黑洞，ADR-0017 决定 3）。
 	var assignedIPv6 netip.Prefix
-	if s.ipv6Pool != nil {
+	if s.ipv6Pool != nil && class.name == classDefault {
 		if v6Prefix, err := s.ipv6Pool.Allocate(); err == nil {
 			assignedIPv6 = v6Prefix
 			defer s.ipv6Pool.Release(assignedIPv6)
 		}
 	}
 
-	conn, err := s.connectIPProxy.Proxy(w, proxyReq)
+	w.Header().Set(headerTransport, class.transport)
+	conn, err := s.connectIPProxy.ProxyWithMode(w, proxyReq, class.mode)
 	if err != nil {
 		return
 	}
@@ -2234,51 +2264,89 @@ func (s *QUICServer) connectIPGlobalLimit() int {
 type connectIPSession struct {
 	conn     *quic.Conn // 可为 nil（测试中没有 QUIC 连接）
 	key      string
+	class    string
 	released bool
 }
 
-// connectIPSessionTable 登记活动的 CONNECT-IP 会话并执行三层上限：
-// 每个 QUIC 连接 1 个、每个 uid/token（key）不超过 perKey、全局不超过 global。
+// connectIPSessionTable 登记活动的 CONNECT-IP 会话并执行三层上限（ADR-0017 决定 7）：
+// 每个 QUIC 连接每个类别 1 个；每个 uid/token（key）不超过 perKey 个设备（按不同 QUIC 连接计，
+// 同一连接上的两条类别会话算一台）；全局不超过 global 个会话。
 type connectIPSessionTable struct {
 	mu     sync.Mutex
-	byConn map[*quic.Conn]*connectIPSession
+	byConn map[*quic.Conn]map[string]*connectIPSession
 	byKey  map[string]map[*connectIPSession]struct{}
 	total  int
 }
 
-// acquire 登记一个会话；任一上限已满返回 false。成功后调用方必须在 defer 中 release。
+// acquire 登记一个 default 类别会话（保留给不区分类别的调用方）。
 func (t *connectIPSessionTable) acquire(conn *quic.Conn, key string, perKey, global int) (*connectIPSession, bool) {
+	return t.acquireClass(conn, key, classDefault, perKey, global)
+}
+
+// devicesLocked 返回 key 下的设备数：不同的 QUIC 连接各算一台，没有连接的会话（测试）各算一台。
+func (t *connectIPSessionTable) devicesLocked(key string) int {
+	seen := make(map[*quic.Conn]struct{})
+	n := 0
+	for sess := range t.byKey[key] {
+		if sess.conn == nil {
+			n++
+			continue
+		}
+		if _, dup := seen[sess.conn]; !dup {
+			seen[sess.conn] = struct{}{}
+		}
+	}
+	return n + len(seen)
+}
+
+// hasConnLocked 报告 key 下是否已有来自 conn 的会话。
+func (t *connectIPSessionTable) hasConnLocked(key string, conn *quic.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	for sess := range t.byKey[key] {
+		if sess.conn == conn {
+			return true
+		}
+	}
+	return false
+}
+
+// acquireClass 登记一个会话；任一上限已满返回 false。成功后调用方必须在 defer 中 release。
+func (t *connectIPSessionTable) acquireClass(conn *quic.Conn, key, class string, perKey, global int) (*connectIPSession, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.byConn == nil {
-		t.byConn = make(map[*quic.Conn]*connectIPSession)
+		t.byConn = make(map[*quic.Conn]map[string]*connectIPSession)
 		t.byKey = make(map[string]map[*connectIPSession]struct{})
 	}
 	if conn != nil {
-		if _, busy := t.byConn[conn]; busy {
+		if _, busy := t.byConn[conn][class]; busy {
 			return nil, false
 		}
 	}
 	if global > 0 && t.total >= global {
 		return nil, false
 	}
-	set := t.byKey[key]
-	if perKey > 0 && len(set) >= perKey {
+	// 同一连接已有该 key 的另一类别会话时不增加设备数。
+	if perKey > 0 && !t.hasConnLocked(key, conn) && t.devicesLocked(key) >= perKey {
 		// 设备数上限替换旧连接时，旧连接的处理协程可能还没来得及退出：
 		// 先清掉连接已关闭的会话，避免把“换设备重连”误判为超限。
-		for other := range set {
+		for other := range t.byKey[key] {
 			if other.conn != nil && !connAlive(other.conn) {
 				t.removeLocked(other)
 			}
 		}
-		set = t.byKey[key]
-		if len(set) >= perKey {
+		if t.devicesLocked(key) >= perKey {
 			return nil, false
 		}
 	}
-	sess := &connectIPSession{conn: conn, key: key}
+	sess := &connectIPSession{conn: conn, key: key, class: class}
 	if conn != nil {
-		t.byConn[conn] = sess
+		if t.byConn[conn] == nil {
+			t.byConn[conn] = make(map[string]*connectIPSession)
+		}
+		t.byConn[conn][class] = sess
 	}
 	if t.byKey[key] == nil {
 		t.byKey[key] = make(map[*connectIPSession]struct{})
@@ -2303,8 +2371,15 @@ func (t *connectIPSessionTable) removeLocked(sess *connectIPSession) {
 		return
 	}
 	sess.released = true
-	if sess.conn != nil && t.byConn[sess.conn] == sess {
-		delete(t.byConn, sess.conn)
+	if sess.conn != nil {
+		if m := t.byConn[sess.conn]; m != nil {
+			if m[sess.class] == sess {
+				delete(m, sess.class)
+			}
+			if len(m) == 0 {
+				delete(t.byConn, sess.conn)
+			}
+		}
 	}
 	if set := t.byKey[sess.key]; set != nil {
 		delete(set, sess)

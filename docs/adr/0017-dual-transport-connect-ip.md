@@ -29,6 +29,7 @@
    - D：`class=default`，IP 包走 QUIC DATAGRAM（RFC 9484 默认方式）。
    - R：`class=ai`，IP 包走 DATAGRAM capsule（RFC 9297 §3.5，Payload = Context ID 0 + IP 包），由 QUIC 流保证不丢。
    `browser`、`game` 为保留类别：token 可携带，v1 服务端对其返回 400 `unsupported_class`，不静默映射。
+   类别授权取**本次请求验签得到的载荷**（不透明 token 与出口跳间凭证没有载荷，视为授权全部已实现类别），不读取连接绑定表：绑定发生在验签之后的另一步，其间并发请求会读到尚未写完的状态（P2b 审核发现，fail-open）。
 2. **类别信号用请求头，不用 URI 模板**。头 `Aero-Class: default|ai`；服务端在响应里回 `Aero-Transport: datagram|capsule`，客户端核对一致，不一致即失败（`CLIENT_TRANSPORT_MISMATCH`），不得静默当作数据报使用。原因：库不支持模板变量；模板保持标准字面量 `ip/*/*/`。订阅 C5 增加能力字段 `transports`，旧节点不含则客户端不开 R。
 3. **地址与源地址改写**。每条会话从自己的类别子网取一个地址。**两个子网都切自现有的 10.88.0.0/16**：`default` 用 10.88.0.0/17，`ai` 用 10.88.128.0/17（取代 ADR-0003 示例里的 10.89/16，2026-11-22 修订）。好处：服务端 NAT 规则、TUN 地址、`ConfigureGlobalTunnelDevice`、客户端 `tunPool` 都不变，没有新增宿主修改（ADR-0012）；按源子网做策略路由（ADR-0006）同样成立。每个子网容量约 3.2 万个地址，不足时再扩展，不影响本契约。TUN 网卡只配 D 的地址。客户端复用层（`ipmux`）在上行把 R 会话的包源地址改写为 R 地址，下行把目的地址改回 TUN 地址，增量更新 IP、TCP、UDP 校验和，并改写 ICMP 差错报文内嵌的原包头。服务端沿用 `ValidateSource` 按会话校验源地址。v1 只处理 IPv4（客户端 TUN 对 IPv6 已黑洞，`stack.go` `SetIPv6Blackhole(true)`）。
 4. **客户端分类（按流，建立时确定，不迁移）**。
@@ -40,7 +41,7 @@
    - 是否让“非 AI 的普通 TCP”也进 R：由 P5 的丢包测量决定；在数据出来之前不进 R。
 5. **客户端发送调度（针对 D）**。写入 `WritePacket` 之前分两级队列：小 UDP 包与 ICMP 优先，大流量限长度，满时尾部丢弃。目的：避免大流量占满 quic-go 的 32 帧数据报队列而阻塞游戏包。阈值与队列长度估算，待实测。
 6. **库**。fork `connect-ip-go v0.4.0` 到 `third_party/connect-ip-go`，用 `replace` 引入，保留 MIT 许可证与版权声明。改动限于：(a) 构造选项选择“数据走 capsule”；(b) 写路径发 DATAGRAM capsule；(c) `readFromStream` 解析 0x00 并交给 `ReadPacket`（有界队列，满时停止读流，借 QUIC 流控反压；控制类 capsule 与数据共用一条流，实现时必须验证不因此死锁，RFC 9297 §3.2）；(d) D 会话收到 0x00 capsule、R 会话收到 QUIC 数据报，均丢弃并计数。服务端与客户端使用同一补丁版。改动提交上游 PR 为可选项，不作为前提。
-7. **服务端会话表**。登记键由“连接”改为“连接 + 类别”：每个 QUIC 连接每个类别最多 1 条，共 2 条；`maxDevices` 按不同 QUIC 连接数计，而不是会话数；全局上限按会话数计；地址租约键为 `leaseKey + "/" + class`；带宽令牌桶仍按 token 共用（两条会话合计）。两个子网都在原 /16 内，NAT、TUN、nftables/iptables 规则与宿主还原逻辑均不改。
+7. **服务端会话表**。登记键由“连接”改为“连接 + 类别”：每个 QUIC 连接每个类别最多 1 条，共 2 条；`maxDevices` 按不同 QUIC 连接数计，而不是会话数；全局上限按会话数计；地址租约键：`default` 沿用原键，`ai` 为原键加 `/ai` 后缀（默认池从 /16 缩为 /17，哈希起点随之变化，升级重启后部分用户的 default 地址会变；租约本来就不持久化，客户端重连时只替换 TUN 地址，不受影响）；带宽令牌桶仍按 token 共用（两条会话合计）。两个子网都在原 /16 内，NAT、TUN、nftables/iptables 规则与宿主还原逻辑均不改。
 8. **严禁降级**。
    - 任何情况下不回落到 TCP/TLS/h2；R 是 H3 请求流，不属于降级。
    - 未协商出 QUIC DATAGRAM 时，D 与 R 都失败，不自动改用 capsule 顶替。

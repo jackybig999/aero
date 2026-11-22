@@ -35,9 +35,12 @@ func NewIPv6Pool(cidrStr string) (*IPv6Pool, error) {
 // Production construction must use NewQUICServerWithIPv6Prefix so an unverified
 // ULA is never advertised as public IPv6 capability.
 func NewQUICServer(v *Validator, cl *ConnLimiter, bl *BandwidthLimiter, dg *DialGuard, rl *RateLimiter) *QUICServer {
-	ipPool, _ := NewIPPool("10.88.0.0/16")
+	ipPool, _ := NewIPPool(edgeDefaultPoolCIDR)
+	aiPool, _ := NewIPPool(edgeAIPoolCIDR)
 	ipv6Pool, _ := newIPv6PoolForTests()
-	return newQUICServer(v, cl, bl, dg, rl, ipPool, ipv6Pool)
+	qs := newQUICServer(v, cl, bl, dg, rl, ipPool, ipv6Pool)
+	qs.aiPool = aiPool
+	return qs
 }
 
 func newIPv6PoolForTests() (*IPv6Pool, error) {
