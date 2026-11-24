@@ -220,7 +220,7 @@ func TestServerConfigParsesTransports(t *testing.T) {
 
 // ai 会话必须固定在承载 default CONNECT-IP 会话的同一个 Session 上：切换节点后旧会话处于排空期时，
 // 不得改拨到新会话（那会让两条会话分处两处，并在 edge 上多占设备名额）。
-func TestDialIPClassPinnedStaysOnDefaultSession(t *testing.T) {
+func TestPinnedSessionStaysOnDefaultSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	mk := func() (*classServer, *Session) {
@@ -234,8 +234,11 @@ func TestDialIPClassPinnedStaysOnDefaultSession(t *testing.T) {
 	}
 
 	m := NewSessionManager()
-	if _, _, err := m.DialIPClassPinned(ctx, classNameAI); !errors.Is(err, errNoPinnedSession) {
-		t.Fatalf("还没有 default 会话时应报 errNoPinnedSession: %v", err)
+	if m.pinnedSession() != nil {
+		t.Fatal("还没有 default 会话时不应有登记")
+	}
+	if _, _, err := dialAIFn(ctx, nil); !errors.Is(err, errNoPinnedSession) {
+		t.Fatalf("没有 Session 时应报 errNoPinnedSession: %v", err)
 	}
 
 	csA, sessA := mk()
@@ -249,11 +252,18 @@ func TestDialIPClassPinnedStaysOnDefaultSession(t *testing.T) {
 	if got := <-csA.seenClass; got != "" {
 		t.Fatalf("default 应不带类别头: %q", got)
 	}
+	if m.pinnedSession() != sessA {
+		t.Fatal("DialIP 成功后应登记承载它的 Session")
+	}
 
-	// 切换节点：A 进入排空期，B 成为当前会话。
+	// 切换节点：A 进入排空期，B 成为当前会话。登记仍是 A，ai 拨到 A。
 	sessA.MarkDraining()
 	m.SetSession(sessB)
-	connAI, _, err := m.DialIPClassPinned(ctx, classNameAI)
+	pinned := m.pinnedSession()
+	if pinned != sessA {
+		t.Fatal("排空期内登记应仍是 default 所在的 A")
+	}
+	connAI, _, err := dialAIFn(ctx, pinned)
 	if err != nil {
 		t.Fatalf("排空期内 ai 应仍能在 A 上建立: %v", err)
 	}
@@ -274,7 +284,7 @@ func TestDialIPClassPinnedStaysOnDefaultSession(t *testing.T) {
 
 	// 承载 default 的 Session 关闭后：报错，不改拨到别处（default 也已断开，引擎重连会整体重建）。
 	_ = sessA.Close()
-	if _, _, err := m.DialIPClassPinned(ctx, classNameAI); !errors.Is(err, errNoPinnedSession) {
+	if _, _, err := dialAIFn(ctx, pinned); !errors.Is(err, errNoPinnedSession) {
 		t.Fatalf("A 关闭后应报 errNoPinnedSession: %v", err)
 	}
 	select {
@@ -290,8 +300,11 @@ func TestDialIPClassPinnedStaysOnDefaultSession(t *testing.T) {
 	} else {
 		defer c.Close()
 	}
+	if m.pinnedSession() != sessB {
+		t.Fatal("再次 DialIP 后登记应更新为 B")
+	}
 	m.Reset()
-	if _, _, err := m.DialIPClassPinned(ctx, classNameAI); !errors.Is(err, errNoPinnedSession) {
-		t.Fatalf("Reset 后应报 errNoPinnedSession: %v", err)
+	if m.pinnedSession() != nil {
+		t.Fatal("Reset 后应清除登记")
 	}
 }

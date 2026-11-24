@@ -641,7 +641,7 @@ func (m *SessionManager) DialUDP(ctx context.Context, target string) (net.Conn, 
 }
 
 // DialIP establishes a CONNECT-IP tunnel using the active session.
-// 成功后记住承载它的 Session：ai 会话要固定在同一个 QUIC 连接上（DialIPClassPinned）。
+// 成功后记住承载它的 Session：ai 会话要固定在同一个 QUIC 连接上（pinnedSession）。
 func (m *SessionManager) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, error) {
 	sess, err := m.GetSession(ctx)
 	if err != nil {
@@ -660,18 +660,18 @@ func (m *SessionManager) DialIP(ctx context.Context) (*connectip.Conn, []netip.P
 // errNoPinnedSession 表示还没有 default CONNECT-IP 会话，或承载它的 Session 已经关闭。
 var errNoPinnedSession = errors.New("no live session carrying the default CONNECT-IP session")
 
-// DialIPClassPinned 在承载 default CONNECT-IP 会话的同一个 Session 上建立指定类别的会话。
-// 不经 GetSession：切换节点后旧会话处于排空期（约 20 秒）时，GetSession 会改拨到新的 QUIC 连接甚至新节点，
-// 让 ai 会话与 default 会话分处两处，并在 edge 上多占一个设备名额。该 Session 已不在时返回错误，
-// 由重拨退避重试；此时 default 会话也已断开，引擎重连会把两条会话一起重建。
-func (m *SessionManager) DialIPClassPinned(ctx context.Context, class string) (*connectip.Conn, []netip.Prefix, error) {
-	m.mu.Lock()
-	sess := m.ipSession
-	m.mu.Unlock()
-	if sess == nil || !sess.IsAlive() {
-		return nil, nil, errNoPinnedSession
+// pinnedSession 返回最近一次 default CONNECT-IP 会话所在的 Session（可能已关闭或处于排空期）。
+// 引擎在建立 default 会话后立即读取它并绑定到复用层：ai 会话只能建在这个 Session 上，
+// 不经 GetSession——切换节点后旧会话处于排空期（约 20 秒）时，GetSession 会改拨到新的 QUIC 连接甚至新节点，
+// 让 ai 会话与 default 会话分处两处，并在 edge 上多占一个设备名额。
+// 绑定到复用层而不是每次重拨时再读，是为了旧复用层的重拨协程不会在重连窗口里用到新连接的 Session。
+func (m *SessionManager) pinnedSession() *Session {
+	if m == nil {
+		return nil
 	}
-	return sess.DialIPClass(ctx, class)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ipSession
 }
 
 // DoHQuery performs a DNS query via POST /dns-query using the active session.

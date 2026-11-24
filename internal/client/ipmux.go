@@ -72,6 +72,8 @@ type ipMux struct {
 	d       IPPacketConn
 	tunAddr netip.Addr
 	cls     *flowClassifier
+	// carrier 是承载 default 会话的 Session，ai 会话只能建在它上面。只在复用层公开之前由引擎设置一次，之后只读。
+	carrier *Session
 
 	rx        chan []byte
 	closeCh   chan struct{}

@@ -27,6 +27,9 @@ type aiHarness struct {
 	aiAddr  netip.Addr
 	// aiHook 非空时替代默认的 ai 拨号行为。后台重拨协程在并发读 dialAIFn：测试不能改写这个全局变量，只能换钩子。
 	aiHook atomic.Pointer[func(context.Context) (IPPacketConn, netip.Addr, error)]
+	// dSess[i] 是第 i 次 default 拨号所在的 Session；aiSess 按顺序记录每次 ai 拨号收到的 Session。
+	dSess  []*Session
+	aiSess []*Session
 }
 
 func (h *aiHarness) lastAI() *fakeConn {
@@ -103,11 +106,20 @@ func startAIHarnessErr(t *testing.T, transports []string, enabled bool, aiErr er
 		c := newFakeConn()
 		h.mu.Lock()
 		h.dConns = append(h.dConns, c)
+		// 与真实的 SessionManager.DialIP 一致：每次 default 拨号都登记承载它的 Session。
+		sess := &Session{addr: "198.51.100.1:443"}
+		h.dSess = append(h.dSess, sess)
 		h.mu.Unlock()
+		m.mu.Lock()
+		m.ipSession = sess
+		m.mu.Unlock()
 		return c, "10.88.0.2/32", nil
 	}
-	dialAIFn = func(ctx context.Context, m *SessionManager) (IPPacketConn, netip.Addr, error) {
+	dialAIFn = func(ctx context.Context, sess *Session) (IPPacketConn, netip.Addr, error) {
 		h.aiDials.Add(1)
+		h.mu.Lock()
+		h.aiSess = append(h.aiSess, sess)
+		h.mu.Unlock()
 		if hk := h.aiHook.Load(); hk != nil {
 			return (*hk)(ctx)
 		}
@@ -527,5 +539,63 @@ func TestAIChannelStateWritesNeedTheirPreconditions(t *testing.T) {
 	}
 	if a.setUnavailable(&ipMux{}, "Y", true) {
 		t.Fatal("a stale mux wrote the state")
+	}
+}
+
+// ai 会话必须建在承载同一代 default 会话的 Session 上：重连后新复用层用新 Session，
+// 旧复用层的重拨协程不会读到新连接的 Session。
+func TestAIChannelDialsOnTheSessionCarryingDefault(t *testing.T) {
+	h := startAIHarness(t, bothTransports, true)
+	h.waitState(t, AIChannelUp)
+	h.mu.Lock()
+	if len(h.dSess) != 1 || len(h.aiSess) != 1 || h.aiSess[0] != h.dSess[0] {
+		h.mu.Unlock()
+		t.Fatalf("首次 ai 拨号应使用 default 所在的 Session: d=%d ai=%d", len(h.dSess), len(h.aiSess))
+	}
+	first := h.dSess[0]
+	h.mu.Unlock()
+
+	oldD, oldAI := h.lastD(), h.lastAI()
+	oldD.readErr <- net.ErrClosed
+	waitUntil(t, "new default session", func() bool { return h.lastD() != oldD })
+	waitUntil(t, "new ai session", func() bool { return h.lastAI() != oldAI })
+	h.waitState(t, AIChannelUp)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.dSess) < 2 {
+		t.Fatalf("重连后应有第二个 default Session: %d", len(h.dSess))
+	}
+	last := h.dSess[len(h.dSess)-1]
+	got := h.aiSess[len(h.aiSess)-1]
+	if got != last || got == first {
+		t.Fatalf("重连后的 ai 拨号应使用新的 default Session（got=%p last=%p first=%p）", got, last, first)
+	}
+}
+
+// 重连窗口：管理器里的登记已被新 default 会话改成新 Session，旧复用层的重拨协程还在跑时，
+// 它必须仍然用自己绑定的 Session（复用层创建时承载 default 会话的那个），不能读到新连接的 Session。
+func TestAIChannelRedialUsesTheSessionBoundToItsMux(t *testing.T) {
+	h := startAIHarness(t, bothTransports, true)
+	h.waitState(t, AIChannelUp)
+	h.mu.Lock()
+	bound := h.dSess[0]
+	h.mu.Unlock()
+
+	other := &Session{addr: "203.0.113.9:443"}
+	h.eng.sessionMgr.mu.Lock()
+	h.eng.sessionMgr.ipSession = other // 模拟新的 default 会话刚登记
+	h.eng.sessionMgr.mu.Unlock()
+
+	first := h.lastAI()
+	first.readErr <- context.DeadlineExceeded // 旧复用层的 ai 会话断开 → 重拨
+	waitUntil(t, "second ai session", func() bool { return h.lastAI() != first })
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, s := range h.aiSess {
+		if s != bound {
+			t.Fatalf("第 %d 次 ai 拨号用了别的 Session（应一直是复用层绑定的那个）", i)
+		}
 	}
 }

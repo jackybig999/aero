@@ -36,12 +36,12 @@ var (
 
 const transportCap = "capsule"
 
-// dialAIFn 建立 ai 会话并返回它分到的 IPv4 地址；可在测试中替换。
-var dialAIFn = func(ctx context.Context, m *SessionManager) (IPPacketConn, netip.Addr, error) {
-	if m == nil {
-		return nil, netip.Addr{}, errors.New("no session manager")
+// dialAIFn 在 sess（承载 default 会话的 Session）上建立 ai 会话并返回它分到的 IPv4 地址；可在测试中替换。
+var dialAIFn = func(ctx context.Context, sess *Session) (IPPacketConn, netip.Addr, error) {
+	if sess == nil || !sess.IsAlive() {
+		return nil, netip.Addr{}, errNoPinnedSession
 	}
-	conn, prefixes, err := m.DialIPClassPinned(ctx, classNameAI)
+	conn, prefixes, err := sess.DialIPClass(ctx, classNameAI)
 	if err != nil {
 		return nil, netip.Addr{}, err
 	}
@@ -235,6 +235,9 @@ func (e *Engine) wrapAI(ctx context.Context, d IPPacketConn, prefix netip.Prefix
 		return d
 	}
 	m := newIPMux(d, prefix.Addr(), e.aiCls)
+	// 此刻刚建立完 default 会话（调用方串行），管理器里记着的就是承载它的 Session；绑定后不再读管理器。
+	// 在 publish 之前设置：重拨协程经 publish 的锁才能看到复用层。
+	m.carrier = e.sessionMgr.pinnedSession()
 	m.SetAIDownHandler(func(err error) { e.aiLinkLost(m, err) })
 	if !e.ai.publish(ctx, m) { // 已取消：不登记也不拨号，交给调用方的中止路径关闭
 		return m
@@ -280,7 +283,7 @@ func (e *Engine) retireAIConn(conn IPPacketConn) {
 func (e *Engine) dialAIOnce(ctx context.Context, m *ipMux) error {
 	dctx, cancel := context.WithTimeout(ctx, aiDialTimeout)
 	defer cancel()
-	conn, addr, err := dialAIFn(dctx, e.sessionMgr)
+	conn, addr, err := dialAIFn(dctx, m.carrier)
 	if err != nil {
 		return err
 	}
