@@ -1,17 +1,31 @@
+## AERO 1.6.1
+
+对 1.6.0 的审核（Opus）后续修复。数据面行为没有变化；单节点用户 `aero update` 即可。
+
+### 桌面端
+- **修复：内核下载与删除的参数校验。** `goDeleteKernel`、`goDownloadKernel` 此前把前端传来的内核类型与版本直接拼成目录名，版本为 `/../..` 之类时，删除会越出内核目录（Windows 上还会结束该目录下的进程）。现在内核类型限 `chrome`、`firefox`，版本只允许字母、数字、`.`、`_`、`-`，并确认目录位于 `kernels` 之内；环境记录里的内核版本同样校验。校验失败直接返回错误，不创建目录、不登记进度。
+- **修复：内核下载来源收紧。** 下载地址必须是 https、默认端口、不带用户信息，并且位于官方主机的官方路径下（`storage.googleapis.com/chrome-for-testing-public/`、`playwright.azureedge.net/builds/firefox/`，以及它现在 307 跳转到的微软官方主机 `playwright.download.prss.microsoft.com/dbazure/download/playwright/builds/firefox/`）；只限主机不够，`storage.googleapis.com` 下任何人的存储桶都在同一主机上。主机名必须是纯 ASCII（防止 `storage.googleapİs.com` 之类的同形字符主机），路径不得含百分号编码、反斜杠或 `..`。下载时每一跳重定向都要重新做同样的完整校验（最多 5 跳），官方源即使返回 30x 也不能跳到其他主机或其他路径。
+
+### 客户端
+- **修复：ai 会话固定在 default 会话所在的同一条 QUIC 连接上。** 此前 ai 重拨经通用的取会话入口，切换节点后旧会话约 20 秒的排空期里，重拨会落到新连接甚至新节点，在 edge 上多占一个设备名额。现在每个复用层在创建时绑定承载 default 会话的连接；该连接不在时，ai 重拨返回错误并按退避重试，default 会话此时也已断开，引擎重连会把两条会话一起重建。旧复用层的重拨协程在重连窗口内也不会用到新连接。
+
+### 文档
+- 更正 1.6.0 的说明：`transports` 只在 edge 自己生成的订阅里；ai 会话断开期间已建立在 ai 上的连接的包会被丢弃（见 1.6.0 客户端一节）。
+
 ## AERO 1.6.0
 
 这一版加入 **AI 稳定通道**（ADR-0017 的 P1–P3）：同一条 HTTP/3 连接里建立两条标准 CONNECT-IP 会话，AI 站点的 TCP 流量走可靠承载（DATAGRAM capsule，RFC 9297 §3.5），其余流量仍走 QUIC 数据报。不使用用户态 TCP/IP 栈，不回落到 TCP/TLS。节点没有声明支持时，客户端行为与上一版完全一致。
 
 ### 服务端
 - CONNECT-IP 按类别建会话：`default`（QUIC 数据报，地址取 10.88.0.0/17）与 `ai`（DATAGRAM capsule，地址取 10.88.128.0/17）。请求头 `Aero-Class`，响应头 `Aero-Transport`；未授权类别 403，保留类别（`browser`、`game`）400。每个 QUIC 连接每个类别最多 1 条会话；`max_devices` 按不同 QUIC 连接数计。
-- 订阅里的每个节点声明 `transports: ["datagram","capsule"]`。
+- edge 自己生成的订阅里，每个节点声明 `transports: ["datagram","capsule"]`。中台订阅暂无该字段（待中台阶段对接），经中台订阅的用户 `ai_channel` 为 `unsupported`，行为与上一版一致。
 - 日志新增 `[CONNECT-IP] session up/down class=… transport=… addr=…`（`aero log` 可见）；不记录 token 与 uid。
 - 连接 token 的绑定与校验改为原子操作。
 - 宿主修改没有新增：NAT、TUN、防火墙规则和 `ip_forward` 的处理与上一版相同（仍只做带标记、可还原的修改）。
 
 ### 客户端
 - 引擎在节点声明 `capsule` 时建立 `ai` 会话；按流分类（UDP、ICMP 与普通 TCP 走 default；目的地址在 AI 集合内的新 TCP 连接走 ai），上行改写源地址、下行改写回 TUN 地址，并增量更新校验和。
-- `ai` 会话建立不了（被拒、超限、传输方式不符）时，新的 AI TCP 连接按 fail-closed 处理，不静默改走 default；已建立的连接不受影响。断线重连时两条会话一起恢复。
+- `ai` 会话建立不了（被拒、超限、传输方式不符）时，新的 AI TCP 连接按 fail-closed 处理，不静默改走 default；已建立在 default 上的连接不受影响。ai 会话断开期间，已建立在 ai 上的连接的包被静默丢弃（TCP 会重传），重拨成功后恢复；重拨分到的地址与之前不同时这些连接会断。断线重连时两条会话一起恢复。
 - 状态接口 `/api/v1/status` 增加 `ai_channel`（`off`/`unsupported`/`connecting`/`up`/`unavailable`）、`ai_channel_reason`、`ai_channel_enabled`，不含地址或凭据。
 - 修复启动哨兵协程读取 `rootCtx` 的数据竞争。
 

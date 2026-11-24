@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REPO="jackybig999/aero"
-VERSION="1.6.0"
+VERSION="1.6.1"
 VERSION="${AERO_VERSION:-$VERSION}"
 BIN=/usr/local/bin/aero-edge
 CLI=/usr/local/bin/aero
