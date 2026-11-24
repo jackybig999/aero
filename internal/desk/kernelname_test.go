@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -82,6 +83,11 @@ func TestTriggerKernelDownloadValidatesBeforeStarting(t *testing.T) {
 		{"chrome", "133", "https://storage.googleapis.com/chrome-for-testing-publicx/a.zip"},        // 前缀不完整
 		{"chrome", "133", "https://storage.googleapis.com:8443/chrome-for-testing-public/a.zip"},    // 非默认端口
 		{"firefox", "134", "https://playwright.azureedge.net/builds/chromium/1/a.zip"},              // 官方主机的其他路径
+		{"chrome", "133", "https://storage.googleapİs.com/chrome-for-testing-public/1/a.zip"},       // U+0130 同形主机（ToLower 后变成 ASCII i）
+		{"chrome", "133", "https://storage.googleapis.com./chrome-for-testing-public/1/a.zip"},      // 尾随点
+		{"chrome", "133", "https://storage.googleapis.com/chrome-for-testing-public%2fx/a.zip"},     // 百分号编码
+		{"chrome", "133", "https://storage.googleapis.com/chrome-for-testing-public/%2e%2e/x.zip"},  // 编码的 ..
+		{"chrome", "133", `https://storage.googleapis.com/chrome-for-testing-public/..\evil/a.zip`}, // 反斜杠
 		{"chrome", "133", ""},
 	}
 	for _, c := range cases {
@@ -99,8 +105,9 @@ func TestTriggerKernelDownloadValidatesBeforeStarting(t *testing.T) {
 		t.Errorf("校验失败不应创建 kernels 目录: %v", err)
 	}
 	for _, ok := range []string{
-		"https://storage.googleapis.com/chrome-for-testing-public/133/win64/chrome-win64.zip",
-		"https://playwright.azureedge.net/builds/firefox/1/firefox-win64.zip",
+		"https://storage.googleapis.com/chrome-for-testing-public/133.0.6943.98/win64/chrome-win64.zip",
+		"https://playwright.azureedge.net/builds/firefox/1495/firefox-win64.zip",
+		getFirefoxDownloadURL("134.0.2"), getChromeCfTDownloadURL("133.0.6943.98"), // 代码里实际生成的地址必须通过
 	} {
 		if err := validateKernelURL(ok); err != nil {
 			t.Errorf("官方地址应通过: %s: %v", ok, err)
@@ -119,20 +126,32 @@ func TestKernelDownloadClientRejectsUnofficialRedirect(t *testing.T) {
 		}
 		return r
 	}
-	for _, bad := range []string{target.URL, "http://storage.googleapis.com/chrome-for-testing-public/a.zip", "https://evil.example.com/a.zip", "https://user@storage.googleapis.com/x"} {
+	for _, bad := range []string{
+		target.URL, "http://storage.googleapis.com/chrome-for-testing-public/a.zip", "https://evil.example.com/a.zip",
+		"https://user@storage.googleapis.com/chrome-for-testing-public/a.zip",
+		"https://storage.googleapis.com/evil-bucket/a.zip",                            // 官方主机但不是官方路径
+		"https://storage.googleapİs.com/chrome-for-testing-public/1/a.zip",            // 同形主机
+		"https://playwright.download.prss.microsoft.com/dbazure/download/other/x.zip", // 微软主机的其他路径
+	} {
 		if err := checkKernelRedirect(mk(bad), nil); err == nil {
 			t.Errorf("重定向到 %s 应被拒绝", bad)
 		}
 	}
-	if err := checkKernelRedirect(mk("https://storage.googleapis.com/chrome-for-testing-public/1/a.zip"), nil); err != nil {
-		t.Errorf("官方主机应放行: %v", err)
+	// 官方放行：Chrome 源，以及 azureedge 实测 307 的目标（微软官方主机）。
+	for _, ok := range []string{
+		"https://storage.googleapis.com/chrome-for-testing-public/1/a.zip",
+		"https://playwright.download.prss.microsoft.com/dbazure/download/playwright/builds/firefox/1495/firefox-win64.zip",
+	} {
+		if err := checkKernelRedirect(mk(ok), nil); err != nil {
+			t.Errorf("官方地址应放行: %s: %v", ok, err)
+		}
 	}
-	if err := checkKernelRedirect(mk("https://storage.googleapis.com/x"), make([]*http.Request, 5)); err == nil {
+	if err := checkKernelRedirect(mk("https://storage.googleapis.com/chrome-for-testing-public/1/a.zip"), make([]*http.Request, 5)); err == nil {
 		t.Error("重定向次数过多应被拒绝")
 	}
 	// 经真实客户端：官方主机以外的重定向目标被拒绝，请求不会到达目标。
-	hit := false
-	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit = true }))
+	var hit atomic.Bool
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit.Store(true) }))
 	defer evil.Close()
 	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, evil.URL, http.StatusFound) }))
 	defer redir.Close()
@@ -141,7 +160,7 @@ func TestKernelDownloadClientRejectsUnofficialRedirect(t *testing.T) {
 		_ = resp.Body.Close()
 		t.Error("跳到非官方主机的重定向应返回错误")
 	}
-	if hit {
+	if hit.Load() {
 		t.Error("重定向目标不应被请求")
 	}
 }
