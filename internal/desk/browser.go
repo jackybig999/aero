@@ -783,7 +783,11 @@ func LaunchFirefox(firefoxPath, dataDir string, profileID int64, proxyCfg *Proxy
 		}
 	}
 
-	SanitizeFirefoxKernel(filepath.Dir(firefoxPath))
+	// 只清理自己下载的内核（dataDir/kernels 之下）。系统里用户自己安装的 Firefox 只读使用：
+	// 删除它的更新程序、写入 distribution/policies.json 都会改动宿主上的另一个软件。
+	if pathWithin(filepath.Join(dataDir, "kernels"), filepath.Dir(firefoxPath)) {
+		SanitizeFirefoxKernel(filepath.Dir(firefoxPath))
+	}
 
 	mPort, err := FindFreePort(2828)
 	if err != nil {
@@ -1337,6 +1341,31 @@ func (s *SafariInstance) Stop() error {
 	return nil
 }
 
+// pathWithin 判断 path 是否位于 base 目录之内（含自身）。按路径分量比较，不做字符串前缀匹配，
+// 因此 base 为 ".../kernels/firefox" 时 ".../kernels/firefox2" 不算在内。
+func pathWithin(base, path string) bool {
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absBase, absPath)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// killProcessesUnderCmd 生成结束“可执行文件位于 dir 之内”的进程的 PowerShell 命令。
+// 前缀末尾带路径分隔符：否则 dir 为 ...\firefox 时会误伤 ...\firefox2 里的进程。
+func killProcessesUnderCmd(dir string) string {
+	prefix := strings.TrimRight(strings.ToLower(dir), `\/`) + `\`
+	return fmt.Sprintf(`Get-Process | Where-Object { $_.Path -and ($_.Path.ToLower().StartsWith('%s')) } | Stop-Process -Force -ErrorAction SilentlyContinue`, strings.ReplaceAll(prefix, `'`, `''`))
+}
+
 // CleanKernelDir 强制安全清理内核目录
 func CleanKernelDir(targetDir string) error {
 	if targetDir == "" {
@@ -1349,7 +1378,7 @@ func CleanKernelDir(targetDir string) error {
 	if runtime.GOOS == "windows" {
 		abs, err := filepath.Abs(targetDir)
 		if err == nil {
-			psCmd := fmt.Sprintf(`Get-Process | Where-Object { $_.Path -and ($_.Path.ToLower().StartsWith('%s')) } | Stop-Process -Force -ErrorAction SilentlyContinue`, strings.ToLower(strings.ReplaceAll(abs, `'`, `''`)))
+			psCmd := killProcessesUnderCmd(abs)
 			_ = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Run()
 		}
 	}

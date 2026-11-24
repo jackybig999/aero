@@ -577,3 +577,76 @@ func TestBrowserEmbeddedExtensionCreation(t *testing.T) {
 		t.Errorf("expected non-empty xpi file at %s", xpiPath)
 	}
 }
+
+func TestPathWithin(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "kernels")
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{base, true},
+		{filepath.Join(base, "firefox"), true},
+		{filepath.Join(base, "firefox", "firefox"), true},
+		{base + "2", false},                                  // 同前缀兄弟目录
+		{filepath.Join(base, "..", "other"), false},          // 上级的兄弟
+		{filepath.Join(base, "..", "kernels-x", "f"), false}, // 前缀相同但不在其内
+		{filepath.Dir(base), false},
+	}
+	for _, c := range cases {
+		if got := pathWithin(base, c.path); got != c.want {
+			t.Errorf("pathWithin(%q, %q) = %v, want %v", base, c.path, got, c.want)
+		}
+	}
+}
+
+func TestKillProcessesUnderCmdUsesDirectoryPrefix(t *testing.T) {
+	cmd := killProcessesUnderCmd(`C:\Data\Kernels\Firefox`)
+	if !strings.Contains(cmd, `StartsWith('c:\data\kernels\firefox\')`) {
+		t.Fatalf("前缀必须小写并以路径分隔符结尾，避免误伤 firefox2：%s", cmd)
+	}
+	if cmd2 := killProcessesUnderCmd(`C:\Data\Kernels\Firefox\`); cmd2 != cmd {
+		t.Fatalf("末尾已有分隔符时结果应相同：%s", cmd2)
+	}
+	if !strings.Contains(killProcessesUnderCmd(`C:\it's`), `it''s`) {
+		t.Fatal("单引号必须按 PowerShell 规则转义")
+	}
+}
+
+// 系统里用户自己安装的 Firefox 只读使用：LaunchFirefox 不得删除其文件，也不得写入 distribution/policies.json。
+// 自己下载的内核（dataDir/kernels 之下）则要清理更新程序并写入策略。
+func TestLaunchFirefoxOnlySanitizesOwnKernels(t *testing.T) {
+	dataDir := t.TempDir()
+	mk := func(dir string) string {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range []string{"firefox.exe", "updater.exe", "maintenanceservice.exe"} {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return filepath.Join(dir, "firefox.exe")
+	}
+
+	system := mk(filepath.Join(t.TempDir(), "Mozilla Firefox"))
+	_, _ = LaunchFirefox(system, dataDir, 9001, nil, nil, "") // 假的可执行文件，启动本身会失败，这里只看有没有动文件
+	sysDir := filepath.Dir(system)
+	for _, f := range []string{"updater.exe", "maintenanceservice.exe"} {
+		if _, err := os.Stat(filepath.Join(sysDir, f)); err != nil {
+			t.Errorf("系统 Firefox 的 %s 不应被删除：%v", f, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(sysDir, "distribution")); !os.IsNotExist(err) {
+		t.Errorf("系统 Firefox 目录下不应写入 distribution：%v", err)
+	}
+
+	own := mk(filepath.Join(dataDir, "kernels", "firefox-1"))
+	_, _ = LaunchFirefox(own, dataDir, 9002, nil, nil, "")
+	ownDir := filepath.Dir(own)
+	if _, err := os.Stat(filepath.Join(ownDir, "updater.exe")); !os.IsNotExist(err) {
+		t.Errorf("自己下载的内核应清理 updater.exe：%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(ownDir, "distribution", "policies.json")); err != nil {
+		t.Errorf("自己下载的内核应写入 policies.json：%v", err)
+	}
+}
