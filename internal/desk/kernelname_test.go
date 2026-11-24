@@ -4,8 +4,11 @@
 package desk
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -25,7 +28,7 @@ func TestKernelDirForRejectsTraversalAndBadNames(t *testing.T) {
 	bad := [][2]string{
 		{"chrome", "/../../.."}, {"chrome", ".."}, {"chrome", "../x"}, {"chrome", `..\x`}, {"chrome", "a/b"},
 		{"chrome", ""}, {"chrome", "."}, {"chrome", ".hidden"}, {"chrome", "1..2"}, {"chrome", "a b"},
-		{"chrome", string(make([]byte, 65))}, {"chrome", "x\x00y"},
+		{"chrome", strings.Repeat("a", 65)}, {"chrome", "x\x00y"},
 		{"", "133"}, {"safari", "17"}, {"../chrome", "1"}, {"chrome/../..", "1"},
 	}
 	for _, b := range bad {
@@ -74,6 +77,11 @@ func TestTriggerKernelDownloadValidatesBeforeStarting(t *testing.T) {
 		{"chrome", "133", "https://storage.googleapis.com@evil.test/a"}, // 用户信息伪装
 		{"chrome", "133", "https://storage.googleapis.com.evil.test/a"}, // 后缀伪装
 		{"chrome", "133", "file:///etc/passwd"},
+		{"chrome", "133", "https://storage.googleapis.com/evil-bucket/a.zip"},                       // 同主机但不是官方 bucket
+		{"chrome", "133", "https://storage.googleapis.com/chrome-for-testing-public/../evil/a.zip"}, // 路径穿越
+		{"chrome", "133", "https://storage.googleapis.com/chrome-for-testing-publicx/a.zip"},        // 前缀不完整
+		{"chrome", "133", "https://storage.googleapis.com:8443/chrome-for-testing-public/a.zip"},    // 非默认端口
+		{"firefox", "134", "https://playwright.azureedge.net/builds/chromium/1/a.zip"},              // 官方主机的其他路径
 		{"chrome", "133", ""},
 	}
 	for _, c := range cases {
@@ -97,5 +105,43 @@ func TestTriggerKernelDownloadValidatesBeforeStarting(t *testing.T) {
 		if err := validateKernelURL(ok); err != nil {
 			t.Errorf("官方地址应通过: %s: %v", ok, err)
 		}
+	}
+}
+
+// 官方源即使返回 30x，也只能跳到 https 的官方主机；跳到其他主机或 http 必须被拒绝。
+func TestKernelDownloadClientRejectsUnofficialRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("evil")) }))
+	defer target.Close()
+	mk := func(rawURL string) *http.Request {
+		r, err := http.NewRequest(http.MethodGet, rawURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	for _, bad := range []string{target.URL, "http://storage.googleapis.com/chrome-for-testing-public/a.zip", "https://evil.example.com/a.zip", "https://user@storage.googleapis.com/x"} {
+		if err := checkKernelRedirect(mk(bad), nil); err == nil {
+			t.Errorf("重定向到 %s 应被拒绝", bad)
+		}
+	}
+	if err := checkKernelRedirect(mk("https://storage.googleapis.com/chrome-for-testing-public/1/a.zip"), nil); err != nil {
+		t.Errorf("官方主机应放行: %v", err)
+	}
+	if err := checkKernelRedirect(mk("https://storage.googleapis.com/x"), make([]*http.Request, 5)); err == nil {
+		t.Error("重定向次数过多应被拒绝")
+	}
+	// 经真实客户端：官方主机以外的重定向目标被拒绝，请求不会到达目标。
+	hit := false
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit = true }))
+	defer evil.Close()
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, evil.URL, http.StatusFound) }))
+	defer redir.Close()
+	c := createKernelHTTPClient(false)
+	if resp, err := c.Get(redir.URL); err == nil {
+		_ = resp.Body.Close()
+		t.Error("跳到非官方主机的重定向应返回错误")
+	}
+	if hit {
+		t.Error("重定向目标不应被请求")
 	}
 }

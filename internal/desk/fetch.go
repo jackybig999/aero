@@ -517,8 +517,9 @@ func createKernelHTTPClient(useProxy bool) *http.Client {
 		transport.Proxy = http.ProxyFromEnvironment
 	}
 	return &http.Client{
-		Transport: transport,
-		Timeout:   0,
+		Transport:     transport,
+		Timeout:       0,
+		CheckRedirect: checkKernelRedirect,
 	}
 }
 
