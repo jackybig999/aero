@@ -154,10 +154,11 @@ func (s *AppService) StartProfile(id int64) error {
 
 	var specificPath string
 	if kernelVersion != "" {
-		targetDir := filepath.Join(s.DataDir, "kernels", fmt.Sprintf("%s_%s", kernelType, kernelVersion))
-		loc := LocateDownloadedKernel(targetDir, kernelType)
-		if loc != "" {
-			specificPath = loc
+		// 内核目录名来自数据库里的环境记录：同样校验，不合法时当作没有指定内核。
+		if _, targetDir, err := kernelDirFor(s.DataDir, kernelType, kernelVersion); err == nil {
+			if loc := LocateDownloadedKernel(targetDir, kernelType); loc != "" {
+				specificPath = loc
+			}
 		}
 	}
 

@@ -185,7 +185,16 @@ func GetKernelProgress(key string) int {
 
 // TriggerKernelDownload 后台异步触发内核下载与自动解压
 func TriggerKernelDownload(dataDir, kernelType, milestone, dlURL string, onDone func(err error)) {
-	key := fmt.Sprintf("%s_%s", kernelType, milestone)
+	key, targetDir, err := kernelDirFor(dataDir, kernelType, milestone)
+	if err == nil {
+		err = validateKernelURL(dlURL)
+	}
+	if err != nil {
+		if onDone != nil {
+			onDone(err)
+		}
+		return
+	}
 
 	kernelProgressMu.Lock()
 	p := kernelProgressMap[key]
@@ -200,7 +209,6 @@ func TriggerKernelDownload(dataDir, kernelType, milestone, dlURL string, onDone 
 	kernelProgressMu.Unlock()
 
 	go func() {
-		targetDir := filepath.Join(dataDir, "kernels", key)
 		err := DownloadAndExtractKernel(context.Background(), dlURL, targetDir, func(percent int) {
 			if percent <= 0 {
 				percent = 1
@@ -1398,8 +1406,10 @@ func CleanKernelDir(targetDir string) error {
 
 // DeleteKernel 彻底清理删除指定的便携内核目录及运行锁
 func DeleteKernel(dataDir, kernelType, milestone string) error {
-	key := fmt.Sprintf("%s_%s", kernelType, milestone)
-	targetDir := filepath.Join(dataDir, "kernels", key)
+	key, targetDir, err := kernelDirFor(dataDir, kernelType, milestone)
+	if err != nil {
+		return err
+	}
 	SetKernelProgress(key, 0)
 	return CleanKernelDir(targetDir)
 }

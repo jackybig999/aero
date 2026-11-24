@@ -266,6 +266,13 @@ func RegisterSharedIPCHandlers(w IPCBinder, appService *AppService, dataDir stri
 
 	w.Bind("goDownloadKernel", func(kernelType, milestone, dlURL string) map[string]interface{} {
 		log.Printf("[INFO] 用户触发下载内核: %s %s, URL: %s\n", kernelType, milestone, dlURL)
+		// 信任边界：参数来自前端，先同步校验，失败直接告知界面（TriggerKernelDownload 内部会再校验一次）。
+		if _, _, err := kernelDirFor(dataDir, kernelType, milestone); err != nil {
+			return map[string]interface{}{"status": "error", "message": err.Error()}
+		}
+		if err := validateKernelURL(dlURL); err != nil {
+			return map[string]interface{}{"status": "error", "message": err.Error()}
+		}
 		TriggerKernelDownload(dataDir, kernelType, milestone, dlURL, func(err error) {
 			if err != nil {
 				log.Printf("[ERROR] 内核下载失败: %v\n", err)
