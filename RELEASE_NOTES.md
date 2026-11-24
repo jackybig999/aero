@@ -1,3 +1,34 @@
+## AERO 1.6.0
+
+这一版加入 **AI 稳定通道**（ADR-0017 的 P1–P3）：同一条 HTTP/3 连接里建立两条标准 CONNECT-IP 会话，AI 站点的 TCP 流量走可靠承载（DATAGRAM capsule，RFC 9297 §3.5），其余流量仍走 QUIC 数据报。不使用用户态 TCP/IP 栈，不回落到 TCP/TLS。节点没有声明支持时，客户端行为与上一版完全一致。
+
+### 服务端
+- CONNECT-IP 按类别建会话：`default`（QUIC 数据报，地址取 10.88.0.0/17）与 `ai`（DATAGRAM capsule，地址取 10.88.128.0/17）。请求头 `Aero-Class`，响应头 `Aero-Transport`；未授权类别 403，保留类别（`browser`、`game`）400。每个 QUIC 连接每个类别最多 1 条会话；`max_devices` 按不同 QUIC 连接数计。
+- 订阅里的每个节点声明 `transports: ["datagram","capsule"]`。
+- 日志新增 `[CONNECT-IP] session up/down class=… transport=… addr=…`（`aero log` 可见）；不记录 token 与 uid。
+- 连接 token 的绑定与校验改为原子操作。
+- 宿主修改没有新增：NAT、TUN、防火墙规则和 `ip_forward` 的处理与上一版相同（仍只做带标记、可还原的修改）。
+
+### 客户端
+- 引擎在节点声明 `capsule` 时建立 `ai` 会话；按流分类（UDP、ICMP 与普通 TCP 走 default；目的地址在 AI 集合内的新 TCP 连接走 ai），上行改写源地址、下行改写回 TUN 地址，并增量更新校验和。
+- `ai` 会话建立不了（被拒、超限、传输方式不符）时，新的 AI TCP 连接按 fail-closed 处理，不静默改走 default；已建立的连接不受影响。断线重连时两条会话一起恢复。
+- 状态接口 `/api/v1/status` 增加 `ai_channel`（`off`/`unsupported`/`connecting`/`up`/`unavailable`）、`ai_channel_reason`、`ai_channel_enabled`，不含地址或凭据。
+- 修复启动哨兵协程读取 `rootCtx` 的数据竞争。
+
+### 桌面端
+- **修复：不再改动用户自己安装的 Firefox。** 没有下载内核而回退到系统里检测到的 Firefox 时，此前会删除其更新程序等文件并写入 `distribution/policies.json`；现在只清理 `kernels` 目录下自己下载的内核，系统浏览器只读使用。
+- Windows 上结束内核目录内进程时，路径前缀末尾加分隔符，不再误伤同前缀的兄弟目录。
+
+### 已知限制
+- AI 稳定通道目前没有界面或接口开关，节点声明支持时默认开启（开关在 P7）。关闭通道会中断已建立在 `ai` 会话上的连接（源地址改变）。
+- 服务端 TUN 与 NAT 对两个子网的实际转发、真实 TUN 上的 AI 连接、真实 AI 站点，只能在真机验证；步骤与预期见 `docs/ai-channel-verification.md`，尚未完成。自动化覆盖了会话协商、地址改写与校验和、分类、引擎状态机与重拨、真实 HTTP/3 上两条会话各自往返。
+- 是否让普通 TCP 也走 `ai` 会话，取决于后续丢包测量（P5），本版不扩大使用范围。
+- 服务端停止时按启动前记录的原值还原 `ip_forward`。原值为 0、运行期间别的服务（如 Docker）又把它设为 1 的情况下，停止 edge 会把它改回 0；重启那个服务即可恢复。
+
+### 升级提示
+- 节点上执行 `aero update` 即可，无需改配置。升级重启后默认地址池从 /16 缩为 /17，部分用户的 default 地址会变化；租约本来不持久化，客户端重连时只替换 TUN 地址，不受影响。
+- 旧版本客户端连接新节点不受影响（不声明会话类别时按 default 处理）；新客户端连接旧节点时 `ai_channel` 为 `unsupported`。
+
 ## AERO 1.5.2
 
 这一版补全服务端多跳转发的第一阶段，并收紧认证封禁。默认配置（单节点）的数据面行为没有变化；客户端没有改动。
