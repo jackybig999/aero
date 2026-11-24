@@ -449,6 +449,12 @@ func roleClient(t *testing.T) {
 	}
 	t.Log("UDP through CONNECT-IP (TUN mode): ok")
 
+	// 订阅里节点声明了 capsule（C5 transports）：客户端应已向真实 edge 建立 ai 会话（ADR-0017）。
+	if !waitTrue(t, 20*time.Second, func() bool { return clientAIChannel(api) == "up" }) {
+		failTun("AI stable channel did not come up against the real edge: state=%q", clientAIChannel(api))
+	}
+	t.Log("AI stable channel (DATAGRAM capsule session) established against the real edge: ok")
+
 	// 退出后客户端命名空间不得残留（TUN 网卡、路由）
 	_ = cl.Process.Signal(syscall.SIGTERM)
 	_ = cl.Wait()
@@ -462,6 +468,22 @@ func roleClient(t *testing.T) {
 		t.Fatal("client called resolvectl (would touch the host's systemd-resolved)")
 	}
 	t.Log("no residue after client exit: ok")
+}
+
+// clientAIChannel 返回客户端状态里的 AI 稳定通道状态（读取失败返回空串）。
+func clientAIChannel(api *http.Client) string {
+	r, err := api.Get("http://" + clientAPI + "/api/v1/status")
+	if err != nil {
+		return ""
+	}
+	defer r.Body.Close()
+	var st struct {
+		AIChannel string `json:"ai_channel"`
+	}
+	if json.NewDecoder(r.Body).Decode(&st) != nil {
+		return ""
+	}
+	return st.AIChannel
 }
 
 func clientConnected(api *http.Client) bool {

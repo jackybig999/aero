@@ -150,6 +150,11 @@ func main() {
 			"resident_listening": st.ResidentListening,
 			"degraded":           st.Degraded,
 			"degraded_reason":    st.DegradedReason,
+
+			// AI 稳定通道（ADR-0017）：状态码、原因码与用户开关，不含任何地址或凭据。
+			"ai_channel":         st.AIChannel,
+			"ai_channel_reason":  st.AIChannelReason,
+			"ai_channel_enabled": st.AIChannelEnabled,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})

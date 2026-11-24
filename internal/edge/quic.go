@@ -2212,6 +2212,12 @@ func (s *QUICServer) serveConnectIP(w http.ResponseWriter, r *http.Request) {
 	if err := conn.AssignAddresses(assignedPrefixes); err != nil {
 		return
 	}
+	// 运维可见性（aero log）：哪类会话、什么传输、分到哪个子网的地址。不记录 token 与 uid。
+	sessionStart := time.Now()
+	log.Printf("[CONNECT-IP] session up class=%s transport=%s addr=%s", class.name, class.transport, assignedPrefix.Addr())
+	defer func() {
+		log.Printf("[CONNECT-IP] session down class=%s transport=%s addr=%s after=%s", class.name, class.transport, assignedPrefix.Addr(), time.Since(sessionStart).Round(time.Second))
+	}()
 	if err := conn.AdvertiseRoute([]connectip.IPRoute{
 		{
 			StartIP:    netip.MustParseAddr("0.0.0.0"),
