@@ -217,3 +217,81 @@ func TestServerConfigParsesTransports(t *testing.T) {
 		t.Fatalf("Apply dropped the field: %v %v", applied, err)
 	}
 }
+
+// ai 会话必须固定在承载 default CONNECT-IP 会话的同一个 Session 上：切换节点后旧会话处于排空期时，
+// 不得改拨到新会话（那会让两条会话分处两处，并在 edge 上多占设备名额）。
+func TestDialIPClassPinnedStaysOnDefaultSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	mk := func() (*classServer, *Session) {
+		cs := &classServer{transportFor: func(class string) (string, connectip.DataMode) {
+			if class == classNameAI {
+				return "capsule", connectip.DataModeCapsule
+			}
+			return "datagram", connectip.DataModeDatagram
+		}}
+		return cs, startClassServer(t, cs)
+	}
+
+	m := NewSessionManager()
+	if _, _, err := m.DialIPClassPinned(ctx, classNameAI); !errors.Is(err, errNoPinnedSession) {
+		t.Fatalf("还没有 default 会话时应报 errNoPinnedSession: %v", err)
+	}
+
+	csA, sessA := mk()
+	csB, sessB := mk()
+	m.SetSession(sessA)
+	connD, _, err := m.DialIP(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connD.Close()
+	if got := <-csA.seenClass; got != "" {
+		t.Fatalf("default 应不带类别头: %q", got)
+	}
+
+	// 切换节点：A 进入排空期，B 成为当前会话。
+	sessA.MarkDraining()
+	m.SetSession(sessB)
+	connAI, _, err := m.DialIPClassPinned(ctx, classNameAI)
+	if err != nil {
+		t.Fatalf("排空期内 ai 应仍能在 A 上建立: %v", err)
+	}
+	defer connAI.Close()
+	select {
+	case got := <-csA.seenClass:
+		if got != classNameAI {
+			t.Fatalf("A 收到的类别 %q", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ai 会话没有建立在 default 所在的 A 上")
+	}
+	select {
+	case got := <-csB.seenClass:
+		t.Fatalf("B 不应收到任何请求，却收到类别 %q", got)
+	default:
+	}
+
+	// 承载 default 的 Session 关闭后：报错，不改拨到别处（default 也已断开，引擎重连会整体重建）。
+	_ = sessA.Close()
+	if _, _, err := m.DialIPClassPinned(ctx, classNameAI); !errors.Is(err, errNoPinnedSession) {
+		t.Fatalf("A 关闭后应报 errNoPinnedSession: %v", err)
+	}
+	select {
+	case got := <-csB.seenClass:
+		t.Fatalf("B 不应收到任何请求，却收到类别 %q", got)
+	default:
+	}
+
+	// Reset 清掉登记。
+	m.SetSession(sessB)
+	if c, _, err := m.DialIP(ctx); err != nil {
+		t.Fatal(err)
+	} else {
+		defer c.Close()
+	}
+	m.Reset()
+	if _, _, err := m.DialIPClassPinned(ctx, classNameAI); !errors.Is(err, errNoPinnedSession) {
+		t.Fatalf("Reset 后应报 errNoPinnedSession: %v", err)
+	}
+}

@@ -406,6 +406,7 @@ type SessionManager struct {
 	mu               sync.Mutex
 	dial             *sessionDial // 在途拨号（单飞）；nil 表示没有拨号
 	currentSession   *Session
+	ipSession        *Session // 承载 default CONNECT-IP 会话的 Session；ai 会话必须与它在同一个 QUIC 连接上
 	dialHook         func(ctx context.Context) (*Session, error)
 	drainingMu       sync.Mutex
 	drainingSessions []*Session
@@ -639,22 +640,38 @@ func (m *SessionManager) DialUDP(ctx context.Context, target string) (net.Conn, 
 	return sess.DialUDP(ctx, target)
 }
 
-// DialIPClass establishes a CONNECT-IP session of the given class using the active session.
-func (m *SessionManager) DialIPClass(ctx context.Context, class string) (*connectip.Conn, []netip.Prefix, error) {
-	sess, err := m.GetSession(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	return sess.DialIPClass(ctx, class)
-}
-
 // DialIP establishes a CONNECT-IP tunnel using the active session.
+// 成功后记住承载它的 Session：ai 会话要固定在同一个 QUIC 连接上（DialIPClassPinned）。
 func (m *SessionManager) DialIP(ctx context.Context) (*connectip.Conn, []netip.Prefix, error) {
 	sess, err := m.GetSession(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	return sess.DialIP(ctx)
+	conn, prefixes, err := sess.DialIP(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	m.mu.Lock()
+	m.ipSession = sess
+	m.mu.Unlock()
+	return conn, prefixes, nil
+}
+
+// errNoPinnedSession 表示还没有 default CONNECT-IP 会话，或承载它的 Session 已经关闭。
+var errNoPinnedSession = errors.New("no live session carrying the default CONNECT-IP session")
+
+// DialIPClassPinned 在承载 default CONNECT-IP 会话的同一个 Session 上建立指定类别的会话。
+// 不经 GetSession：切换节点后旧会话处于排空期（约 20 秒）时，GetSession 会改拨到新的 QUIC 连接甚至新节点，
+// 让 ai 会话与 default 会话分处两处，并在 edge 上多占一个设备名额。该 Session 已不在时返回错误，
+// 由重拨退避重试；此时 default 会话也已断开，引擎重连会把两条会话一起重建。
+func (m *SessionManager) DialIPClassPinned(ctx context.Context, class string) (*connectip.Conn, []netip.Prefix, error) {
+	m.mu.Lock()
+	sess := m.ipSession
+	m.mu.Unlock()
+	if sess == nil || !sess.IsAlive() {
+		return nil, nil, errNoPinnedSession
+	}
+	return sess.DialIPClass(ctx, class)
 }
 
 // DoHQuery performs a DNS query via POST /dns-query using the active session.
@@ -689,6 +706,7 @@ func (m *SessionManager) Reset() {
 		_ = m.currentSession.Close()
 		m.currentSession = nil
 	}
+	m.ipSession = nil // 其 Session 随 currentSession 或排空列表关闭；不再保留引用
 	m.mu.Unlock()
 
 	m.drainingMu.Lock()

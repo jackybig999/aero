@@ -41,7 +41,7 @@ var dialAIFn = func(ctx context.Context, m *SessionManager) (IPPacketConn, netip
 	if m == nil {
 		return nil, netip.Addr{}, errors.New("no session manager")
 	}
-	conn, prefixes, err := m.DialIPClass(ctx, classNameAI)
+	conn, prefixes, err := m.DialIPClassPinned(ctx, classNameAI)
 	if err != nil {
 		return nil, netip.Addr{}, err
 	}
