@@ -1,3 +1,35 @@
+## AERO 1.7.1
+
+修复连接后网页大面积打不开（部分站点是黑洞）和连接时偶发一直转圈。服务端没有改动。
+
+### 1. 连接后部分站点成了黑洞（geo 同步不刷新路由）
+- **现象**：连上后网页奇慢甚至打不开，重连一次又好一些；日志里首次连接规划 `9906` 条路由，geo 更新到 `119915` 条规则之后再连就是 `13559` 条。
+- **根因（已用测试复现）**：连接后约 3 秒（以及每 24 小时、手动点“更新 geo”）会同步一次服务端下发的直连名单，但**只换了分流名单，没有刷新 TUN 路由**。新增的直连网段仍按旧路由进了 TUN，数据泵又把“直连”目标的包 `continue` 静默丢弃，这批站点就成了黑洞，直到重连或换网络。
+- **修复**：geo 名单安装后立即刷新 TUN 路由，让路由与名单保持一致，不一致的窗口随之消失（先设“同步成功”的状态，再刷新路由；没有 TUN 时不做任何路由计算）。
+- **数据泵的丢弃保持不变**：国内直连地址与私网地址仍然绝不进入海外隧道（既有验收测试 `TestIPDataPump_DomesticIPBypass` 的规定）。新增一条一次性日志 `[PUMP] dropped a packet to a direct (domestic) address that reached the TUN: the route plan is out of date with the direct list`，这类问题以后在 `client.log` 里可见（此前完全静默）。
+
+### 2. 连接时偶发一直转圈、必须点“测速”才恢复
+- **现象**：点连接后一直转圈，连“连接超时”都不出现。
+- **机制**：界面对引擎的调用此前默认走 IPC：go-webview2 在**窗口的 UI 线程上同步执行**绑定函数（`chromium.go` 的 `MessageReceived` → `callbinding`），结果经 `PostThreadMessage(WM_APP)` 派发回页面，且没有任何超时。连接期间 `refreshStatus` 因 `busy` 直接返回，只剩连接轮询一个串行 `await` 的调用者，28 秒的期限检查写在 `await` 之后，一次结果没回来就永远转圈；再有一次 IPC 调用（点测速、更新 geo）会产生新的派发，把积压的结果一起送出。线程消息在模态循环里（拖动窗口、托盘菜单的 `TrackPopupMenu`）会被丢弃，这是可能的触发方式。
+- **没有证实**的是触发那一次丢失的具体原因（我没法在 Linux 上复现 Windows 消息循环）；修法不依赖这个答案。
+- **修复**：页面从本机 HTTP 服务加载时，`api()` 用 `fetch`（在 Go 的 HTTP 协程里执行，不占 UI 线程，不依赖线程消息）；IPC 只在退路（退回内嵌页面）里使用并且只在这时才绑定 `goClientAPI`；每次调用有硬超时；连接轮询重写成“每次调用独立超时 + 总期限在每轮开头检查”，并绑定到连接代次，取消后马上重连时旧轮询不会取消新连接。
+- 超时按接口设定并大于服务端上限（L0 §8.1，留不少于 20% 余量）：geo 同步 180 秒（服务端 150 秒）、导入订阅 40 秒（30 秒）、测速 9 秒（5 秒）、连接/断开/模式/取消 15 秒，其余 6 秒。测试从 `main.go` 里读出每个接口的服务端超时来比对。
+- `[UI] loading the UI from the local server (… fetch transport)` 或 `… embedded page with the IPC transport` 写入 `client.log`。
+
+### 其他
+- `isAllowedLocalURL` 接受 `::1`（`-api ::1` 时 `http://[::1]:端口` 此前所有 POST 都会 403）。
+
+### 测试
+- 复现测试：TUN 运行中同步到新直连网段后，TUN 路由必须刷新、不再覆盖新直连地址（去掉刷新后失败）。
+- `cmd/client` 用 node 执行界面里同一份 `pollUntil`/`withTimeout`/`apiTimeoutMs`（去掉单次调用超时后失败）；真实 HTTP 服务器加完整中间件链验证浏览器同源 `fetch` 被放行、跨站被拒绝。
+
+### 已知限制（独立审核提出，本版没有改）
+- 路由预算超限时（`withinRouteBudget`）会退回只用内置名单规划路由，而分流名单仍包含服务端下发的网段，此时下发网段的地址仍会进 TUN 并被丢弃，直到预算问题消除；这种情况现在会在日志里出现上面那条 `[PUMP]` 提示。
+- 客户端 TUN 的 MTU 是 1224，而 RFC 9000 要求客户端 Initial 的 UDP 载荷不少于 1200 字节，IPv4 包至少 1228 字节：浏览器的 HTTP/3 在设置了 DF 时发不出去，会回落到 TCP（首次访问多等一会儿）；未验证。
+- 数据泵单协程同步写隧道：QUIC 数据报队列满（32 个）时会阻塞，拥塞时整机上行包括下载流的 ACK 排在同一个阻塞点后面。
+- `applyNextHopMTU` 实际不起作用，connect-ip 回的 PTB 写的 MTU 是 1280，比网卡 MTU 还大，系统会忽略；系统 DNS 服务器的 `/32` 路由进 TUN 后，发往它的非 UDP/53 流量（TCP 53、DoT）仍按私网/国内处理。
+- 没有真机验证；如果升级后仍偶发转圈，请在转圈时执行 `(Invoke-RestMethod http://127.0.0.1:19877/api/v1/status) | Select-Object connected, starting, last_error`，并发来 `client.log` 里该时间段的 `[API]`、`[START]`、`[PUMP]`、`[GEODATA]` 行。
+
 ## AERO 1.7.0
 
 针对“连接成功后网页极慢、下载几乎没有进展、AI 对话与 AI 命令行工具打不开”：根因是隧道的 QUIC 拥塞控制对随机丢包过敏。本版加入对随机丢包不敏感的拥塞控制，服务端用 `aero cc lossy` 开启。
