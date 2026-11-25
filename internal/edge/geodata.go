@@ -90,6 +90,9 @@ type GeoDataHandler struct {
 	gzMu    sync.Mutex
 	gzEtag  string // 当前压缩副本对应的 ETag
 	gzBytes []byte
+
+	// bg 跟踪 StartCronUpdate 起的后台协程；Wait 等它们退出（调用方先取消 ctx）。
+	bg sync.WaitGroup
 }
 
 // NewGeoDataHandler initializes a GeoDataHandler from local cache if present, or built-in rules
@@ -142,12 +145,15 @@ func (h *GeoDataHandler) StartCronUpdate(ctx context.Context) {
 		interval = 24 * time.Hour
 	}
 	// Initial update immediately in background to eliminate 24h cold-start wait
+	h.bg.Add(2)
 	go func() {
+		defer h.bg.Done()
 		if err := h.fetchAndUpdateWithContext(ctx); err != nil {
 			log.Printf("[GEODATA] Initial startup update failed: %v", err)
 		}
 	}()
 	go func() {
+		defer h.bg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -163,6 +169,10 @@ func (h *GeoDataHandler) StartCronUpdate(ctx context.Context) {
 		}
 	}()
 }
+
+// Wait 等 StartCronUpdate 起的后台协程退出。调用前必须先取消传给 StartCronUpdate 的 ctx，否则会一直等到下一次定时。
+// 服务器关闭时必须等：此前只取消不等待，协程在取消之后仍会走到落盘，把已被删除的数据目录重新创建出来并写入文件。
+func (h *GeoDataHandler) Wait() { h.bg.Wait() }
 
 func (h *GeoDataHandler) fetchAndUpdateWithContext(parentCtx context.Context) error {
 	urls := []string{h.fetchURL}
@@ -196,6 +206,11 @@ func (h *GeoDataHandler) fetchAndUpdateWithContext(parentCtx context.Context) er
 			h.lastUpdate = time.Now()
 			h.mu.Unlock()
 			return nil
+		}
+
+		// 已经取消（服务器正在关闭）：不再落盘。否则会在关闭之后把数据目录重新创建出来并写入文件。
+		if err := parentCtx.Err(); err != nil {
+			return err
 		}
 
 		// Atomic disk persistence: write to .tmp, then rename

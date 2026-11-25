@@ -878,6 +878,9 @@ func (s *Server) Close() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	if s.geoHandler != nil {
+		s.geoHandler.Wait() // 后台 geo 刷新协程随 ctx 取消退出；等它退出，之后不会再往数据目录写文件
+	}
 	if s.quicServer != nil {
 		s.quicServer.Close()
 	}
