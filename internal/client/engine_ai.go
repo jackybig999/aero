@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"net/netip"
 	"slices"
@@ -249,9 +250,13 @@ func (e *Engine) wrapAI(ctx context.Context, d IPPacketConn, prefix netip.Prefix
 	}
 	e.aiCls.enabled.Store(true)
 	e.ai.setFor(m, AIChannelConnecting, "")
+	tr := e.startTr.Load()
 	if err := e.dialAIOnce(ctx, m); err != nil {
+		reason, _ := aiReason(err)
+		tr.note("ai=failed(%s)", reason)
 		e.aiDialFailed(m, err)
 	} else {
+		tr.note("ai=up")
 		e.aiAttached(m)
 	}
 	return m
@@ -327,6 +332,7 @@ func upperSnake(s string) string {
 // aiDialFailed 记录 ai 会话建立失败：状态 unavailable；非永久性错误则后台重试。
 func (e *Engine) aiDialFailed(m *ipMux, err error) {
 	reason, permanent := aiReason(err)
+	log.Printf("[AI] session dial failed (reason=%s, permanent=%v): %v", reason, permanent, err)
 	if !e.ai.setUnavailable(m, reason, e.ai.enabled.Load()) { // 复用层已失效（Stop、重连）：不写状态、不重拨
 		return
 	}

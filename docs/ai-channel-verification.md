@@ -62,3 +62,37 @@
 - 目前没有界面或接口开关，AI 稳定通道默认开启（P7 提供开关）。
 - 用户关闭通道时，已建立在 ai 会话上的连接会中断（源地址改变），这是显式操作。
 - 数据泵重启（重连）后第一个包可能丢失，TCP 会重传。
+
+## Windows 客户端（PowerShell）的写法
+上面的命令按 Linux 写。在 Windows PowerShell 里 `curl` 是 `Invoke-WebRequest` 的别名，不认识 `-s`、`-sI`；`tcpdump` 在 Windows 上不存在，抓包只能在服务端做。
+
+```powershell
+# 客户端状态（重点看 ai_channel）
+(Invoke-RestMethod http://127.0.0.1:19877/api/v1/status) | Select-Object connected, ai_channel, ai_channel_reason, ai_channel_enabled
+# 访问 AI 站点与普通站点（用 curl.exe）
+curl.exe -sI https://api.openai.com
+curl.exe -sI https://example.org
+# 丢包与速度
+ping -n 100 1.1.1.1
+curl.exe -o NUL -s -w "下载=%{speed_download}B/s 连接=%{time_connect}s 首字节=%{time_starttransfer}s 总计=%{time_total}s`n" "https://speed.cloudflare.com/__down?bytes=20000000"
+# 客户端日志（已过滤长字符串）
+Get-Content "$env:APPDATA\AERO\client.log" -Tail 200 | ForEach-Object { $_ -replace '[A-Za-z0-9_-]{32,}','<redacted>' }
+```
+
+服务端没有 `tcpdump` 时不要为此安装（那会改动 VPS），可以用只读的连接跟踪表：`grep <ai 地址> /proc/net/nf_conntrack`。
+
+## 连接慢或超时：看 `[START]` 日志
+v1.6.2 起，每次启动都会在 `client.log` 里记录各阶段耗时。界面等满 28 秒会自行取消并显示“连接超时”，取消的启动以前不留日志；现在会写明停在哪个阶段。
+
+```
+[START] begin (mode=tun)
+[START] detect-tun ok in 3ms (total 3ms)
+[START] resolve ok in 120ms (total 123ms)
+[START] quic-dial ok in 2.4s (total 2.5s) [port=2083]      ← 端口不是订阅里的主端口，说明主端口慢、备用端口胜出
+[START] connect-ip ok in 410ms (total 2.9s)
+[START] ai-session ok in 0.5s (total 3.4s) [ai=up]         ← ai=failed(原因码) 不影响隧道
+[START] tun-open ok in 1.2s (total 4.6s)
+[START] data-plane ok in 20ms (total 4.6s)
+[START] done, total 4.6s
+```
+失败或取消时：`[START] FAILED at stage "quic-dial" after 8.0s (total 8.1s): <原因>` 或 `[START] CANCELLED at stage "connect-ip" after 20s ...`。把这几行贴给维护者即可定位。

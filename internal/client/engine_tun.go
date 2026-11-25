@@ -134,6 +134,7 @@ func (e *Engine) refreshTunRoutes(extra ...net.IP) {
 // bringUpTunLocked 建立 CONNECT-IP、创建自有网卡并启动数据面。失败时已建立的部分全部释放。
 // startCtx 是本次启动的取消域：Stop/Close/BeginStop 取消它即可中断拨号，不必等持 lifecycleMu 的启动自然超时。
 func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error {
+	tr := e.startTr.Load() // 只写日志；直接调用（测试）时为 nil，各方法对 nil 安全
 	dialCtx, cancel := context.WithTimeout(startCtx, 8*time.Second)
 	ipConn, prefixStr, err := dialIPFn(dialCtx, e.sessionMgr)
 	cancel()
@@ -150,7 +151,9 @@ func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error
 
 	// 节点声明了 capsule 时接入 ai 会话（失败不影响隧道，见 wrapAI）；否则 ipConn 原样使用。
 	// 放在路由下发之前：拨号最长 aiDialTimeout，期间不能让整机流量落进还没有数据面的 TUN。
+	tr.enter("ai-session")
 	ipConn = e.wrapAI(startCtx, ipConn, prefix)
+	tr.enter("tun-open")
 	closeConn := func() error { e.retireAIConn(ipConn); return ipConn.Close() }
 
 	e.mu.RLock()
@@ -168,6 +171,7 @@ func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error
 	e.tunHost = host
 	e.mu.Unlock()
 
+	tr.enter("data-plane")
 	e.stackEngine = NewStackEngineWithConn(host.Device(), ipConn, e.dnsHandler)
 	e.stackEngine.SetKillSwitch(e.killSwitch.Load())
 	if err := e.stackEngine.Start(); err != nil {
@@ -178,6 +182,7 @@ func (e *Engine) bringUpTunLocked(startCtx context.Context, nodeIP net.IP) error
 	e.startReconnector(e.rootCtx, e.stackEngine, host, prefix)
 	e.stackEngine.SetWebRTCActive(true)
 	SetGlobalMobileWebRTCActive(true)
+	tr.finish()
 	log.Printf("[ENGINE] TUN %s up: %s, %d IPv4 + %d IPv6 routes", tunName, prefix, len(plan.IPv4), len(plan.IPv6))
 	return nil
 }

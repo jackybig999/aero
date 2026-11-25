@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.6.1"
+	ClientVersion = "1.6.2"
 	Protocol      = "aero/3.0"
 )
 
@@ -138,6 +138,8 @@ type Engine struct {
 	mixedListener net.Listener
 	// mixedHandshakeTimeout 为 0 时用默认 10 秒；仅测试注入更短的值（须在连接建立前设置）
 	mixedHandshakeTimeout time.Duration
+	// startTr 是最近一次启动的阶段耗时记录（只写日志）。启动由 lifecycleMu 串行，其他协程只读指针。
+	startTr atomic.Pointer[startTrace]
 
 	currentISP  string
 	savedSubURL string
@@ -895,6 +897,8 @@ func (e *Engine) startLocked(ticket uint64) error {
 
 	startCtx, startCancel := context.WithCancel(context.Background())
 	e.startCancel = startCancel
+	tr := newStartTrace(e.mode)
+	e.startTr.Store(tr)
 	e.mu.Unlock()
 
 	rollbackLocked := func(ticket uint64, startCancel context.CancelFunc, err error) error {
@@ -940,8 +944,10 @@ func (e *Engine) startLocked(ticket uint64) error {
 	// 底层库自行返回的 context.Canceled 不属于此类，按普通失败回滚到 stopped 并清 startPending。
 	failStart := func(err error) error {
 		if e.state.Load() == stateStopping || startCtx.Err() != nil {
+			tr.fail(err, true)
 			return e.abortStartLocked(startCancel, nm)
 		}
+		tr.fail(err, false)
 		return rollbackLocked(ticket, startCancel, err)
 	}
 	e.degraded.Store(false)
@@ -961,6 +967,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	// 本地模式（sysproxy）不碰宿主；TUN 模式先检测第三方 TUN 冲突（只读）。
 	// 自有网卡的全部状态随网卡销毁而消失，无需清理上次残留（ADR-0013）。
 	if mode != "sysproxy" {
+		tr.enter("detect-tun")
 		conflict, vpnName, err := detectThirdPartyTUN()
 		if err != nil {
 			return failStart(fmt.Errorf("detect third-party tun: %w", err))
@@ -986,6 +993,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 		port = p
 	}
 
+	tr.enter("resolve")
 	var nodeIP net.IP
 	if curAddr, _, _, curIP := getActiveEdge(); curAddr == activeAddr && curIP != nil {
 		nodeIP = curIP
@@ -1073,6 +1081,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	cfg.PacketConnFactory = e.packetConnFactory
 	e.mu.RUnlock()
 
+	tr.enter("quic-dial")
 	start := time.Now()
 	cl, err := Dial(probeCtx, cfg)
 	if err != nil {
@@ -1087,6 +1096,8 @@ func (e *Engine) startLocked(ticket uint64) error {
 	}
 	actualPort := cl.ActualPort()
 	rtt := time.Since(start)
+	tr.note("port=%d", actualPort)
+	tr.enter("connect-ip")
 
 	// 多端口跳频动态对齐 (Port Hopping Alignment Contract)
 	if actualPort > 0 && actualPort != port {
@@ -1186,6 +1197,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 		e.mu.Lock()
 		if e.startEpoch != ticket || !e.startPending.Load() || e.state.Load() != stateStarting {
 			e.mu.Unlock()
+			tr.fail(errors.New("stop requested while finishing start"), true)
 			return e.abortStartLocked(startCancel, nm)
 		}
 		e.state.Store(stateRunning)
@@ -1193,6 +1205,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 		e.startPending.Store(false)
 		e.startCancel = nil
 		e.mu.Unlock()
+		tr.finish()
 		log.Printf("[ENGINE] data plane started in %s (mixed proxy %s)", desc, e.listenAddr)
 		return nil
 	}
@@ -1236,6 +1249,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	e.mu.Lock()
 	if e.startEpoch != ticket || !e.startPending.Load() || e.state.Load() != stateStarting {
 		e.mu.Unlock()
+		tr.fail(errors.New("stop requested while finishing start"), true)
 		return e.abortStartLocked(startCancel, nm)
 	}
 	e.state.Store(stateRunning)
