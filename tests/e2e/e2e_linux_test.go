@@ -173,6 +173,7 @@ func runRoot(t *testing.T) {
 	must(t, "ip", "link", "add", "veth-ac", "type", "veth", "peer", "name", "veth-ca", "netns", fmt.Sprint(client.Process.Pid))
 	must(t, "ip", "addr", "add", edgeOnC+"/24", "dev", "veth-ac")
 	must(t, "ip", "link", "set", "veth-ac", "up")
+	applyNetem(t, "veth-ac") // 仅在 AERO_E2E_NETEM 设置时生效
 
 	// 客户端第一阶段通过后重启 edge，验证客户端自动重连
 	waitFile(t, filepath.Join(dir, "client-phase1"), 90*time.Second)
@@ -292,6 +293,18 @@ func roleInternet(t *testing.T) {
 	}
 	go func() {
 		_ = http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/bulk" { // 吞吐测试用：?mb=N 返回 N MiB 数据
+				var mb int
+				fmt.Sscan(r.URL.Query().Get("mb"), &mb)
+				w.Header().Set("Content-Length", fmt.Sprint(mb<<20))
+				chunk := make([]byte, 64<<10)
+				for sent := 0; sent < mb<<20; sent += len(chunk) {
+					if _, err := w.Write(chunk); err != nil {
+						return
+					}
+				}
+				return
+			}
 			fmt.Fprintf(w, "hello-e2e from %s", r.RemoteAddr)
 		}))
 	}()
@@ -320,6 +333,7 @@ func roleClient(t *testing.T) {
 	must(t, "ip", "link", "set", "lo", "up")
 	must(t, "ip", "addr", "add", clientIP+"/24", "dev", "veth-ca")
 	must(t, "ip", "link", "set", "veth-ca", "up")
+	applyNetem(t, "veth-ca")
 
 	// 直连 B 必须不通（C 没有到 B 的路由）：后面能访问到 B 就证明经过了 edge
 	if c, err := net.DialTimeout("tcp", internetIP+":80", 2*time.Second); err == nil {
@@ -367,6 +381,15 @@ func roleClient(t *testing.T) {
 		fail("UDP through tunnel: %q %v", got, err)
 	}
 	t.Log("UDP through tunnel: ok")
+
+	if mb := os.Getenv("AERO_E2E_BULK_MB"); mb != "" {
+		var n int
+		fmt.Sscan(mb, &n)
+		for i := 0; i < 2; i++ { // 两次：第二次排除拥塞窗口冷启动
+			bytes, d, err := socksBulk(internetIP+":80", n)
+			t.Logf("BULK run %d: %d bytes in %v = %.2f Mbit/s (err=%v) netem=%q", i+1, bytes, d.Round(time.Millisecond), float64(bytes)*8/d.Seconds()/1e6, err, os.Getenv("AERO_E2E_NETEM"))
+		}
+	}
 
 	// edge 重启后客户端应自动恢复
 	_ = os.WriteFile(filepath.Join(dir, "client-phase1"), nil, 0o644)
@@ -525,6 +548,39 @@ func socksHandshake(c net.Conn, cmd byte, target string) (net.Addr, error) {
 		return nil, fmt.Errorf("socks reply %v", rep[:4])
 	}
 	return &net.UDPAddr{IP: net.IP(rep[4:8]), Port: int(binary.BigEndian.Uint16(rep[8:10]))}, nil
+}
+
+// applyNetem 在 dev 上按 AERO_E2E_NETEM（如 "delay 95ms 5ms loss 0.5%"）注入延迟与丢包，用来复现长距离、有丢包的链路。
+// 未设置时什么也不做。两端各设一次，所以延迟与丢包在两个方向各生效一次。
+func applyNetem(t *testing.T, dev string) {
+	t.Helper()
+	spec := strings.Fields(os.Getenv("AERO_E2E_NETEM"))
+	if len(spec) == 0 {
+		return
+	}
+	must(t, "tc", append([]string{"qdisc", "add", "dev", dev, "root", "netem"}, spec...)...)
+}
+
+// socksBulk 经 SOCKS 下载 /bulk?mb=N，返回收到的字节数与耗时（读到 150 秒截止）。
+func socksBulk(target string, mb int) (int64, time.Duration, error) {
+	c, err := net.DialTimeout("tcp", socksAddr, 5*time.Second)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(150 * time.Second))
+	if _, err := socksHandshake(c, 1, target); err != nil {
+		return 0, 0, err
+	}
+	start := time.Now()
+	fmt.Fprintf(c, "GET /bulk?mb=%d HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", mb, target)
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		return 0, time.Since(start), err
+	}
+	defer resp.Body.Close()
+	n, err := io.Copy(io.Discard, resp.Body)
+	return n, time.Since(start), err
 }
 
 func socksHTTPGet(target string) (string, error) {

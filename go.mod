@@ -35,3 +35,5 @@ require (
 )
 
 replace github.com/quic-go/connect-ip-go => ./third_party/connect-ip-go
+
+replace github.com/quic-go/quic-go => ./third_party/quic-go

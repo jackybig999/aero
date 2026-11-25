@@ -45,6 +45,13 @@ jobs:
           go vet ./...
           go test -race -shuffle=on ./...
 
+      - name: Forked Library Tests (third_party/quic-go, ADR-0019)
+        # fork 目录有独立的 go.mod；上游全量测试体积大，只跑被改动的拥塞控制包与全量 vet
+        run: |
+          cd third_party/quic-go
+          go vet ./...
+          go test -race -shuffle=on ./internal/congestion/...
+
       - name: Allow user namespaces for isolated network tests
         # Ubuntu 默认用 AppArmor 限制非特权用户命名空间；命名空间测试（宿主状态、TUN、端到端）需要它。只影响 CI 虚拟机。
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
