@@ -703,6 +703,29 @@ func probeCandidatePortsLadder(ctx context.Context, scheme, hostOnly, requestURI
 	}
 }
 
+// subErrKind 把拉取订阅的错误归为不含 URL 的短类别，用于日志（net/http 的错误文本带完整 URL，路径里含订阅标识）。
+func subErrKind(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return "refused"
+	case strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded"):
+		return "timeout"
+	}
+	if i := strings.Index(msg, "HTTP "); i >= 0 && len(msg) >= i+8 {
+		return msg[i : i+8]
+	}
+	return "error"
+}
+
 // FetchSubscription 从远端中台或备用源拉取并解析订阅
 func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) (*Subscription, error) {
 	rawURL = strings.TrimSpace(rawURL)
@@ -727,6 +750,7 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		if scheme == "" {
 			scheme = "https"
 		}
+		t0 := time.Now()
 
 		// 1. 检查内存端口缓存：若之前已成功探测出非标工作端口，优先走缓存快照
 		if cachedPort, ok := GetCachedSubPort(hostOnly); ok && cachedPort > 0 && cachedPort != 443 && cachedPort != 80 {
@@ -740,8 +764,10 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 			cachedCancel()
 			if cErr == nil && cSub != nil && len(cSub.Servers) > 0 {
 				SaveLastBody(rawURL, cBody)
+				log.Printf("[SUB] fetched via cached port %d in %v", cachedPort, time.Since(t0).Round(time.Millisecond))
 				return cSub, nil
 			}
+			log.Printf("[SUB] cached port %d failed after %v (%s), probing again", cachedPort, time.Since(t0).Round(time.Millisecond), subErrKind(cErr))
 			// 缓存端口失效（可能服务端换端口），剔除该缓存项并继续正常探测
 			SetCachedSubPort(hostOnly, 0)
 		}
@@ -752,22 +778,28 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 			primaryTimeout = opt.Timeout
 		}
 		primaryCtx, primaryCancel := context.WithTimeout(ctx, primaryTimeout)
+		tPrimary := time.Now()
 		sub, body, err := fetchSingleSubURL(primaryCtx, rawURL, opt)
 		primaryCancel()
 
 		if err == nil && sub != nil && len(sub.Servers) > 0 {
 			SetCachedSubPort(hostOnly, 443)
 			SaveLastBody(rawURL, body)
+			log.Printf("[SUB] primary 443 ok in %v", time.Since(tPrimary).Round(time.Millisecond))
 			return sub, nil
 		}
+		log.Printf("[SUB] primary 443 failed after %v (%s), trying candidate ports", time.Since(tPrimary).Round(time.Millisecond), subErrKind(err))
 
 		// 3. 主端口 443 遇阻，启动 RFC 8305 阶梯并发探测 StandardCandidatePorts
+		tLadder := time.Now()
 		altSub, altBody, winPort, ladderErr := probeCandidatePortsLadder(ctx, scheme, hostOnly, u.RequestURI(), opt)
 		if ladderErr == nil && altSub != nil && len(altSub.Servers) > 0 {
 			SetCachedSubPort(hostOnly, winPort)
 			SaveLastBody(rawURL, altBody)
+			log.Printf("[SUB] candidate port %d ok in %v (total %v)", winPort, time.Since(tLadder).Round(time.Millisecond), time.Since(t0).Round(time.Millisecond))
 			return altSub, nil
 		}
+		log.Printf("[SUB] candidate ports failed after %v (%s), total %v", time.Since(tLadder).Round(time.Millisecond), subErrKind(ladderErr), time.Since(t0).Round(time.Millisecond))
 
 		// 4. 判定致命状态：403 明确拒绝（到期或超额）清理缓存
 		if err != nil && strings.Contains(err.Error(), "HTTP 403") {
@@ -782,6 +814,7 @@ func FetchSubscription(ctx context.Context, rawURL string, opt SubFetchOptions) 
 		// 5. 尝试离线缓存兜底
 		if !opt.DisableCache {
 			if lastSub := cachedSubscription(rawURL, ladderErr); lastSub != nil {
+				log.Printf("[SUB] network fetch failed, using the offline cached subscription (total %v)", time.Since(t0).Round(time.Millisecond))
 				return lastSub, nil
 			}
 		}

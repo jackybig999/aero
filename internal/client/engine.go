@@ -582,7 +582,8 @@ func (e *Engine) refreshActiveNodeLocked(applied *Applied, srv ServerConfig) {
 
 // LoadAndApplySubscription 从远程 URL 加载并应用订阅，挂载 singleflight 阻断重入
 func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
-	v, err, _ := subSingleFlight.Do(src, func() (any, error) {
+	tCall := time.Now()
+	v, err, shared := subSingleFlight.Do(src, func() (any, error) {
 		ctx, cancel := context.WithTimeout(e.getContext(), 30*time.Second)
 		defer cancel()
 		sub, err := FetchSubscription(ctx, src, SubFetchOptions{})
@@ -612,9 +613,13 @@ func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
 		return applied, nil
 	})
 	if err != nil {
+		log.Printf("[SUB] load failed after %v (%s)", time.Since(tCall).Round(time.Millisecond), subErrKind(err))
 		return nil, err
 	}
-	return v.(*Applied), nil
+	applied := v.(*Applied)
+	// shared 为真表示与另一个同 URL 的导入合并（等待它完成）；日志里的耗时是本次调用的总等待
+	log.Printf("[SUB] load+apply ok in %v (nodes=%d, fromCache=%v, joinedInflight=%v)", time.Since(tCall).Round(time.Millisecond), len(applied.Servers), applied.FromCache, shared)
+	return applied, nil
 }
 
 // SwitchActiveNode 切换激活节点
@@ -857,8 +862,12 @@ func (e *Engine) Start() error {
 
 // StartWith 使用指定票据在 lifecycleMu 锁保护下启动引擎
 func (e *Engine) StartWith(ticket uint64) error {
+	tWait := time.Now()
 	e.lifecycleMu.Lock()
 	defer e.lifecycleMu.Unlock()
+	if w := time.Since(tWait); w >= 100*time.Millisecond {
+		log.Printf("[START] waited %v for the lifecycle lock (another start/stop was in progress)", w.Round(time.Millisecond))
+	}
 	return e.startLocked(ticket)
 }
 

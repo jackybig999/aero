@@ -220,11 +220,14 @@ func main() {
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": "empty subscription URL"})
 			return
 		}
+		tImport := time.Now()
 		applied, err := eng.LoadAndApplySubscription(req.Sub)
 		if err != nil {
+			log.Printf("[API] import failed after %v", time.Since(tImport).Round(time.Millisecond))
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": err.Error()})
 			return
 		}
+		log.Printf("[API] import ok in %v (nodes=%d)", time.Since(tImport).Round(time.Millisecond), len(applied.Servers))
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "ok",
 			"nodes":  len(applied.Servers),
@@ -338,6 +341,7 @@ func main() {
 		}
 
 		ticket := eng.RequestStart()
+		log.Printf("[API] connect accepted (ticket=%d)", ticket)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status": "starting",
 		})
@@ -352,6 +356,7 @@ func main() {
 			}()
 
 			if eng.IsStopping() {
+				log.Printf("[API] connect waits for the previous stop to finish")
 				deadline := time.Now().Add(28 * time.Second)
 				for eng.IsStopping() {
 					if time.Now().After(deadline) {

@@ -549,3 +549,66 @@ func TestFetchSubscription_PrivateIPBlocked(t *testing.T) {
 		}
 	}
 }
+
+// 诊断日志：443 成功、回退到候选端口、全部失败走离线缓存兜底，各有一行带耗时的 [SUB] 记录，且不含订阅 URL（路径里有订阅标识）。
+func TestFetchSubscription_LogsTimingsWithoutURL(t *testing.T) {
+	ClearCachedSubPorts()
+	defer ClearCachedSubPorts()
+	buf := captureLog(t)
+
+	okBody := func(addr string) string {
+		return fmt.Sprintf(`{"version":"aero/3.0","userId":"admin","servers":[{"name":"n","address":%q,"token":"tok","sni":"x.aero.test","protocol":"connect-ip"}]}`, addr)
+	}
+	useSubHTTPS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.Host, ":8443") {
+			fmt.Fprint(w, okBody("log-tier1.aero.test:8443"))
+			return
+		}
+		if r.Host == "log-primary.aero.test" {
+			fmt.Fprint(w, okBody("log-primary.aero.test:443"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+
+	if _, err := FetchSubscription(context.Background(), "https://log-primary.aero.test/sub/SECRETSLUG123", SubFetchOptions{DisableCache: true}); err != nil {
+		t.Fatalf("443: %v", err)
+	}
+	if _, err := FetchSubscription(context.Background(), "https://log-tier1.aero.test/sub/SECRETSLUG456", SubFetchOptions{DisableCache: true}); err != nil {
+		t.Fatalf("fallback: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"[SUB] primary 443 ok in ", "[SUB] primary 443 failed after ", "[SUB] candidate port 8443 ok in "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("日志缺少 %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "SECRETSLUG") {
+		t.Errorf("日志不得包含订阅标识:\n%s", out)
+	}
+}
+
+func TestSubErrKind(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{nil, "none"},
+		{context.DeadlineExceeded, "timeout"},
+		{context.Canceled, "canceled"},
+		{fmt.Errorf(`Get "https://h/sub/SECRET": dial tcp 1.2.3.4:443: connect: connection refused`), "refused"},
+		{fmt.Errorf(`Get "https://h/sub/SECRET": net/http: TLS handshake timeout`), "timeout"},
+		{fmt.Errorf(`fetch https://h/sub/SECRET: HTTP 503 Service Unavailable`), "HTTP 503"},
+		{fmt.Errorf(`weird https://h/sub/SECRET`), "error"},
+	}
+	for _, c := range cases {
+		got := subErrKind(c.err)
+		if got != c.want {
+			t.Errorf("subErrKind(%v) = %q, want %q", c.err, got, c.want)
+		}
+		if strings.Contains(got, "SECRET") {
+			t.Errorf("类别不得含 URL: %q", got)
+		}
+	}
+}
