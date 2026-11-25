@@ -30,6 +30,10 @@ type cubicSender struct {
 
 	reno bool
 
+	// lossTolerant 为真时，丢包率低且没有排队的丢包事件不降窗口（AERO fork，ADR-0019）。
+	lossTolerant bool
+	outcomes     lossStats
+
 	// Track the largest packet that has been sent.
 	largestSentPacketNumber protocol.PacketNumber
 
@@ -85,6 +89,19 @@ func NewCubicSender(
 		protocol.MaxCongestionWindowPackets*initialMaxDatagramSize,
 		qlogger,
 	)
+}
+
+// NewLossTolerantSender 创建对随机丢包不敏感的发送方：CUBIC 增长曲线加选择性的丢包响应（见 loss_tolerant.go）。
+func NewLossTolerantSender(
+	clock Clock,
+	rttStats *utils.RTTStats,
+	connStats *utils.ConnectionStats,
+	initialMaxDatagramSize protocol.ByteCount,
+	qlogger qlogwriter.Recorder,
+) *cubicSender {
+	c := NewCubicSender(clock, rttStats, connStats, initialMaxDatagramSize, false, qlogger)
+	c.lossTolerant = true
+	return c
 }
 
 func newCubicSender(
@@ -187,6 +204,9 @@ func (c *cubicSender) OnPacketAcked(
 	eventTime monotime.Time,
 ) {
 	c.largestAckedPacketNumber = max(ackedPacketNumber, c.largestAckedPacketNumber)
+	if c.lossTolerant {
+		c.outcomes.onAcked()
+	}
 	if c.InRecovery() {
 		return
 	}
@@ -199,10 +219,17 @@ func (c *cubicSender) OnPacketAcked(
 func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lostBytes, priorInFlight protocol.ByteCount) {
 	c.connStats.PacketsLost.Add(1)
 	c.connStats.BytesLost.Add(uint64(lostBytes))
+	if c.lossTolerant {
+		c.outcomes.onLost()
+	}
 
 	// TCP NewReno (RFC6582) says that once a loss occurs, any losses in packets
 	// already sent should be treated as a single loss event, since it's expected.
 	if packetNumber <= c.largestSentAtLastCutback {
+		return
+	}
+	// AERO fork（ADR-0019）：丢包率低且没有排队，按随机丢包处理，不降窗口、不进入恢复。
+	if c.lossTolerant && c.outcomes.ratio() < lossTolerantRatio && !rttInflated(c.rttStats) {
 		return
 	}
 	c.lastCutbackExitedSlowstart = c.InSlowStart()

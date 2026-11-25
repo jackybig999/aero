@@ -90,8 +90,10 @@ type sentPacketHandler struct {
 	bytesInFlight protocol.ByteCount
 
 	congestion congestion.SendAlgorithmWithDebugInfos
-	rttStats   *utils.RTTStats
-	connStats  *utils.ConnectionStats
+	// lossTolerant 记住选择的发送方，连接迁移后重建拥塞控制时沿用（AERO fork，ADR-0019）。
+	lossTolerant bool
+	rttStats     *utils.RTTStats
+	connStats    *utils.ConnectionStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -117,6 +119,27 @@ var _ SentPacketHandler = &sentPacketHandler{}
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
 // If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
+// newSendAlgorithm 创建拥塞控制：默认与上游一致（NewReno，见下），lossTolerant 为真时用对随机丢包不敏感的发送方。
+func newSendAlgorithm(
+	rttStats *utils.RTTStats,
+	connStats *utils.ConnectionStats,
+	initialMaxDatagramSize protocol.ByteCount,
+	qlogger qlogwriter.Recorder,
+	lossTolerant bool,
+) congestion.SendAlgorithmWithDebugInfos {
+	if lossTolerant {
+		return congestion.NewLossTolerantSender(congestion.DefaultClock{}, rttStats, connStats, initialMaxDatagramSize, qlogger)
+	}
+	return congestion.NewCubicSender(
+		congestion.DefaultClock{},
+		rttStats,
+		connStats,
+		initialMaxDatagramSize,
+		true, // use Reno
+		qlogger,
+	)
+}
+
 func NewSentPacketHandler(
 	initialPN protocol.PacketNumber,
 	initialMaxDatagramSize protocol.ByteCount,
@@ -129,14 +152,28 @@ func NewSentPacketHandler(
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) SentPacketHandler {
-	congestion := congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		rttStats,
-		connStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		qlogger,
+	return NewSentPacketHandlerWithCongestionControl(
+		initialPN, initialMaxDatagramSize, rttStats, connStats, clientAddressValidated, enableECN,
+		ignorePacketsBelow, pers, qlogger, logger, false,
 	)
+}
+
+// NewSentPacketHandlerWithCongestionControl 与 NewSentPacketHandler 相同，另可选对随机丢包不敏感的发送方
+// （quic.Config.CongestionControl == "lossy"，AERO fork，ADR-0019）。
+func NewSentPacketHandlerWithCongestionControl(
+	initialPN protocol.PacketNumber,
+	initialMaxDatagramSize protocol.ByteCount,
+	rttStats *utils.RTTStats,
+	connStats *utils.ConnectionStats,
+	clientAddressValidated bool,
+	enableECN bool,
+	ignorePacketsBelow func(protocol.PacketNumber),
+	pers protocol.Perspective,
+	qlogger qlogwriter.Recorder,
+	logger utils.Logger,
+	lossTolerant bool,
+) SentPacketHandler {
+	congestion := newSendAlgorithm(rttStats, connStats, initialMaxDatagramSize, qlogger, lossTolerant)
 
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
@@ -148,6 +185,7 @@ func NewSentPacketHandler(
 		rttStats:                       rttStats,
 		connStats:                      connStats,
 		congestion:                     congestion,
+		lossTolerant:                   lossTolerant,
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
 		qlogger:                        qlogger,
@@ -1131,13 +1169,6 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	for pn := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
-	h.congestion = congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		h.rttStats,
-		h.connStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		h.qlogger,
-	)
+	h.congestion = newSendAlgorithm(h.rttStats, h.connStats, initialMaxDatagramSize, h.qlogger, h.lossTolerant)
 	h.setLossDetectionTimer(now)
 }

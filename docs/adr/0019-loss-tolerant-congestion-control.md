@@ -20,12 +20,12 @@
 | 每方向 0.5% 丢包 | 1.9 Mbit/s |
 | 同上，发送方忽略随机丢包（实验副本） | 97~128 Mbit/s |
 
-根因：quic-go v0.63.0 的拥塞控制只有 CUBIC（`internal/congestion`），没有对外的替换接口；CUBIC 把每次丢包当作拥塞并降低窗口。随机丢包的长距离链路上窗口涨不起来。
+根因：quic-go v0.63.0 的拥塞控制只有一种基于丢包的实现（`internal/congestion`，创建时写的是 `true, // use Reno`，即 NewReno：丢包乘 0.7，拥塞避免期每个往返只加一个包），没有对外的替换接口。随机丢包的长距离链路上窗口既被反复压低，又因为每个往返只涨一个包而恢复极慢（往返 190ms 时恢复一次要几百个往返）。
 DATAGRAM 帧同样受拥塞控制约束：RFC 9221 §5.4 “DATAGRAM frames employ the QUIC connection's congestion controller”，§5.2 它们是 ack-eliciting；quic-go 里 ack-eliciting 的包增加 `bytesInFlight` 并调用 `congestion.OnPacketSent`（`internal/ackhandler/sent_packet_handler.go:285-300`）。所以 IP 数据报同样受限。TCP 在其上还有第二层拥塞控制（RFC 9484 §10），丢包被两层放大。
 
 ## 备选
 A. BBR 发送方：按带宽与时延模型发送，不把随机丢包当拥塞。业界标准做法；工作量最大，需带宽瓶颈测试验证公平性与不过冲。
-B. 低丢包不降窗口的 CUBIC：改动小；丢包率低于阈值且 RTT 没有膨胀时不降窗口，其余按原 CUBIC。经验规则，真拥塞时不如 BBR 稳。
+B. “lossy” 发送方：CUBIC 增长曲线（按时间增长，与往返时延无关）加选择性的丢包响应——最近丢包率低于 5% 且平滑 RTT 没有明显高于最小 RTT（没有在排队）时，把丢包当作随机丢包，不降窗口；否则按原行为降窗口。经验规则，真拥塞时不如 BBR 稳。
 C. Brutal（固定速率）：按订阅里的带宽固定速率发送，不理丢包。最简单；需要每用户配带宽，配高了会塞满自己的出口线路。
 D. 不改拥塞控制，改为终结 TCP 后经 QUIC 流转发：违反 ADR-0012 第 1 条（禁止用户态协议栈）与既定“永不用 gVisor”，排除。
 

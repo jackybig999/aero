@@ -108,6 +108,8 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(uint64(4321)))
 		case "MaxConnectionReceiveWindow":
 			f.Set(reflect.ValueOf(uint64(10)))
+		case "CongestionControl":
+			f.Set(reflect.ValueOf("lossy"))
 		case "MaxIncomingStreams":
 			f.Set(reflect.ValueOf(int64(11)))
 		case "MaxIncomingUniStreams":

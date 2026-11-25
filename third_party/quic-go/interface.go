@@ -178,6 +178,12 @@ type Config struct {
 	Allow0RTT bool
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
+	// CongestionControl selects the congestion control algorithm (AERO fork, ADR-0019).
+	// "" or "cubic": the upstream behavior (loss-based; every loss reduces the window).
+	// "lossy": CUBIC growth, and losses are not treated as congestion while the recent loss rate is low and
+	// the RTT is not inflated (no queue building up). Meant for long-distance paths with random loss.
+	// Unknown values behave like "cubic". Each endpoint controls the algorithm of the data it sends.
+	CongestionControl string
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-09.
 	EnableStreamResetPartialDelivery bool
