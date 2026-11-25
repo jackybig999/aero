@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
 
@@ -66,7 +67,11 @@ func (s *QUICServer) hopDoH() (*http.Client, error) {
 				InsecureSkipVerify: s.allowLoopbackForTest.Load(),
 				NextProtos:         []string{"h3"},
 			},
-			QUICConfig: DefaultQUICConfig(),
+			QUICConfig: func() *quic.Config {
+				c := DefaultQUICConfig()
+				c.CongestionControl = s.hopCongestionControl()
+				return c
+			}(),
 		}
 		s.hopDoHc.tr = tr
 		s.hopDoHc.client = &http.Client{

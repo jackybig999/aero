@@ -383,6 +383,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 		InitialConnectionReceiveWindow: 32 * 1024 * 1024,
 		MaxConnectionReceiveWindow:     64 * 1024 * 1024,
 		InitialPacketSize:              0,
+		CongestionControl:              congestionControl(), // ADR-0019：默认对随机丢包不敏感的发送方
 	}
 
 	factory := cfg.PacketConnFactory

@@ -177,6 +177,10 @@ func runRoot(t *testing.T) {
 
 	// 客户端第一阶段通过后重启 edge，验证客户端自动重连
 	waitFile(t, filepath.Join(dir, "client-phase1"), 90*time.Second)
+	if os.Getenv("AERO_E2E_TBF") != "" { // 瓶颈队列的统计：dropped 是瓶颈处被丢弃的包数，反映发送方过冲了多少
+		out, _ := exec.Command("tc", "-s", "qdisc", "show", "dev", "veth-ac").CombinedOutput()
+		t.Logf("BOTTLENECK veth-ac (edge->client):\n%s", out)
+	}
 	stopProc(t, edge, "edge")
 	edge = startEdge(t, dir, cfgFile, httpc)
 	_ = os.WriteFile(filepath.Join(dir, "edge-restarted"), nil, 0o644)
@@ -387,7 +391,7 @@ func roleClient(t *testing.T) {
 		fmt.Sscan(mb, &n)
 		for i := 0; i < 2; i++ { // 两次：第二次排除拥塞窗口冷启动
 			bytes, d, err := socksBulk(internetIP+":80", n)
-			t.Logf("BULK run %d: %d bytes in %v = %.2f Mbit/s (err=%v) netem=%q", i+1, bytes, d.Round(time.Millisecond), float64(bytes)*8/d.Seconds()/1e6, err, os.Getenv("AERO_E2E_NETEM"))
+			t.Logf("BULK run %d: %d bytes in %v = %.2f Mbit/s (err=%v) netem=%q tbf=%q", i+1, bytes, d.Round(time.Millisecond), float64(bytes)*8/d.Seconds()/1e6, err, os.Getenv("AERO_E2E_NETEM"), os.Getenv("AERO_E2E_TBF"))
 		}
 	}
 
@@ -550,15 +554,22 @@ func socksHandshake(c net.Conn, cmd byte, target string) (net.Addr, error) {
 	return &net.UDPAddr{IP: net.IP(rep[4:8]), Port: int(binary.BigEndian.Uint16(rep[8:10]))}, nil
 }
 
-// applyNetem 在 dev 上按 AERO_E2E_NETEM（如 "delay 95ms 5ms loss 0.5%"）注入延迟与丢包，用来复现长距离、有丢包的链路。
-// 未设置时什么也不做。两端各设一次，所以延迟与丢包在两个方向各生效一次。
+// applyNetem 在 dev 上按 AERO_E2E_NETEM（如 "delay 95ms 5ms loss 0.5%"）注入延迟与丢包，用来复现长距离、有丢包的链路；
+// AERO_E2E_TBF（如 "rate 20mbit burst 32kb limit 150kb"）在其后加一个带宽瓶颈（令牌桶，limit 是缓冲区大小），
+// 用来验证拥塞控制在真拥塞时仍会退让。两个都未设置时什么也不做。两端各设一次，所以在两个方向各生效一次。
 func applyNetem(t *testing.T, dev string) {
 	t.Helper()
-	spec := strings.Fields(os.Getenv("AERO_E2E_NETEM"))
-	if len(spec) == 0 {
-		return
+	netem := strings.Fields(os.Getenv("AERO_E2E_NETEM"))
+	tbf := strings.Fields(os.Getenv("AERO_E2E_TBF"))
+	switch {
+	case len(netem) > 0 && len(tbf) > 0:
+		must(t, "tc", append([]string{"qdisc", "add", "dev", dev, "root", "handle", "1:", "netem"}, netem...)...)
+		must(t, "tc", append([]string{"qdisc", "add", "dev", dev, "parent", "1:1", "handle", "10:", "tbf"}, tbf...)...)
+	case len(netem) > 0:
+		must(t, "tc", append([]string{"qdisc", "add", "dev", dev, "root", "netem"}, netem...)...)
+	case len(tbf) > 0:
+		must(t, "tc", append([]string{"qdisc", "add", "dev", dev, "root", "tbf"}, tbf...)...)
 	}
-	must(t, "tc", append([]string{"qdisc", "add", "dev", dev, "root", "netem"}, spec...)...)
 }
 
 // socksBulk 经 SOCKS 下载 /bulk?mb=N，返回收到的字节数与耗时（读到 150 秒截止）。

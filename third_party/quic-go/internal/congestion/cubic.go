@@ -129,6 +129,17 @@ func (c *Cubic) OnApplicationLimited() {
 // a loss event. Returns the new congestion window in packets. The new
 // congestion window is a multiplicative decrease of our current window.
 func (c *Cubic) CongestionWindowAfterPacketLoss(currentCongestionWindow protocol.ByteCount) protocol.ByteCount {
+	return c.windowAfterLoss(currentCongestionWindow, c.beta())
+}
+
+// CongestionWindowAfterMildLoss 与 CongestionWindowAfterPacketLoss 相同，只是降幅由 factor 决定
+// （AERO fork，ADR-0019：丢包率偏高但没有排队时只轻降）。同样更新 lastMaxCongestionWindow 并重置 epoch，
+// 使 CUBIC 的增长曲线从降低后的窗口重新开始；否则一个往返后窗口会回到降之前的值，轻降就没有效果。
+func (c *Cubic) CongestionWindowAfterMildLoss(currentCongestionWindow protocol.ByteCount, factor float32) protocol.ByteCount {
+	return c.windowAfterLoss(currentCongestionWindow, factor)
+}
+
+func (c *Cubic) windowAfterLoss(currentCongestionWindow protocol.ByteCount, factor float32) protocol.ByteCount {
 	if currentCongestionWindow+maxDatagramSize < c.lastMaxCongestionWindow {
 		// We never reached the old max, so assume we are competing with another
 		// flow. Use our extra back off factor to allow the other flow to go up.
@@ -137,7 +148,7 @@ func (c *Cubic) CongestionWindowAfterPacketLoss(currentCongestionWindow protocol
 		c.lastMaxCongestionWindow = currentCongestionWindow
 	}
 	c.epoch = 0 // Reset time.
-	return protocol.ByteCount(float32(currentCongestionWindow) * c.beta())
+	return protocol.ByteCount(float32(currentCongestionWindow) * factor)
 }
 
 // CongestionWindowAfterAck computes a new congestion window to use after a received ACK.

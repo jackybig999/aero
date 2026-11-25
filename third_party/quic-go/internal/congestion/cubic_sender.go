@@ -33,6 +33,9 @@ type cubicSender struct {
 	// lossTolerant 为真时，丢包率低且没有排队的丢包事件不降窗口（AERO fork，ADR-0019）。
 	lossTolerant bool
 	outcomes     lossStats
+	// largestSentAtMildCut：轻降发生时已发出的最大包号。同一批丢失的包只轻降一次；
+	// 与 largestSentAtLastCutback 分开记，这样同一批里丢包率继续升高到 lossHardRatio 以上时仍能升级为原行为的降窗。
+	largestSentAtMildCut protocol.PacketNumber
 
 	// Track the largest packet that has been sent.
 	largestSentPacketNumber protocol.PacketNumber
@@ -120,6 +123,7 @@ func newCubicSender(
 		largestSentPacketNumber:    protocol.InvalidPacketNumber,
 		largestAckedPacketNumber:   protocol.InvalidPacketNumber,
 		largestSentAtLastCutback:   protocol.InvalidPacketNumber,
+		largestSentAtMildCut:       protocol.InvalidPacketNumber,
 		initialCongestionWindow:    initialCongestionWindow,
 		initialMaxCongestionWindow: initialMaxCongestionWindow,
 		congestionWindow:           initialCongestionWindow,
@@ -219,7 +223,10 @@ func (c *cubicSender) OnPacketAcked(
 func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lostBytes, priorInFlight protocol.ByteCount) {
 	c.connStats.PacketsLost.Add(1)
 	c.connStats.BytesLost.Add(uint64(lostBytes))
-	if c.lossTolerant {
+	// lostBytes == 0 是 ECN-CE 标记（sent_packet_handler.go 里 OnCongestionEvent(largestAcked, 0, ...)）：
+	// 路径明确在告知拥塞（RFC 9002 §7.1），始终按原行为处理，不计入丢包统计、不适用丢包容忍。
+	isLoss := lostBytes > 0
+	if c.lossTolerant && isLoss {
 		c.outcomes.onLost()
 	}
 
@@ -228,9 +235,23 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	if packetNumber <= c.largestSentAtLastCutback {
 		return
 	}
-	// AERO fork（ADR-0019）：丢包率低且没有排队，按随机丢包处理，不降窗口、不进入恢复。
-	if c.lossTolerant && c.outcomes.ratio() < lossTolerantRatio && !rttInflated(c.rttStats) {
-		return
+	// AERO fork（ADR-0019）：没有排队时按最近的丢包率分级响应（见 loss_tolerant.go）。
+	if c.lossTolerant && isLoss && !rttInflated(c.rttStats) {
+		switch ratio := c.outcomes.ratio(); {
+		case ratio < lossTolerantRatio:
+			return // 随机丢包：不降窗口、不进入恢复
+		case ratio < lossHardRatio:
+			if packetNumber <= c.largestSentAtMildCut {
+				return // 这一批已经轻降过
+			}
+			// 丢包率偏高但没有排队：轻降一次并退出慢启动。CUBIC 的 epoch 与 lastMax 同样更新，增长曲线从新窗口开始。
+			c.congestionWindow = max(c.cubic.CongestionWindowAfterMildLoss(c.congestionWindow, lossMildCutFactor), c.minCongestionWindow())
+			c.slowStartThreshold = c.congestionWindow
+			c.largestSentAtMildCut = c.largestSentPacketNumber
+			c.numAckedPackets = 0
+			return
+		}
+		// ratio >= lossHardRatio：落到下面，按原行为降窗口（同一批里丢包率继续升高时会升级到这里）
 	}
 	c.lastCutbackExitedSlowstart = c.InSlowStart()
 	c.maybeQlogStateChange(qlog.CongestionStateRecovery)

@@ -101,20 +101,83 @@ func TestLossTolerantBacksOffWhenQueueBuilds(t *testing.T) {
 	n := s.SendAvailableSendWindow()
 	s.LoseNPackets(1)
 	s.AckNPackets(n - 1)
-	require.Less(t, s.sender.GetCongestionWindow(), before, "排队时丢包应降窗口")
+	require.Less(t, float64(s.sender.GetCongestionWindow()), float64(before)*0.75, "排队时丢包应按原行为降窗")
 }
 
-// 丢包率高（超过阈值）时，即使 RTT 没膨胀也降窗口。
+// 把发送方放进拥塞避免阶段（退出慢启动），窗口约为 packets 个包。
+func (s *testCubicSender) enterCongestionAvoidance(t *testing.T, packets int) {
+	t.Helper()
+	s.growTo(t, packets)
+	s.sender.slowStartThreshold = s.sender.congestionWindow
+	require.False(t, s.sender.InSlowStart())
+}
+
+// primeLossRatio 直接把丢包统计设为窗口大小下的指定丢包率（不经过发送/确认流程，用来构造“已有一定丢包率”的状态）。
+func (s *testCubicSender) primeLossRatio(t *testing.T, ratio float64) {
+	t.Helper()
+	s.sender.outcomes = lossStats{acked: float64(lossWindowSamples) * (1 - ratio), lost: float64(lossWindowSamples) * ratio}
+}
+
+// 丢包率介于两个阈值之间（没有排队）：只轻降到约 0.85 倍，并且 CUBIC 的增长曲线从降低后的窗口重新开始：
+// 一个往返后窗口不会弹回降之前的值。
+func TestLossTolerantMildCutBetweenThresholds(t *testing.T) {
+	s := newTestLossTolerantSender()
+	s.enterCongestionAvoidance(t, 150)
+	s.primeLossRatio(t, 0.14) // 高于 lossTolerantRatio，低于 lossHardRatio；再来一次丢包仍在这一档
+	before := s.sender.GetCongestionWindow()
+
+	n := s.SendAvailableSendWindow()
+	s.LoseNPackets(1)
+	after := s.sender.GetCongestionWindow()
+	require.InDelta(t, float64(before)*lossMildCutFactor, float64(after), float64(maxDatagramSize), "应轻降到约 0.85 倍")
+	require.Greater(t, s.sender.cubic.lastMaxCongestionWindow, protocol.ByteCount(0), "lastMax 应更新")
+	require.True(t, s.sender.cubic.epoch.IsZero(), "epoch 应重置")
+
+	// 同一批里再丢包：不再重复轻降
+	s.LoseNPackets(1)
+	require.Equal(t, after, s.sender.GetCongestionWindow(), "同一批只轻降一次")
+
+	// 确认这一批剩下的包，再发满、确认一个窗口（大约一个往返）：窗口不应回到降之前的值。
+	// 没有重置 CUBIC 的 epoch 与 lastMax 时，窗口一个往返后就回到降之前（审核实测 217739 → 185078 → 217742）。
+	s.AckNPackets(n - 2)
+	m := s.SendAvailableSendWindow()
+	s.AckNPackets(m)
+	require.Less(t, float64(s.sender.GetCongestionWindow()), float64(before)*0.97, "增长曲线应从降低后的窗口开始，一个往返不会回到原值")
+}
+
+// 同一批丢包里丢包率继续升高到 lossHardRatio 以上：从轻降升级为原行为的降窗，不能只降 0.85 就结束。
+func TestLossTolerantEscalatesToFullCutWithinABatch(t *testing.T) {
+	s := newTestLossTolerantSender()
+	s.enterCongestionAvoidance(t, 150)
+	before := s.sender.GetCongestionWindow()
+	n := s.SendAvailableSendWindow()
+	s.LoseNPackets(n * 2 / 5) // 一批里丢 40%
+	require.Less(t, float64(s.sender.GetCongestionWindow()), float64(before)*0.75, "严重丢包应按原行为降到约 0.7 倍以下")
+}
+
+// ECN-CE 标记（lostBytes == 0）始终按原行为降窗，不受丢包容忍影响（RFC 9002 §7.1）。
+func TestLossTolerantECNAlwaysCuts(t *testing.T) {
+	s := newTestLossTolerantSender()
+	s.enterCongestionAvoidance(t, 150)
+	s.primeLossRatio(t, 0) // 统计里没有丢包
+	before := s.sender.GetCongestionWindow()
+	s.SendAvailableSendWindow()
+	s.sender.OnCongestionEvent(s.packetNumber-1, 0, s.bytesInFlight)
+	require.Less(t, float64(s.sender.GetCongestionWindow()), float64(before)*0.75, "ECN 应按原行为降窗")
+	require.Zero(t, s.sender.outcomes.lost, "ECN 事件不计入丢包统计")
+}
+
+// 丢包率很高（超过 lossHardRatio）时，即使 RTT 没膨胀也按原行为降窗口。
 func TestLossTolerantBacksOffOnHighLossRate(t *testing.T) {
 	s := newTestLossTolerantSender()
 	s.growTo(t, 150)
 	before := s.sender.GetCongestionWindow()
-	// 一批里丢 20%：丢包率远高于 lossTolerantRatio
+	// 统计窗口里已经有 30% 的丢包（高于 lossHardRatio）：再来一次丢包就按原行为降窗
+	s.primeLossRatio(t, 0.30)
 	n := s.SendAvailableSendWindow()
-	lost := n / 5
-	s.LoseNPackets(lost)
-	s.AckNPackets(n - lost)
-	require.Less(t, s.sender.GetCongestionWindow(), before, "高丢包率应降窗口")
+	s.LoseNPackets(1)
+	s.AckNPackets(n - 1)
+	require.Less(t, float64(s.sender.GetCongestionWindow()), float64(before)*0.75, "高丢包率应按原行为降到约 0.7 倍以下，而不是只轻降")
 }
 
 // 默认（lossTolerant=false）行为与上游完全一致：随机丢包照样降窗口。

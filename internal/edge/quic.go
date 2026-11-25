@@ -958,7 +958,9 @@ func (s *QUICServer) dialHopConn(nextHopAddr string) (*hopPooledConn, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	qConn, err := quic.DialAddr(ctx, nextHopAddr, tlsConf, DefaultQUICConfig())
+	hopCfg := DefaultQUICConfig()
+	hopCfg.CongestionControl = s.hopCongestionControl()
+	qConn, err := quic.DialAddr(ctx, nextHopAddr, tlsConf, hopCfg)
 	if err != nil {
 		// 故意用 %v 而不是 %w，原因见 dialNextHopUDP。
 		return nil, fmt.Errorf("dial next hop %s over quic: %v", nextHopAddr, err)
@@ -982,7 +984,7 @@ func (s *QUICServer) dialNextHopUDP(nextHopAddr, target, hopCred string) (net.Co
 	}
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dialCancel()
-	qConn, err := quic.DialAddr(dialCtx, nextHopAddr, tlsConf, &quic.Config{EnableDatagrams: true})
+	qConn, err := quic.DialAddr(dialCtx, nextHopAddr, tlsConf, &quic.Config{EnableDatagrams: true, CongestionControl: s.hopCongestionControl()})
 	if err != nil {
 		// 故意用 %v 而不是 %w：下一跳地址解析失败若被 rejectDial 识别成 DNS 错误，会返回
 		// destination_ip_unroutable，与契约“出口失败一律 502 connection_refused”不符（api/dataplane.md §8）。
@@ -1260,6 +1262,38 @@ func (s *QUICServer) releaseUDPSlot(token string) {
 // 4. QUIC Listener & Connection Loop
 // ==========================================
 
+// CongestionControlEnv 与客户端同名：设置后优先于配置文件（测试与临时回退用）。
+const CongestionControlEnv = "AERO_CONGESTION_CONTROL"
+
+// DefaultCongestionControl 是服务端（下行，由节点发送）的默认值：先保持上游行为，节点用 `aero cc lossy` 单独开启（ADR-0019，灰度）。
+// 客户端的默认值是 lossy（只影响它自己发出的上行）。
+const DefaultCongestionControl = "cubic"
+
+// ValidCongestionControl 判断 congestion_control 的取值是否合法。
+func ValidCongestionControl(v string) bool { return v == "lossy" || v == "cubic" }
+
+// ResolveCongestionControl 决定下行使用的拥塞控制：环境变量 > 配置 > 默认（DefaultCongestionControl）；无效的值回落到默认。
+// 背景见 ADR-0019：上游基于丢包的拥塞控制在长距离随机丢包链路上吞吐只有 1~5 Mbit/s；lossy 对随机丢包不敏感。
+func ResolveCongestionControl(cfgValue string) string {
+	if v := os.Getenv(CongestionControlEnv); ValidCongestionControl(v) {
+		return v
+	}
+	if ValidCongestionControl(cfgValue) {
+		return cfgValue
+	}
+	return DefaultCongestionControl
+}
+
+// hopCongestionControl 是入口节点向出口节点拨号时使用的拥塞控制：与本节点监听侧用同一个设置（ADR-0019）。
+// 入口到出口很可能就是跨境的那一段，上行数据由入口发送，不能只改监听侧。
+func (s *QUICServer) hopCongestionControl() string {
+	var v string
+	if s != nil && s.cfg != nil {
+		v = s.cfg.CongestionControl
+	}
+	return ResolveCongestionControl(v)
+}
+
 // DefaultQUICConfig returns the hardened QUIC configuration for AERO edge nodes
 func DefaultQUICConfig() *quic.Config {
 	return &quic.Config{
@@ -1283,6 +1317,12 @@ func StartQUIC(addr string, tlsConfig *tls.Config, server *QUICServer, ctx conte
 	}
 
 	quicCfg := DefaultQUICConfig()
+	var cfgCC string
+	if server != nil && server.cfg != nil {
+		cfgCC = server.cfg.CongestionControl
+	}
+	quicCfg.CongestionControl = ResolveCongestionControl(cfgCC)
+	log.Printf("[EDGE] QUIC congestion control: %s", quicCfg.CongestionControl)
 
 	// 根据部署 Profile 动态收紧接收窗口，防范 512MB VPS 内存撑爆 (SEC-02)
 	if server != nil && server.cfg != nil {

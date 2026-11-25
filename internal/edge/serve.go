@@ -45,20 +45,21 @@ var coverCSS []byte
 
 // ServerConfig configures the AERO edge server
 type ServerConfig struct {
-	Listen                     string                        `json:"listen"`         // e.g. ":443"
-	Domain                     string                        `json:"domain"`         // public domain / SNI
-	Token                      string                        `json:"token"`          // initial auth token (auto if empty)
-	CertFile                   string                        `json:"cert_file"`      // TLS cert PEM
-	KeyFile                    string                        `json:"key_file"`       // TLS key PEM
-	DataDir                    string                        `json:"data_dir"`       // data dir for tokens.json / client-sub.json
-	AdminKey                   string                        `json:"admin_key"`      // admin auth key
-	Profile                    string                        `json:"profile"`        // tiny|small|medium
-	MaxConn                    int                           `json:"max_conn"`       // max tunnels global
-	MaxConnUser                int                           `json:"max_conn_user"`  // max tunnels per user
-	RateIP                     int                           `json:"rate_ip"`        // new conns/s/IP
-	BWUser                     int                           `json:"bw_user"`        // bytes/s per token
-	AdvertiseHost              string                        `json:"advertise_host"` // host in subscription
-	CoverName                  string                        `json:"cover_name"`     // cover site title
+	Listen                     string                        `json:"listen"`                       // e.g. ":443"
+	Domain                     string                        `json:"domain"`                       // public domain / SNI
+	Token                      string                        `json:"token"`                        // initial auth token (auto if empty)
+	CertFile                   string                        `json:"cert_file"`                    // TLS cert PEM
+	KeyFile                    string                        `json:"key_file"`                     // TLS key PEM
+	DataDir                    string                        `json:"data_dir"`                     // data dir for tokens.json / client-sub.json
+	AdminKey                   string                        `json:"admin_key"`                    // admin auth key
+	Profile                    string                        `json:"profile"`                      // tiny|small|medium
+	MaxConn                    int                           `json:"max_conn"`                     // max tunnels global
+	MaxConnUser                int                           `json:"max_conn_user"`                // max tunnels per user
+	RateIP                     int                           `json:"rate_ip"`                      // new conns/s/IP
+	BWUser                     int                           `json:"bw_user"`                      // bytes/s per token
+	CongestionControl          string                        `json:"congestion_control,omitempty"` // lossy（默认）|cubic：下行（服务端发送）的 QUIC 拥塞控制，ADR-0019
+	AdvertiseHost              string                        `json:"advertise_host"`               // host in subscription
+	CoverName                  string                        `json:"cover_name"`                   // cover site title
 	LineType                   string                        `json:"line_type,omitempty" yaml:"line_type"`
 	ISPAffinity                string                        `json:"isp_affinity,omitempty" yaml:"isp_affinity"`
 	IP                         string                        `json:"ip,omitempty" yaml:"ip"`

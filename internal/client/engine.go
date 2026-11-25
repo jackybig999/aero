@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.6.3"
+	ClientVersion = "1.7.0"
 	Protocol      = "aero/3.0"
 )
 
@@ -1144,6 +1144,7 @@ func (e *Engine) startLocked(ticket uint64) error {
 	actualPort := cl.ActualPort()
 	rtt := time.Since(start)
 	tr.note("port=%d", actualPort)
+	tr.note("cc=%s", congestionControl()) // 本端上行用的拥塞控制（ADR-0019）
 	tr.enter("connect-ip")
 
 	// 多端口跳频动态对齐 (Port Hopping Alignment Contract)

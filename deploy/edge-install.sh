@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REPO="jackybig999/aero"
-VERSION="1.6.3"
+VERSION="1.7.0"
 VERSION="${AERO_VERSION:-$VERSION}"
 BIN=/usr/local/bin/aero-edge
 CLI=/usr/local/bin/aero
@@ -80,6 +80,7 @@ if [[ $UPGRADE -eq 1 ]]; then
   if "$BIN" check -config "$CONFIG"; then
     systemctl restart aero-edge
     echo "已升级到 v${VERSION} 并重启服务。"
+    echo "提示：往返长、有随机丢包的链路上网页/下载/AI 很慢时，执行 aero cc lossy 开启对随机丢包不敏感的拥塞控制；aero cc cubic 回退。"
   else
     echo "已升级到 v${VERSION}，但检查未通过，服务保持运行旧进程；修复后执行: aero restart"
   fi

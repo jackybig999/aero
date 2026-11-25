@@ -34,7 +34,7 @@ var (
 const minAdminKeyLen = 32
 
 // configKeys 是允许经命令行修改的配置项（其余配置由 edge 自己维护）。
-var configKeys = []string{"domain", "listen", "admin_key", "warp", "usage_api", "remote_admin_v1", "connect_ip", "token_issuer"}
+var configKeys = []string{"domain", "listen", "admin_key", "warp", "usage_api", "remote_admin_v1", "connect_ip", "token_issuer", "congestion_control"}
 
 func readConfigMap(path string) (map[string]any, error) {
 	m := map[string]any{}
@@ -110,6 +110,11 @@ func ConfigSet(path, key, value string) (string, error) {
 		}
 		iss[kid] = pub
 		m["token_issuers"] = iss
+	case "congestion_control":
+		if !ValidCongestionControl(value) {
+			return "", fmt.Errorf("congestion_control must be lossy or cubic")
+		}
+		m[key] = value
 	case "usage_api", "remote_admin_v1", "connect_ip":
 		b, err := strconv.ParseBool(value)
 		if err != nil {
@@ -144,6 +149,11 @@ func ConfigGet(path, key string) (string, error) {
 			return "all", nil
 		}
 		return "ai", nil
+	case "congestion_control": // 未设置或无效时返回默认值（不含环境变量覆盖），方便 aero cc 直接显示当前生效的取值
+		if v, _ := m[key].(string); ValidCongestionControl(v) {
+			return v, nil
+		}
+		return DefaultCongestionControl, nil
 	case "domain", "listen", "admin_key", "usage_api", "remote_admin_v1", "connect_ip", "metering_key", "node_id", "cert_file", "key_file", "data_dir":
 		if v, ok := m[key]; ok && v != nil {
 			return fmt.Sprint(v), nil
@@ -176,6 +186,11 @@ func CheckNode(path string) []CheckItem {
 		return out
 	}
 	add("OK", "config", "%s", path)
+	if cc := strings.TrimSpace(cfg.CongestionControl); cc != "" && !ValidCongestionControl(cc) {
+		add("FAIL", "congestion_control", "%q is invalid (aero-edge config set congestion_control lossy|cubic)", cc)
+	} else {
+		add("OK", "congestion_control", "%s", ResolveCongestionControl(cc))
+	}
 	isIngress := strings.EqualFold(strings.TrimSpace(cfg.Role), "ingress")
 	if isIngress {
 		if strings.TrimSpace(cfg.NextHopAddr) == "" {

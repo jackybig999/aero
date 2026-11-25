@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AERO Edge 节点运维命令 v1.6.3
+# AERO Edge 节点运维命令 v1.7.0
 #
 # 安装只安装服务端（edge-install.sh）；域名、证书、WARP、端口、管理密钥都在本机用本命令完成：
 # 修改经 `aero-edge config` 校验后由 edge 写入自己的配置，`aero-edge check` 全部通过后才（重新）启动服务。
@@ -184,6 +184,18 @@ cmd_tunnel() {
     *) echo " 全局隧道: $( [[ "$(cfg_get connect_ip)" == false ]] && echo 关闭 || echo 开启 )（aero tunnel on|off）"; return 0 ;;
   esac
   check_and_restart
+}
+
+# 拥塞控制（ADR-0019）：lossy 对随机丢包不敏感，适合往返长、有随机丢包的跨境链路（默认的 cubic 在这类链路上
+# 网页、下载、AI 会很慢）；cubic 是上游默认行为。节点发出的数据（客户端的下载方向）由这里的设置决定。
+cmd_cc() {
+  need_root
+  case "${1:-}" in
+    lossy|cubic) cfg_set congestion_control "$1" ;;
+    status|"") echo " 拥塞控制: $(cfg_get congestion_control)（aero cc lossy|cubic；lossy 适合往返长、有随机丢包的链路，cubic 为默认）"; return 0 ;;
+    *) err "用法: aero cc [status|lossy|cubic]"; return 1 ;;
+  esac
+  check_and_restart && echo " 拥塞控制已设为: $(cfg_get congestion_control)；客户端自己发出的数据用客户端环境变量 AERO_CONGESTION_CONTROL（lossy 默认，cubic 回退）。"
 }
 
 cmd_port() {
@@ -389,17 +401,18 @@ cmd_menu() {
     menu_item 7 "证书（检查 / 签发）"
     menu_item 8 "修改主端口"
     menu_item 9 "全局隧道开关（CONNECT-IP）"
-    menu_item 10 "WARP 管理"
-    menu_item 11 "重置管理密钥"
+    menu_item 10 "拥塞控制开关（lossy / cubic，长距离有丢包的链路选 lossy）"
+    menu_item 11 "WARP 管理"
+    menu_item 12 "重置管理密钥"
     menu_title "【信息】"
-    menu_item 12 "节点地址与 Web 控制台链接"
-    menu_item 13 "TUN 与转发规则状态"
+    menu_item 13 "节点地址与 Web 控制台链接"
+    menu_item 14 "TUN 与转发规则状态"
     menu_title "【维护】"
-    menu_item 14 "升级服务端"
-    printf " ${R}%3s.${N} ${R}%s${N}\n" 15 "卸载 AERO Edge"
+    menu_item 15 "升级服务端"
+    printf " ${R}%3s.${N} ${R}%s${N}\n" 16 "卸载 AERO Edge"
     menu_item 0 "退出"
     echo
-    read -r -p "请选择 [0-15]: " c </dev/tty || { echo; return 0; }
+    read -r -p "请选择 [0-16]: " c </dev/tty || { echo; return 0; }
     case "$c" in
       1) menu_run setup ;;
       2) menu_run status ;;
@@ -414,12 +427,17 @@ cmd_menu() {
          else
            confirm "关闭全局隧道（只保留 TCP/UDP 代理与 DoH）?" && menu_run tunnel off || true
          fi ;;
-      10) menu_warp ;;
-      11) confirm "重置管理密钥（旧密钥立即失效，已登记该节点的中台需同步）?" && menu_run key || true ;;
-      12) menu_run info ;;
-      13) menu_run net ;;
-      14) menu_run update ;;
-      15) menu_run uninstall ;;
+      10) if [[ "$(cfg_get congestion_control)" == lossy ]]; then
+            confirm "切换为 cubic（上游默认行为；会重启服务，客户端短暂断开）?" && menu_run cc cubic || true
+          else
+            confirm "切换为 lossy（对随机丢包不敏感；会重启服务，客户端短暂断开）?" && menu_run cc lossy || true
+          fi ;;
+      11) menu_warp ;;
+      12) confirm "重置管理密钥（旧密钥立即失效，已登记该节点的中台需同步）?" && menu_run key || true ;;
+      13) menu_run info ;;
+      14) menu_run net ;;
+      15) menu_run update ;;
+      16) menu_run uninstall ;;
       0|q|Q) return 0 ;;
       "") ;;
       *) warn "无效选择: $c"; sleep 1 ;;
@@ -440,6 +458,7 @@ usage() {
                      WARP 官方客户端（可选插件）与 edge 使用开关
   port [端口]        主端口（默认 443，被占用时自动轮试）
   tunnel [on|off]    全局隧道 CONNECT-IP（关闭后不建 TUN、不改宿主，只提供 TCP/UDP 代理）
+  cc [lossy|cubic]   拥塞控制：lossy 对随机丢包不敏感（长距离、有丢包的链路，网页/下载/AI 慢时用），cubic 为默认
   key                生成新的管理密钥
   start|stop|restart|log
   info               节点地址与 Web 控制台链接
@@ -463,6 +482,7 @@ case "${1:-menu}" in
   warp) cmd_warp "${2:-status}" ;;
   port) cmd_port "${2:-}" ;;
   tunnel) cmd_tunnel "${2:-}" ;;
+  cc) cmd_cc "${2:-}" ;;
   key) cmd_key ;;
   start|restart) need_root; check_and_restart ;;
   stop) need_root; systemctl stop aero-edge && ok "已停止" ;;
