@@ -127,10 +127,16 @@ func (m *mockSessionPool) Reset() {
 
 // 验收项 3：订阅单飞与防雪崩 (singleflight)
 func TestLoadAndApplySubscriptionSingleflight(t *testing.T) {
-	fetchCount := atomic.Int32{}
+	// 处理器先登记“第一个请求已到”，再等 release：在途的那一次拉取一直开着，直到所有调用方都有足够时间加入它。
+	// 此前用固定 50ms 的睡眠，负载高的机器（Windows 运行器）上有协程晚于它结束才启动，会发起第二次拉取而误报。
+	var fetchCount atomic.Int32
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fetchCount.Add(1)
-		time.Sleep(50 * time.Millisecond)
+		once.Do(func() { close(arrived) })
+		<-release
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{
 			"version": "aero/3.0",
@@ -155,6 +161,13 @@ func TestLoadAndApplySubscriptionSingleflight(t *testing.T) {
 			_, errs[idx] = eng.LoadAndApplySubscription("https://singleflight.example.com/sub/superadmin")
 		}()
 	}
+	select {
+	case <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("第一个上游请求没有到达")
+	}
+	time.Sleep(500 * time.Millisecond) // 在途的拉取一直开着，所有协程在这段时间里都已调用并加入同一次拉取
+	close(release)
 	wg.Wait()
 
 	for i, err := range errs {
