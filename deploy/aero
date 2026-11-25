@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AERO Edge 节点运维命令 v1.6.1
+# AERO Edge 节点运维命令 v1.6.2
 #
 # 安装只安装服务端（edge-install.sh）；域名、证书、WARP、端口、管理密钥都在本机用本命令完成：
 # 修改经 `aero-edge config` 校验后由 edge 写入自己的配置，`aero-edge check` 全部通过后才（重新）启动服务。

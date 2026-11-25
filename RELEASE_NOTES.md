@@ -1,3 +1,16 @@
+## AERO 1.6.2
+
+只增加诊断日志，不改变任何行为；服务端无需配置，`aero update` 即可（客户端换新版才有这些日志）。
+
+### 客户端
+- **启动各阶段耗时写入 `client.log`**：`[START] detect-tun / resolve / quic-dial / connect-ip / ai-session / tun-open / data-plane`，每阶段一行，带阶段耗时与总耗时；QUIC 拨号一行还会带上最终使用的端口（不是订阅主端口时，说明主端口慢、备用端口胜出），ai-session 一行带 `ai=up` 或 `ai=failed(原因码)`。
+- **启动失败或被取消时写明停在哪个阶段**：`[START] FAILED at stage "…" after …` 与 `[START] CANCELLED at stage "…" after …`。此前界面等满 28 秒会自行取消并显示“连接超时”，被取消的启动不留任何日志，无法判断慢在哪一步。
+- ai 会话拨号失败时写一行 `[AI] session dial failed (reason=…)`。
+- 日志不含地址、令牌等敏感信息。
+
+### 文档
+- `docs/ai-channel-verification.md` 增加 Windows PowerShell 的写法（`curl` 在 PowerShell 里是 `Invoke-WebRequest` 的别名）与 `[START]` 日志的读法。
+
 ## AERO 1.6.1
 
 对 1.6.0 的审核（Opus）后续修复。数据面行为没有变化；单节点用户 `aero update` 即可。
