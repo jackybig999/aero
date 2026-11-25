@@ -96,3 +96,15 @@ v1.6.2 起，每次启动都会在 `client.log` 里记录各阶段耗时。界�
 [START] done, total 4.6s
 ```
 失败或取消时：`[START] FAILED at stage "quic-dial" after 8.0s (total 8.1s): <原因>` 或 `[START] CANCELLED at stage "connect-ip" after 20s ...`。把这几行贴给维护者即可定位。
+
+### 点“连接”之前的步骤（v1.6.3 起也有日志）
+点“连接”后，界面先 `POST /import`（导入订阅）再启动引擎。同一订阅在最近 10 分钟内已成功导入时，点连接会直接复用，不再走网络。日志里相关的行：
+```
+[API] import ok in 1.4s (nodes=1)                              ← 这次点连接确实拉了订阅（耗时 1.4 秒）
+[SUB] primary 443 failed after 2.5s (timeout), trying candidate ports   ← TCP/443 首包丢失，等满超时
+[SUB] network fetch failed, using the offline cached subscription (total 8.5s)
+[SUB] reused the subscription applied 3m0s ago (skipped the network fetch)  ← 复用，没有网络请求
+[START] waited 4.2s for the lifecycle lock (another start/stop was in progress)
+[API] connect accepted (ticket=3)
+```
+订阅拉取的错误只写类别（`timeout`、`refused`、`HTTP 503`），不含订阅地址。

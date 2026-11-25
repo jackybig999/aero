@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,6 +37,9 @@ var (
 
 //go:embed ui/*
 var uiEmbed embed.FS
+
+// subReuseMaxAge 是点“连接”时复用已导入订阅的最长间隔；超过则重新拉取。
+const subReuseMaxAge = 10 * time.Minute
 
 func main() {
 	showVer := flag.Bool("version", false, "print version and exit")
@@ -206,6 +210,17 @@ func main() {
 		})
 	})
 
+	// 2b. 读取已保存的订阅地址（界面启动时用；WebView2 的 localStorage 不跨启动保留）
+	mux.HandleFunc("/api/v1/subscription", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "sub": client.LoadSavedSubscription()})
+	})
+
 	// 3. 订阅导入
 	mux.HandleFunc("/api/v1/import", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -215,10 +230,25 @@ func main() {
 		}
 		var req struct {
 			Sub string `json:"sub"`
+			// Reuse 为真时，同一订阅在最近 10 分钟内已成功导入则直接复用，不再走网络（点“连接”时用）。
+			Reuse bool `json:"reuse"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Sub == "" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "error": "empty subscription URL"})
 			return
+		}
+		// 订阅地址保存到数据目录：输入的与已保存的不同就覆盖，下次启动自动读回（日志不写地址，路径里含订阅标识）。
+		// 先于拉取保存：网络一时不通时，使用者输入的地址也不会丢。
+		if changed, serr := client.SaveSubscriptionURL(req.Sub); serr != nil {
+			log.Printf("[CLIENT] subscription URL not saved: %v", serr)
+		} else if changed {
+			log.Printf("[CLIENT] subscription URL saved to the data directory (changed)")
+		}
+		if req.Reuse {
+			if n, ok := eng.ReuseAppliedSubscription(req.Sub, subReuseMaxAge); ok {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "nodes": n, "reused": true})
+				return
+			}
 		}
 		tImport := time.Now()
 		applied, err := eng.LoadAndApplySubscription(req.Sub)
@@ -605,7 +635,7 @@ func main() {
 	// 13. 嵌入 Web 前端静态资源
 	mux.Handle("/", http.FileServer(http.FS(uiFS)))
 
-	apiHandler := csrfProtectMiddleware(sessionToken, mux)
+	apiHandler := uiNonceMiddleware(csrfProtectMiddleware(sessionToken, mux))
 
 	apiServer := &http.Server{
 		Addr:    *apiAddr,
@@ -634,7 +664,7 @@ func main() {
 	if *headless {
 		runHeadless(shutdown)
 	} else {
-		runClientWindow(htmlUI, apiHandler, shutdown)
+		runClientWindow(htmlUI, uiURLFor(*apiAddr), apiHandler, shutdown)
 	}
 }
 
@@ -644,6 +674,14 @@ func csrfProtectMiddleware(sessionToken string, next http.Handler) http.Handler 
 		if r.URL.Path == "/healthz" || r.URL.Path == "/health" ||
 			(r.Method == http.MethodGet && !strings.HasPrefix(r.URL.Path, "/api/")) {
 			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 0. API 只接受以回环地址访问：Host 头不是 127.0.0.1/localhost/[::1] 的请求一律拒绝。
+		// DNS rebinding 的页面与攻击者域名同源（Sec-Fetch-Site 不是 cross-site），能直接读 GET 接口（含已保存的订阅地址）；
+		// -api 监听在 0.0.0.0 时局域网主机也是同样的情形。校验 Host 同时挡住这两种。
+		if strings.HasPrefix(r.URL.Path, "/api/") && !isAllowedLocalHost(r.Host) {
+			http.Error(w, `{"status":"error","code":"HOST_NOT_ALLOWED"}`, http.StatusForbidden)
 			return
 		}
 
@@ -676,6 +714,20 @@ func csrfProtectMiddleware(sessionToken string, next http.Handler) http.Handler 
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isAllowedLocalHost 判断 Host 头（可带端口）是否是回环名/地址。
+func isAllowedLocalHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func isAllowedLocalURL(rawURL string) bool {

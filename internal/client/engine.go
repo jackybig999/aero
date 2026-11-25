@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.6.2"
+	ClientVersion = "1.6.3"
 	Protocol      = "aero/3.0"
 )
 
@@ -143,7 +143,10 @@ type Engine struct {
 
 	currentISP  string
 	savedSubURL string
-	geoDataURL  string
+	// subAppliedAt / subAppliedFromCache 记录 savedSubURL 最近一次成功应用的时间与是否来自离线缓存（e.mu 保护）。
+	subAppliedAt        time.Time
+	subAppliedFromCache bool
+	geoDataURL          string
 
 	// degraded 为真表示请求的是 TUN，但虚拟网卡不可用，当前以“仅本地代理”运行（隧道已连上，只有走本地端口的流量经隧道）。
 	degraded       atomic.Bool
@@ -605,11 +608,19 @@ func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
 		e.mu.Lock()
 		e.currentISP = bestISP
 		e.savedSubURL = src
+		// savedSubURL 先于 Apply 写入，而 Apply 会先替换节点列表、切换节点还可能失败：
+		// 在应用成功之前清零，ReuseAppliedSubscription 不会把“新地址 + 旧节点”或“应用失败的订阅”当作可复用。
+		e.subAppliedAt = time.Time{}
+		e.subAppliedFromCache = false
 		e.mu.Unlock()
 
 		if err := e.Apply(applied); err != nil {
 			return nil, err
 		}
+		e.mu.Lock()
+		e.subAppliedAt = time.Now()
+		e.subAppliedFromCache = applied.FromCache
+		e.mu.Unlock()
 		return applied, nil
 	})
 	if err != nil {
@@ -620,6 +631,33 @@ func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
 	// shared 为真表示与另一个同 URL 的导入合并（等待它完成）；日志里的耗时是本次调用的总等待
 	log.Printf("[SUB] load+apply ok in %v (nodes=%d, fromCache=%v, joinedInflight=%v)", time.Since(tCall).Round(time.Millisecond), len(applied.Servers), applied.FromCache, shared)
 	return applied, nil
+}
+
+// ReuseAppliedSubscription 在 src 就是当前已应用的订阅、且近期（maxAge 内）成功拉取过时返回节点数与 true，
+// 调用方据此跳过网络拉取。点“连接”时用它：订阅在界面启动时已经导入过，每次点连接都重新拉一遍只会白白等待
+// （到节点的 TCP/443 新连接首包偶尔丢失，要多等 1~3 秒）。令牌由后台刷新协程负责更新，不依赖点连接时重拉。
+// 以下情况不复用，交给正常导入：地址不同、没有应用过、上次结果来自离线缓存、超过 maxAge、
+// 当前令牌已到刷新时刻（有效期的 75%）。
+func (e *Engine) ReuseAppliedSubscription(src string, maxAge time.Duration) (nodes int, ok bool) {
+	e.mu.RLock()
+	applied := e.appliedSub
+	same := src != "" && src == e.savedSubURL
+	at, fromCache := e.subAppliedAt, e.subAppliedFromCache
+	e.mu.RUnlock()
+	if !same || applied == nil || len(applied.Servers) == 0 || fromCache || at.IsZero() {
+		return 0, false
+	}
+	age := time.Since(at)
+	if age > maxAge {
+		return 0, false
+	}
+	if _, tok, _, _ := getActiveEdge(); tok != "" {
+		if when, signed := nextTokenRefresh(tok); signed && !tokenRefreshNow().Before(when) {
+			return 0, false
+		}
+	}
+	log.Printf("[SUB] reused the subscription applied %v ago (skipped the network fetch)", age.Round(time.Second))
+	return len(applied.Servers), true
 }
 
 // SwitchActiveNode 切换激活节点

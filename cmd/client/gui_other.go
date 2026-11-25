@@ -23,7 +23,7 @@ func isProcessAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
+func runClientWindow(htmlUI, uiURL string, handler http.Handler, shutdown func()) {
 	log.Println("[CLIENT] Native GUI window is only supported on Windows. Running in headless mode.")
 	runHeadless(shutdown)
 }

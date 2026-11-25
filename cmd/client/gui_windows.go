@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/jchv/go-webview2"
@@ -507,7 +508,7 @@ func setupSystemTray(w webview2.WebView) {
 	}
 }
 
-func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
+func runClientWindow(htmlUI, uiURL string, handler http.Handler, shutdown func()) {
 	cleanOrphanWebViewData()
 	hideOwnConsole()
 	if !ensureSingleInstance() {
@@ -550,6 +551,7 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 	// 绑定内存级原生 IPC 通道，彻底切断对 127.0.0.1 网络端口依赖
 	w.Bind("goClientAPI", func(method, path, bodyStr string) (string, error) {
 		req := httptest.NewRequest(method, path, strings.NewReader(bodyStr))
+		req.Host = "127.0.0.1" // httptest 默认 example.com；API 中间件只接受回环 Host
 		req.Header.Set("Origin", "http://127.0.0.1")
 		req.Header.Set("Referer", "http://127.0.0.1/")
 		if bodyStr != "" {
@@ -560,7 +562,16 @@ func runClientWindow(htmlUI string, handler http.Handler, shutdown func()) {
 		return rec.Body.String(), nil
 	})
 
-	w.SetHtml(htmlUI)
+	// 界面从本机 HTTP 服务加载：http://127.0.0.1 是安全上下文，扫码才能用 getUserMedia 调相机
+	// （SetHtml/NavigateToString 加载的页面没有 navigator.mediaDevices）。服务没就绪时退回内嵌页面，
+	// 保证窗口不会停在连接失败的页面上；界面与引擎之间仍走上面的内存 IPC 通道（goClientAPI），不经 HTTP。
+	if uiURL != "" && waitUIServer(uiURL, uiNonce, 3*time.Second) {
+		log.Printf("[UI] loading the UI from the local server (secure context)")
+		w.Navigate(uiURL)
+	} else {
+		log.Printf("[UI] local UI server not ready, using the embedded page (camera scanning unavailable)")
+		w.SetHtml(htmlUI)
+	}
 
 	setupSystemTray(w)
 

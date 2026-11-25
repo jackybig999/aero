@@ -291,6 +291,17 @@ function showTunConflictModal(vpnName) {
   }
 }
 
+// restoreSavedSub 把客户端保存的订阅地址填回输入框（有保存值时优先于 localStorage）。
+async function restoreSavedSub() {
+  try {
+    const r = await api('GET', '/api/v1/subscription')
+    if (r && typeof r.sub === 'string' && r.sub) {
+      $('subUrl').value = r.sub
+      try { localStorage.setItem(SUB_KEY, r.sub) } catch {}
+    }
+  } catch {}
+}
+
 async function ensureImported(strict = false) {
   if (isImporting) return
   isImporting = true
@@ -383,7 +394,8 @@ async function proceedConnect(sub) {
   msg(t('connecting'))
   try {
     // 1. 导入订阅并解析服务器与 Token
-    const imp = await api('POST', '/api/v1/import', { sub })
+    // reuse：启动界面时已导入过同一订阅的话直接复用，不再为点连接多等一次网络往返（到节点的新 TCP 连接偶尔首包丢失）
+    const imp = await api('POST', '/api/v1/import', { sub, reuse: true })
     if (imp && (imp.status === 'error' || imp.error)) throw new Error(imp.error || 'import')
     fetchNodes()
     
@@ -597,19 +609,51 @@ function stopCamera() {
   v.classList.remove('on')
 }
 
+// camErrorKey 把 getUserMedia 的错误归为界面文案：系统/浏览器拒绝、没有相机、相机被占用，其余用通用提示。
+function camErrorKey(e) {
+  switch (e && e.name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return 'camDenied'
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return 'camNone'
+    case 'NotReadableError':
+    case 'AbortError':
+      return 'camBusy'
+    default:
+      return 'camFail'
+  }
+}
+
 async function openCamera() {
   msg('')
   const v = $('cam')
+  // 不是安全上下文（例如用 NavigateToString 加载的页面）时，navigator.mediaDevices 不存在，没法调相机
+  if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    msg(t('camNoApi'), 'err')
+    return
+  }
   try {
-    camStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment' },
-    })
+    try {
+      // 手机优先后置；桌面没有后置摄像头时 ideal 约束也能满足，不会报错
+      camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } })
+    } catch (e) {
+      // 约束不满足时退回任意摄像头；权限被拒绝等其他错误直接抛出
+      if (e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError')) {
+        camStream = await navigator.mediaDevices.getUserMedia({ video: true })
+      } else {
+        throw e
+      }
+    }
     v.srcObject = camStream
     v.classList.add('on')
     await v.play()
     scanLoop()
   } catch (e) {
-    msg(t('camFail') + ' (' + (e.message || e) + ')', 'err')
+    stopCamera()
+    const detail = e && e.name ? ' (' + e.name + ')' : ''
+    msg(t(camErrorKey(e)) + detail, 'err')
   }
 }
 
@@ -1344,7 +1388,8 @@ function init() {
   fetchNodes()
   setInterval(refreshStatus, 2000)
   refreshStatus()
-  ensureImported(false).then(() => fetchNodes()).catch(() => {})
+  // 订阅地址以客户端保存在数据目录里的为准（Windows 的 WebView2 把 localStorage 放在退出即删的临时目录，不跨启动保留）
+  restoreSavedSub().then(() => ensureImported(false)).then(() => fetchNodes()).catch(() => {})
 }
 
 init()
