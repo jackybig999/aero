@@ -92,17 +92,72 @@ function applyProbe(p) {
   }
 }
 
-async function api(method, path, body) {
-  if (typeof window.goClientAPI === 'function') {
+// <testable:begin>
+// withTimeout：promise 超过 ms 仍未返回就以错误拒绝。IPC 调用本身没有超时：结果没有回到页面时 await 会永远挂住，
+// 界面就一直转圈（连接轮询里的 28 秒超时检查在 await 之后，永远执行不到）。
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error((label || 'call') + ' timed out after ' + ms + 'ms')), ms)
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v) },
+      (e) => { clearTimeout(timer); reject(e) },
+    )
+  })
+}
+
+// pollUntil：按间隔轮询，每次调用有独立的硬超时（单次调用挂住不会拖住整个轮询），总期限在每轮开头检查。
+// decide(status) 返回非 undefined/null 的值即结束并返回 {decision, status}；超过期限返回 {timedOut:true, last}；
+// isCancelled() 为真返回 {cancelled:true}（最迟在当前这次调用返回或超时之后，不是立刻）。fetchStatus 抛错或超时只算这一轮失败，继续轮询。
+async function pollUntil(opts) {
+  const now = opts.now || Date.now
+  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)))
+  const start = now()
+  let last = null
+  for (;;) {
+    await sleep(opts.intervalMs)
+    if (opts.isCancelled && opts.isCancelled()) return { cancelled: true }
+    if (now() - start > opts.deadlineMs) return { timedOut: true, last }
+    let st = null
     try {
-      const resStr = await window.goClientAPI(method, path, body != null ? JSON.stringify(body) : '')
+      st = await withTimeout(opts.fetchStatus(), opts.callTimeoutMs, 'status')
+    } catch (e) {
+      continue
+    }
+    if (opts.isCancelled && opts.isCancelled()) return { cancelled: true }
+    if (!st) continue
+    last = st
+    const d = opts.decide(st)
+    if (d !== undefined && d !== null) return { decision: d, status: st }
+  }
+}
+
+// apiTimeoutMs：界面等一个接口的最长时间。必须大于服务端对该接口的时限并留余量（L0 §8.1：上游超时大于下游，余量不少于 20%），
+// 否则 fetch 先中止，服务端的 r.Context 被取消，调用白白失败（geo 同步服务端最长 150 秒、测速 5 秒、导入订阅 30 秒）。
+function apiTimeoutMs(path) {
+  if (path.indexOf('/geodata/sync') >= 0) return 180000
+  if (path.indexOf('/import') >= 0) return 40000
+  if (path.indexOf('/nodes/probe') >= 0) return 9000
+  if (/\/(connect|disconnect|mode|cancel)(\?|$)|\/nodes\/select/.test(path)) return 15000
+  return 6000
+}
+// <testable:end>
+
+// 页面从本机 HTTP 服务加载时用 fetch：它在 Go 的 HTTP 协程里执行，不占窗口的 UI 线程，也不依赖线程消息派发；
+// 只有内嵌页面（没有 http 来源的退路）才用 IPC。IPC 在 UI 线程上同步执行，耗时的调用会卡住整个窗口。
+function useIPC() {
+  return typeof window.goClientAPI === 'function' && !/^https?:$/.test(location.protocol)
+}
+
+async function api(method, path, body) {
+  if (useIPC()) {
+    try {
+      const resStr = await withTimeout(window.goClientAPI(method, path, body != null ? JSON.stringify(body) : ''), apiTimeoutMs(path) + 5000, 'ipc')
       return JSON.parse(resStr || '{}')
     } catch (e) {
       console.error('IPC bridge error:', e)
     }
   }
-  const slow = path.indexOf('/connect') >= 0 || path.indexOf('/disconnect') >= 0 || path.indexOf('/mode') >= 0 || path.indexOf('/import') >= 0
-  const opt = { method, headers: {}, signal: AbortSignal.timeout(slow ? 15000 : 5000) }
+  const opt = { method, headers: {}, signal: AbortSignal.timeout(apiTimeoutMs(path)) }
   if (body != null) {
     opt.headers['Content-Type'] = 'application/json'
     opt.body = JSON.stringify(body)
@@ -390,6 +445,7 @@ async function proceedConnect(sub) {
     localStorage.setItem(SUB_KEY, sub)
   } catch {}
   busy = true
+  const gen = ++connectGen
   setState('wait', t('connecting'))
   msg(t('connecting'))
   try {
@@ -432,7 +488,7 @@ async function proceedConnect(sub) {
     }
 
     if (c && c.status === 'starting') {
-      await pollConnectStatus()
+      await pollConnectStatus(gen)
       return
     }
 
@@ -456,64 +512,61 @@ async function proceedConnect(sub) {
   }
 }
 
-async function pollConnectStatus() {
-  const startTime = Date.now()
-  const timeoutMs = 28000
-  const mode = selectedMode()
+// connectGen 是连接尝试的代次：每次开始连接加一。轮询只属于启动它的那一代，
+// 取消后马上重连时旧轮询在下一轮就退出，不会在它的期限到点后 POST /cancel 把新的连接取消掉。
+let connectGen = 0
 
-  while (busy) {
-    await new Promise((r) => setTimeout(r, 200))
-    if (!busy) return // 用户点击了取消中断
+async function pollConnectStatus(gen) {
+  const out = await pollUntil({
+    intervalMs: 200,
+    deadlineMs: 28000,
+    callTimeoutMs: 6000, // 单次状态查询的硬超时：一次结果没回来也不会让轮询永远挂住
+    isCancelled: () => gen !== connectGen || !busy, // 用户点击了取消中断，或已经开始了新的一次连接
+    fetchStatus: () => api('GET', '/api/v1/status'),
+    decide: (st) => {
+      if (st.connected) return 'connected'
+      if (st.error_code === 'CONFLICT_TUN') return 'conflict'
+      if (st.error_code === 'UDP_UNAVAILABLE') return 'udp'
+      if (!st.starting && !st.stopping && st.last_error) return 'error'
+      if (!st.starting && !st.stopping && !st.connected) return 'stopped'
+      return undefined
+    },
+  })
+  if (out.cancelled) return
 
-    let st = null
+  if (out.timedOut) {
     try {
-      st = await api('GET', '/api/v1/status')
-    } catch (e) {
-      console.warn('poll status err:', e)
-      continue
-    }
+      await api('POST', '/api/v1/cancel')
+    } catch {}
+    setState('err', t('ready'))
+    const st = out.last
+    const detail = st && st.last_error ? ` (${friendlyConnectError(st.last_error)})` : ''
+    msg((t('connTimeout') || '连接超时，请重试') + detail, 'err')
+    return
+  }
 
-    if (!st) continue
-
-    if (st.connected) {
+  const st = out.status
+  switch (out.decision) {
+    case 'connected':
       doProbe()
       await refreshStatus()
       setState('on', t('connected'))
       msg(t('connectedAs') + ' · ' + modeLabel(effectiveMode), 'ok')
       return
-    }
-
-    if (st.error_code === 'CONFLICT_TUN') {
+    case 'conflict':
       handleTUNConflict(st.conflict_vpn || '')
       return
-    }
-
-    if (st.error_code === 'UDP_UNAVAILABLE') {
+    case 'udp':
       handleUDPUnavailable(st.last_error || '')
       return
-    }
-
-    if (!st.starting && !st.stopping && st.last_error) {
+    case 'error':
       setState('err', t('ready'))
       msg(friendlyConnectError(st.last_error), 'err')
       return
-    }
-
-    if (!st.starting && !st.stopping && !st.connected) {
+    case 'stopped':
       setState('off', t('ready'))
       msg(t('ready'))
       return
-    }
-
-    if (Date.now() - startTime > timeoutMs) {
-      try {
-        await api('POST', '/api/v1/cancel')
-      } catch {}
-      setState('err', t('ready'))
-      const detail = st && st.last_error ? ` (${friendlyConnectError(st.last_error)})` : ''
-      msg((t('connTimeout') || '连接超时，请重试') + detail, 'err')
-      return
-    }
   }
 }
 

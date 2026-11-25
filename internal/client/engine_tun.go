@@ -112,11 +112,12 @@ func (e *Engine) withinRouteBudget(in RoutePlanInput) RoutePlanInput {
 func (e *Engine) refreshTunRoutes(extra ...net.IP) {
 	e.mu.RLock()
 	host := e.tunHost
-	in := e.tunPlanInputLocked(extra...)
-	e.mu.RUnlock()
-	if host == nil {
+	if host == nil { // 没有 TUN（本地代理模式或还没连上）：不必规划路由
+		e.mu.RUnlock()
 		return
 	}
+	in := e.tunPlanInputLocked(extra...)
+	e.mu.RUnlock()
 	plan, err := PlanTUNRoutes(in)
 	if err == nil {
 		err = host.ApplyRoutes(plan)

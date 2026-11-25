@@ -548,28 +548,30 @@ func runClientWindow(htmlUI, uiURL string, handler http.Handler, shutdown func()
 
 	w.SetSize(winW, winH, webview2.HintNone)
 
-	// 绑定内存级原生 IPC 通道，彻底切断对 127.0.0.1 网络端口依赖
-	w.Bind("goClientAPI", func(method, path, bodyStr string) (string, error) {
-		req := httptest.NewRequest(method, path, strings.NewReader(bodyStr))
-		req.Host = "127.0.0.1" // httptest 默认 example.com；API 中间件只接受回环 Host
-		req.Header.Set("Origin", "http://127.0.0.1")
-		req.Header.Set("Referer", "http://127.0.0.1/")
-		if bodyStr != "" {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-		return rec.Body.String(), nil
-	})
-
 	// 界面从本机 HTTP 服务加载：http://127.0.0.1 是安全上下文，扫码才能用 getUserMedia 调相机
-	// （SetHtml/NavigateToString 加载的页面没有 navigator.mediaDevices）。服务没就绪时退回内嵌页面，
-	// 保证窗口不会停在连接失败的页面上；界面与引擎之间仍走上面的内存 IPC 通道（goClientAPI），不经 HTTP。
+	// （SetHtml/NavigateToString 加载的页面没有 navigator.mediaDevices）。界面里的 api() 用 fetch 访问同一个服务：
+	// 它在 Go 的 HTTP 协程里执行，不占窗口的 UI 线程，也不依赖线程消息派发。
+	//
+	// IPC（goClientAPI）只在退路——服务没就绪、退回内嵌页面时才绑定：go-webview2 在 UI 线程上同步执行绑定函数
+	// （chromium.go MessageReceived → callbinding），耗时的 API 调用会卡住整个窗口，结果还要经 PostThreadMessage
+	// 派发回页面，一次没送达连接轮询就永远转圈。HTTP 来源的页面不绑定它，也缩小了“任意来源页面都能调用”的暴露面。
 	if uiURL != "" && waitUIServer(uiURL, uiNonce, 3*time.Second) {
-		log.Printf("[UI] loading the UI from the local server (secure context)")
+		log.Printf("[UI] loading the UI from the local server (secure context, fetch transport)")
 		w.Navigate(uiURL)
 	} else {
-		log.Printf("[UI] local UI server not ready, using the embedded page (camera scanning unavailable)")
+		log.Printf("[UI] local UI server not ready, using the embedded page with the IPC transport (camera scanning unavailable)")
+		w.Bind("goClientAPI", func(method, path, bodyStr string) (string, error) {
+			req := httptest.NewRequest(method, path, strings.NewReader(bodyStr))
+			req.Host = "127.0.0.1" // httptest 默认 example.com；API 中间件只接受回环 Host
+			req.Header.Set("Origin", "http://127.0.0.1")
+			req.Header.Set("Referer", "http://127.0.0.1/")
+			if bodyStr != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			return rec.Body.String(), nil
+		})
 		w.SetHtml(htmlUI)
 	}
 

@@ -225,6 +225,7 @@ func (e *Engine) LoadGeoDataFromDisk() (int, error) {
 	if fi, err := f.Stat(); err == nil {
 		e.setGeoStatus(fi.ModTime(), "")
 	}
+	e.refreshTunRoutes() // 直连网段变了：TUN 路由要同步，否则新直连地址仍被路由进 TUN
 	return idx.count, nil
 }
 
@@ -403,6 +404,10 @@ func (e *Engine) SyncGeoData(ctx context.Context) (int, bool, error) {
 		e.splitEngine.installDirect(idx)
 		e.setGeoStatus(time.Now(), "")
 		log.Printf("[GEODATA] updated: %d rules from %s", idx.count, src.url)
+		// 直连网段变了：TUN 路由要同步。此前只换了名单，路由还是按旧名单规划的，新增的直连网段仍被路由进 TUN，
+		// 数据泵又把“直连”目标的包丢掉，这一批站点成了黑洞，直到重连（连接后约 3 秒的自动同步每次都会触发）。
+		// 放在设置状态之后：路由刷新要几百毫秒，不能拖住“同步成功”的状态。
+		e.refreshTunRoutes()
 		return idx.count, true, nil
 	}
 

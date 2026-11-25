@@ -739,7 +739,7 @@ func isAllowedLocalURL(rawURL string) bool {
 		return false
 	}
 	h := u.Hostname()
-	return h == "127.0.0.1" || h == "localhost"
+	return h == "127.0.0.1" || h == "localhost" || h == "::1"
 }
 
 func getClientHTMLUI(uiFS fs.FS) string {

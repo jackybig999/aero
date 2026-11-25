@@ -45,6 +45,8 @@ type IPDataPump struct {
 	currentMTU     atomic.Int32
 	ipv6Blackhole  atomic.Bool
 	webrtcActive   atomic.Bool
+	// directInTUNLogged：国内直连地址的包进了 TUN 的提示只记一次，避免刷屏。
+	directInTUNLogged atomic.Bool
 
 	// devMu 串行化对虚拟网卡的写入（DNS 应答协程与下行协程并发写；Wintun 等驱动
 	// 不保证并发写安全）。dnsSlots 限制同时进行的 DNS 查询数（L0 §9.2）。
@@ -224,8 +226,18 @@ func (p *IPDataPump) pumpTunToRemote() {
 			}
 
 			// 3b. 智能国内流量下沉与私网防御：若目的 IP 属于私网或中国大陆 IP，严禁送入远端海外 CONNECT-IP 隧道
+			// （既有验收测试 TestIPDataPump_DomesticIPBypass 规定：国内 IP 绝不泄露进入海外隧道）。
 			dstIP := net.IP(raw[16:20])
-			if isLocalOrPrivateIP("", dstIP) || (p.dnsHandler != nil && p.dnsHandler.split != nil && p.dnsHandler.split.MatchIP(dstIP) == DIRECT) {
+			if isLocalOrPrivateIP("", dstIP) {
+				continue
+			}
+			if p.dnsHandler != nil && p.dnsHandler.split != nil && p.dnsHandler.split.MatchIP(dstIP) == DIRECT {
+				// 国内直连地址本应由路由送往物理网卡，不会到这里；到了这里说明路由规划与分流名单不一致
+				// （名单刚更新、路由还没刷新，或预算退回了内置名单）。包被丢弃，这一批站点在不一致期间不通。
+				// 记一次日志，让这类问题在 client.log 里可见（此前完全静默）。
+				if p.directInTUNLogged.CompareAndSwap(false, true) {
+					log.Printf("[PUMP] dropped a packet to a direct (domestic) address that reached the TUN: the route plan is out of date with the direct list")
+				}
 				continue
 			}
 
