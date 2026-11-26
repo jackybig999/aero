@@ -62,6 +62,11 @@ func main() {
 		defer closeLog()
 	}
 
+	// 自监控：记录本进程 CPU，持续偏高时自动抓剖析（见 internal/client/selfmon.go）。
+	selfCtx, stopSelf := context.WithCancel(context.Background())
+	defer stopSelf()
+	client.StartSelfMonitor(selfCtx, client.GetDataDir())
+
 	runMode, err := client.NormalizeMode(*mode)
 	if err != nil {
 		fatalf("[CLIENT] %v", err)
