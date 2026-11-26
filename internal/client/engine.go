@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	ClientVersion = "1.8.0"
+	ClientVersion = "1.8.1"
 	Protocol      = "aero/3.0"
 )
 
@@ -2150,9 +2150,12 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 
 	residentCtx := context.WithValue(e.daemonCtx, residentConnContextKey{}, true)
 	ctx, cancel := context.WithTimeout(residentCtx, 10*time.Second)
+	dialStart := time.Now()
 	remote, err := e.DialTCP(ctx, target)
+	dial := time.Since(dialStart)
 	cancel()
 	if err != nil {
+		logProxyDialFailed("socks", target, dial, err)
 		_, _ = conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
@@ -2161,7 +2164,7 @@ func (e *Engine) handleSocks5(conn net.Conn, br *bufio.Reader) {
 	// 成功响应
 	_, _ = conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0})
 
-	relayTraffic(conn, remote, residentCtx)
+	relayMetered("socks", target, dial, conn, remote, residentCtx)
 }
 
 func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
@@ -2177,16 +2180,19 @@ func (e *Engine) handleHTTPConnect(conn net.Conn, br *bufio.Reader) {
 	target := req.RequestURI
 	residentCtx := context.WithValue(e.daemonCtx, residentConnContextKey{}, true)
 	ctx, cancel := context.WithTimeout(residentCtx, 10*time.Second)
+	dialStart := time.Now()
 	remote, err := e.DialTCP(ctx, target)
+	dial := time.Since(dialStart)
 	cancel()
 	if err != nil {
+		logProxyDialFailed("http", target, dial, err)
 		_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer remote.Close()
 
 	_, _ = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	relayTraffic(conn, remote, residentCtx)
+	relayMetered("http", target, dial, conn, remote, residentCtx)
 }
 
 func readSocks5Target(br *bufio.Reader, atyp byte) (string, uint16, error) {

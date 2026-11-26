@@ -96,6 +96,9 @@ type ipMux struct {
 
 	wg    sync.WaitGroup
 	stats muxStats
+
+	// meter 是逐连接的只读监控（flowmeter.go），在复用层公开给数据泵之前由引擎设置一次；nil 表示关闭。
+	meter *flowMeter
 }
 
 var _ IPPacketConn = (*ipMux)(nil)
@@ -301,6 +304,7 @@ func (m *ipMux) ReadPacket(b []byte) (int, error) {
 	case p := <-m.rx:
 		n := copy(b, p)
 		muxPutBuf(p)
+		m.meter.down(b[:n])
 		return n, nil
 	case <-m.closeCh:
 		return 0, m.readErr()
@@ -322,6 +326,7 @@ func (m *ipMux) WritePacket(b []byte) ([]byte, error) {
 		if newTCP && l == nil && m.cls.reliableOn() {
 			m.stats.reliableFallbackD.Add(1) // 普通 TCP 新连接遇到 R 不可用，留在 default
 		}
+		m.meter.up(b, "D")
 		return m.d.WritePacket(b)
 	}
 	if l == nil {
@@ -349,6 +354,11 @@ func (m *ipMux) WritePacket(b []byte) ([]byte, error) {
 		muxPutBuf(p)
 		return m.d.WritePacket(b)
 	}
+	if class == flowAI {
+		m.meter.up(b, "AI")
+	} else {
+		m.meter.up(b, "R")
+	}
 	select {
 	case l.tx <- p:
 		m.stats.aiPacketsUp.Add(1)
@@ -370,6 +380,7 @@ func (m *ipMux) Close() error {
 	if already {
 		return nil
 	}
+	defer m.meter.stop() // 输出还没结束的连接
 	m.closeOnce.Do(func() { close(m.closeCh) })
 	if l != nil {
 		m.dropLink(l)

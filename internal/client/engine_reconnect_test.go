@@ -107,6 +107,9 @@ func TestEngineReconnectAfterTunnelDrop(t *testing.T) {
 		h.eng.lifecycleMu.Lock()
 		cur := h.eng.stackEngine.currentConn()
 		h.eng.lifecycleMu.Unlock()
+		if mc, ok := cur.(*meterConn); ok { // 逐连接监控的包装层（flowmeter）
+			cur = mc.IPPacketConn
+		}
 		if cur == IPPacketConn(h.conn(1)) {
 			break
 		}

@@ -460,6 +460,7 @@ func Dial(ctx context.Context, cfg *TransportConfig) (*Client, error) {
 			pconn:      pconn,
 		}
 		client.lastActive.Store(time.Now().UnixMilli())
+		startQUICStats(conn, "client", actualPort)
 		return client, nil
 	}
 
@@ -607,6 +608,7 @@ dialDone:
 		pconn:      pconn,
 	}
 	client.lastActive.Store(time.Now().UnixMilli())
+	startQUICStats(conn, "client", actualPort)
 	return client, nil
 }
 

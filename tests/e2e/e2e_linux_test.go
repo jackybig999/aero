@@ -197,6 +197,15 @@ func runRoot(t *testing.T) {
 		t.Fatalf("client role timed out\n%s", readFile(dir, "role-client.log"))
 	}
 	t.Logf("client role:\n%s", readFile(dir, "role-client.log"))
+	if os.Getenv("AERO_E2E_LOGS") != "" { // 诊断：把进程日志里的监控行（QSTAT/PROXY/FLOW）带出来
+		for _, name := range []string{"client.log", "edge.log"} {
+			for _, l := range strings.Split(readFile(dir, name), "\n") {
+				if strings.Contains(l, "[QSTAT]") || strings.Contains(l, "[PROXY]") || strings.Contains(l, "[FLOW]") {
+					t.Logf("%s: %s", name, l)
+				}
+			}
+		}
+	}
 
 	stopProc(t, edge, "edge")
 	if connectIP { // edge 退出后宿主（命名空间 A）必须还原

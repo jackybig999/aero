@@ -304,6 +304,40 @@ type DNSHandler struct {
 
 	// aiRecorder 在 AI 域名的 A 记录应答（含缓存命中）时被调用，登记地址与最小 TTL（ADR-0017 决定 4）。
 	aiRecorder atomic.Pointer[func([]netip.Addr, time.Duration)]
+
+	// names 是地址 → 最近解析的域名，只用于日志（逐连接监控）；表满时整体清空，不影响解析。
+	namesMu sync.Mutex
+	names   map[netip.Addr]string
+}
+
+const dnsNamesMax = 8192
+
+// noteName 记录 A 应答里的地址对应的域名。
+func (h *DNSHandler) noteName(query, resp []byte) {
+	qname, qtype := extractDNSQuestionAndType(query)
+	if qname == "" || qtype != dnsTypeA {
+		return
+	}
+	addrs, _, ok := dnsAnswerIPv4s(resp)
+	if !ok || len(addrs) == 0 {
+		return
+	}
+	name := strings.ToLower(qname)
+	h.namesMu.Lock()
+	defer h.namesMu.Unlock()
+	if h.names == nil || len(h.names) >= dnsNamesMax {
+		h.names = make(map[netip.Addr]string, 256)
+	}
+	for _, a := range addrs {
+		h.names[a] = name
+	}
+}
+
+// NameOf 返回地址最近一次解析对应的域名；没有记录返回空串。
+func (h *DNSHandler) NameOf(a netip.Addr) string {
+	h.namesMu.Lock()
+	defer h.namesMu.Unlock()
+	return h.names[a]
 }
 
 // SetAIRecorder 设置 AI 域名应答的登记回调；nil 取消。
@@ -448,6 +482,14 @@ const (
 // 阶段 2：AI 与其余非直连域名经 DoH 由 edge 原样转发，所有记录类型一视同仁，客户端只改回事务 ID；
 // TUN 没有 IPv6 路由时 AAAA 返回空 NOERROR 应答；上游失败返回 SERVFAIL
 func (h *DNSHandler) HandleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byte {
+	resp := h.handleQuery(pkt, srcIP, srcPort)
+	if resp != nil {
+		h.noteName(pkt, resp)
+	}
+	return resp
+}
+
+func (h *DNSHandler) handleQuery(pkt []byte, srcIP net.IP, srcPort uint16) []byte {
 	qname, qtype := extractDNSQuestionAndType(pkt)
 	if qname == "" {
 		return nil

@@ -233,9 +233,13 @@ func (e *Engine) wrapAI(ctx context.Context, d IPPacketConn, prefix netip.Prefix
 		} else {
 			e.ai.set(AIChannelOff, "")
 		}
+		if meter := newFlowMeter(e.dnsNameOf); meter != nil {
+			return &meterConn{IPPacketConn: d, meter: meter}
+		}
 		return d
 	}
 	m := newIPMux(d, prefix.Addr(), e.aiCls)
+	m.meter = newFlowMeter(e.dnsNameOf)
 	// 此刻刚建立完 default 会话（调用方串行），管理器里记着的就是承载它的 Session；绑定后不再读管理器。
 	// 在 publish 之前设置：重拨协程经 publish 的锁才能看到复用层。
 	m.carrier = e.sessionMgr.pinnedSession()
@@ -420,4 +424,36 @@ func (e *Engine) resetAIState() {
 	e.ai.state, e.ai.reason = "", ""
 	e.ai.redialing = nil
 	e.ai.mu.Unlock()
+}
+
+// dnsNameOf 把远端地址反查成最近解析过的域名（只用于日志）。
+func (e *Engine) dnsNameOf(a netip.Addr) string {
+	if e.dnsHandler == nil {
+		return ""
+	}
+	return e.dnsHandler.NameOf(a)
+}
+
+// meterConn 给没有复用层的连接（节点不支持 capsule）加上逐连接监控：所有流量都走 default，路径记为 D。
+type meterConn struct {
+	IPPacketConn
+	meter *flowMeter
+}
+
+func (c *meterConn) ReadPacket(b []byte) (int, error) {
+	n, err := c.IPPacketConn.ReadPacket(b)
+	if err == nil {
+		c.meter.down(b[:n])
+	}
+	return n, err
+}
+
+func (c *meterConn) WritePacket(b []byte) ([]byte, error) {
+	c.meter.up(b, "D")
+	return c.IPPacketConn.WritePacket(b)
+}
+
+func (c *meterConn) Close() error {
+	defer c.meter.stop()
+	return c.IPPacketConn.Close()
 }

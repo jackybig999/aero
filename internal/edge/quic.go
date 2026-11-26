@@ -1423,6 +1423,11 @@ func (s *QUICServer) ServeListener(ctx context.Context, ln *quic.Listener) error
 func (s *QUICServer) handleQUICConn(conn *quic.Conn) {
 	// 连接结束后立即摘除跟踪记录；否则只能等 5 分钟一次的 reaper，期间指针与绑定一直占用内存。
 	defer s.connTracker.Remove(conn)
+	port := 0
+	if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		port = ua.Port
+	}
+	startQUICStats(conn, "edge", port) // 节点发出的包里的 lost 就是下行（下载）丢失
 	if s.h3Server != nil {
 		_ = s.h3Server.ServeQUICConn(conn)
 	}
