@@ -117,6 +117,7 @@ type muxFixture struct {
 func newMuxFixture(t *testing.T) *muxFixture {
 	t.Helper()
 	cls := newFlowClassifier()
+	cls.reliableTCP.Store(false) // 旧用例按“只有 AI 地址走 R”写；普通 TCP 走 R 见 TestMuxReliable*
 	cls.ai.Add(aiHost, time.Hour)
 	d := newFakeConn()
 	m := newIPMux(d, natTun, cls)
@@ -520,5 +521,296 @@ func TestBuildICMPUnreachable(t *testing.T) {
 	p := buildICMPv4Unreachable(short, 1)
 	if p == nil || len(p) != 20+8+len(short) || onesComplementSum(p[20:]) != 0 || !refIPHeaderValid(p) {
 		t.Fatalf("short packet quote wrong: len=%d", len(p))
+	}
+}
+
+// 普通 TCP（非 AI 地址）在 R 可用时走 R，源地址改写正确；UDP 仍走 default。
+func TestMuxReliableOrdinaryTCPUsesR(t *testing.T) {
+	f := newMuxFixture(t)
+	f.cls.reliableTCP.Store(true)
+	a := f.attachAI(t)
+	syn := tcpWithFlags(natTun, otherHost, 51000, 443, fSYN, 0)
+	if r, err := f.m.WritePacket(syn); err != nil || r != nil {
+		t.Fatalf("reply=%v err=%v", r, err)
+	}
+	got := a.recv(t)
+	if netip.AddrFrom4([4]byte(got[12:16])) != natAI || netip.AddrFrom4([4]byte(got[16:20])) != otherHost {
+		t.Fatalf("addresses %v -> %v", got[12:16], got[16:20])
+	}
+	if !refIPHeaderValid(got) || !refL4Valid(t, got) {
+		t.Fatal("rewritten packet has invalid checksums")
+	}
+	f.d.expectNothing(t)
+	f.m.WritePacket(tcpWithFlags(natTun, otherHost, 51000, 443, fACK, 900))
+	if got := a.recv(t); !refL4Valid(t, got) {
+		t.Fatal("data packet invalid")
+	}
+	// UDP（即使目的地址相同）与 ICMP 仍走 default，不被改写。
+	udp := udpPacket(natTun, otherHost)
+	if _, err := f.m.WritePacket(udp); err != nil {
+		t.Fatal(err)
+	}
+	if string(f.d.recv(t)) != string(udp) {
+		t.Fatal("UDP packet was modified")
+	}
+	a.expectNothing(t)
+}
+
+// R 不可用：普通 TCP 新连接留在 default（不丢弃、不回 ICMP）；AI 新连接仍然 fail-closed。
+func TestMuxReliableFallsBackToDefaultWhenRDown(t *testing.T) {
+	f := newMuxFixture(t)
+	f.cls.reliableTCP.Store(true)
+	syn := tcpWithFlags(natTun, otherHost, 51010, 443, fSYN, 0)
+	orig := append([]byte(nil), syn...)
+	if r, err := f.m.WritePacket(syn); err != nil || r != nil {
+		t.Fatalf("reply=%v err=%v", r, err)
+	}
+	if got := f.d.recv(t); string(got) != string(orig) {
+		t.Fatal("the SYN must reach default untouched")
+	}
+	// 同一条流的后续包继续走 default；R 随后恢复也不迁移这条流。
+	a := f.attachAI(t)
+	ack := tcpWithFlags(natTun, otherHost, 51010, 443, fACK, 300)
+	if _, err := f.m.WritePacket(ack); err != nil {
+		t.Fatal(err)
+	}
+	f.d.recv(t)
+	a.expectNothing(t)
+	// 新连接此时走 R。
+	f.m.WritePacket(tcpWithFlags(natTun, otherHost, 51011, 443, fSYN, 0))
+	a.recv(t)
+	// AI 地址在 R 断开时仍 fail-closed（ICMP 不可达，不改走 default）。
+	f.m.DetachAI()
+	icmp, err := f.m.WritePacket(tcpWithFlags(natTun, aiHost, 51012, 443, fSYN, 0))
+	if err != nil || icmp == nil || icmp[9] != 1 {
+		t.Fatalf("AI SYN with R down: %v %v", icmp, err)
+	}
+	f.d.expectNothing(t)
+	if got := f.m.stats.reliableFallbackD.Load(); got != 1 {
+		t.Fatalf("reliableFallbackD = %d", got)
+	}
+}
+
+// 已固定在 R 上的普通 TCP 流，R 丢失后收到 RST（立即失败，不静默挂起），数据不会改走 default。
+func TestMuxReliableFlowGetsResetWhenRLost(t *testing.T) {
+	f := newMuxFixture(t)
+	f.cls.reliableTCP.Store(true)
+	a := f.attachAI(t)
+	f.m.WritePacket(tcpWithFlags(natTun, otherHost, 51020, 443, fSYN, 0))
+	a.recv(t)
+	f.m.DetachAI()
+	data := tcpWithFlags(natTun, otherHost, 51020, 443, fACK, 500)
+	binary.BigEndian.PutUint32(data[20+4:20+8], 1000) // seq
+	binary.BigEndian.PutUint32(data[20+8:20+12], 777) // ack
+	rst, err := f.m.WritePacket(data)
+	if err != nil || rst == nil {
+		t.Fatalf("expected a RST, got %v %v", rst, err)
+	}
+	f.d.expectNothing(t)
+	if netip.AddrFrom4([4]byte(rst[12:16])) != otherHost || netip.AddrFrom4([4]byte(rst[16:20])) != natTun {
+		t.Fatalf("RST addresses %v -> %v", rst[12:16], rst[16:20])
+	}
+	if !refIPHeaderValid(rst) || !refL4Valid(t, rst) {
+		t.Fatal("RST has invalid checksums")
+	}
+	if rst[20+13] != 0x04 || binary.BigEndian.Uint32(rst[20+4:20+8]) != 777 {
+		t.Fatalf("RST flags/seq: %#x %d (want RST, seq = the packet's ack number)", rst[20+13], binary.BigEndian.Uint32(rst[20+4:20+8]))
+	}
+	if binary.BigEndian.Uint16(rst[20:22]) != 443 || binary.BigEndian.Uint16(rst[22:24]) != 51020 {
+		t.Fatal("RST ports are not swapped")
+	}
+	if f.m.stats.reliableReset.Load() != 1 {
+		t.Fatalf("reliableReset = %d", f.m.stats.reliableReset.Load())
+	}
+}
+
+func TestBuildTCPReset(t *testing.T) {
+	// 没有 ACK 的包（如 SYN）：RST|ACK，序号 0，确认号 = 对方序号 + 1。
+	syn := tcpWithFlags(natTun, otherHost, 52000, 443, fSYN, 0)
+	binary.BigEndian.PutUint32(syn[20+4:20+8], 4000)
+	r := buildTCPReset(syn)
+	if r == nil || !refIPHeaderValid(r) || !refL4Valid(t, r) {
+		t.Fatalf("bad RST: % x", r)
+	}
+	if r[20+13] != 0x14 || binary.BigEndian.Uint32(r[20+4:20+8]) != 0 || binary.BigEndian.Uint32(r[20+8:20+12]) != 4001 {
+		t.Fatalf("RST|ACK fields wrong: flags %#x seq %d ack %d", r[20+13], binary.BigEndian.Uint32(r[20+4:20+8]), binary.BigEndian.Uint32(r[20+8:20+12]))
+	}
+	// 带载荷、没有 ACK 位的包：确认号 = 序号 + 载荷长度。
+	d := tcpWithFlags(natTun, otherHost, 52001, 443, 0, 40)
+	binary.BigEndian.PutUint32(d[20+4:20+8], 10)
+	if r := buildTCPReset(d); r == nil || binary.BigEndian.Uint32(r[20+8:20+12]) != 50 {
+		t.Fatalf("ack number for a data packet: % x", r)
+	}
+	// 不对 RST 回 RST；非 TCP、截断的包返回 nil。
+	if buildTCPReset(tcpWithFlags(natTun, otherHost, 52002, 443, fRST, 0)) != nil {
+		t.Fatal("must not answer a RST with a RST")
+	}
+	if buildTCPReset(udpPacket(natTun, otherHost)) != nil || buildTCPReset(syn[:25]) != nil || buildTCPReset(nil) != nil {
+		t.Fatal("non-TCP or truncated input must give nil")
+	}
+}
+
+// R 重拨换了新地址：固定在旧链路上的流收到 RST，不会改用新源地址续传；新连接正常走新链路。
+func TestMuxReliableFlowResetAfterRReplaced(t *testing.T) {
+	f := newMuxFixture(t)
+	f.cls.reliableTCP.Store(true)
+	a1 := f.attachAI(t)
+	f.m.WritePacket(tcpWithFlags(natTun, otherHost, 53000, 443, fSYN, 0))
+	a1.recv(t)
+	// 链路被替换（新地址）。
+	a2 := newFakeConn()
+	newAddr := netip.MustParseAddr("10.88.128.9")
+	if err := f.m.AttachAI(a2, newAddr); err != nil {
+		t.Fatal(err)
+	}
+	rst, err := f.m.WritePacket(tcpWithFlags(natTun, otherHost, 53000, 443, fACK, 200))
+	if err != nil || rst == nil || rst[20+13]&0x04 == 0 {
+		t.Fatalf("expected RST for the stale flow, got %v %v", rst, err)
+	}
+	a1.expectNothing(t)
+	a2.expectNothing(t) // 旧流的包不得用新地址发出
+	f.d.expectNothing(t)
+	// 新连接走新链路，源地址是新地址。
+	f.m.WritePacket(tcpWithFlags(natTun, otherHost, 53001, 443, fSYN, 0))
+	got := a2.recv(t)
+	if netip.AddrFrom4([4]byte(got[12:16])) != newAddr {
+		t.Fatalf("new flow source %v", got[12:16])
+	}
+	// AI 地址的旧流同样如此。
+	if f.m.stats.reliableReset.Load() != 1 {
+		t.Fatalf("reliableReset = %d", f.m.stats.reliableReset.Load())
+	}
+}
+
+// 用户关闭“AI 稳定通道”（先关分类、再断开 R）：已固定在 R 上的流立即收到 RST；新连接走 default；
+// 重新打开后，关闭期间在同一四元组上重新建立的 default 流不会被旧表项当成 R 流。
+func TestMuxReliableFlowsResetWhenChannelDisabled(t *testing.T) {
+	f := newMuxFixture(t)
+	f.cls.reliableTCP.Store(true)
+	a := f.attachAI(t)
+	f.m.WritePacket(tcpWithFlags(natTun, otherHost, 53010, 443, fSYN, 0))
+	a.recv(t)
+	f.cls.enabled.Store(false)
+	f.m.DetachAI()
+	rst, err := f.m.WritePacket(tcpWithFlags(natTun, otherHost, 53010, 443, fACK, 300))
+	if err != nil || rst == nil || rst[20+13]&0x04 == 0 {
+		t.Fatalf("expected RST, got %v %v", rst, err)
+	}
+	f.d.expectNothing(t)
+	// 同一四元组的新连接（SYN）走 default，并清掉旧 R 表项。
+	syn := tcpWithFlags(natTun, otherHost, 53010, 443, fSYN, 0)
+	if _, err := f.m.WritePacket(syn); err != nil {
+		t.Fatal(err)
+	}
+	f.d.recv(t)
+	f.cls.enabled.Store(true)
+	a2 := f.attachAI(t)
+	if _, err := f.m.WritePacket(tcpWithFlags(natTun, otherHost, 53010, 443, fACK, 100)); err != nil {
+		t.Fatal(err)
+	}
+	f.d.recv(t)         // 这条流在关闭期间已经是 default 流，继续走 default
+	a2.expectNothing(t) // 不会因旧表项被改写成 R 地址
+}
+
+// WritePacket 与 AttachAI/DetachAI 并发（-race）：不 panic、不死锁，包要么进 R、要么进 default、要么得到 RST/ICMP。
+func TestMuxReliableConcurrentWritesAndLinkChanges(t *testing.T) {
+	f := newMuxFixture(t)
+	f.cls.reliableTCP.Store(true)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	// 排空 default 与 R 的输出，避免 fake 通道写满。
+	drain := func(c *fakeConn) {
+		defer wg.Done()
+		for {
+			select {
+			case <-c.out:
+			case <-stop:
+				return
+			}
+		}
+	}
+	wg.Add(1)
+	go drain(f.d)
+	var links []*fakeConn
+	var lmu sync.Mutex
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 60; i++ {
+			c := newFakeConn()
+			lmu.Lock()
+			links = append(links, c)
+			lmu.Unlock()
+			wg.Add(1)
+			go drain(c)
+			_ = f.m.AttachAI(c, netip.MustParseAddr("10.88.128.7"))
+			time.Sleep(time.Millisecond)
+			if i%3 == 0 {
+				f.m.DetachAI()
+			}
+		}
+	}()
+	var writers sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		writers.Add(1)
+		go func(g int) {
+			defer writers.Done()
+			for i := 0; i < 400; i++ {
+				port := uint16(54000 + g*1000 + i%50)
+				flags := byte(fACK)
+				if i%50 == 0 {
+					flags = fSYN
+				}
+				if _, err := f.m.WritePacket(tcpWithFlags(natTun, otherHost, port, 443, flags, 100)); err != nil {
+					t.Errorf("WritePacket: %v", err)
+					return
+				}
+			}
+		}(g)
+	}
+	writers.Wait()
+	close(stop)
+	wg.Wait()
+}
+
+// 带 IP 选项（ihl>20）、TCP 选项（数据偏移>5）、FIN 不带 ACK、总长度恰好等于 ihl+20 的包，RST 的字段与校验和都正确。
+func TestBuildTCPResetVariants(t *testing.T) {
+	base := tcpWithFlags(natTun, otherHost, 55000, 443, 0x01 /*FIN*/, 0)
+	binary.BigEndian.PutUint32(base[20+4:20+8], 500)
+	r := buildTCPReset(base)
+	if r == nil || !refL4Valid(t, r) || r[20+13] != 0x14 || binary.BigEndian.Uint32(r[20+8:20+12]) != 501 {
+		t.Fatalf("FIN without ACK: % x", r)
+	}
+	// TCP 选项：数据偏移 8（32 字节头）+ 10 字节载荷，确认号 = seq + 10。
+	seg := make([]byte, 32+10)
+	binary.BigEndian.PutUint16(seg[0:2], 55001)
+	binary.BigEndian.PutUint16(seg[2:4], 443)
+	binary.BigEndian.PutUint32(seg[4:8], 1000)
+	seg[12], seg[13] = 0x80, fACK|0x08
+	opt := withL4Checksum(buildIPv4(natTun, otherHost, 6, nil, seg, 0), 16)
+	ro := buildTCPReset(opt)
+	if ro == nil || !refL4Valid(t, ro) || ro[20+13] != 0x04 {
+		t.Fatalf("TCP options: % x", ro)
+	}
+	// 没有 ACK 位 + TCP 选项：确认号只算载荷（不把选项当载荷）。
+	seg[13] = 0x08
+	opt2 := withL4Checksum(buildIPv4(natTun, otherHost, 6, nil, seg, 0), 16)
+	if r2 := buildTCPReset(opt2); r2 == nil || binary.BigEndian.Uint32(r2[20+8:20+12]) != 1010 {
+		t.Fatalf("ack number with TCP options: % x", r2)
+	}
+	// IP 选项：ihl=24。
+	ipopt := buildIPv4(natTun, otherHost, 6, []byte{1, 1, 1, 0}, seg[:20], 0)
+	if rr := buildTCPReset(withL4Checksum(ipopt, 16)); rr == nil || !refL4Valid(t, rr) || rr[20+13]&0x04 == 0 || rr[0] != 0x45 {
+		t.Fatalf("IP options (ihl=24): bad RST % x", rr)
+	}
+	// 总长度 = ihl+20 = 40，包长恰好 40：刚好够。总长度 < ihl+20 或包截断：nil。
+	exact := tcpWithFlags(natTun, otherHost, 55002, 443, fACK, 0)
+	if buildTCPReset(exact) == nil {
+		t.Fatal("a header-only TCP packet must get a RST")
+	}
+	short := append([]byte(nil), exact[:30]...)
+	binary.BigEndian.PutUint16(short[2:4], 30) // total=len=30 < ihl+20
+	if buildTCPReset(short) != nil {
+		t.Fatal("a TCP header cut short must give nil")
 	}
 }

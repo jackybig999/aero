@@ -12,4 +12,4 @@
 CLA 建立后，本文件会补充签署方式与流程。
 
 ## 提交前自检（项目成员）
-按 `AGENTS.md` 与 `PROJECT_RULES.md` 执行；提交前 `bash tmp/gate.sh` 必须输出 `GATE PASS`。新增依赖须写明理由，且许可证在 `tools/licenses-allowed.txt` 白名单内（ADR-0018、L0 §7.6）。
+`bash tmp/gate.sh` 必须输出 `GATE PASS`。新增依赖须写明理由，且许可证在 `tools/licenses-allowed.txt` 白名单内（ADR-0018）。

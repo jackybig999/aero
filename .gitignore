@@ -32,3 +32,11 @@ target/
 *Zone.Identifier*
 
 !cmd/*/*.syso
+
+# 工程规则与代理入口只留在本机，不进仓库
+/AGENTS.md
+/CLAUDE.md
+/GLOBAL_ENGINEERING_RULES.md
+/PROJECT_RULES.md
+/engineering-profile.yaml
+/WAIVERS.md

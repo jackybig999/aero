@@ -20,6 +20,8 @@ import (
 //   - 隔离：ai 会话的上行有独立队列与写协程，队列满就丢尾（内层 TCP 自己退让），绝不阻塞 default 会话的上行；
 //     ai 会话的任何读写错误只让 ai 降级（回调 onAIDown），不让泵报错；只有 default 会话失败才使整条隧道断线重连。
 //   - fail-closed：ai 会话不可用时，新建的 AI TCP 连接得到 ICMP 不可达，已建立的流静默丢包；不会改走 default。
+//   - 普通 TCP（非 AI 地址）在 ai 会话可用时同样走它（flowReliable，原因见 flowclass.go）；不可用时新连接留在 default。
+//     已固定在 R 上的流，在 R 断开、被替换（重拨后地址变了）或用户关闭通道之后，收到 TCP RST 立即失败，应用重连后按当时状态再选。
 
 const (
 	muxRxLen     = 256 // 下行合并队列（包数）
@@ -50,6 +52,7 @@ func muxPutBuf(b []byte) {
 type aiLink struct {
 	conn IPPacketConn
 	addr netip.Addr // ai 会话的地址（源地址改写的目标）
+	gen  uint64     // 链路代次：每次接入递增，从 1 开始；固定在 R 上的流记着自己的代次，链路被替换后旧流不能续传
 	tx   chan []byte
 	done chan struct{}
 	once sync.Once
@@ -66,6 +69,9 @@ type muxStats struct {
 	aiPacketsUp    atomic.Uint64
 	aiPacketsDown  atomic.Uint64
 	defaultPackets atomic.Uint64
+	// 普通 TCP 走 R（flowReliable）相关：新连接因 R 不可用而留在 default 的次数；已固定在 R 上的流在 R 丢失后被回 RST 的次数。
+	reliableFallbackD atomic.Uint64
+	reliableReset     atomic.Uint64
 }
 
 type ipMux struct {
@@ -80,6 +86,8 @@ type ipMux struct {
 	closeOnce sync.Once
 	errMu     sync.Mutex
 	err       error // 使 ReadPacket 返回的错误：default 会话失败，或 net.ErrClosed
+
+	linkGen atomic.Uint64 // 下一条 aiLink 的代次来源
 
 	mu     sync.Mutex
 	link   *aiLink
@@ -120,7 +128,7 @@ func (m *ipMux) AttachAI(conn IPPacketConn, addr netip.Addr) error {
 		_ = conn.Close()
 		return errors.New("ai session address is not IPv4")
 	}
-	l := &aiLink{conn: conn, addr: addr, tx: make(chan []byte, muxAITxLen), done: make(chan struct{})}
+	l := &aiLink{conn: conn, addr: addr, gen: m.linkGen.Add(1), tx: make(chan []byte, muxAITxLen), done: make(chan struct{})}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -302,19 +310,37 @@ func (m *ipMux) ReadPacket(b []byte) (int, error) {
 // WritePacket 实现 IPPacketConn：按流选择会话。ai 会话的任何问题都不会作为错误返回给泵
 // （否则泵会断开整条隧道）；需要通知应用的情况（新连接被拒）通过返回的 ICMP 包回写到 TUN。
 func (m *ipMux) WritePacket(b []byte) ([]byte, error) {
-	class, newTCP := m.cls.classify(b)
-	if class == flowDefault {
-		return m.d.WritePacket(b)
-	}
 	m.mu.Lock()
 	l := m.link
 	m.mu.Unlock()
+	var gen uint64 // 0 表示 R 不可用
+	if l != nil {
+		gen = l.gen
+	}
+	class, newTCP, flowGen := m.cls.classifyG(b, gen)
+	if class == flowDefault {
+		if newTCP && l == nil && m.cls.reliableOn() {
+			m.stats.reliableFallbackD.Add(1) // 普通 TCP 新连接遇到 R 不可用，留在 default
+		}
+		return m.d.WritePacket(b)
+	}
 	if l == nil {
 		m.stats.aiUnavailable.Add(1)
+		if class == flowReliable {
+			// 普通 TCP 的新连接在 R 不可用时留在 default，所以走到这里的一定是已固定在 R 上的流：
+			// 源地址是 R 的，换会话无法继续，回 RST 让应用立刻重连（新连接再按当时的 R 状态选）。
+			m.stats.reliableReset.Add(1)
+			return buildTCPReset(b), nil
+		}
 		if newTCP {
 			return buildICMPv4Unreachable(b, icmpHostUnreachable), nil
 		}
 		return nil, nil
+	}
+	if !newTCP && flowGen != l.gen {
+		// 流固定在一条已经被替换的 R 链路上（R 重拨后地址变了）：用新地址续传会让对端看到陌生四元组，只会挂到超时。
+		m.stats.reliableReset.Add(1)
+		return buildTCPReset(b), nil
 	}
 	p := muxGetBuf(len(b))
 	copy(p, b)
@@ -393,5 +419,64 @@ func buildICMPv4Unreachable(orig []byte, code byte) []byte {
 	pkt[20], pkt[21] = 3, code
 	copy(pkt[28:], orig[:quote])
 	binary.BigEndian.PutUint16(pkt[22:24], onesComplementSum(pkt[20:]))
+	return pkt
+}
+
+// buildTCPReset 为 orig（本机应用发出的 IPv4 TCP 包）构造对应的 RST 应答，写回 TUN 后应用会立刻收到连接重置。
+// 规则同 RFC 9293 §3.10.7.1：orig 带 ACK 时 RST 的序号取其确认号；否则序号 0、确认号 = 对方序号 + 载荷长度 + SYN/FIN 各占 1。
+// 不对 RST 回 RST；orig 不是完整的 IPv4 TCP 包时返回 nil。
+func buildTCPReset(orig []byte) []byte {
+	ihl := ipv4Header(orig)
+	if ihl == 0 || orig[9] != 6 || int(binary.BigEndian.Uint16(orig[2:4])) < ihl+20 {
+		return nil
+	}
+	tcp := orig[ihl:]
+	flags := tcp[13]
+	if flags&0x04 != 0 {
+		return nil
+	}
+	seq := binary.BigEndian.Uint32(tcp[4:8])
+	ack := binary.BigEndian.Uint32(tcp[8:12])
+	off := int(tcp[12]>>4) * 4
+	if off < 20 { // 非法的数据偏移按最小头长算
+		off = 20
+	}
+	payload := int(binary.BigEndian.Uint16(orig[2:4])) - ihl - off
+	if payload < 0 {
+		payload = 0
+	}
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], 40)
+	pkt[8], pkt[9] = 64, 6
+	copy(pkt[12:16], orig[16:20]) // 源：原报文的目的
+	copy(pkt[16:20], orig[12:16]) // 目的：原报文的源
+	binary.BigEndian.PutUint16(pkt[10:12], onesComplementSum(pkt[:20]))
+	t := pkt[20:]
+	copy(t[0:2], tcp[2:4]) // 源端口：原目的端口
+	copy(t[2:4], tcp[0:2])
+	if flags&0x10 != 0 {
+		binary.BigEndian.PutUint32(t[4:8], ack)
+		t[13] = 0x04 // RST
+	} else {
+		n := uint32(payload)
+		if flags&0x02 != 0 {
+			n++
+		}
+		if flags&0x01 != 0 {
+			n++
+		}
+		binary.BigEndian.PutUint32(t[8:12], seq+n)
+		t[13] = 0x14 // RST|ACK
+	}
+	t[12] = 0x50
+	// TCP 校验和：伪首部（源、目的、0、协议、长度）+ 报文。
+	ph := make([]byte, 12+20)
+	copy(ph[0:4], pkt[12:16])
+	copy(ph[4:8], pkt[16:20])
+	ph[9] = 6
+	binary.BigEndian.PutUint16(ph[10:12], 20)
+	copy(ph[12:], t)
+	binary.BigEndian.PutUint16(t[16:18], onesComplementSum(ph))
 	return pkt
 }

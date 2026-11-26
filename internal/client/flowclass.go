@@ -7,6 +7,8 @@ import (
 	"container/list"
 	"encoding/binary"
 	"net/netip"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,13 +18,19 @@ import (
 // 数据面按目的地址判断一条 TCP 流走哪个会话。分类错误只影响传输方式，不影响出口与安全属性。
 //
 //   - UDP、ICMP、其他协议：始终走 default 会话（QUIC/HTTP3 自带重传，放进可靠流是两层重传）；
-//   - TCP：建立时按目的地址决定，之后整条流固定在这个会话上（两个会话的源地址不同，中途换会话会断流）。
+//   - TCP：建立时决定，之后整条流固定在这个会话上（两个会话的源地址不同，中途换会话会断流）。
+//     目的地址在 AI 集合里的走 ai 会话（R 不可用时 fail-closed）；其余 TCP 在 R 可用时也走 R（flowReliable），
+//     R 不可用时新连接留在 default。原因：default 是不可重传的 QUIC DATAGRAM，路径上的丢包会原样落到内层 TCP 上
+//     （Mathis：吞吐 ≈ 1.22·MSS/(RTT·√p)；RTT 190ms、丢包 7~11%、MSS 1184 时只有 23~29 KB/s，与真机一致），
+//     R 由 QUIC 流保证不丢，内层 TCP 只看到延迟抖动。游戏等 UDP 仍走 default 以保持低延迟。
+//     环境变量 AERO_TCP_RELIABLE=0 可回退为“只有 AI 地址走 R”。
 
 type flowClass uint8
 
 const (
-	flowDefault flowClass = iota // default 会话（数据报）
-	flowAI                       // ai 会话（DATAGRAM capsule）
+	flowDefault  flowClass = iota // default 会话（数据报）
+	flowAI                        // ai 会话（DATAGRAM capsule），目的地址是 AI 域名的解析结果
+	flowReliable                  // 同一条 ai 会话，普通 TCP：与 flowAI 的区别只在 R 不可用时的处理（见 ipMux.WritePacket）
 )
 
 const (
@@ -168,6 +176,7 @@ type tcpFlowKey struct {
 type tcpFlowEntry struct {
 	key   tcpFlowKey
 	class flowClass
+	gen   uint64 // 固定到 R 时，当时那条 R 链路的代次（见 aiLink.gen）；default 流为 0
 	last  time.Time
 }
 
@@ -186,32 +195,32 @@ func newTCPFlowTable() *tcpFlowTable {
 	return &tcpFlowTable{m: make(map[tcpFlowKey]*list.Element), ll: list.New(), max: tcpFlowMax, idle: tcpFlowIdle, now: time.Now}
 }
 
-func (t *tcpFlowTable) lookup(k tcpFlowKey) (flowClass, bool) {
+func (t *tcpFlowTable) lookup(k tcpFlowKey) (flowClass, uint64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	el, ok := t.m[k]
 	if !ok {
-		return flowDefault, false
+		return flowDefault, 0, false
 	}
 	e := el.Value.(*tcpFlowEntry)
 	now := t.now()
 	if now.Sub(e.last) > t.idle {
 		t.ll.Remove(el)
 		delete(t.m, k)
-		return flowDefault, false
+		return flowDefault, 0, false
 	}
 	e.last = now
 	t.ll.MoveToFront(el)
-	return e.class, true
+	return e.class, e.gen, true
 }
 
-func (t *tcpFlowTable) set(k tcpFlowKey, c flowClass) {
+func (t *tcpFlowTable) set(k tcpFlowKey, c flowClass, gen uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
 	if el, ok := t.m[k]; ok {
 		e := el.Value.(*tcpFlowEntry)
-		e.class, e.last = c, now
+		e.class, e.gen, e.last = c, gen, now
 		t.ll.MoveToFront(el)
 		return
 	}
@@ -227,7 +236,7 @@ func (t *tcpFlowTable) set(k tcpFlowKey, c flowClass) {
 		t.ll.Remove(back)
 		delete(t.m, e.key)
 	}
-	t.m[k] = t.ll.PushFront(&tcpFlowEntry{key: k, class: c, last: now})
+	t.m[k] = t.ll.PushFront(&tcpFlowEntry{key: k, class: c, gen: gen, last: now})
 }
 
 func (t *tcpFlowTable) remove(k tcpFlowKey) {
@@ -249,57 +258,115 @@ func (t *tcpFlowTable) len() int {
 
 // flowClassifier 决定每个上行 IPv4 包走哪个会话。线程安全；ai 集合由 DNS 处理器填充。
 type flowClassifier struct {
-	ai      *aiAddrSet
-	flows   *tcpFlowTable
-	enabled atomic.Bool // 用户关闭“AI 稳定通道”时为 false：一切走 default
+	ai          *aiAddrSet
+	flows       *tcpFlowTable
+	enabled     atomic.Bool // 用户关闭“AI 稳定通道”时为 false：一切走 default
+	reliableTCP atomic.Bool // 普通 TCP 也走 R（默认开；AERO_TCP_RELIABLE=0 关闭）
+}
+
+// ReliableTCPEnv 是回退开关的环境变量名：取 0、false、off、no 时普通 TCP 不走 R。
+const ReliableTCPEnv = "AERO_TCP_RELIABLE"
+
+func reliableTCPFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(ReliableTCPEnv))) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
 }
 
 func newFlowClassifier() *flowClassifier {
 	c := &flowClassifier{ai: newAIAddrSet(), flows: newTCPFlowTable()}
 	c.enabled.Store(true)
+	c.reliableTCP.Store(reliableTCPFromEnv())
 	return c
 }
 
-// classify 返回 pkt 应走的会话；newTCP 表示这是一个纯 SYN（新连接的第一个包）。
-// 不是 IPv4 TCP 的一律 default，且不产生任何状态。
+// classify 等价于 R 可用时的 classifyR。
 func (c *flowClassifier) classify(pkt []byte) (class flowClass, newTCP bool) {
-	if !c.enabled.Load() {
-		return flowDefault, false
+	return c.classifyR(pkt, true)
+}
+
+// classifyR 是 classifyG 的简写：rUp 为真表示 R 可用（代次固定为 1），丢弃流的代次。
+func (c *flowClassifier) classifyR(pkt []byte, rUp bool) (class flowClass, newTCP bool) {
+	var gen uint64
+	if rUp {
+		gen = 1
 	}
+	class, newTCP, _ = c.classifyG(pkt, gen)
+	return class, newTCP
+}
+
+// classifyG 返回 pkt 应走的会话；newTCP 表示这是一个纯 SYN（新连接的第一个包）；flowGen 是这条流固定到 R 时的链路代次。
+// gen 是 R 当前链路的代次，0 表示 R 不可用：此时普通 TCP 的新连接留在 default。
+// 复用层据 flowGen 与当前代次是否相等判断流是否还在原来的 R 链路上（R 重拨后地址变了，旧流不能再续传）。
+// 不是 IPv4 TCP 的一律 default，且不产生任何状态。
+func (c *flowClassifier) classifyG(pkt []byte, gen uint64) (class flowClass, newTCP bool, flowGen uint64) {
 	ihl := ipv4Header(pkt)
 	if ihl == 0 || pkt[9] != 6 {
-		return flowDefault, false
+		return flowDefault, false, 0
 	}
 	dst := netip.AddrFrom4([4]byte(pkt[16:20]))
 	if binary.BigEndian.Uint16(pkt[6:8])&0x3fff != 0 {
 		// 任何分片（MF 置位或偏移非 0）一律 default 且不记录：非首片没有端口，首片若走 ai 而后续分片走 default，
 		// 同一个报文会被拆到两条会话上无法重组。分片的 TCP 极少见。
-		return flowDefault, false
+		return flowDefault, false, 0
 	}
 	if int(binary.BigEndian.Uint16(pkt[2:4])) < ihl+14 { // 总长度（ipv4Header 已保证不超过 len(pkt)）
-		return flowDefault, false
+		return flowDefault, false, 0
 	}
 	key := tcpFlowKey{dst: dst, sport: binary.BigEndian.Uint16(pkt[ihl : ihl+2]), dport: binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])}
 	flags := pkt[ihl+13]
 	syn := flags&0x02 != 0 && flags&0x10 == 0
+	if !c.enabled.Load() {
+		// 用户关闭“AI 稳定通道”：新连接一律 default，并清掉同一四元组可能残留的 R 表项（否则重新打开后中途包会被当成 R 流）。
+		// 已固定在 R 上的流仍按原表项返回：复用层此时没有 R 链路，会让这些流立即收到 RST，而不是改用 TUN 源地址走 default 后挂起。
+		if syn {
+			c.flows.remove(key)
+			return flowDefault, false, 0
+		}
+		if cl, g, ok := c.flows.lookup(key); ok && cl != flowDefault {
+			if flags&0x04 != 0 {
+				c.flows.remove(key)
+			}
+			return cl, false, g
+		}
+		return flowDefault, false, 0
+	}
 	if !syn {
-		if cl, ok := c.flows.lookup(key); ok {
+		if cl, g, ok := c.flows.lookup(key); ok {
 			if flags&0x04 != 0 { // RST：这条流结束
 				c.flows.remove(key)
 			}
-			return cl, false
+			return cl, false, g
 		}
-	}
-	if !syn {
 		// 表里没有这条流的中途包（用户刚打开通道、条目过期或被淘汰）：永远走 default，不记录。
 		// 只有纯 SYN 才能开始一条 ai 流；否则一条已经在 default 上的连接会因源地址突变而断流。
-		return flowDefault, false
+		return flowDefault, false, 0
 	}
 	// 新连接（纯 SYN，也覆盖源端口复用）：按目的地址决定并记录。
 	cl := flowDefault
-	if c.ai.Contains(dst) {
+	switch {
+	case c.ai.Contains(dst):
 		cl = flowAI
+	case gen != 0 && c.reliableTCP.Load():
+		cl = flowReliable
 	}
-	c.flows.set(key, cl)
-	return cl, true
+	if cl == flowDefault {
+		gen = 0
+	}
+	c.flows.set(key, cl, gen)
+	return cl, true, gen
+}
+
+// reliableOn 报告普通 TCP 是否按设置走 R（通道开关与回退开关都开着）。
+func (c *flowClassifier) reliableOn() bool { return c.enabled.Load() && c.reliableTCP.Load() }
+
+// tcpKeyOf 返回 pkt 的流表键；pkt 不是带完整 TCP 头的 IPv4 包时 ok 为 false。
+func tcpKeyOf(pkt []byte) (k tcpFlowKey, ok bool) {
+	ihl := ipv4Header(pkt)
+	if ihl == 0 || pkt[9] != 6 || len(pkt) < ihl+4 {
+		return tcpFlowKey{}, false
+	}
+	return tcpFlowKey{dst: netip.AddrFrom4([4]byte(pkt[16:20])), sport: binary.BigEndian.Uint16(pkt[ihl : ihl+2]), dport: binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])}, true
 }

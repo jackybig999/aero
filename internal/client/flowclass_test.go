@@ -30,9 +30,12 @@ func (c *fakeClock) advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
+// newTestClassifier 返回“只有 AI 地址走 R”的分类器（等价于 AERO_TCP_RELIABLE=0），旧用例按这个语义写；
+// 普通 TCP 也走 R 的行为见 TestClassifyReliable*。
 func newTestClassifier() (*flowClassifier, *fakeClock) {
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	c := newFlowClassifier()
+	c.reliableTCP.Store(false)
 	c.ai.now = clk.now
 	c.flows.now = clk.now
 	return c, clk
@@ -255,7 +258,7 @@ func TestClassifySYNRevisitsPortReuseAndRSTEnds(t *testing.T) {
 	if cl, _ := c.classify(tcpPacket(natTun, aiHost, 50010, 443, fRST)); cl != flowAI {
 		t.Fatal("RST must still use the flow's session")
 	}
-	if _, ok := c.flows.lookup(k); ok {
+	if _, _, ok := c.flows.lookup(k); ok {
 		t.Fatal("RST did not end the flow")
 	}
 }
@@ -329,7 +332,7 @@ func TestTCPFlowTableIdleAndCapacity(t *testing.T) {
 	}
 	// 空闲超时：条目被视为不存在。
 	clk.advance(tcpFlowIdle + time.Second)
-	if _, ok := c.flows.lookup(tcpFlowKey{dst: aiHost, sport: 41000, dport: 443}); ok {
+	if _, _, ok := c.flows.lookup(tcpFlowKey{dst: aiHost, sport: 41000, dport: 443}); ok {
 		t.Fatal("idle entry not expired")
 	}
 }
@@ -411,4 +414,68 @@ func TestDNSHandlerRecordsAIAnswers(t *testing.T) {
 	}
 	h.SetAIRecorder(nil) // 取消后不再回调
 	h.HandleQuery(buildDNSQuery("claude.ai", dnsTypeA), net.ParseIP("10.88.0.2"), 5000)
+}
+
+func TestReliableTCPDefaultOnAndEnvOff(t *testing.T) {
+	t.Setenv(ReliableTCPEnv, "")
+	if !newFlowClassifier().reliableTCP.Load() {
+		t.Fatal("ordinary TCP over R must be on by default")
+	}
+	for _, v := range []string{"0", "false", "OFF", " no "} {
+		t.Setenv(ReliableTCPEnv, v)
+		if newFlowClassifier().reliableTCP.Load() {
+			t.Fatalf("%s=%q should turn it off", ReliableTCPEnv, v)
+		}
+	}
+	t.Setenv(ReliableTCPEnv, "1")
+	if !newFlowClassifier().reliableTCP.Load() {
+		t.Fatal("1 should keep it on")
+	}
+}
+
+func TestClassifyReliableOrdinaryTCPUsesRWhenUp(t *testing.T) {
+	c, _ := newTestClassifier()
+	c.reliableTCP.Store(true)
+	// 普通 TCP 新连接：R 可用 → flowReliable，且整条流固定。
+	if cl, syn := c.classifyR(tcpPacket(natTun, otherHost, 50100, 443, fSYN), true); cl != flowReliable || !syn {
+		t.Fatalf("class=%d syn=%v", cl, syn)
+	}
+	for _, flags := range []byte{fACK, fACK | 0x08, fRST} {
+		if cl, _ := c.classifyR(tcpPacket(natTun, otherHost, 50100, 443, flags), false); cl != flowReliable {
+			t.Fatalf("flags %#x: an established R flow changed class to %d (R state must not matter mid-flow)", flags, cl)
+		}
+	}
+	// R 不可用时的新连接留在 default，并固定在 default：之后 R 恢复也不迁移。
+	if cl, _ := c.classifyR(tcpPacket(natTun, otherHost, 50101, 443, fSYN), false); cl != flowDefault {
+		t.Fatalf("new flow while R is down: class=%d", cl)
+	}
+	if cl, _ := c.classifyR(tcpPacket(natTun, otherHost, 50101, 443, fACK), true); cl != flowDefault {
+		t.Fatal("a flow started on default must stay there when R comes back")
+	}
+	// AI 地址优先于普通 TCP：仍是 flowAI（R 不可用时 fail-closed，不退到 default）。
+	c.ai.Add(aiHost, time.Hour)
+	if cl, _ := c.classifyR(tcpPacket(natTun, aiHost, 50102, 443, fSYN), false); cl != flowAI {
+		t.Fatalf("AI address with R down: class=%d", cl)
+	}
+	// 不是 TCP 的流量始终 default，不产生状态。
+	before := c.flows.len()
+	if cl, _ := c.classifyR(udpPacket(natTun, otherHost), true); cl != flowDefault || c.flows.len() != before {
+		t.Fatal("UDP must stay on default and leave no state")
+	}
+}
+
+func TestClassifyReliableOffKeepsOrdinaryTCPOnDefault(t *testing.T) {
+	c, _ := newTestClassifier() // reliableTCP=false
+	if cl, _ := c.classifyR(tcpPacket(natTun, otherHost, 50110, 443, fSYN), true); cl != flowDefault {
+		t.Fatalf("class=%d", cl)
+	}
+}
+
+func TestClassifyDisabledOverridesReliable(t *testing.T) {
+	c, _ := newTestClassifier()
+	c.reliableTCP.Store(true)
+	c.enabled.Store(false) // 用户关闭“AI 稳定通道”：一切走 default
+	if cl, _ := c.classifyR(tcpPacket(natTun, otherHost, 50120, 443, fSYN), true); cl != flowDefault {
+		t.Fatalf("class=%d", cl)
+	}
 }
