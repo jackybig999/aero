@@ -835,3 +835,200 @@ func TestDownlinkBudgetReturnsToZeroUnderConcurrentClose(t *testing.T) {
 		t.Fatalf("downlink budget leaked: %d bytes (base %d)", got-base, base)
 	}
 }
+
+// codel 状态机（纯函数，手动给时间，不依赖真实时钟）：
+// 排队时间低于 target 不丢；持续高于 target 满一个 interval 才开始丢；之后按 interval/sqrt(n) 一次只丢一个；回落立即停止。
+func TestCoDelDropsOnlyAfterPersistentQueueing(t *testing.T) {
+	old := downlinkCoDelTarget
+	downlinkCoDelTarget = 50 * time.Millisecond
+	defer func() { downlinkCoDelTarget = old }()
+
+	var c codel
+	t0 := time.Unix(1000, 0)
+	at := func(d time.Duration) time.Time { return t0.Add(d) }
+	const high, low = 300 * time.Millisecond, 10 * time.Millisecond
+
+	if c.shouldDrop(at(0), low, 100) {
+		t.Fatal("dropped with sojourn below target")
+	}
+	if c.shouldDrop(at(time.Second), high, 100) { // 首次高于 target：只记时刻
+		t.Fatal("dropped on the first sample above target")
+	}
+	if c.shouldDrop(at(time.Second+downlinkCoDelInterval-time.Millisecond), high, 100) {
+		t.Fatal("dropped before a full interval above target")
+	}
+	d1 := at(time.Second + downlinkCoDelInterval)
+	if !c.shouldDrop(d1, high, 100) {
+		t.Fatal("no drop after a full interval above target")
+	}
+	// 同一时刻不再丢第二个：一次只丢一个，不成批
+	for i := 0; i < 50; i++ {
+		if c.shouldDrop(d1, high, 100) {
+			t.Fatal("dropped two packets back to back")
+		}
+	}
+	// 第二次丢包在 interval/sqrt(2) ≈ 176ms 之后（count=2），再下一次更近（count=3 ≈ 144ms）
+	if c.shouldDrop(d1.Add(170*time.Millisecond), high, 100) {
+		t.Fatal("second drop came too early")
+	}
+	d2 := d1.Add(downlinkCoDelInterval) // 已越过 dropNext
+	if !c.shouldDrop(d2, high, 100) {
+		t.Fatal("no second drop after the control-law interval")
+	}
+	// 排队时间回落：立即结束丢包状态
+	if c.shouldDrop(d2.Add(time.Millisecond), low, 100) || c.dropping {
+		t.Fatal("still dropping after the queue drained below target")
+	}
+	// 队列只剩这一个包时即使排队久也不丢（backlog==0）
+	if c.shouldDrop(d2.Add(2*time.Second), high, 0) {
+		t.Fatal("dropped the last packet of the queue")
+	}
+	// target=0 关闭
+	downlinkCoDelTarget = 0
+	var off codel
+	for i := 0; i < 10; i++ {
+		if off.shouldDrop(at(time.Duration(i)*time.Second), time.Hour, 100) {
+			t.Fatal("dropped with CoDel disabled")
+		}
+	}
+}
+
+// RFC 8289 的 count 沿用：队列反复短暂越过 target 时，每轮都从很低的丢包频率起步，不得逐轮累积上涨。
+func TestCoDelCountDoesNotAccumulateAcrossShortDips(t *testing.T) {
+	old := downlinkCoDelTarget
+	downlinkCoDelTarget = 50 * time.Millisecond
+	defer func() { downlinkCoDelTarget = old }()
+
+	var c codel
+	now := time.Unix(1000, 0)
+	const high, low = 300 * time.Millisecond, 10 * time.Millisecond
+	// 每一轮：越过 target 满一个 interval 后丢 2 个包，随后回落一次。
+	for round := 1; round <= 6; round++ {
+		c.shouldDrop(now, high, 100) // 记 firstAbove（第一轮；之后可能因快速重入直接开始）
+		now = now.Add(downlinkCoDelInterval)
+		for !c.dropping {
+			if c.shouldDrop(now, high, 100) {
+				break
+			}
+			now = now.Add(10 * time.Millisecond)
+		}
+		for c.count < 2 { // 第二个包按控制律稍后丢
+			now = now.Add(10 * time.Millisecond)
+			c.shouldDrop(now, high, 100)
+		}
+		if c.count > 2 {
+			t.Fatalf("round %d: count = %d after two drops, accumulated across rounds", round, c.count)
+		}
+		now = now.Add(20 * time.Millisecond)
+		c.shouldDrop(now, low, 100) // 短暂回落，结束丢包状态
+		now = now.Add(20 * time.Millisecond)
+	}
+}
+
+// slowConn 每写一个包要花 10ms（虚拟时间），模拟出速只有约 120KB/s 的会话。
+type slowConn struct{ written atomic.Int64 }
+
+func (c *slowConn) ReadPacket([]byte) (int, error) { return 0, net.ErrClosed }
+func (c *slowConn) WritePacket([]byte) ([]byte, error) {
+	time.Sleep(10 * time.Millisecond)
+	c.written.Add(1)
+	return nil, nil
+}
+func (c *slowConn) Close() error { return nil }
+
+// 出速低、队列堆积：开始丢包前至少先排满一个 interval，之后只零星丢（不成批），其余照常发送，预算全部归还。
+// 使用 synctest 的虚拟时钟，结果确定且不真实等待（L0 §13.1）。
+func TestDownlinkCoDelDropsGraduallyUnderSlowDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		old := downlinkCoDelTarget
+		downlinkCoDelTarget = 50 * time.Millisecond
+		defer func() { downlinkCoDelTarget = old }()
+
+		router := NewGlobalTunnelRouter()
+		device := &readerTestDevice{packets: make(chan []byte, 1), closed: make(chan struct{})}
+		reader, err := NewGlobalTunnelReader(nil, device, router)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }() // 失败时也要收尾，否则 synctest 报协程泄漏
+		base := downlinkQueuedBytes.Load()
+		conn := &slowConn{}
+		binding := GlobalTunnelBinding{IPv4: netip.MustParseAddr("10.88.0.60"), Conn: conn}
+		pkt := buildRouterTestIPv4(netip.MustParseAddr("1.1.1.1"), binding.IPv4)
+
+		const total = 100
+		for i := 0; i < total; i++ {
+			reader.enqueueDownlink(binding, pkt)
+		}
+		d := reader.downlinkFor(binding)
+		time.Sleep(2 * time.Second) // 虚拟时间：足够全部处理完（且早于 5 秒一次的 [DOWNQ] 统计清零）
+		synctest.Wait()
+
+		dropped, written := d.dropAge.Load(), conn.written.Load()
+		if dropped < 1 || dropped > 15 {
+			t.Fatalf("dropped = %d, want a few (1..15), not a mass drop", dropped)
+		}
+		if written+int64(dropped) != total {
+			t.Fatalf("written %d + dropped %d != %d", written, dropped, total)
+		}
+		if d.dropFull.Load() != 0 {
+			t.Fatalf("queue-full drops = %d, want 0", d.dropFull.Load())
+		}
+		_ = reader.Close()
+		if got := downlinkQueuedBytes.Load(); got != base {
+			t.Fatalf("budget after close = %d, want %d", got, base)
+		}
+	})
+}
+
+// gatedFastConn：gate 关闭前 WritePacket 阻塞（模拟写通道被流控/拥塞窗口挡住），放行后每包 60µs（约 20MB/s）。
+type gatedFastConn struct {
+	gate    chan struct{}
+	written atomic.Int64
+}
+
+func (c *gatedFastConn) ReadPacket([]byte) (int, error) { return 0, net.ErrClosed }
+func (c *gatedFastConn) WritePacket([]byte) ([]byte, error) {
+	<-c.gate
+	time.Sleep(60 * time.Microsecond)
+	c.written.Add(1)
+	return nil, nil
+}
+func (c *gatedFastConn) Close() error { return nil }
+
+// 回归（审查意见）：高速会话上 512 包突发，且写通道被挡住一个往返（190ms）后再放行，整队不得被成批丢弃。
+// 虚拟时间下：停顿 190ms < interval(250ms)，排空 512 包只需约 31ms，期间不应有任何 CoDel 丢包，512 包全部发出。
+func TestDownlinkCoDelNoDropOnBurstAfterOneRTTStall(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		old := downlinkCoDelTarget
+		downlinkCoDelTarget = 50 * time.Millisecond
+		defer func() { downlinkCoDelTarget = old }()
+
+		router := NewGlobalTunnelRouter()
+		device := &readerTestDevice{packets: make(chan []byte, 1), closed: make(chan struct{})}
+		reader, err := NewGlobalTunnelReader(nil, device, router)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		conn := &gatedFastConn{gate: make(chan struct{})}
+		binding := GlobalTunnelBinding{IPv4: netip.MustParseAddr("10.88.0.61"), Conn: conn}
+		pkt := buildRouterTestIPv4(netip.MustParseAddr("1.1.1.1"), binding.IPv4)
+
+		for i := 0; i < downlinkQueueLen; i++ { // 第 1 个卡在 WritePacket，其余排队
+			reader.enqueueDownlink(binding, pkt)
+		}
+		d := reader.downlinkFor(binding)
+		time.Sleep(190 * time.Millisecond) // 一个跨境往返
+		close(conn.gate)
+		time.Sleep(time.Second)
+		synctest.Wait()
+
+		if got := d.dropAge.Load(); got != 0 {
+			t.Fatalf("CoDel dropped %d packets after a one-RTT stall, want 0", got)
+		}
+		if got := conn.written.Load(); got != downlinkQueueLen {
+			t.Fatalf("written = %d, want %d", got, downlinkQueueLen)
+		}
+	})
+}

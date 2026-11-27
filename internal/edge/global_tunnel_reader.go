@@ -9,9 +9,11 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,9 +94,95 @@ const downlinkBudgetBytes = 64 << 20
 
 var downlinkQueuedBytes atomic.Int64
 
+// 下行队列的主动队列管理（CoDel，RFC 8289 的简化实现）。
+// 为什么需要：队列只按包数限长，会话出速低时（跨境链路上常只有几百 KB/s）512 个包要排好几秒，
+// 内层 TCP 看不到丢包就一直加窗，新连接的握手、AI 的流式输出都被排在大下载后面等几秒
+// （真机 [FLOW] syn 2~6 秒，链路 RTT 仅 0.18 秒）。
+// 做法：出队时若排队时间持续高于 target 满一个 interval，才开始丢包，且每 interval/sqrt(丢包计数) 只丢一个，
+// 排队时间回落到 target 以下立即停止。不会成批丢包，所以出口被流控挡住一个往返时不会把整队丢光。
+// interval 取 250ms（不小于跨境往返时间，让内层 TCP 来得及对上一次丢包作出反应）。出速高时队列排得快，不触发。
+// 环境变量 AERO_DOWNQ_TARGET_MS 覆盖 target（毫秒；0 关闭，回到只按包数限长）。
+const downlinkCoDelInterval = 250 * time.Millisecond
+
+var downlinkCoDelTarget = downlinkTargetFromEnv()
+
+func downlinkTargetFromEnv() time.Duration {
+	const def = 50 * time.Millisecond
+	v := os.Getenv("AERO_DOWNQ_TARGET_MS")
+	if v == "" {
+		return def
+	}
+	ms, err := strconv.Atoi(v)
+	if err != nil || ms < 0 {
+		log.Printf("[DOWNQ] AERO_DOWNQ_TARGET_MS=%q 无效（需为非负整数毫秒），使用默认 %v", v, def)
+		return def
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// codel 是单个会话下行队列的 CoDel 状态；只由该会话的发送协程访问，不需要锁。
+// 与 RFC 8289 §5 伪代码的差异（有意）：
+//   - “队列很短”按“出队后队列里已没有别的包”判断（backlog==0），RFC 是剩余字节不超过一个 MTU，这里更保守，只会少丢；
+//   - 快速重入：刚结束丢包状态不久（距 dropNext 不到一个 interval）又见排队时间高于 target，不必再等满一个 interval。
+type codel struct {
+	firstAbove time.Time // 排队时间首次持续高于 target 的判定时刻（零值：当前不高于）
+	dropNext   time.Time // 丢包状态下，下一次允许丢包的时刻
+	count      uint32    // 丢包计数（控制律的 n）
+	lastCount  uint32    // 进入上一轮丢包状态时的 count（RFC 8289 的 lastcount）
+	dropping   bool
+}
+
+// shouldDrop 在出队时判定这个报文是否丢弃。soj 是它的排队时间，backlog 是它之后队列里还剩的包数。
+func (c *codel) shouldDrop(now time.Time, soj time.Duration, backlog int) bool {
+	target := downlinkCoDelTarget
+	if target <= 0 {
+		return false
+	}
+	if soj < target || backlog == 0 { // 队列已经很短：不丢，并结束丢包状态
+		c.firstAbove = time.Time{}
+		c.dropping = false
+		return false
+	}
+	if !c.dropping {
+		recent := !c.dropNext.IsZero() && now.Sub(c.dropNext) < downlinkCoDelInterval // 快速重入
+		if c.firstAbove.IsZero() {
+			c.firstAbove = now.Add(downlinkCoDelInterval)
+			if !recent {
+				return false
+			}
+		} else if now.Before(c.firstAbove) && !recent {
+			return false
+		}
+		// 进入丢包状态。RFC 8289：若上一轮丢得不少（delta>1）且离上一轮不远，从 delta 起步，
+		// 否则从 1 起步；这样队列反复短暂越过 target 时丢包频率不会逐轮累积上涨。
+		delta := c.count - c.lastCount
+		if delta > 1 && now.Sub(c.dropNext) < 16*downlinkCoDelInterval {
+			c.count = delta
+		} else {
+			c.count = 1
+		}
+		c.lastCount = c.count
+		c.dropping = true
+		c.dropNext = now.Add(c.controlLaw())
+		return true
+	}
+	if now.Before(c.dropNext) {
+		return false
+	}
+	c.count++
+	c.dropNext = c.dropNext.Add(c.controlLaw())
+	return true
+}
+
+// controlLaw 返回两次丢包的间隔：interval / sqrt(count)。
+func (c *codel) controlLaw() time.Duration {
+	return time.Duration(float64(downlinkCoDelInterval) / math.Sqrt(float64(c.count)))
+}
+
 type downlinkPacket struct {
 	buf *[]byte
 	n   int
+	at  time.Time // 入队时间
 }
 
 type tunnelDownlink struct {
@@ -103,6 +191,12 @@ type tunnelDownlink struct {
 	ch        chan downlinkPacket
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// 本会话的队列统计（每 downlinkStatEvery 个存活检查周期输出一次 [DOWNQ] 并清零）。
+	dropAge    atomic.Uint64 // 因排队时间过长（CoDel）丢弃
+	codel      codel         // 只由发送协程访问
+	dropFull   atomic.Uint64 // 因队列已满丢弃
+	maxSojourn atomic.Int64  // 出队时观察到的最长停留（纳秒）
 
 	// mu 与 closed 使“入队”与“停止”互斥：stop 之后不会再有报文进入 ch，
 	// 因此发送协程退出前的 drain 能扣回队列中全部剩余报文的预算（否则全局预算会缓慢泄漏）。
@@ -385,8 +479,9 @@ func (r *GlobalTunnelReader) enqueueDownlink(binding GlobalTunnelBinding, packet
 	}
 	n := copy(*buf, packet)
 	select {
-	case d.ch <- downlinkPacket{buf: buf, n: n}:
+	case d.ch <- downlinkPacket{buf: buf, n: n, at: time.Now()}:
 	default:
+		d.dropFull.Add(1)
 		putDownlinkBuf(buf) // 队列满：丢包，不阻塞读循环
 	}
 }
@@ -428,18 +523,34 @@ func (r *GlobalTunnelReader) runDownlink(d *tunnelDownlink) {
 	writer, canWrite := r.device.(globalTunnelDeviceWriter)
 	liveness := time.NewTicker(downlinkLivenessInterval)
 	defer liveness.Stop()
+	ticks := 0
 	for {
 		select {
 		case <-d.done:
+			d.logStats() // 最后不足一个统计周期的数据也输出
 			r.drainDownlink(d)
 			return
 		case <-liveness.C:
 			if d.binding.Generation != 0 && !r.router.IsCurrent(d.binding) {
 				r.removeDownlink(d)
+				d.logStats()
 				r.drainDownlink(d)
 				return
 			}
+			if ticks++; ticks%downlinkStatEvery == 0 {
+				d.logStats()
+			}
 		case p := <-d.ch:
+			now := time.Now()
+			soj := now.Sub(p.at)
+			if int64(soj) > d.maxSojourn.Load() {
+				d.maxSojourn.Store(int64(soj))
+			}
+			if d.codel.shouldDrop(now, soj, len(d.ch)) {
+				d.dropAge.Add(1)
+				putDownlinkBuf(p.buf) // 排队过久：丢弃，给内层 TCP 退让信号
+				continue
+			}
 			icmpPkt, err := d.conn.WritePacket((*p.buf)[:p.n])
 			if err == nil {
 				d.binding.usage.Add(0, int64(p.n))
@@ -453,6 +564,19 @@ func (r *GlobalTunnelReader) runDownlink(d *tunnelDownlink) {
 			}
 		}
 	}
+}
+
+// downlinkStatEvery 是输出 [DOWNQ] 的间隔（单位：存活检查周期，即秒）。
+const downlinkStatEvery = 5
+
+// logStats 在本周期有丢包或排队延迟明显时输出一行并清零；空闲与健康的会话不输出。
+func (d *tunnelDownlink) logStats() {
+	age, full, soj := d.dropAge.Swap(0), d.dropFull.Swap(0), time.Duration(d.maxSojourn.Swap(0))
+	if age == 0 && full == 0 && soj < 100*time.Millisecond {
+		return
+	}
+	log.Printf("[DOWNQ] gen=%d 队列=%d/%d 最长停留=%v 因排队过久丢弃=%d 因队满丢弃=%d（target %v）",
+		d.binding.Generation, len(d.ch), cap(d.ch), soj.Round(time.Millisecond), age, full, downlinkCoDelTarget)
 }
 
 // drainDownlink 归还队列中剩余报文的缓冲。
