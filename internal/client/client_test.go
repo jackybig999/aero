@@ -129,12 +129,17 @@ func (m *mockSessionPool) Reset() {
 func TestLoadAndApplySubscriptionSingleflight(t *testing.T) {
 	// 处理器先登记“第一个请求已到”，再等 release：在途的那一次拉取一直开着，直到所有调用方都有足够时间加入它。
 	// 此前用固定 50ms 的睡眠，负载高的机器（Windows 运行器）上有协程晚于它结束才启动，会发起第二次拉取而误报。
-	var fetchCount atomic.Int32
+	// 按 Host（含端口）统计请求数：单飞只允许一次拉取，一次拉取内部主端口失败后的候选端口阶梯探测
+	// 会向不同端口各发一个请求，这是正常行为；单飞失效才会让同一个 host:port 被请求不止一次。
+	var mu sync.Mutex
+	perHost := map[string]int{}
 	arrived := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fetchCount.Add(1)
+		mu.Lock()
+		perHost[r.Host]++
+		mu.Unlock()
 		once.Do(func() { close(arrived) })
 		<-release
 		w.Header().Set("Content-Type", "application/json")
@@ -176,8 +181,15 @@ func TestLoadAndApplySubscriptionSingleflight(t *testing.T) {
 		}
 	}
 
-	if count := fetchCount.Load(); count != 1 {
-		t.Fatalf("expected exactly 1 upstream fetch due to singleflight, got %d", count)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(perHost) == 0 {
+		t.Fatal("没有任何上游请求到达，测试没有检查到东西")
+	}
+	for host, n := range perHost {
+		if n != 1 {
+			t.Fatalf("expected exactly 1 upstream fetch per host due to singleflight, %s got %d (all: %v)", host, n, perHost)
+		}
 	}
 }
 

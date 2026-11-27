@@ -37,30 +37,33 @@ func TestTokenLifetimeAndRefreshPoint(t *testing.T) {
 }
 
 // 有效期过 75% 时自动重新拉取订阅并切换到新 token（引擎字段与全局活跃节点都更新）。
+// 处理器按请求序号发 token：第 1 次（初始导入）发旧的，之后都发新的。初始导入时 Apply 会唤醒刷新协程，
+// 旧 token 已过 75%，它立刻重拉；这一次与测试线程谁先谁后都不影响结果，不依赖时序。
 func TestTokenRefresherRotatesToNewToken(t *testing.T) {
 	now := time.Now()
 	oldTok := fakeSignedToken(now.Add(-90*time.Minute), now.Add(30*time.Minute), "old") // 已过 75%
 	newTok := fakeSignedToken(now, now.Add(24*time.Hour), "new")
-	var current atomic.Value
-	current.Store(oldTok)
 	var fetches atomic.Int32
 	ClearCachedSubPorts()
 	defer ClearCachedSubPorts()
 	useSubHTTPS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fetches.Add(1)
+		tok := newTok
+		if fetches.Add(1) == 1 {
+			tok = oldTok
+		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"version":"aero/3.0","servers":[{"name":"n1","host":"198.51.100.7","address":"198.51.100.7:443","ip":"198.51.100.7","token":%q,"sni":"n1.example.com","protocol":"connect-ip"}]}`, current.Load().(string))
+		fmt.Fprintf(w, `{"version":"aero/3.0","servers":[{"name":"n1","host":"198.51.100.7","address":"198.51.100.7:443","ip":"198.51.100.7","token":%q,"sni":"n1.example.com","protocol":"connect-ip"}]}`, tok)
 	}))
 
 	eng := NewEngine()
 	defer eng.Close()
-	if _, err := eng.LoadAndApplySubscription("https://sub.aero.test/sub/x"); err != nil {
+	applied, err := eng.LoadAndApplySubscription("https://sub.aero.test/sub/x")
+	if err != nil {
 		t.Fatalf("initial load: %v", err)
 	}
-	if _, tok, _, _ := getActiveEdge(); tok != oldTok {
-		t.Fatal("initial token not applied")
+	if applied.PrimaryToken != oldTok {
+		t.Fatal("initial import did not carry the old token")
 	}
-	current.Store(newTok) // 中台签发了新 token
 	eng.kickTokenRefresh()
 
 	deadline := time.Now().Add(5 * time.Second)

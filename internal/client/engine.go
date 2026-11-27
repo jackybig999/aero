@@ -585,6 +585,12 @@ func (e *Engine) refreshActiveNodeLocked(applied *Applied, srv ServerConfig) {
 
 // LoadAndApplySubscription 从远程 URL 加载并应用订阅，挂载 singleflight 阻断重入
 func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
+	applied, _, err := e.loadAndApplySubscription(src)
+	return applied, err
+}
+
+// loadAndApplySubscription 同 LoadAndApplySubscription，另返回本次调用是否合并进了别人在途的导入（shared）。
+func (e *Engine) loadAndApplySubscription(src string) (*Applied, bool, error) {
 	tCall := time.Now()
 	v, err, shared := subSingleFlight.Do(src, func() (any, error) {
 		ctx, cancel := context.WithTimeout(e.getContext(), 30*time.Second)
@@ -625,12 +631,12 @@ func (e *Engine) LoadAndApplySubscription(src string) (*Applied, error) {
 	})
 	if err != nil {
 		log.Printf("[SUB] load failed after %v (%s)", time.Since(tCall).Round(time.Millisecond), subErrKind(err))
-		return nil, err
+		return nil, shared, err
 	}
 	applied := v.(*Applied)
 	// shared 为真表示与另一个同 URL 的导入合并（等待它完成）；日志里的耗时是本次调用的总等待
 	log.Printf("[SUB] load+apply ok in %v (nodes=%d, fromCache=%v, joinedInflight=%v)", time.Since(tCall).Round(time.Millisecond), len(applied.Servers), applied.FromCache, shared)
-	return applied, nil
+	return applied, shared, nil
 }
 
 // ReuseAppliedSubscription 在 src 就是当前已应用的订阅、且近期（maxAge 内）成功拉取过时返回节点数与 true，

@@ -109,7 +109,14 @@ func (e *Engine) runTokenRefresher() {
 		if !signed || src == "" || tokenRefreshNow().Before(at) {
 			continue // 尚未到刷新时刻（等待被截断为 tokenRefreshMaxWait）
 		}
-		applied, err := e.LoadAndApplySubscription(src)
+		applied, shared, err := e.loadAndApplySubscription(src)
+		if err == nil && shared && !applied.FromCache {
+			// 合并进了一次更早开始的导入（例如刚导入订阅时 Apply 的 kick 唤醒了本协程，那次拉取发生在 token 轮换之前）：
+			// 它拿到的不一定是新 token，在途的那次已经结束，重拉一次即可，不必按失败退避。
+			if _, curTok, _, _ := getActiveEdge(); curTok == tok {
+				applied, _, err = e.loadAndApplySubscription(src)
+			}
+		}
 		// Apply 会 kick 本协程；那是自己引起的，不是新订阅。不清掉的话下一轮会重置退避并立刻重拉（空转）。
 		e.drainTokenRefreshKick()
 		_, newTok, _, _ := getActiveEdge()
